@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+set -eu
+
+echo "ARR pre-commit: git diff --check"
+git diff --cached --check
+
+if [ -n "${PYTHON:-}" ]; then
+  PYTHON_BIN="$PYTHON"
+elif [ -x "_codex_runtime/tmp/venv-final-pass/Scripts/python.exe" ]; then
+  PYTHON_BIN="_codex_runtime/tmp/venv-final-pass/Scripts/python.exe"
+elif [ -x "_codex_runtime/tmp/venv-arr/Scripts/python.exe" ]; then
+  PYTHON_BIN="_codex_runtime/tmp/venv-arr/Scripts/python.exe"
+else
+  PYTHON_BIN="python"
+fi
+
+echo "ARR pre-commit: compileall"
+"$PYTHON_BIN" -m compileall -q services tests
+
+echo "ARR pre-commit: contratos rapidos"
+"$PYTHON_BIN" -m pytest -q \
+  tests/test_project_governance.py \
+  services/arr-orchestrator/tests/test_arr_blackbox.py \
+  services/arr-orchestrator/tests/test_arr_follow.py \
+  services/buscador-puente-arr/tests/test_arr_trace.py

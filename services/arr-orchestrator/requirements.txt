@@ -1,0 +1,5 @@
+requests==2.32.5
+watchdog==6.0.0
+setuptools<81
+guessit==3.8.0
+pytest>=8.4,<9

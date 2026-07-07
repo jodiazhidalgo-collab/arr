@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "entrada": {
+    "extensiones_video": [".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".mts", ".webm"]
+  },
+  "video": {
+    "pistas_exactas": 1,
+    "idiomas_aceptados": ["es", "spa", "esp", "esl", "spanish", "castilian"],
+    "idiomas_indeterminados_como_es": ["", "-", "und", "undefined", "unknown", "unk", "none"],
+    "aceptar_por_audio_es": true,
+    "idiomas_corregibles_por_audio_es": ["eng", "en", "en-us", "en-gb", "english", "de", "ger", "deu", "fra", "fre", "fr", "ita", "it", "und", "undefined", "unknown", "unk", "none"],
+    "idioma_final_por_audio_es": "es",
+    "idioma_final": "es",
+    "marcar_default": true,
+    "marcar_forzado": false
+  },
+  "audio": {
+    "idiomas_aceptados": ["es", "spa"],
+    "aceptar_indeterminado_si_video_es": true,
+    "idiomas_condicionales_si_video_es": ["und", "undefined", "unknown", "unk", "none"],
+    "idioma_final_condicional": "es",
+    "canales_convertir_ac3_desde": 6,
+    "bitrate_ac3": "640k",
+    "titulo_ac3_convertido": "AC3 5.1",
+    "marcar_default": true,
+    "marcar_forzado": false,
+    "codec_prioridad": {
+      "truehd": 900,
+      "mlp": 850,
+      "dts": 800,
+      "eac3": 700,
+      "ac3": 600,
+      "flac": 500,
+      "aac": 400,
+      "mp3": 300
+    },
+    "titulos_codec": {
+      "ac3": "AC3",
+      "eac3": "E-AC3",
+      "aac": "AAC",
+      "dts": "DTS",
+      "truehd": "TrueHD",
+      "flac": "FLAC",
+      "mp3": "MP3"
+    }
+  },
+  "subtitulos": {
+    "idiomas_aceptados": ["es", "spa"],
+    "formatos_texto_aceptados": ["subrip", "ass", "ssa", "webvtt", "mov_text"],
+    "formatos_imagen_no_aceptados": ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"],
+    "frases_descartar_hasta": 1,
+    "delay_audio": {
+      "activo": true,
+      "texto_titulo": "ESPAÑOL delay audio",
+      "frases_maximo": 150
+    },
+    "sin_subtitulos_modo": "procesar_sin_subtitulos",
+    "frases_maximo_unico_forzado": 150,
+    "unico_es_modo": "aplicar_limite",
+    "titulo_final": "Forzados",
+    "sufijo_srt_externo": ".es.forced.srt",
+    "interno_default": false,
+    "interno_forzado": false
+  },
+  "limpieza": {
+    "crear_capitulos": true,
+    "capitulo_cada_segundos": 600,
+    "borrar_metadata_original": true,
+    "limpiar_tags_mkv": true,
+    "exportar_srt_externo": true
+  },
+  "trailers": {
+    "extensiones_video": [".mp4", ".mkv", ".webm", ".m4v", ".mov", ".avi"],
+    "score_minimo_con_ano": 0.62,
+    "score_minimo_sin_ano": 0.78,
+    "nombre_final": "trailer",
+    "si_existe": "renombrar_sin_borrar",
+    "palabras_ruido_titulo": ["4k", "2160p", "1080p", "720p", "uhd", "hdr", "hdr10", "dv", "bluray", "blu ray", "webrip", "web dl", "x264", "x265", "hevc", "remux", "dual", "esp", "spa", "spanish", "castellano", "latino", "microhd", "rip"]
+  }
+}

@@ -1,0 +1,1174 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from arr_orchestrator.config import Config
+from arr_orchestrator.db import Database
+from arr_orchestrator.engine import Engine
+from arr_orchestrator.filebot import MOVE_PATTERN, is_duplicate_output
+from arr_orchestrator.filesystem import (
+    extraction_command_previews,
+    matching_root,
+    manifest,
+    media_files,
+    media_worker_source,
+    move_job_to,
+    move_job_to_review_clean,
+    move_tv_job_to_review,
+    move_trailer_package_into_job,
+    prepare_filebot_input,
+    top_level_item,
+    trailer_package_manifest,
+    trailer_ready_source,
+    write_reason,
+)
+from arr_orchestrator.media_worker import MediaWorkerClient
+from arr_orchestrator.torrent import torrent_info
+from arr_orchestrator.name_resolver import ResolvedIdentity, ResolverUnavailable
+from arr_orchestrator.name_resolver import ResolverAmbiguous
+
+
+def test_config(root: Path) -> Config:
+    data = root / "data"
+    complete = data / "downloads" / "torrents" / "complete"
+    return Config(
+        mode="active",
+        config_dir=root / "config",
+        data_root=data,
+        watch_inbox=data / "torrents" / "watch" / "inbox",
+        processed_root=data / "torrents" / "watch" / "processed",
+        watch_error=data / "torrents" / "watch" / "error",
+        event_dir=data / "torrents" / "events" / "inbox" / "qbt",
+        complete_root=complete,
+        workshop_root=complete / "taller",
+        movies_output=complete / "movies_automatizacion",
+        movies_final=data / "media" / "movies",
+        tv_output=data / "media" / "tv",
+        trailers_inbox=complete / "trailers_automatizacion",
+        review_dir=data / "media" / "repetidas_vs_error",
+        media_worker_url="http://media-worker:8790",
+        callback_url="http://arr-orchestrator:8787",
+        media_reports_root=root / "config" / "media-worker",
+        codex_diag_root=root / "diagnosticos_codex",
+        diagnostics_root=root / "diagnostics" / "arr",
+        qbt_url="http://gluetun:8080",
+        qbt_user="admin",
+        qbt_password="",
+        rdt_url="http://rdtclient:6500",
+        rdt_user="admin",
+        rdt_password="",
+        stable_seconds=1,
+        reconcile_seconds=30,
+        fallback_seconds=5400,
+        health_port=8787,
+        filebot_bin="/opt/filebot/filebot",
+        tmdb_api_token="",
+        resolver_language="es-ES",
+        resolver_region="ES",
+        resolver_http_timeout_ms=2500,
+        resolver_total_budget_ms=5000,
+        resolver_retry_seconds=60,
+    )
+
+
+test_config.__test__ = False
+
+
+class CoreTests(unittest.TestCase):
+    def _run_tv_name_with_ambiguous_resolver(self, name: str, message: str):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        config = test_config(root)
+        config.ensure_directories()
+        database = Database(root / "test.db")
+        database.initialize()
+        engine = Engine(config, database)
+        job_root = config.workshop_root / "job-tv-policy"
+        original = job_root / "original"
+        original.mkdir(parents=True)
+        file_name = name if name.lower().endswith(".mkv") else f"{name}.mkv"
+        source = original / file_name
+        source.write_bytes(b"episode")
+        job = database.create_job(
+            "fs:tv:policy",
+            "fs",
+            "tv",
+            file_name,
+            state="ready_filebot",
+            source_path=str(original),
+            stage_path=str(job_root),
+        )
+
+        class AmbiguousResolver:
+            enabled = True
+
+            def resolve(self, _job, _input_root):
+                raise ResolverAmbiguous(message, {"query": name})
+
+            def output_matches(self, _identity, _names):
+                return False
+
+        class FakeFileBot:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, job_id, category, input_path, output_root):
+                self.calls.append((job_id, category, input_path, output_root))
+                source_file = media_files(input_path)[0]
+                destination = output_root / "Serie" / "Season 01" / source_file.name
+                destination.parent.mkdir(parents=True)
+                destination.write_bytes(b"episode")
+                source_file.unlink()
+                return {
+                    "exit_code": 0,
+                    "moves": [{"source": str(source_file), "destination": str(destination)}],
+                    "output_media": [str(destination)],
+                    "duplicate": False,
+                    "stdout_tail": "",
+                }
+
+        fake_filebot = FakeFileBot()
+        engine.name_resolver = AmbiguousResolver()
+        engine.filebot = fake_filebot
+
+        engine._run_filebot(job)
+
+        updated = database.get_job(job["job_id"])
+        detail = database.job_detail(job["job_id"])
+        calls = list(fake_filebot.calls)
+        database.close()
+        temporary.cleanup()
+        return updated, detail, calls
+
+    def _run_conflict_before_resolver(self, category: str, name: str):
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        config = test_config(root)
+        config.ensure_directories()
+        database = Database(root / "test.db")
+        database.initialize()
+        engine = Engine(config, database)
+        job_root = config.workshop_root / "job-conflict-policy"
+        original = job_root / "original"
+        original.mkdir(parents=True)
+        file_name = name if name.lower().endswith(".mkv") else f"{name}.mkv"
+        source = original / file_name
+        source.write_bytes(b"media")
+        job = database.create_job(
+            f"fs:{category}:conflict-policy",
+            "fs",
+            category,
+            file_name,
+            state="ready_filebot",
+            source_path=str(original),
+            stage_path=str(job_root),
+        )
+
+        class ResolverMustNotRun:
+            enabled = True
+
+            def resolve(self, _job, _input_root):
+                raise AssertionError("resolver must not run")
+
+        class FileBotMustNotRun:
+            def run(self, *_args, **_kwargs):
+                raise AssertionError("filebot must not run")
+
+        engine.name_resolver = ResolverMustNotRun()
+        engine.filebot = FileBotMustNotRun()
+
+        engine._run_filebot(job)
+
+        updated = database.get_job(job["job_id"])
+        detail = database.job_detail(job["job_id"])
+        database.close()
+        temporary.cleanup()
+        return updated, detail
+
+    def test_filebot_move_output_is_parsed(self) -> None:
+        output = (
+            "[MOVE] from [/input/Big Buck Bunny.mp4] "
+            "to [/output/Big Buck Bunny (2008).mp4]"
+        )
+        self.assertEqual(
+            MOVE_PATTERN.findall(output),
+            [
+                (
+                    "/input/Big Buck Bunny.mp4",
+                    "/output/Big Buck Bunny (2008).mp4",
+                )
+            ],
+        )
+
+    def test_filebot_skip_existing_is_duplicate(self) -> None:
+        output = (
+            "[SKIP] Skipped [/input/episode.mkv] because "
+            "[/output/episode.mkv] already exists\n"
+            "Processed 0 files\n"
+            "Failure"
+        )
+        self.assertTrue(is_duplicate_output(output, []))
+
+    def test_source_path_can_adopt_qbt_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Database(Path(temporary) / "test.db")
+            database.initialize()
+            created = database.create_job(
+                "fs:movies:Example",
+                "fs",
+                "movies",
+                "Example",
+                state="waiting_stable",
+                source_path="/data/complete/movies/Example",
+            )
+            adopted = database.get_job_by_source_path("/data/complete/movies/Example")
+            self.assertEqual(created["job_id"], adopted["job_id"])
+            database.update_job(
+                adopted["job_id"],
+                infohash="abc123",
+                qbt_hash="abc123",
+                origin="qbt",
+            )
+            self.assertEqual(
+                database.get_job_by_infohash("ABC123")["job_id"],
+                created["job_id"],
+            )
+            database.transition(
+                created["job_id"],
+                "done",
+                "test",
+                "finished",
+            )
+            self.assertIsNone(database.get_active_job_by_infohash("abc123"))
+            database.close()
+
+    def test_manifest_changes_with_file_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            file_path = root / "movie.mkv"
+            file_path.write_bytes(b"a")
+            first, _ = manifest(root)
+            file_path.write_bytes(b"ab")
+            second, _ = manifest(root)
+            self.assertNotEqual(first, second)
+
+    def test_top_level_item(self) -> None:
+        root = Path("/data/complete/movies")
+        changed = root / "Movie" / "video.mkv"
+        self.assertEqual(top_level_item(root, changed), root / "Movie")
+
+    def test_complete_allowlist_ignores_workshop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            complete_root = root / "downloads" / "torrents" / "complete"
+            roots = [
+                complete_root / "movies",
+                complete_root / "tv",
+                complete_root / "manual",
+                complete_root / "movies_automatizacion",
+                complete_root / "trailers_automatizacion",
+            ]
+            movie = complete_root / "movies" / "Movie" / "video.mkv"
+            movie.parent.mkdir(parents=True)
+            movie.write_bytes(b"movie")
+            self.assertEqual(matching_root(movie, roots), complete_root / "movies")
+
+            workshop_file = complete_root / "taller" / "job-id" / "original" / "video.mkv"
+            workshop_file.parent.mkdir(parents=True)
+            workshop_file.write_bytes(b"movie")
+            self.assertIsNone(matching_root(workshop_file, roots))
+
+    def test_write_reason_creates_json_and_txt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "Movie"
+            write_reason(
+                destination,
+                {"phase": "filebot", "reason": "destination_exists"},
+                "Pelicula repetida.txt",
+                ["FileBot indica que el destino ya existe."],
+            )
+            self.assertTrue((destination / "reason.json").exists())
+            text = (destination / "Pelicula repetida.txt").read_text(encoding="utf-8")
+            self.assertIn("Pelicula repetida", text)
+            self.assertIn("destino ya existe", text)
+
+    def test_move_job_to_uses_human_review_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            source = root / "job-id"
+            source.mkdir()
+            (source / "original.mkv").write_bytes(b"movie")
+            (review / "El jinete pálido (1985)").mkdir(parents=True)
+
+            destination = move_job_to(source, review, "El jinete pálido (1985)")
+
+            self.assertEqual(destination.name, "El jinete pálido (1985) (1)")
+            self.assertTrue((destination / "original.mkv").exists())
+
+    def test_move_job_to_review_clean_flattens_original_movie_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            job_root = root / "taller" / "job-movie"
+            source_dir = job_root / "original" / "Shelter In Place (2021) [2160p]"
+            source_dir.mkdir(parents=True)
+            movie = source_dir / "Shelter.In.Place.2021.2160p.mkv"
+            movie.write_bytes(b"movie")
+
+            destination = move_job_to_review_clean(
+                job_root,
+                review,
+                "Shelter In Place (2021) [2160p]",
+            )
+
+            self.assertEqual(destination.name, "Shelter In Place (2021) [2160p]")
+            self.assertFalse((destination / "original").exists())
+            self.assertFalse((destination / "Shelter In Place (2021) [2160p]").exists())
+            self.assertTrue((destination / movie.name).exists())
+            self.assertFalse(job_root.exists())
+
+    def test_move_job_to_review_clean_prefers_filebot_input_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            job_root = root / "taller" / "job-movie"
+            original = job_root / "original"
+            prepared = job_root / "filebot_input" / "Pelicula rara"
+            original.mkdir(parents=True)
+            prepared.mkdir(parents=True)
+            (prepared / "Pelicula rara.mkv").write_bytes(b"movie")
+
+            destination = move_job_to_review_clean(job_root, review, "Pelicula rara")
+
+            self.assertFalse((destination / "original").exists())
+            self.assertFalse((destination / "filebot_input").exists())
+            self.assertTrue((destination / "Pelicula rara.mkv").exists())
+            self.assertFalse(job_root.exists())
+
+    def test_movie_duplicate_review_uses_clean_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = root / "taller" / "job-movie"
+            source_dir = job_root / "original" / "Duplicada (2026)"
+            source_dir.mkdir(parents=True)
+            (source_dir / "Duplicada (2026).mkv").write_bytes(b"movie")
+
+            destination = engine._move_duplicate_to_review(
+                {"category": "movies", "name": "Duplicada (2026)"},
+                job_root,
+            )
+
+            self.assertEqual(destination.name, "Duplicada (2026)")
+            self.assertFalse((destination / "original").exists())
+            self.assertTrue((destination / "Duplicada (2026).mkv").exists())
+            database.close()
+
+    def test_move_tv_job_to_review_uses_series_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            job_root = root / "taller" / "job-tv"
+            source_dir = job_root / "original" / "Cuarto Milenio [HDTV 1080p][Cap.2139]"
+            source_dir.mkdir(parents=True)
+            source = source_dir / "Cuarto Milenio [HDTV 1080p][Cap.2139].mkv"
+            source.write_bytes(b"episode")
+
+            destination = move_tv_job_to_review(
+                job_root,
+                review,
+                "Cuarto Milenio [HDTV 1080p][Cap.2139]",
+            )
+
+            self.assertEqual(destination.name, "Cuarto Milenio")
+            self.assertFalse((destination / "original").exists())
+            self.assertTrue((destination / "Season 21" / "Cuarto Milenio - S21E39.mkv").exists())
+            self.assertFalse(job_root.exists())
+
+    def test_move_tv_job_to_review_numbers_existing_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            (review / "Cuarto Milenio").mkdir(parents=True)
+            job_root = root / "taller" / "job-tv"
+            source_dir = job_root / "original" / "Cuarto Milenio [HDTV 1080p][Cap.2139]"
+            source_dir.mkdir(parents=True)
+            (source_dir / "Cuarto Milenio [HDTV 1080p][Cap.2139].mkv").write_bytes(b"episode")
+
+            destination = move_tv_job_to_review(
+                job_root,
+                review,
+                "Cuarto Milenio [HDTV 1080p][Cap.2139]",
+            )
+
+            self.assertEqual(destination.name, "Cuarto Milenio (1)")
+            self.assertTrue((destination / "Season 21" / "Cuarto Milenio - S21E39.mkv").exists())
+
+    def test_media_worker_source_ignores_technical_original_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = Path(temporary) / "original"
+            movie = original / "Maridos en accion (2026)"
+            technical = original / "_tecnico"
+            movie.mkdir(parents=True)
+            technical.mkdir()
+            (technical / "nota.txt").write_text("x", encoding="utf-8")
+            (movie / "Maridos en accion (2026).mkv").write_bytes(b"movie")
+
+            self.assertEqual(media_worker_source(original), movie)
+
+    def test_prepare_filebot_input_never_returns_original_root_for_loose_movie(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            job_root = Path(temporary) / "taller" / "job-1"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            movie = original / "Un padre en apuros 4Kwebrip2160.atomohd.li.mkv"
+            movie.write_bytes(b"movie")
+
+            prepared = prepare_filebot_input(original, job_root, movie.name)
+
+            self.assertNotEqual(prepared, original)
+            self.assertIn("filebot_input", prepared.parts)
+            self.assertEqual(len(media_files(prepared)), 1)
+            self.assertTrue((prepared / movie.name).exists())
+
+    def test_prepare_filebot_input_keeps_normal_movie_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            job_root = Path(temporary) / "taller" / "job-1"
+            movie_dir = job_root / "original" / "El jinete palido (1985)"
+            movie_dir.mkdir(parents=True)
+            (movie_dir / "El jinete palido (1985).mkv").write_bytes(b"movie")
+
+            prepared = prepare_filebot_input(job_root / "original", job_root, "El jinete palido (1985)")
+
+            self.assertEqual(prepared, movie_dir)
+            self.assertTrue((movie_dir / "El jinete palido (1985).mkv").exists())
+
+    def test_prepare_filebot_input_wraps_extracted_archive_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            job_root = Path(temporary) / "taller" / "job-1"
+            extracted = job_root / "extracted"
+            extracted.mkdir(parents=True)
+            (extracted / "movie.mkv").write_bytes(b"movie")
+            (extracted / "movie.srt").write_text("subtitle", encoding="utf-8")
+
+            prepared = prepare_filebot_input(extracted, job_root, "Archive Movie 2026.zip")
+
+            self.assertNotEqual(prepared, extracted)
+            self.assertIn("filebot_input", prepared.parts)
+            self.assertTrue((prepared / "movie.mkv").exists())
+            self.assertTrue((prepared / "movie.srt").exists())
+
+    def test_extraction_command_previews_archives_without_running_them(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            job_root = Path(temporary) / "taller" / "job-extract"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            archive = original / "movie.part1.rar"
+            archive.write_bytes(b"fake archive")
+
+            previews = extraction_command_previews(job_root)
+
+            self.assertEqual(len(previews), 1)
+            self.assertEqual(previews[0]["argv"][0], "unrar")
+            self.assertEqual(previews[0]["archive"], str(archive))
+            self.assertEqual(previews[0]["cwd"], str(job_root))
+            self.assertEqual(previews[0]["timeout_sec"], 7200)
+
+    def test_run_filebot_movies_uses_private_input_and_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-1"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Un padre en apuros 4Kwebrip2160.atomohd.li.mkv"
+            source.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:un-padre",
+                "fs",
+                "movies",
+                source.name,
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+            )
+
+            class FakeFileBot:
+                calls = []
+
+                def run(self, job_id, category, input_path, output_root):
+                    self.calls.append((job_id, category, input_path, output_root))
+                    source_file = media_files(input_path)[0]
+                    destination = output_root / "Un padre en apuros (2026)" / "Un padre en apuros (2026).mkv"
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(b"movie")
+                    source_file.unlink()
+                    return {
+                        "exit_code": 0,
+                        "moves": [{"source": str(source_file), "destination": str(destination)}],
+                        "output_media": [str(destination)],
+                        "duplicate": False,
+                        "stdout_tail": "",
+                    }
+
+            fake = FakeFileBot()
+            engine.filebot = fake
+
+            engine._run_filebot(job)
+
+            _, category, input_path, output_root = fake.calls[0]
+            updated = database.get_job(job["job_id"])
+            detail = database.job_detail(job["job_id"])
+            self.assertEqual(category, "movies")
+            self.assertNotEqual(input_path, original)
+            self.assertIn("filebot_input", input_path.parts)
+            self.assertEqual(output_root, job_root / "filebot_output")
+            self.assertEqual(updated["state"], "media_postprocess_ready")
+            self.assertEqual(
+                Path(updated["source_path"]),
+                job_root / "filebot_output" / "Un padre en apuros (2026)",
+            )
+            self.assertNotIn("movies_automatizacion", updated["source_path"])
+            command_events = [
+                event for event in detail["timeline"]
+                if event["phase"] == "filebot" and event["event_type"] == "command"
+            ]
+            self.assertEqual(len(command_events), 1)
+            self.assertEqual(command_events[0]["structured"]["command_preview"]["mode"], "legacy_amc")
+            self.assertIn("timeout_sec", command_events[0]["structured"])
+            database.close()
+
+    def test_media_worker_preview_exposes_endpoint_payload_and_timeout(self) -> None:
+        client = MediaWorkerClient(
+            "http://media-worker:8790",
+            "http://arr-orchestrator:8787",
+            timeout_seconds=123,
+        )
+
+        preview = client.preview_process_movie(
+            "job-1",
+            Path("/data/work/source"),
+            Path("/data/media/movies"),
+            Path("/data/media/repetidas_vs_error"),
+            Path("/config/media-worker"),
+        )
+
+        self.assertEqual(preview["method"], "POST")
+        self.assertEqual(preview["service"], "media-worker")
+        self.assertEqual(preview["endpoint"], "/process-movie")
+        self.assertEqual(preview["timeout_sec"], 123)
+        self.assertEqual(preview["payload"]["job_id"], "job-1")
+        self.assertEqual(preview["payload"]["callback_url"], "http://arr-orchestrator:8787/jobs/job-1/events")
+
+    def test_run_media_postprocess_records_command_preview_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            source = root / "movie-ready"
+            source.mkdir()
+            job = database.create_job(
+                "fs:movies:media-command",
+                "fs",
+                "movies",
+                "Movie Ready",
+                state="media_postprocess_ready",
+                source_path=str(source),
+                stage_path=str(config.workshop_root / "job-media"),
+            )
+
+            class FakeMediaWorker:
+                def preview_process_movie(self, job_id, source_path, final_root, review_root, reports_root):
+                    return {
+                        "method": "POST",
+                        "service": "media-worker",
+                        "endpoint": "/process-movie",
+                        "payload": {
+                            "job_id": job_id,
+                            "source_path": str(source_path),
+                            "final_root": str(final_root),
+                            "review_root": str(review_root),
+                            "reports_root": str(reports_root),
+                        },
+                        "timeout_sec": 14400,
+                    }
+
+                def process_movie(self, *_args):
+                    return {"status": "done"}
+
+            engine.media_worker = FakeMediaWorker()
+            engine._run_media_postprocess(job)
+
+            detail = database.job_detail(job["job_id"])
+            command_events = [
+                event for event in detail["timeline"]
+                if event["phase"] == "media" and event["event_type"] == "command"
+            ]
+            self.assertEqual(len(command_events), 1)
+            self.assertEqual(command_events[0]["structured"]["command_preview"]["endpoint"], "/process-movie")
+            self.assertEqual(database.get_job(job["job_id"])["state"], "ready_cleanup")
+            database.close()
+
+    def test_run_filebot_tv_keeps_tv_output_but_not_original_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-tv"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Serie.S01E01.mkv"
+            source.write_bytes(b"episode")
+            job = database.create_job(
+                "fs:tv:serie",
+                "fs",
+                "tv",
+                source.name,
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+            )
+
+            class FakeFileBot:
+                calls = []
+
+                def run(self, job_id, category, input_path, output_root):
+                    self.calls.append((job_id, category, input_path, output_root))
+                    source_file = media_files(input_path)[0]
+                    destination = output_root / "Serie" / "Season 01" / "Serie - S01E01.mkv"
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(b"episode")
+                    source_file.unlink()
+                    return {
+                        "exit_code": 0,
+                        "moves": [{"source": str(source_file), "destination": str(destination)}],
+                        "output_media": [str(destination)],
+                        "duplicate": False,
+                        "stdout_tail": "",
+                    }
+
+            fake = FakeFileBot()
+            engine.filebot = fake
+
+            engine._run_filebot(job)
+
+            _, category, input_path, output_root = fake.calls[0]
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(category, "tv")
+            self.assertNotEqual(input_path, original)
+            self.assertIn("filebot_input", input_path.parts)
+            self.assertEqual(output_root, config.tv_output)
+            self.assertEqual(updated["state"], "ready_cleanup")
+            database.close()
+
+    def test_guided_identity_is_passed_to_filebot_and_persisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-guided"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Un padre en apuros 4Kwebrip2160.atomohd.li.mkv"
+            source.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:guided",
+                "fs",
+                "movies",
+                source.name,
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+            )
+            identity = ResolvedIdentity(
+                media_type="movie",
+                tmdb_id=9279,
+                title="Un padre en apuros",
+                original_title="Jingle All the Way",
+                year=1996,
+                aliases=["Un padre en apuros", "Jingle All the Way"],
+                score=100,
+                margin=50,
+                query="Un padre en apuros",
+                guess={"title": "Un padre en apuros"},
+                source="search",
+            )
+
+            class FakeResolver:
+                enabled = True
+
+                def resolve(self, _job, _input_root):
+                    return identity
+
+                def output_matches(self, _identity, names):
+                    return names == ["Un padre en apuros (1996)"]
+
+            class FakeFileBot:
+                received_identity = None
+
+                def run(self, _job_id, _category, input_path, output_root, resolved):
+                    self.received_identity = resolved
+                    source_file = media_files(input_path)[0]
+                    destination = (
+                        output_root
+                        / "Un padre en apuros (1996)"
+                        / "Un padre en apuros (1996).mkv"
+                    )
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(b"movie")
+                    source_file.unlink()
+                    return {
+                        "exit_code": 0,
+                        "moves": [
+                            {"source": str(source_file), "destination": str(destination)}
+                        ],
+                        "output_media": [str(destination)],
+                        "duplicate": False,
+                        "stdout_tail": "",
+                    }
+
+            fake_filebot = FakeFileBot()
+            engine.name_resolver = FakeResolver()
+            engine.filebot = fake_filebot
+
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "media_postprocess_ready")
+            self.assertEqual(fake_filebot.received_identity.tmdb_id, 9279)
+            self.assertIn('"tmdb_id": 9279', updated["identity_json"])
+            database.close()
+
+    def test_wrong_filebot_identity_is_blocked_before_media_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-wrong"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Un padre en apuros.mkv"
+            source.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:wrong",
+                "fs",
+                "movies",
+                source.name,
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+            )
+            identity = ResolvedIdentity(
+                media_type="movie",
+                tmdb_id=9279,
+                title="Un padre en apuros",
+                original_title="Jingle All the Way",
+                year=1996,
+                aliases=["Un padre en apuros", "Jingle All the Way"],
+                score=100,
+                margin=50,
+                query="Un padre en apuros",
+                guess={},
+                source="search",
+            )
+
+            class FakeResolver:
+                enabled = True
+
+                def resolve(self, _job, _input_root):
+                    return identity
+
+                def output_matches(self, _identity, _names):
+                    return False
+
+            class FakeFileBot:
+                def run(self, _job_id, _category, input_path, output_root, _identity):
+                    source_file = media_files(input_path)[0]
+                    destination = (
+                        output_root
+                        / "El padre La venganza tiene un precio (2018)"
+                        / "El padre La venganza tiene un precio (2018).mkv"
+                    )
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(b"movie")
+                    source_file.unlink()
+                    return {
+                        "exit_code": 0,
+                        "moves": [
+                            {"source": str(source_file), "destination": str(destination)}
+                        ],
+                        "output_media": [str(destination)],
+                        "duplicate": False,
+                        "stdout_tail": "",
+                    }
+
+            engine.name_resolver = FakeResolver()
+            engine.filebot = FakeFileBot()
+
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "manual_review")
+            self.assertEqual(updated["last_error_code"], "filebot_identity_mismatch")
+            self.assertNotEqual(updated["state"], "media_postprocess_ready")
+            database.close()
+
+    def test_tmdb_outage_waits_for_retry_instead_of_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-retry"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Un padre en apuros.mkv"
+            source.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:retry",
+                "fs",
+                "movies",
+                source.name,
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+            )
+
+            class OfflineResolver:
+                enabled = True
+
+                def resolve(self, _job, _input_root):
+                    raise ResolverUnavailable("TMDb temporalmente caido")
+
+            engine.name_resolver = OfflineResolver()
+
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "identity_retry")
+            self.assertEqual(updated["last_error_code"], "identity_unavailable")
+            self.assertTrue(Path(updated["source_path"]).exists())
+            database.close()
+
+    def test_run_filebot_multiple_movie_outputs_goes_to_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-pack"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Pack peliculas.mkv"
+            source.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:pack",
+                "fs",
+                "movies",
+                "Pack peliculas",
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+            )
+
+            class FakeFileBot:
+                def run(self, job_id, category, input_path, output_root):
+                    media_files(input_path)[0].unlink()
+                    first = output_root / "Pelicula A (2026)" / "Pelicula A (2026).mkv"
+                    second = output_root / "Pelicula B (2026)" / "Pelicula B (2026).mkv"
+                    first.parent.mkdir(parents=True)
+                    second.parent.mkdir(parents=True)
+                    first.write_bytes(b"a")
+                    second.write_bytes(b"b")
+                    return {
+                        "exit_code": 0,
+                        "moves": [
+                            {"source": "a", "destination": str(first)},
+                            {"source": "b", "destination": str(second)},
+                        ],
+                        "output_media": [str(first), str(second)],
+                        "duplicate": False,
+                        "stdout_tail": "",
+                    }
+
+            engine.filebot = FakeFileBot()
+
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "manual_review")
+            self.assertEqual(updated["last_error_code"], "multiple_movie_outputs")
+            review_path = Path(updated["stage_path"])
+            self.assertTrue((review_path / "reason.json").exists())
+            self.assertTrue((review_path / "Revision manual.txt").exists())
+            database.close()
+
+    def test_trailer_package_waits_for_json_and_video(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inbox = Path(temporary) / "trailers"
+            inbox.mkdir()
+            video = inbox / "ejecucion_inminente__abc.mkv"
+            meta = inbox / "ejecucion_inminente__abc.json"
+            video.write_bytes(b"trailer")
+
+            self.assertIsNone(trailer_ready_source(video))
+            self.assertIsNone(trailer_ready_source(meta))
+
+            meta.write_text(
+                '{"title":"Ejecucion inminente","year":"1999","video_file":"ejecucion_inminente__abc.mkv"}',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(trailer_ready_source(meta), meta)
+            signature, entries = trailer_package_manifest(meta)
+            self.assertNotEqual(signature, "missing")
+            self.assertEqual({entry["path"] for entry in entries}, {video.name, meta.name})
+
+    def test_move_trailer_package_into_job_moves_json_and_video_together(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inbox = root / "trailers"
+            workshop = root / "taller"
+            inbox.mkdir()
+            video = inbox / "el_jinete_palido__abc.mkv"
+            meta = inbox / "el_jinete_palido__abc.json"
+            video.write_bytes(b"trailer")
+            meta.write_text(
+                '{"title":"El jinete palido","year":"1985","video_file":"el_jinete_palido__abc.mkv"}',
+                encoding="utf-8",
+            )
+
+            job_root, package = move_trailer_package_into_job(meta, workshop, "job-1")
+
+            self.assertEqual(job_root, workshop / "job-1")
+            self.assertTrue((package / video.name).exists())
+            self.assertTrue((package / meta.name).exists())
+            self.assertFalse(video.exists())
+            self.assertFalse(meta.exists())
+
+    def test_delay_audio_temp_file_is_ignored_in_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            temp_file = (
+                config.complete_root
+                / "movies"
+                / ".Pelicula.mkv.12345678.delay-audio-part"
+            )
+            temp_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_file.write_bytes(b"partial")
+
+            engine._handle_complete_path(temp_file)
+            engine._reconcile_complete()
+
+            self.assertEqual(database.latest_jobs(), [])
+            database.close()
+
+    def test_terminal_codex_diagnostic_is_written_in_category_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job = database.create_job(
+                "fs:movies:diagnostic",
+                "fs",
+                "movies",
+                "Pelicula de prueba (2026).mkv",
+                state="done",
+                source_path="/data/media/movies/Pelicula de prueba (2026)",
+            )
+            database.add_event(
+                job["job_id"],
+                "cleanup",
+                "finished",
+                "Trabajo terminado",
+            )
+
+            engine._create_terminal_diagnostic(database.get_job(job["job_id"]))
+
+            reports = list((config.codex_diag_root / "movies").glob("*_informe_codex.zip"))
+            self.assertEqual(len(reports), 1)
+            database.close()
+
+    def test_review_codex_diagnostic_is_written_in_review_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job = database.create_job(
+                "fs:tv:review-diagnostic",
+                "fs",
+                "tv",
+                "La Agencia [Cap.201]",
+                state="manual_review",
+                source_path="/data/media/repetidas_vs_error/La Agencia [Cap.201]",
+            )
+
+            engine._create_terminal_diagnostic(database.get_job(job["job_id"]))
+
+            reports = list((config.codex_diag_root / "repetidas_vs_error").glob("*_informe_codex.zip"))
+            self.assertEqual(len(reports), 1)
+            database.close()
+
+    def test_category_uses_name_parser(self) -> None:
+        self.assertEqual(
+            Engine._category("", "La reina del flow S03 E53 (2026) NETFLIX.mkv"),
+            "tv",
+        )
+        self.assertEqual(Engine._category("", "la reina del flow.3x41.1080.mkv"), "tv")
+        self.assertEqual(
+            Engine._category("", "Los Simpsons - Temporada 34 [Cap.3401]"), "tv"
+        )
+        self.assertEqual(Engine._category("", "Los Simpson T06"), "tv")
+        self.assertEqual(
+            Engine._category("", "Erase Una Vez En... Hollywood (2019).mkv"),
+            "movies",
+        )
+        self.assertEqual(
+            Engine._category(
+                "",
+                "Lynda - Scott Simpson - Compleat Course Collection ( Linux, Ubuntu, Shell, CLI..) [AhLaN]",
+            ),
+            "manual",
+        )
+
+    def test_tv_cap_101_continues_to_filebot_when_tmdb_returns_empty(self) -> None:
+        updated, detail, calls = self._run_tv_name_with_ambiguous_resolver(
+            "Satisfacion garantizada [HDTV 1080p][Cap.101]",
+            "TMDb no devolvio candidatos",
+        )
+
+        self.assertEqual(updated["state"], "ready_cleanup")
+        self.assertNotEqual(updated.get("last_error_code"), "identity_suspicious")
+        self.assertEqual(calls[0][1], "tv")
+        self.assertTrue(detail["decisions"])
+        self.assertTrue(
+            any(
+                event["event_type"] == "warning"
+                and "senal TV local" in event["message"]
+                for event in detail["decisions"]
+            )
+        )
+
+    def test_tv_cap_201_continues_to_filebot_when_identity_threshold_is_low(self) -> None:
+        updated, detail, calls = self._run_tv_name_with_ambiguous_resolver(
+            "La Agencia [4k 2160p][Cap.201]",
+            "La identidad no supera el umbral de seguridad",
+        )
+
+        self.assertEqual(updated["state"], "ready_cleanup")
+        self.assertNotEqual(updated.get("last_error_code"), "identity_suspicious")
+        self.assertEqual(calls[0][1], "tv")
+        self.assertTrue(detail["decisions"])
+
+    def test_movies_category_with_cap_201_goes_to_manual_review_by_conflict(self) -> None:
+        updated, detail = self._run_conflict_before_resolver(
+            "movies",
+            "La Agencia [4k 2160p][Cap.201]",
+        )
+
+        self.assertEqual(updated["state"], "manual_review")
+        self.assertEqual(updated["last_error_code"], "category_conflict")
+        self.assertTrue(detail["decisions"])
+
+    def test_tv_category_with_clear_movie_year_goes_to_manual_review_by_conflict(self) -> None:
+        updated, detail = self._run_conflict_before_resolver(
+            "tv",
+            "Erase Una Vez En... Hollywood (2019).mkv",
+        )
+
+        self.assertEqual(updated["state"], "manual_review")
+        self.assertEqual(updated["last_error_code"], "category_conflict")
+        self.assertTrue(detail["decisions"])
+
+    def test_category_conflict_goes_to_manual_review_before_resolver(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-conflict"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Los Simpsons - Temporada 34 [Cap.3401].mkv"
+            source.write_bytes(b"episode")
+            job = database.create_job(
+                "fs:movies:conflict",
+                "fs",
+                "movies",
+                "Los Simpsons - Temporada 34 [Cap.3401]",
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+            )
+
+            class ResolverMustNotRun:
+                enabled = True
+
+                def resolve(self, _job, _input_root):
+                    raise AssertionError("resolver must not run")
+
+            class FileBotMustNotRun:
+                def run(self, *_args, **_kwargs):
+                    raise AssertionError("filebot must not run")
+
+            engine.name_resolver = ResolverMustNotRun()
+            engine.filebot = FileBotMustNotRun()
+
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "manual_review")
+            self.assertEqual(updated["last_error_code"], "category_conflict")
+            review_path = Path(updated["stage_path"])
+            self.assertTrue((review_path / "reason.json").exists())
+            database.close()
+
+    def test_real_torrent_fixture_when_available(self) -> None:
+        fixture = Path(tempfile.gettempdir()) / "arr-test-big-buck-bunny.torrent"
+        fixture.write_bytes(
+            b"d4:infod6:lengthi1e4:name14:Big Buck Bunny"
+            b"12:piece lengthi16384e6:pieces20:01234567890123456789ee"
+        )
+        infohash, name = torrent_info(fixture)
+        self.assertEqual(infohash, "3dfceb0ea9b3a32ec304238cad0b63e704f692d6")
+        self.assertEqual(name, "Big Buck Bunny")
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,479 @@
+# ======================================================= #
+#  MAPA DEL FLUJO COMPLETO - ARR                          #
+#  TRES CAMINOS: DESCARGA, MEDIA, TRAILER                 #
+# ======================================================= #
+# gluetun 153
+# qbittorrent 197
+# jackett 215
+# flaresolverr 230
+# rdtclient 241
+# arr-orchestrator 256
+# media-worker 305
+# media-panel 332
+# buscador-puente-arr 369
+# compose-backup 410
+#
+# ======================================================= #
+#  IDEA GENERAL                                           #
+# ======================================================= #
+# El proyecto tiene un motor central:
+# arr-orchestrator.
+#
+# Los demas servicios ayudan, pero no mandan el flujo.
+#
+# No hay cola antigua queue/movies ni queue/tv.
+# El trabajo temporal se hace en:
+# /data/downloads/torrents/complete/taller
+#
+# ======================================================= #
+#  CAMINO 1 - DESCARGA NORMAL                             #
+#  peliculas y series                                     #
+# ======================================================= #
+# Entrada posible A:
+# qBittorrent
+#
+# - Incomplete:
+#   /data/downloads/torrents/incomplete/movies
+#   /data/downloads/torrents/incomplete/tv
+#
+# - Complete:
+#   /data/downloads/torrents/complete/movies
+#   /data/downloads/torrents/complete/tv
+#
+# - qBittorrent avisa al terminar.
+#
+# Entrada posible B:
+# RDT-Client
+#
+# - RDT trabaja con:
+#   /data/downloads/movies
+#   /data/downloads/tv
+#   /data/downloads/manual
+#
+# En el NAS, esas rutas corresponden al mismo complete:
+#   /data/downloads/torrents/complete/movies
+#   /data/downloads/torrents/complete/tv
+#   /data/downloads/torrents/complete/manual
+#
+# Despues:
+# 1) arr-orchestrator crea job.
+# 2) Espera estabilidad del item.
+# 3) Mueve a taller.
+# 4) Extrae si hay RAR/ZIP.
+# 5) Decide pelicula o serie.
+# 6) Llama a FileBot one-shot.
+# 7) Limpia la entrada de qB/RDT sin borrar media final.
+#
+# Salidas:
+# - Peliculas: /data/media/movies
+# - Series:    /data/media/tv
+#
+# ======================================================= #
+#  CAMINO 2 - MEDIA AUTOMATIZACION                        #
+#  peliculas ya preparadas para procesado de media         #
+# ======================================================= #
+# Entrada:
+# /data/downloads/torrents/complete/movies_automatizacion
+#
+# Flujo:
+# 1) arr-orchestrator detecta la carpeta.
+# 2) La mueve a taller.
+# 3) La entrega a media-worker.
+# 4) media-worker procesa video, audio, subtitulos,
+#    capitulos y validaciones que correspondan.
+# 5) Si todo va bien, entrega en:
+#    /data/media/movies
+#
+# Si algo no cuadra:
+# /data/media/repetidas_vs_error
+#
+# ======================================================= #
+#  CAMINO 3 - TRAILERS                                    #
+#  paquetes de trailer                                    #
+# ======================================================= #
+# Entrada:
+# /data/downloads/torrents/complete/trailers_automatizacion
+#
+# Flujo:
+# 1) arr-orchestrator espera a que el paquete este listo.
+# 2) Lo mueve a taller.
+# 3) Llama a media-worker como trailer.
+# 4) media-worker coloca el trailer en la pelicula correcta.
+#
+# Si no puede colocarlo:
+# /data/media/repetidas_vs_error
+#
+# ======================================================= #
+#  ENTRADA MANUAL                                         #
+# ======================================================= #
+# Ruta:
+# /data/downloads/torrents/complete/manual
+#
+# Se usa cuando quieres sacar algo del flujo automatico.
+# Lo que entra como manual va directo a revision/manual.
+#
+# ======================================================= #
+#  WATCH DE TORRENTS                                      #
+# ======================================================= #
+# Entrada de torrents:
+# /data/torrents/watch/inbox
+#
+# Forzado por carpeta:
+# /data/torrents/watch/inbox/movies
+# /data/torrents/watch/inbox/tv
+# /data/torrents/watch/inbox/manual
+#
+# Procesados:
+# /data/torrents/watch/processed/rd
+# /data/torrents/watch/processed/qbit
+#
+# Error de torrent:
+# /data/torrents/watch/error
+#
+# ======================================================= #
+#  PANEL E INFORMES                                       #
+# ======================================================= #
+# Panel:
+# Panel definido por ARR_PANEL_URL en .env
+#
+# Diagnosticos para Codex:
+# ${ARR_ROOT}/diagnosticos_codex
+#
+# Si algo falla, primero mirar el Informe Codex del job.
+#
+# ======================================================= #
+#  COPIA DEL COMPOSE                                      #
+# ======================================================= #
+# compose-backup guarda copias del docker-compose.yaml.
+# Ruta:
+# ${ARR_ROOT}/backups
+
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      TZ: Europe/Madrid
+      VPN_SERVICE_PROVIDER: protonvpn
+      VPN_TYPE: wireguard
+      WIREGUARD_PRIVATE_KEY: "${WIREGUARD_PRIVATE_KEY}"
+      WIREGUARD_ADDRESSES: "${WIREGUARD_ADDRESSES}"
+      SERVER_COUNTRIES: "Spain,Netherlands,France"
+      FIREWALL_OUTBOUND_SUBNETS: "${VPN_FIREWALL_OUTBOUND_SUBNETS}"
+      VPN_PORT_FORWARDING: "on"
+      VPN_PORT_FORWARDING_LISTENING_PORT: "0"
+      PORT_FORWARD_ONLY: "on"
+      VPN_PORT_FORWARDING_UP_COMMAND: >-
+        /bin/sh -c '
+          for i in $$(seq 1 90); do
+            PORT="$$(cat /tmp/gluetun/forwarded_port 2>/dev/null | tr -cd "0-9")";
+            if [ -n "$$PORT" ]; then
+              echo "gluetun: aplicando listen_port=$$PORT a qBittorrent";
+              wget -qO- --post-data "json={\"listen_port\":$$PORT,\"random_port\":false,\"upnp\":false}" \
+                http://127.0.0.1:8080/api/v2/app/setPreferences >/dev/null 2>&1 && exit 0;
+            fi
+            sleep 2;
+          done
+          echo "gluetun: no pude aplicar el puerto a qBittorrent";
+          exit 0
+        '
+      VPN_PORT_FORWARDING_DOWN_COMMAND: >-
+        /bin/sh -c 'exit 0'
+    volumes:
+      - ${ARR_ROOT}/config/gluetun:/gluetun
+    ports:
+      - "8080:8080"
+      - "9696:9696"
+      - "8000:8000"
+      - "9117:9117"
+      - "8191:8191"
+    restart: unless-stopped
+
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=1000
+      - PGID=10
+      - TZ=Europe/Madrid
+      - UMASK=002
+      - WEBUI_PORT=8080
+    volumes:
+      - ${ARR_ROOT}/config/qbittorrent:/config
+      - ${ARR_DATA_ROOT}:/data
+      - ${ARR_ROOT}/services/arr-orchestrator/hooks/qbt-complete.sh:/hooks/qbt-complete.sh:ro
+    restart: unless-stopped
+
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    container_name: jackett
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - PUID=1000
+      - PGID=10
+      - TZ=Europe/Madrid
+    volumes:
+      - ${ARR_ROOT}/config/jackett:/config
+      - ${ARR_DATA_ROOT}/downloads:/downloads
+    restart: unless-stopped
+
+  flaresolverr:
+    image: flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    network_mode: "service:gluetun"
+    depends_on:
+      - gluetun
+    environment:
+      - LOG_LEVEL=info
+      - TZ=Europe/Madrid
+    restart: unless-stopped
+
+  rdtclient:
+    image: rogerfar/rdtclient:latest
+    container_name: rdtclient
+    environment:
+      - PUID=1000
+      - PGID=10
+      - TZ=Europe/Madrid
+      - UMASK=002
+    volumes:
+      - ${ARR_ROOT}/config/rdtclient:/data/db
+      - ${ARR_DATA_ROOT}/downloads/torrents/complete:/data/downloads
+    ports:
+      - "6500:6500"
+    restart: unless-stopped
+
+  arr-orchestrator:
+    build:
+      context: ./services/arr-orchestrator
+    image: arr-orchestrator:local
+    container_name: arr-orchestrator
+    user: "1000:10"
+    depends_on:
+      - gluetun
+      - qbittorrent
+      - rdtclient
+      - media-worker
+    environment:
+      TZ: Europe/Madrid
+      ARR_MODE: "active"
+      ARR_STABLE_SECONDS: "8"
+      ARR_RECONCILE_SECONDS: "30"
+      ARR_WORKSHOP_ROOT: "/data/downloads/torrents/complete/taller"
+      ARR_RDT_FALLBACK_SECONDS: "5400"
+      ARR_MEDIA_AUTOMATION_INBOX: "/data/downloads/torrents/complete/movies_automatizacion"
+      ARR_TRAILERS_INBOX: "/data/downloads/torrents/complete/trailers_automatizacion"
+      ARR_REVIEW_DIR: "/data/media/repetidas_vs_error"
+      ARR_MOVIES_FINAL: "/data/media/movies"
+      ARR_TV_FINAL: "/data/media/tv"
+      MEDIA_WORKER_URL: "http://media-worker:8790"
+      QBT_URL: "http://gluetun:8080"
+      QBT_USER: "${QBT_USER}"
+      QBT_PASSWORD: "${QBT_PASSWORD}"
+      RDT_URL: "http://rdtclient:6500"
+      RDT_USER: "${RDT_USER}"
+      RDT_PASSWORD: "${RDT_PASSWORD}"
+      TMDB_API_TOKEN: "${TMDB_API_TOKEN}"
+      ARR_RESOLVER_LANGUAGE: "es-ES"
+      ARR_RESOLVER_REGION: "ES"
+      ARR_RESOLVER_HTTP_TIMEOUT_MS: "2500"
+      ARR_RESOLVER_TOTAL_BUDGET_MS: "5000"
+      ARR_RESOLVER_RETRY_SECONDS: "60"
+      CODEX_DIAG_ROOT: "/diagnosticos_codex"
+      ARR_DIAGNOSTICS_ROOT: "/diagnostics/arr"
+      ARR_HOST_ROOT: "${ARR_ROOT}"
+      ARR_HOST_DATA_ROOT: "${ARR_DATA_ROOT}"
+      ARR_ROOT_UNC: "${ARR_ROOT_UNC:-}"
+    volumes:
+      - ${ARR_ROOT}/config/arr-orchestrator:/config
+      - ${ARR_DATA_ROOT}:/data
+      - ${ARR_ROOT}/diagnosticos_codex:/diagnosticos_codex
+      - ${ARR_ROOT}/diagnostics:/diagnostics
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  media-worker:
+    build:
+      context: ./services/media-worker
+    image: arr-media-worker:local
+    container_name: arr-media-worker
+    user: "1000:10"
+    environment:
+      TZ: Europe/Madrid
+      MEDIA_WORKER_PORT: "8790"
+      MEDIA_AUTO_REGLAS: "/config/media-rules/reglas_motor.json"
+      MEDIA_AUTO_REPORTES: "/config/media-worker/runtime"
+      MEDIA_AUTO_LOGS: "/config/media-worker/logs"
+      MEDIA_AUTO_TALLER: "/config/media-worker/temp/taller"
+      MEDIA_AUTO_TEMP: "/config/media-worker/temp"
+      MEDIA_RESCATE_REPORTES: "/config/media-worker/runtime"
+      MEDIA_RESCATE_TEMP: "/config/media-worker/temp/rescue"
+    volumes:
+      - ${ARR_ROOT}/config:/config
+      - ${ARR_DATA_ROOT}:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8790/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  media-panel:
+    build:
+      context: ./services/media-panel
+    image: arr-media-panel:local
+    container_name: arr-media-panel
+    user: "1000:10"
+    depends_on:
+      - arr-orchestrator
+      - media-worker
+    environment:
+      TZ: Europe/Madrid
+      MEDIA_PANEL_PORT: "8080"
+      MEDIA_RULES_PATH: "/config/media-rules/reglas_motor.json"
+      MEDIA_DEFAULT_RULES_PATH: "/defaults/reglas_motor_default.json"
+      MEDIA_REPORT_ROOT: "/config/media-worker"
+      MEDIA_REVIEW_DIR: "/data/media/repetidas_vs_error"
+      ARR_COMPLETE_ROOT: "/data/downloads/torrents/complete"
+      ARR_MOVIES_ROOT: "/data/media/movies"
+      ARR_TV_ROOT: "/data/media/tv"
+      ARR_ORCHESTRATOR_URL: "http://arr-orchestrator:8787"
+      MEDIA_WORKER_URL: "http://media-worker:8790"
+      CODEX_DIAG_ROOT: "/diagnosticos_codex"
+    volumes:
+      - ${ARR_ROOT}/config:/config
+      - ${ARR_DATA_ROOT}:/data:ro
+      - ${ARR_ROOT}/diagnosticos_codex:/diagnosticos_codex
+      - ${ARR_ROOT}/services/media-worker/media_worker/legacy/reglas_motor_default.json:/defaults/reglas_motor_default.json:ro
+    ports:
+      - "5830:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  buscador-puente-arr:
+    build:
+      context: ./services/buscador-puente-arr
+    image: arr-buscador-puente-arr:local
+    container_name: arr-buscador-puente-arr
+    user: "1000:10"
+    depends_on:
+      - gluetun
+      - qbittorrent
+      - jackett
+      - rdtclient
+    environment:
+      PORT: "9003"
+      TZ: Europe/Madrid
+      JACKETT_BASE: "http://gluetun:9117"
+      JACKETT_API_KEY: "${JACKETT_API_KEY}"
+      REAL_DEBRID_TOKEN: "${REAL_DEBRID_TOKEN}"
+      REAL_DEBRID_API: "${REAL_DEBRID_API}"
+      RDT_BASE: "http://rdtclient:6500"
+      RDT_USER: "${RDT_USER}"
+      RDT_PASS: "${RDT_PASSWORD}"
+      RDT_SAVE_ROOT: "/data/downloads"
+      QBIT_BASE: "http://gluetun:8080"
+      QBIT_USER: "${QBT_USER}"
+      QBIT_PASS: "${QBT_PASSWORD}"
+      QBIT_SAVE_ROOT: "/data/downloads/torrents/complete"
+      LOG_DIR: "/app/logs"
+      DATA_DIR: "/app/data"
+      ARR_DIAGNOSTICS_ROOT: "/diagnostics/arr"
+      ARR_HOST_ROOT: "${ARR_ROOT}"
+      ARR_HOST_DATA_ROOT: "${ARR_DATA_ROOT}"
+      ARR_ROOT_UNC: "${ARR_ROOT_UNC:-}"
+    volumes:
+      - ${ARR_ROOT}/config/buscador-puente-arr/data:/app/data
+      - ${ARR_ROOT}/config/buscador-puente-arr/logs:/app/logs
+      - ${ARR_ROOT}/diagnostics:/diagnostics
+    ports:
+      - "9003:9003"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/healthz', timeout=5).read()"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  compose-backup:
+    image: python:3.12-alpine
+    container_name: arr-compose-backup
+    environment:
+      TZ: Europe/Madrid
+      INTERVAL_HOURS: "24"
+      KEEP_BACKUPS: "30"
+      SOURCE_FILE: "/source/docker-compose.yaml"
+      BACKUP_DIR: "/backups"
+    volumes:
+      - ${ARR_ROOT}/docker-compose.yaml:/source/docker-compose.yaml:ro
+      - ${ARR_ROOT}/backups:/backups
+    command:
+      - sh
+      - -ec
+      - |
+          python -u - <<'PY'
+          import os, time, shutil
+          from pathlib import Path
+          from datetime import datetime
+
+          interval_hours = int(os.environ.get("INTERVAL_HOURS", "24") or "24")
+          keep_backups = int(os.environ.get("KEEP_BACKUPS", "30") or "30")
+          source_file = Path(os.environ.get("SOURCE_FILE", "/source/docker-compose.yaml"))
+          backup_dir = Path(os.environ.get("BACKUP_DIR", "/backups"))
+
+          def do_backup():
+              backup_dir.mkdir(parents=True, exist_ok=True)
+
+              if not source_file.exists():
+                  print(f"compose-backup: no encuentro {source_file}")
+                  return
+
+              stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+              dst = backup_dir / f"docker-compose_{stamp}.yaml"
+
+              shutil.copy2(source_file, dst)
+              print(f"compose-backup: copia creada -> {dst}")
+
+              backups = sorted(backup_dir.glob("docker-compose_*.yaml"))
+              old_backups = backups[:-keep_backups] if keep_backups > 0 else backups
+
+              for old in old_backups:
+                  try:
+                      old.unlink()
+                      print(f"compose-backup: copia antigua borrada -> {old.name}")
+                  except Exception as e:
+                      print(f"compose-backup: no pude borrar {old.name}: {e}")
+
+          print(f"compose-backup: iniciado, copia cada {interval_hours}h, conserva {keep_backups}")
+
+          while True:
+              try:
+                  do_backup()
+              except Exception as e:
+                  print(f"compose-backup: error haciendo copia: {e}")
+
+              time.sleep(interval_hours * 3600)
+          PY
+    restart: unless-stopped

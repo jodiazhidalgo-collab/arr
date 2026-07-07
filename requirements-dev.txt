@@ -1,0 +1,13 @@
+# Dependencias de desarrollo y pytest para lanzar la suite ARR desde la raiz.
+#
+# ARR es multi-servicio. No se incluyen literalmente los requirements de cada
+# servicio porque arr-orchestrator y buscador-puente-arr fijan versiones
+# distintas de requests para sus imagenes Docker. Este fichero declara una
+# capa de test local compatible para contratos y pruebas sinteticas.
+pytest>=8.4,<9
+flask==3.0.3
+waitress==3.0.2
+requests==2.32.5
+watchdog==6.0.0
+setuptools<81
+guessit==3.8.0

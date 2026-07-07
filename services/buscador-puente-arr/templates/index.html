@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Buscador puente arr</title>
+  <link rel="stylesheet" href="/static/css/app.css?v=8">
+</head>
+<body>
+  <main class="shell">
+    <section class="toolbar">
+      <div class="titlebar">
+        <button id="settingsToggle" class="gear-button" type="button" aria-label="Abrir ajustes">⚙️</button>
+        <div>
+          <h1>Buscador puente arr</h1>
+          <p id="status">Listo</p>
+        </div>
+      </div>
+
+      <div id="mainView">
+        <form id="searchForm" class="search">
+          <input id="query" type="search" autocomplete="off" placeholder="Buscar">
+          <button id="searchBtn" type="submit">Buscar</button>
+          <button id="clearSearchBtn" class="secondary clear-search" type="button">Limpiar</button>
+          <select id="category" class="hidden-field" aria-label="Destino">
+            <option value="">Auto</option>
+            <option value="movies">Películas</option>
+            <option value="tv">Series</option>
+            <option value="manual">Manual</option>
+          </select>
+          <select id="sortMode" class="hidden-field" aria-label="Orden">
+            <option value="size_desc">GB ↓</option>
+            <option value="size_asc">GB ↑</option>
+            <option value="tracker_asc">A-Z</option>
+            <option value="tracker_desc">Z-A</option>
+            <option value="seeders_desc">Semillas ↓</option>
+            <option value="peers_desc">Pares ↓</option>
+          </select>
+          <div class="filter-strip" aria-label="Filtros">
+            <button id="categoryButton" class="filter-chip" type="button">Auto</button>
+            <div class="tracker-picker">
+              <button id="trackerButton" class="filter-chip tracker-button" type="button" aria-expanded="false">Trackers: Todos</button>
+              <div id="trackerPanel" class="tracker-panel" hidden>
+                <input id="trackerSearch" type="search" autocomplete="off" placeholder="Buscar tracker">
+                <div class="tracker-actions">
+                  <button id="trackerAll" type="button">Todos</button>
+                  <button id="trackerNone" type="button">Ninguno</button>
+                </div>
+                <div id="trackerList" class="tracker-list"></div>
+              </div>
+            </div>
+            <button id="sortGbButton" class="filter-chip" type="button">GB ↓</button>
+            <button id="sortAzButton" class="filter-chip" type="button">A-Z</button>
+            <button id="seedMinButton" class="filter-chip" type="button">Semillas ≥ 1</button>
+            <button id="peerMinButton" class="filter-chip" type="button">Pares ≥ 0</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="results" class="results"></section>
+
+    <section id="settingsView" class="settings-view" hidden>
+      <div class="settings-tabs" role="tablist" aria-label="Ajustes">
+        <button class="settings-tab is-active" type="button" data-tab="rdt">RD/RDT</button>
+        <button class="settings-tab" type="button" data-tab="qbit">qBittorrent</button>
+        <button class="settings-tab" type="button" data-tab="auto">Auto</button>
+      </div>
+
+      <section class="settings-panel is-active" data-panel="rdt">
+        <h2>RD / RDT</h2>
+        <p>Cuándo insistir y cuándo soltar a qB.</p>
+        <div class="settings-grid">
+          <label><span class="settings-label-title">Espera inicial RD/RDT (seg)</span><span class="settings-help">Tiempo para que RDT cree la entrada.</span><input id="rdtStartTimeout" type="number" min="30" max="600" step="10"></label>
+          <label><span class="settings-label-title">Reintentos RD</span><span class="settings-help">Veces que insiste si RD tarda.</span><input id="rdRetries" type="number" min="1" max="8" step="1"></label>
+          <label><span class="settings-label-title">Esperar RD listo antes de qB (seg)</span><span class="settings-help">Si RD no queda listo en este tiempo, se borra y pasa a qB.</span><input id="rdtReadyTimeout" type="number" min="1" max="120" step="1"></label>
+        </div>
+        <label class="switch-row"><span><span class="settings-label-title">Fallback a qB si RD/RDT falla</span><span class="settings-help">Si RD/RDT falla, usa qB.</span></span><input id="rdtFallback" type="checkbox"></label>
+        <label class="switch-row"><span><span class="settings-label-title">Borrar RD/RDT al mandar a qB</span><span class="settings-help">Limpia RDT al pasar a qB.</span></span><input id="rdtCleanup" type="checkbox"></label>
+        <div class="settings-actions">
+          <button id="testRdt" type="button">Test RD/RDT</button>
+          <button class="secondary" type="button" data-reset="all">Valores seguros</button>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-panel="qbit">
+        <h2>qBittorrent</h2>
+        <p>Plan B cuando RD no resuelve.</p>
+        <label class="switch-row">Fallback a qB activado <input id="qbitFallback" type="checkbox"></label>
+        <label class="switch-row">Mandar a qB pausado <input id="qbitPaused" type="checkbox"></label>
+        <div class="settings-grid">
+          <label>Si Auto duda
+            <select id="autoUncertainCategory">
+              <option value="manual">Manual</option>
+              <option value="movies">Películas</option>
+              <option value="tv">Series</option>
+            </select>
+          </label>
+          <label>Categoría defecto
+            <select id="qbitDefaultCategory">
+              <option value="manual">Manual</option>
+              <option value="movies">Películas</option>
+              <option value="tv">Series</option>
+            </select>
+          </label>
+        </div>
+        <div class="settings-actions">
+          <button id="testQbit" type="button">Test qB</button>
+          <button id="saveSettingsQbit" class="secondary" type="button">Guardar ajustes</button>
+        </div>
+      </section>
+
+      <section class="settings-panel" data-panel="auto">
+        <h2>Auto inteligente</h2>
+        <p>Reglas editables para decidir tv / movies / manual.</p>
+        <label>Plantillas de serie
+          <textarea id="seriesTemplates" rows="6" spellcheck="false"></textarea>
+        </label>
+        <label>Palabras de serie
+          <textarea id="seriesWords" rows="4" spellcheck="false"></textarea>
+        </label>
+        <label>Pistas de película
+          <textarea id="movieWords" rows="4" spellcheck="false"></textarea>
+        </label>
+        <label class="switch-row">Detectar años 19XX / 20XX como película <input id="movieYears" type="checkbox"></label>
+        <div class="classifier-test">
+          <input id="classifyTitle" type="text" placeholder="Probar título">
+          <span id="classifyResult">Sin probar</span>
+        </div>
+        <div class="settings-actions">
+          <button id="testClassify" type="button">Probar título</button>
+          <button class="secondary" type="button" data-reset="auto">Restaurar Auto</button>
+        </div>
+      </section>
+
+      <div class="settings-footer">
+        <button id="cancelSettings" class="secondary" type="button">Cancelar</button>
+        <button id="saveSettings" type="button">Guardar</button>
+      </div>
+    </section>
+  </main>
+  <script src="/static/js/app.js?v=13"></script>
+</body>
+</html>
