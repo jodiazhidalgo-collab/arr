@@ -6,6 +6,7 @@ on:
       - master
       - main
   pull_request:
+  workflow_dispatch:
 
 jobs:
   tests:
@@ -26,8 +27,63 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
+      - name: Prepare evidence folder
+        run: New-Item -ItemType Directory -Force _codex_runtime/artifacts | Out-Null
+
       - name: Compile Python files
-        run: python -m compileall -q services tests
+        run: python -m compileall -q conftest.py tests services/arr-orchestrator services/buscador-puente-arr services/media-panel
 
       - name: Run pytest
-        run: python -m pytest -q
+        run: python -m pytest -q --junitxml _codex_runtime/artifacts/pytest-junit.xml --durations=20
+
+      - name: Write review summary
+        if: always()
+        shell: pwsh
+        run: |
+          Add-Content $env:GITHUB_STEP_SUMMARY "## ARR CI"
+          Add-Content $env:GITHUB_STEP_SUMMARY ""
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Commit: $env:GITHUB_SHA"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- Ref: $env:GITHUB_REF"
+          Add-Content $env:GITHUB_STEP_SUMMARY '- Evidence: artifact `arr-pytest-evidence`'
+
+          $junitPath = "_codex_runtime/artifacts/pytest-junit.xml"
+          if (Test-Path $junitPath) {
+            [xml]$junit = Get-Content $junitPath
+            $suites = @()
+            if ($junit.testsuites.testsuite) {
+              $suites = @($junit.testsuites.testsuite)
+            } elseif ($junit.testsuite) {
+              $suites = @($junit.testsuite)
+            }
+
+            $tests = 0
+            $failures = 0
+            $errors = 0
+            $skipped = 0
+            foreach ($suite in $suites) {
+              $tests += [int]$suite.tests
+              $failures += [int]$suite.failures
+              $errors += [int]$suite.errors
+              $skipped += [int]$suite.skipped
+            }
+
+            Add-Content $env:GITHUB_STEP_SUMMARY ""
+            Add-Content $env:GITHUB_STEP_SUMMARY "### Pytest"
+            Add-Content $env:GITHUB_STEP_SUMMARY ""
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Tests: $tests"
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Failures: $failures"
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Errors: $errors"
+            Add-Content $env:GITHUB_STEP_SUMMARY "- Skipped: $skipped"
+          } else {
+            Add-Content $env:GITHUB_STEP_SUMMARY ""
+            Add-Content $env:GITHUB_STEP_SUMMARY "No pytest JUnit report was generated."
+          }
+
+      - name: Upload pytest evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arr-pytest-evidence
+          path: _codex_runtime/artifacts/
+          if-no-files-found: warn
+          retention-days: 30

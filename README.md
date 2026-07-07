@@ -31,6 +31,7 @@ Lee tambien:
 
 - `AGENTS.md`: reglas operativas locales, si existen en tu entorno privado.
 - `README_DIAGNOSTICO_CODEX.md`: puente rapido para informes y trazas.
+- `docs/AI_REVIEW.md`: guia publica para revision IA, GitHub Actions y evidencias pytest.
 
 ## Desarrollo local
 

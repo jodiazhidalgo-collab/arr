@@ -8,6 +8,11 @@ Si una sandbox externa dice que no puede ejecutar pytest por falta de dependenci
 
 ## Archivos que prueban que pytest esta integrado
 
+- `.github/workflows/ci.yml`
+  - Ejecuta pytest en GitHub Actions con Python 3.12.
+  - Genera `pytest-junit.xml` como evidencia descargable.
+  - Publica el artefacto `arr-pytest-evidence`.
+  - Es ejecutable automaticamente en `push`/`pull_request` y manualmente con `workflow_dispatch`.
 - `requirements-dev.txt`
   - Incluye `pytest>=8.4,<9`.
   - Declara una capa local compatible para probar `arr-orchestrator` y `buscador-puente-arr`.
@@ -32,6 +37,7 @@ Si una sandbox externa dice que no puede ejecutar pytest por falta de dependenci
 
 ## Tests pytest visibles en el repo
 
+- `tests/test_project_governance.py`
 - `tests/test_pytest_contracts.py`
 - `services/arr-orchestrator/tests/test_arr_blackbox.py`
 - `services/arr-orchestrator/tests/test_arr_follow.py`
@@ -53,7 +59,7 @@ python -m venv _codex_runtime\tmp\venv_arr_pytest
 .\_codex_runtime\tmp\venv_arr_pytest\Scripts\python.exe -m pip install --upgrade pip
 .\_codex_runtime\tmp\venv_arr_pytest\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\_codex_runtime\tmp\venv_arr_pytest\Scripts\python.exe -m compileall -q conftest.py tests services\arr-orchestrator services\buscador-puente-arr services\media-panel
-.\_codex_runtime\tmp\venv_arr_pytest\Scripts\python.exe -m pytest -q
+.\_codex_runtime\tmp\venv_arr_pytest\Scripts\python.exe -m pytest -q --junitxml _codex_runtime\artifacts\pytest-junit.xml --durations=20
 ```
 
 La entrada principal es `pytest`, porque `pytest.ini` declara el `pythonpath` de los servicios. Si se quieren ejecutar los `unittest` de cada servicio directamente, hay que declarar el `PYTHONPATH` de ese servicio, ya que `unittest` no lee `pytest.ini`:
@@ -71,7 +77,7 @@ Los tests live de FileBot, motor completo y TMDb siguen protegidos por variables
 
 ## Evidencia del entorno real local
 
-Fecha de verificacion local: 2026-07-03.
+Fecha de verificacion local: 2026-07-07.
 
 ```text
 python --version
@@ -101,17 +107,15 @@ Ejecucion realizada en un venv temporal bajo `_codex_runtime/tmp/`:
 python -m compileall -q conftest.py tests services\arr-orchestrator services\buscador-puente-arr services\media-panel
 OK
 
-python -m pytest -q
-89 passed, 8 skipped in 7.93s
+python -m pytest -q --junitxml _codex_runtime\artifacts\pytest-junit.xml --durations=20
+108 passed, 7 skipped in 8.44s
 
 $env:PYTHONPATH = "services\arr-orchestrator"
 python -m unittest discover -s services\arr-orchestrator\tests -v
-Ran 88 tests in 3.746s
-OK (skipped=8)
+OK
 
 $env:PYTHONPATH = "services\buscador-puente-arr"
 python -m unittest discover -s services\buscador-puente-arr\tests -v
-Ran 5 tests in 0.540s
 OK
 ```
 
@@ -119,6 +123,7 @@ OK
 
 - ARR si trae pytest integrado desde la raiz.
 - Pytest no se incluye como binario dentro del repo; se declara en `requirements-dev.txt`.
+- GitHub Actions guarda un informe JUnit y lo publica como artefacto `arr-pytest-evidence`.
 - La suite pytest raiz ejecuta contratos propios de ARR y los tests de los servicios.
 - `unittest` directo por servicio tambien funciona, pero necesita `PYTHONPATH` porque no consume la configuracion de `pytest.ini`.
 - Los tests sinteticos usan `_codex_runtime/test-data/pytest-session` o `tmp_path`.
