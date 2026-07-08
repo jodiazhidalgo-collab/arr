@@ -260,11 +260,10 @@ class Engine:
             content_path = Path(str(torrent.get("content_path") or ""))
             if not infohash or not content_path.exists():
                 continue
-            if not self._inside_complete(content_path):
+            source_path = self._qbt_materialized_source(content_path)
+            if not source_path:
                 continue
-            job = self.db.get_active_job_by_infohash(infohash)
-            if not job:
-                job = self.db.get_job_by_source_path(str(content_path))
+            job = self._job_for_qbt_content(infohash, source_path, content_path)
             if not job:
                 job = self.db.create_job(
                     self._new_source_uid("qbt", infohash),
@@ -274,17 +273,18 @@ class Engine:
                     state="waiting_stable",
                     infohash=infohash,
                     qbt_hash=infohash,
-                    source_path=str(content_path),
+                    source_path=str(source_path),
                     submitted_at=float(torrent.get("added_on") or time.time()),
                 )
             elif job["state"] not in TERMINAL_STATES:
-                self.db.update_job(
-                    job["job_id"],
-                    infohash=infohash,
-                    qbt_hash=infohash,
-                    source_path=str(content_path),
-                    category=category,
-                    state="waiting_stable",
+                self._attach_qbt_identity(
+                    job,
+                    infohash,
+                    category,
+                    source_path,
+                    content_path,
+                    float(torrent.get("added_on") or time.time()),
+                    "Descarga qBittorrent correlacionada con trabajo existente",
                 )
 
     def _reconcile_rdt(self) -> None:
@@ -450,15 +450,14 @@ class Engine:
             return
         category = self._category(str(torrent.get("category") or ""), str(torrent.get("name") or ""))
         content_path = Path(str(torrent.get("content_path") or ""))
-        if not content_path.exists() or not self._inside_complete(content_path):
+        source_path = self._qbt_materialized_source(content_path) if content_path.exists() else None
+        if not source_path:
             self.log.warning(
                 "Evento qB aplazado: contenido terminado aún no visible en complete: %s",
                 content_path,
             )
             return
-        job = self.db.get_active_job_by_infohash(infohash)
-        if not job:
-            job = self.db.get_job_by_source_path(str(content_path))
+        job = self._job_for_qbt_content(infohash, source_path, content_path)
         if not job:
             job = self.db.create_job(
                 self._new_source_uid("qbt", infohash),
@@ -468,20 +467,18 @@ class Engine:
                 state="waiting_stable",
                 infohash=infohash,
                 qbt_hash=infohash,
-                source_path=str(content_path),
+                source_path=str(source_path),
                 submitted_at=float(torrent.get("added_on") or time.time()),
             )
         else:
-            self.db.transition(
-                job["job_id"],
-                "waiting_stable",
-                "qbt",
+            self._attach_qbt_identity(
+                job,
+                infohash,
+                category,
+                source_path,
+                content_path,
+                float(torrent.get("added_on") or time.time()),
                 "Evento de finalización recibido de qBittorrent",
-                origin="qbt",
-                infohash=infohash,
-                qbt_hash=infohash,
-                category=category,
-                source_path=str(content_path),
             )
         path.unlink(missing_ok=True)
 
@@ -525,6 +522,8 @@ class Engine:
                 source_path=str(item),
                 state="waiting_stable",
             )
+        if job["state"] not in TERMINAL_STATES and not job.get("qbt_hash"):
+            self._adopt_qbt_for_materialized_job(job, category, item)
 
     def _job_for_materialized(self, category: str, item: Path) -> Optional[Dict[str, object]]:
         for job in self.db.jobs_in_states(
@@ -535,6 +534,120 @@ class Engine:
             if self._same_name(str(job["name"]), item.name):
                 return job
         return None
+
+    def _qbt_materialized_source(self, content_path: Path) -> Optional[Path]:
+        root = self._complete_category_path(content_path)
+        if not root:
+            return None
+        return top_level_item(root, content_path)
+
+    def _job_for_qbt_content(
+        self,
+        infohash: str,
+        source_path: Path,
+        content_path: Path,
+    ) -> Optional[Dict[str, object]]:
+        job = self.db.get_active_job_by_infohash(infohash)
+        if job:
+            return job
+        seen: set[str] = set()
+        for candidate in (source_path, content_path):
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            job = self.db.get_job_by_source_path(key)
+            if job:
+                return job
+        return None
+
+    def _attach_qbt_identity(
+        self,
+        job: Dict[str, object],
+        infohash: str,
+        category: str,
+        source_path: Path,
+        content_path: Path,
+        submitted_at: float,
+        message: str,
+    ) -> Dict[str, object]:
+        job_id = str(job["job_id"])
+        current_state = str(job.get("state") or "")
+        materializing_states = {
+            "received",
+            "source_submitted",
+            "waiting_materialization",
+            "waiting_stable",
+        }
+        target_state = "waiting_stable" if current_state in materializing_states else current_state
+        updates: Dict[str, object] = {}
+        if str(job.get("infohash") or "").lower() != infohash:
+            updates["infohash"] = infohash
+        if str(job.get("qbt_hash") or "").lower() != infohash:
+            updates["qbt_hash"] = infohash
+        if str(job.get("category") or "") != category:
+            updates["category"] = category
+        if str(job.get("source_path") or "") != str(source_path):
+            updates["source_path"] = str(source_path)
+        if not job.get("submitted_at") and submitted_at:
+            updates["submitted_at"] = submitted_at
+
+        structured = {
+            "state": target_state,
+            "infohash": infohash,
+            "qbt_hash": infohash,
+            "category": category,
+            "source_path": str(source_path),
+            "content_path": str(content_path),
+            "previous_source_path": str(job.get("source_path") or ""),
+        }
+        if target_state != current_state:
+            return self.db.transition(
+                job_id,
+                target_state,
+                "qbt",
+                message,
+                **updates,
+            )
+        if updates:
+            updated = self.db.update_job(job_id, **updates)
+            self.db.add_event(job_id, "qbt", "decision", message, structured)
+            return updated
+        return job
+
+    def _adopt_qbt_for_materialized_job(
+        self,
+        job: Dict[str, object],
+        category: str,
+        item: Path,
+    ) -> Dict[str, object]:
+        try:
+            torrents = self.qbt.torrents("completed")
+        except Exception as error:
+            self.dependencies["qbittorrent"] = f"error: {error}"
+            return job
+        self.dependencies["qbittorrent"] = "ok"
+        for torrent in torrents:
+            infohash = str(torrent.get("hash") or "").lower()
+            content_path = Path(str(torrent.get("content_path") or ""))
+            if not infohash or not content_path.exists():
+                continue
+            source_path = self._qbt_materialized_source(content_path)
+            if not source_path or not self._same_path(source_path, item):
+                continue
+            return self._attach_qbt_identity(
+                job,
+                infohash,
+                self._category(
+                    str(torrent.get("category") or category),
+                    str(torrent.get("name") or item.name),
+                ),
+                source_path,
+                content_path,
+                float(torrent.get("added_on") or time.time()),
+                "Descarga qBittorrent adoptada por trabajo detectado en carpeta",
+            )
+        return job
 
     def process_jobs(self) -> None:
         jobs = self.db.jobs_in_states(PROCESSABLE_STATES, 100)
@@ -1704,6 +1817,13 @@ class Engine:
         if not self.db.get_job_by_source_uid(base):
             return base
         return f"{base}:{int(time.time() * 1000)}"
+
+    @staticmethod
+    def _same_path(left: Path, right: Path) -> bool:
+        try:
+            return left.resolve() == right.resolve()
+        except OSError:
+            return str(left) == str(right)
 
     @staticmethod
     def _same_name(left: str, right: str) -> bool:

@@ -242,6 +242,125 @@ class CoreTests(unittest.TestCase):
             self.assertIsNone(database.get_active_job_by_infohash("abc123"))
             database.close()
 
+    def test_reconcile_qbt_adopts_existing_fs_job_for_folder_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            item = config.complete_root / "movies" / "Wasabi"
+            content = item / "Wasabi.avi"
+            content.parent.mkdir(parents=True)
+            content.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:wasabi",
+                "fs",
+                "movies",
+                "Wasabi",
+                state="waiting_stable",
+                source_path=str(item),
+            )
+
+            class FakeQbt:
+                def torrents(self, _torrent_filter):
+                    return [
+                        {
+                            "hash": "abc123",
+                            "category": "movies",
+                            "name": "Wasabi",
+                            "content_path": str(content),
+                            "added_on": 123,
+                        }
+                    ]
+
+            engine.qbt = FakeQbt()
+            engine._reconcile_qbt()
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["qbt_hash"], "abc123")
+            self.assertEqual(updated["infohash"], "abc123")
+            self.assertEqual(updated["source_path"], str(item))
+            self.assertEqual(len(database.latest_jobs()), 1)
+            self.assertTrue(
+                any(event["phase"] == "qbt" for event in database.job_detail(job["job_id"])["timeline"])
+            )
+            database.close()
+
+    def test_qbt_event_uses_top_level_folder_as_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            item = config.complete_root / "movies" / "Wasabi"
+            content = item / "Wasabi.avi"
+            content.parent.mkdir(parents=True)
+            content.write_bytes(b"movie")
+            infohash = "a" * 40
+            event_path = config.event_dir / "wasabi.event"
+            event_path.write_text(f"hash={infohash}\n", encoding="utf-8")
+
+            class FakeQbt:
+                def torrent(self, _infohash):
+                    return {
+                        "hash": infohash,
+                        "category": "movies",
+                        "name": "Wasabi",
+                        "content_path": str(content),
+                        "progress": 1,
+                        "completion_on": 123,
+                        "added_on": 100,
+                    }
+
+            engine.qbt = FakeQbt()
+            engine._handle_qbt_event(event_path)
+
+            jobs = database.latest_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["qbt_hash"], infohash)
+            self.assertEqual(jobs[0]["source_path"], str(item))
+            self.assertFalse(event_path.exists())
+            database.close()
+
+    def test_materialized_fs_job_adopts_qbt_before_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            item = config.complete_root / "movies" / "Wasabi"
+            content = item / "Wasabi.avi"
+            content.parent.mkdir(parents=True)
+            content.write_bytes(b"movie")
+
+            class FakeQbt:
+                def torrents(self, _torrent_filter):
+                    return [
+                        {
+                            "hash": "abc123",
+                            "category": "movies",
+                            "name": "Wasabi",
+                            "content_path": str(content),
+                            "added_on": 123,
+                        }
+                    ]
+
+            engine.qbt = FakeQbt()
+            engine._register_materialized("movies", item)
+
+            jobs = database.latest_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["origin"], "fs")
+            self.assertEqual(jobs[0]["qbt_hash"], "abc123")
+            self.assertEqual(jobs[0]["source_path"], str(item))
+            database.close()
+
     def test_manifest_changes_with_file_size(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
