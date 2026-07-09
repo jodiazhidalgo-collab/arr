@@ -1,4 +1,5 @@
 import json
+import inspect
 import re
 import threading
 import time
@@ -89,6 +90,7 @@ class PersistentJobStore:
         job_id: str,
         kind: str = "",
         states: set[str] | None = None,
+        active_stale_after_sec: int = 0,
     ) -> dict:
         try:
             path = self._path(job_id)
@@ -104,6 +106,12 @@ class PersistentJobStore:
                 return {"removed": False, "reason": "kind_mismatch", "state": str(job.get("state") or "")}
             state = str(job.get("state") or "")
             if state in ACTIVE_STATES:
+                now = int(time.time())
+                updated_at = int(job.get("updated_at") or job.get("created_at") or 0)
+                active_age = max(0, now - updated_at)
+                if active_stale_after_sec > 0 and active_age >= active_stale_after_sec:
+                    path.unlink(missing_ok=True)
+                    return {"removed": True, "reason": "stale_active", "state": state}
                 return {"removed": False, "reason": "active", "state": state}
             allowed = states or DISMISSABLE_STATES
             if state not in allowed:
@@ -181,11 +189,37 @@ class PersistentJobStore:
     def _run(self, job_id: str, runner: Callable[[], Any]) -> None:
         self._update(job_id, state="running", error="")
         try:
-            result = runner()
+            if self._runner_accepts_progress(runner):
+                result = runner(self._progress_updater(job_id))
+            else:
+                result = runner()
             self._update(job_id, state="done", result=result, error="")
         except Exception as exc:
             self.logger.exception("ui job failed id=%s", job_id)
             self._update(job_id, state="error", error=str(exc)[:500])
+
+    def _runner_accepts_progress(self, runner: Callable[..., Any]) -> bool:
+        try:
+            signature = inspect.signature(runner)
+        except (TypeError, ValueError):
+            return False
+        for parameter in signature.parameters.values():
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
+            ):
+                return True
+        return False
+
+    def _progress_updater(self, job_id: str) -> Callable[..., None]:
+        def update(progress: dict | None = None, **changes: Any) -> None:
+            payload = dict(progress or {})
+            payload.update(changes)
+            payload["updated_at"] = int(time.time())
+            self._update(job_id, progress=payload)
+
+        return update
 
     def _update(self, job_id: str, **changes) -> None:
         with self.lock:

@@ -56,7 +56,8 @@ let selectedTrackers = new Set(readSavedTrackers());
 let minSeeders = readSavedNumber("arr_min_seeders", 1);
 let minPeers = readSavedNumber("arr_min_peers", 0);
 const PAGE_SIZE = 30;
-const DONE_BADGE_AUTO_CLEAR_MS = 2 * 60 * 1000;
+const ACCEPTED_BADGE_AUTO_CLEAR_MS = 1600;
+const ACTIVE_RESET_CHECK_MS = 1400;
 let currentPage = Math.max(1, readSavedNumber("arr_page", 1));
 let searchTimer = 0;
 let searchPollTimer = 0;
@@ -642,13 +643,13 @@ function metaText(item) {
 
 function setCardState(row, text, state) {
   const badge = row.querySelector(".state-badge");
-  row.classList.remove("is-sending", "is-queued", "is-error");
-  if (state) row.classList.add(state);
+  row.classList.remove("is-sending", "is-queued", "is-error", "is-rd", "is-qbit", "is-accepted", "is-reset");
+  if (state) row.classList.add(...String(state).split(/\s+/).filter(Boolean));
   if (badge) badge.textContent = text || "";
 }
 
 function resetCard(row) {
-  row.classList.remove("is-sending", "is-queued", "is-error");
+  row.classList.remove("is-sending", "is-queued", "is-error", "is-rd", "is-qbit", "is-accepted", "is-reset");
   row.dataset.busy = "0";
   const badge = row.querySelector(".state-badge");
   if (badge) badge.remove();
@@ -671,15 +672,15 @@ function clearSendState(item, row, jobId, announce = true) {
   forgetSendJob(item.id, jobId);
   resetCard(row);
   dismissSendJob(jobId);
-  if (announce) status("Marca quitada");
+  if (announce) status("Envio limpiado");
 }
 
-function scheduleDoneBadgeClear(item, row, jobId) {
+function scheduleAcceptedBadgeClear(item, row, jobId) {
   clearFinalSendTimer(item.id);
   sendClearTimers[item.id] = setTimeout(() => {
     if (!row.isConnected || sendJobIdFor(item.id) !== jobId) return;
     clearSendState(item, row, jobId, false);
-  }, DONE_BADGE_AUTO_CLEAR_MS);
+  }, ACCEPTED_BADGE_AUTO_CLEAR_MS);
 }
 
 function showCardBadge(row, text, options = {}) {
@@ -713,6 +714,30 @@ function showCardBadge(row, text, options = {}) {
   }
 }
 
+function acceptedSendTone(job) {
+  const result = job.result || {};
+  const engine = String(result.engine || "").toLowerCase();
+  const state = String(result.submission_state || "").toLowerCase();
+  if (engine.includes("qbit") || state === "submitted_qbit" || result.hash) return "qbit";
+  if (engine.includes("rdt") || state === "rdt_monitoring" || state === "transport_done" || result.rdt_id) return "rd";
+  return "qbit";
+}
+
+function acceptedSendLabel(job) {
+  return acceptedSendTone(job) === "qbit" ? "qB aceptado" : "RD aceptado";
+}
+
+function runningSendLabel(job) {
+  const progress = job.progress || {};
+  return progress.label || "Enviando a RD";
+}
+
+function runningSendClass(job) {
+  const progress = job.progress || {};
+  const tone = progress.tone === "qbit" ? "is-qbit" : "is-rd";
+  return `is-sending ${tone}`;
+}
+
 function applySendJob(job, item, row, announce = false) {
   if (!job || !row.isConnected) return;
   row.dataset.busy = "1";
@@ -720,33 +745,44 @@ function applySendJob(job, item, row, announce = false) {
   showCardBadge(row, "");
   if (job.state === "queued" || job.state === "running") {
     clearFinalSendTimer(item.id);
-    setCardState(row, "Enviando...", "is-sending");
-    if (announce) status(`Enviando: ${item.title}`);
+    if (job.recoverable) {
+      showCardBadge(row, "Reset envio", {
+        clearable: true,
+        title: "Limpiar envio bloqueado",
+        ariaLabel: "Reset envio bloqueado",
+        onClear: () => clearSendState(item, row, job.id)
+      });
+      setCardState(row, "Reset envio", "is-error is-reset");
+      if (announce) status(`Envio bloqueado: ${item.title}`);
+      setTimeout(() => pollSendJob(job.id, item, row, announce), ACTIVE_RESET_CHECK_MS);
+      return;
+    }
+    const label = runningSendLabel(job);
+    setCardState(row, label, runningSendClass(job));
+    if (announce) status(`${label}: ${item.title}`);
     setTimeout(() => pollSendJob(job.id, item, row, announce), 900);
     return;
   }
   if (job.state === "done") {
-    const category = job.result && job.result.category;
-    const label = category === "tv" ? "En cola TV" : category === "movies" ? "En cola Pelis" : "En cola";
-    showCardBadge(row, label, {
-      clearable: true,
-      title: "Quitar marca",
-      ariaLabel: `Quitar marca ${label}`,
-      onClear: () => clearSendState(item, row, job.id)
-    });
-    setCardState(row, label, "is-queued");
-    scheduleDoneBadgeClear(item, row, job.id);
-    if (announce) status(`Enviado: ${item.title} -> ${category || "auto"}`);
+    const tone = acceptedSendTone(job);
+    const label = acceptedSendLabel(job);
+    showCardBadge(row, label);
+    setCardState(row, label, `is-queued is-${tone} is-accepted`);
+    scheduleAcceptedBadgeClear(item, row, job.id);
+    if (announce) {
+      playFinishSound();
+      status(`${label}: ${item.title}`);
+    }
     return;
   }
   clearFinalSendTimer(item.id);
-  showCardBadge(row, "Error", {
+  showCardBadge(row, "Reset envio", {
     clearable: true,
-    title: "Quitar error",
-    ariaLabel: "Quitar error de esta tarjeta",
+    title: "Limpiar envio con error",
+    ariaLabel: "Reset envio con error",
     onClear: () => clearSendState(item, row, job.id)
   });
-  setCardState(row, "Error", "is-error");
+  setCardState(row, "Reset envio", "is-error is-reset");
   if (announce) status(`Error: ${shortError(job.error || "fallo al enviar")}`);
 }
 
@@ -784,9 +820,9 @@ async function send(item, row) {
   const jobId = newJobId();
   rememberSendJob(item.id, jobId, "queued");
   row.dataset.busy = "1";
-  showCardBadge(row, "Enviando...");
-  setCardState(row, "Enviando...", "is-sending");
-  status(`Enviando: ${item.title}`);
+  showCardBadge(row, "Enviando a RD");
+  setCardState(row, "Enviando a RD", "is-sending is-rd");
+  status(`Enviando a RD: ${item.title}`);
   try {
     const response = await fetch("/api/jobs/download", {
       method: "POST",

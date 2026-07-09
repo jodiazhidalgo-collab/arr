@@ -9,8 +9,8 @@ import unicodedata
 import xml.etree.ElementTree as ET
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any, Callable
 from urllib.parse import quote, urljoin
-from typing import Any
 
 import requests
 from flask import Flask, jsonify, render_template, request
@@ -881,11 +881,53 @@ def job_fingerprint(value: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def emit_download_progress(progress: Callable[..., None] | None, phase: str, label: str, tone: str, **extra: Any) -> None:
+    if not callable(progress):
+        return
+    payload = {
+        "phase": phase,
+        "label": label,
+        "tone": tone,
+    }
+    payload.update({key: value for key, value in extra.items() if value not in (None, "")})
+    progress(payload)
+
+
+def download_job_stale_after_sec(job: dict) -> int:
+    progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    phase = str(progress.get("phase") or "")
+    settings = load_settings()
+    rdt = settings.get("rdt", {}) if isinstance(settings.get("rdt"), dict) else {}
+    start_timeout = max(45, int(rdt.get("start_timeout_sec") or 120))
+    ready_timeout = max(1, int(rdt.get("ready_timeout_sec") or 5))
+    if phase == "qbit_sending":
+        return 90
+    if phase == "rdt_sending":
+        return start_timeout + ready_timeout + 45
+    return start_timeout + ready_timeout + 90
+
+
+def enrich_download_job_public(payload: dict, job: dict) -> None:
+    if job.get("kind") != "download":
+        return
+    progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    payload["progress"] = progress
+    payload["stale_after_sec"] = download_job_stale_after_sec(job)
+    updated_at = int(job.get("updated_at") or job.get("created_at") or 0)
+    age = max(0, int(time.time()) - updated_at)
+    payload["active_age_sec"] = age
+    payload["recoverable"] = job.get("state") in {"error", "interrupted"} or (
+        job.get("state") in {"queued", "running"} and age >= int(payload["stale_after_sec"])
+    )
+
+
 def public_job(job: dict) -> dict:
-    return {
+    payload = {
         key: job.get(key)
         for key in ("id", "kind", "state", "created_at", "updated_at", "request", "result", "error")
     }
+    enrich_download_job_public(payload, job)
+    return payload
 
 
 def run_search_job(
@@ -1571,6 +1613,7 @@ def finish_submission(
         "title": title,
         "category": category,
         "requested_category": requested_category or "auto",
+        "submission_state": state,
         "submission_key": key,
     })
     submissions.update(
@@ -1922,6 +1965,7 @@ def deliver(
     cleanup: bool = False,
     source_result_id: str = "",
     trace_id: str = "",
+    progress: Callable[..., None] | None = None,
 ) -> dict:
     with ENGINE_LOCK:
         settings = load_settings()
@@ -1962,6 +2006,7 @@ def deliver(
             logger.info("download duplicate guarded title=%s category=%s state=%s key=%s", title, category, reused_row.get("state"), key[:12])
             return reusable_submission_result(reused_row, title, requested_for_key, category)
 
+        emit_download_progress(progress, "rdt_sending", "Enviando a RD", "rd", engine="RDT-Client")
         if download_url.startswith("magnet:"):
             try:
                 submissions.update(key, state="submitting_rdt", engine="RDT-Client")
@@ -1982,6 +2027,14 @@ def deliver(
                     arr_trace.finish("download", trace_id, "transport_error", error=str(main_error)[:500])
                     raise
                 submissions.update(key, state="fallback_to_qbit", last_error=str(main_error)[:500])
+                emit_download_progress(
+                    progress,
+                    "qbit_sending",
+                    "Enviando a qB",
+                    "qbit",
+                    engine="qBittorrent",
+                    fallback_from=str(main_error)[:180],
+                )
                 try:
                     arr_trace.event("download", trace_id, "fallback", "started", "Enviando magnet a qBittorrent", {"engine": "qBittorrent"})
                     qbit = qbit_add_magnet(download_url, category, cleanup)
@@ -2037,6 +2090,14 @@ def deliver(
                 arr_trace.finish("download", trace_id, "transport_error", error=str(main_error)[:500])
                 raise
             submissions.update(key, state="fallback_to_qbit", last_error=str(main_error)[:500])
+            emit_download_progress(
+                progress,
+                "qbit_sending",
+                "Enviando a qB",
+                "qbit",
+                engine="qBittorrent",
+                fallback_from=str(main_error)[:180],
+            )
             try:
                 arr_trace.event("download", trace_id, "fallback", "started", "Enviando torrent a qBittorrent", {"engine": "qBittorrent"})
                 if resolved_magnet:
@@ -2290,8 +2351,8 @@ def api_download_job_start():
     trace_id = f"download-{fingerprint[:16]}"
     request_data["trace_id"] = trace_id
 
-    def run_download_job() -> dict:
-        result = deliver(item["title"], item["download_url"], category, cleanup, str(item.get("id") or ""), trace_id)
+    def run_download_job(progress: Callable[..., None]) -> dict:
+        result = deliver(item["title"], item["download_url"], category, cleanup, str(item.get("id") or ""), trace_id, progress)
         result.update({
             "source_result_id": item.get("id"),
             "source_tracker": item.get("tracker"),
@@ -2329,7 +2390,9 @@ def api_download_job_get(job_id: str):
 
 @app.post("/api/jobs/download/<job_id>/dismiss")
 def api_download_job_dismiss(job_id: str):
-    result = ui_jobs.dismiss(job_id, "download", {"done", "error", "interrupted"})
+    job = ui_jobs.get(job_id, "download")
+    stale_after = download_job_stale_after_sec(job) if job else 0
+    result = ui_jobs.dismiss(job_id, "download", {"done", "error", "interrupted"}, stale_after)
     reason = str(result.get("reason") or "")
     if result.get("removed") or reason == "missing":
         return jsonify({"ok": True, **result})
