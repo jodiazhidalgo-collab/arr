@@ -56,6 +56,7 @@ let selectedTrackers = new Set(readSavedTrackers());
 let minSeeders = readSavedNumber("arr_min_seeders", 1);
 let minPeers = readSavedNumber("arr_min_peers", 0);
 const PAGE_SIZE = 30;
+const DONE_BADGE_AUTO_CLEAR_MS = 2 * 60 * 1000;
 let currentPage = Math.max(1, readSavedNumber("arr_page", 1));
 let searchTimer = 0;
 let searchPollTimer = 0;
@@ -64,6 +65,7 @@ let searchSoundJobId = "";
 let restoreScrollPending = true;
 let rememberedScrollY = readSavedNumber("arr_scroll_y", 0);
 let sendJobs = readSavedObject("arr_send_jobs");
+let sendClearTimers = {};
 let settings = null;
 let defaultSettings = null;
 let finishSound = null;
@@ -174,9 +176,35 @@ function restoreSavedScroll() {
 }
 
 function saveSendJobs() {
-  const entries = Object.entries(sendJobs).slice(-200);
+  const entries = Object.entries(sendJobs)
+    .filter(([, entry]) => typeof entry === "string" || (entry && entry.jobId))
+    .slice(-200);
   sendJobs = Object.fromEntries(entries);
   localStorage.setItem("arr_send_jobs", JSON.stringify(sendJobs));
+}
+
+function sendJobIdFor(itemId) {
+  const entry = sendJobs[itemId];
+  if (!entry) return "";
+  return typeof entry === "string" ? entry : String(entry.jobId || "");
+}
+
+function rememberSendJob(itemId, jobId, state = "") {
+  if (!itemId || !jobId) return;
+  sendJobs[itemId] = {
+    jobId,
+    state,
+    updatedAt: Date.now()
+  };
+  saveSendJobs();
+}
+
+function forgetSendJob(itemId, jobId = "") {
+  const current = sendJobIdFor(itemId);
+  if (!current || (jobId && current !== jobId)) return false;
+  delete sendJobs[itemId];
+  saveSendJobs();
+  return true;
 }
 
 function status(text) {
@@ -626,21 +654,72 @@ function resetCard(row) {
   if (badge) badge.remove();
 }
 
-function showCardBadge(row, text) {
+function clearFinalSendTimer(itemId) {
+  if (sendClearTimers[itemId]) {
+    clearTimeout(sendClearTimers[itemId]);
+    delete sendClearTimers[itemId];
+  }
+}
+
+function dismissSendJob(jobId) {
+  if (!jobId) return;
+  fetch(`/api/jobs/download/${encodeURIComponent(jobId)}/dismiss`, { method: "POST" }).catch(() => {});
+}
+
+function clearSendState(item, row, jobId, announce = true) {
+  clearFinalSendTimer(item.id);
+  forgetSendJob(item.id, jobId);
+  resetCard(row);
+  dismissSendJob(jobId);
+  if (announce) status("Marca quitada");
+}
+
+function scheduleDoneBadgeClear(item, row, jobId) {
+  clearFinalSendTimer(item.id);
+  sendClearTimers[item.id] = setTimeout(() => {
+    if (!row.isConnected || sendJobIdFor(item.id) !== jobId) return;
+    clearSendState(item, row, jobId, false);
+  }, DONE_BADGE_AUTO_CLEAR_MS);
+}
+
+function showCardBadge(row, text, options = {}) {
   let badge = row.querySelector(".state-badge");
+  const tag = options.clearable ? "button" : "span";
+  if (badge && badge.tagName.toLowerCase() !== tag) {
+    badge.remove();
+    badge = null;
+  }
   if (!badge) {
-    badge = document.createElement("span");
+    badge = document.createElement(tag);
     badge.className = "state-badge";
+    if (tag === "button") badge.type = "button";
     row.querySelector(".meta").appendChild(badge);
   }
   badge.textContent = text;
+  badge.title = options.title || "";
+  badge.setAttribute("aria-label", options.ariaLabel || text || "");
+  if (options.clearable) {
+    badge.classList.add("is-clearable");
+    badge.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      options.onClear();
+    };
+    badge.onkeydown = (event) => event.stopPropagation();
+  } else {
+    badge.classList.remove("is-clearable");
+    badge.onclick = null;
+    badge.onkeydown = null;
+  }
 }
 
 function applySendJob(job, item, row, announce = false) {
   if (!job || !row.isConnected) return;
   row.dataset.busy = "1";
+  rememberSendJob(item.id, job.id, job.state);
   showCardBadge(row, "");
   if (job.state === "queued" || job.state === "running") {
+    clearFinalSendTimer(item.id);
     setCardState(row, "Enviando...", "is-sending");
     if (announce) status(`Enviando: ${item.title}`);
     setTimeout(() => pollSendJob(job.id, item, row, announce), 900);
@@ -649,10 +728,24 @@ function applySendJob(job, item, row, announce = false) {
   if (job.state === "done") {
     const category = job.result && job.result.category;
     const label = category === "tv" ? "En cola TV" : category === "movies" ? "En cola Pelis" : "En cola";
+    showCardBadge(row, label, {
+      clearable: true,
+      title: "Quitar marca",
+      ariaLabel: `Quitar marca ${label}`,
+      onClear: () => clearSendState(item, row, job.id)
+    });
     setCardState(row, label, "is-queued");
+    scheduleDoneBadgeClear(item, row, job.id);
     if (announce) status(`Enviado: ${item.title} -> ${category || "auto"}`);
     return;
   }
+  clearFinalSendTimer(item.id);
+  showCardBadge(row, "Error", {
+    clearable: true,
+    title: "Quitar error",
+    ariaLabel: "Quitar error de esta tarjeta",
+    onClear: () => clearSendState(item, row, job.id)
+  });
   setCardState(row, "Error", "is-error");
   if (announce) status(`Error: ${shortError(job.error || "fallo al enviar")}`);
 }
@@ -663,10 +756,7 @@ async function pollSendJob(jobId, item, row, announce = false) {
     const response = await fetch(`/api/jobs/download/${encodeURIComponent(jobId)}`);
     const data = await response.json();
     if (response.status === 404) {
-      if (sendJobs[item.id] === jobId) {
-        delete sendJobs[item.id];
-        saveSendJobs();
-      }
+      forgetSendJob(item.id, jobId);
       resetCard(row);
       return;
     }
@@ -679,12 +769,12 @@ async function pollSendJob(jobId, item, row, announce = false) {
 }
 
 function restoreSendState(item, row) {
-  const jobId = sendJobs[item.id];
+  const jobId = sendJobIdFor(item.id);
   if (jobId) pollSendJob(jobId, item, row, false);
 }
 
 async function send(item, row) {
-  const rememberedJobId = sendJobs[item.id];
+  const rememberedJobId = sendJobIdFor(item.id);
   if (rememberedJobId) {
     status(`Recuperando envío: ${item.title}`);
     pollSendJob(rememberedJobId, item, row, true);
@@ -692,8 +782,7 @@ async function send(item, row) {
   }
   if (row.dataset.busy === "1") return;
   const jobId = newJobId();
-  sendJobs[item.id] = jobId;
-  saveSendJobs();
+  rememberSendJob(item.id, jobId, "queued");
   row.dataset.busy = "1";
   showCardBadge(row, "Enviando...");
   setCardState(row, "Enviando...", "is-sending");
@@ -712,8 +801,7 @@ async function send(item, row) {
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.error || "fallo al enviar");
     if (data.job.id !== jobId) {
-      sendJobs[item.id] = data.job.id;
-      saveSendJobs();
+      rememberSendJob(item.id, data.job.id, data.job.state);
     }
     applySendJob(data.job, item, row, true);
   } catch (error) {

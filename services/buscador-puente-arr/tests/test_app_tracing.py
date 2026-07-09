@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import app as app_module
 from modulos.arr_trace import ArrTrace
+from modulos.persistent_jobs import PersistentJobStore
 from modulos.submission_store import SubmissionStore
 
 
@@ -20,6 +21,7 @@ class DeliveryTracingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.temporary.name)
+        app_module.ui_jobs = PersistentJobStore(self.root / "ui_jobs", app_module.logger)
         app_module.submissions = SubmissionStore(self.root / "submissions.sqlite3", app_module.logger)
         app_module.arr_trace = ArrTrace(self.root / "diagnostics" / "arr", app_module.logger)
 
@@ -137,6 +139,61 @@ class DeliveryTracingTests(unittest.TestCase):
         summary = self.trace_summary("download-error")
         self.assertEqual(summary["state"], "transport_error")
         self.assertEqual(summary["errors"], 1)
+
+    def test_download_job_dismiss_removes_finished_ui_job_only(self) -> None:
+        job_id = "job_finished_123"
+        path = self.root / "ui_jobs" / f"{job_id}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "id": job_id,
+                    "kind": "download",
+                    "fingerprint": "fp",
+                    "state": "done",
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "request": {"title": "Pelicula"},
+                    "result": {"ok": True},
+                    "error": "",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = app_module.app.test_client().post(f"/api/jobs/download/{job_id}/dismiss")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        self.assertFalse(path.exists())
+        self.assertEqual(app_module.submissions.stats(), {})
+
+    def test_download_job_dismiss_does_not_remove_active_ui_job(self) -> None:
+        job_id = "job_running_123"
+        path = self.root / "ui_jobs" / f"{job_id}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "id": job_id,
+                    "kind": "download",
+                    "fingerprint": "fp",
+                    "state": "running",
+                    "created_at": 1,
+                    "updated_at": 1,
+                    "request": {"title": "Pelicula"},
+                    "result": None,
+                    "error": "",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = app_module.app.test_client().post(f"/api/jobs/download/{job_id}/dismiss")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.get_json()["ok"])
+        self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

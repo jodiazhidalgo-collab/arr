@@ -337,7 +337,8 @@ button:disabled {
   font-size: 12px;
 }
 
-.meta span {
+.meta span,
+.meta .state-badge {
   display: inline-flex;
   align-items: center;
   min-height: 24px;
@@ -348,11 +349,26 @@ button:disabled {
 }
 
 .state-badge {
+  flex: 0 0 auto;
   margin-left: auto;
   color: #d9e6eb;
   border-color: #3c5361;
   background: rgba(31, 111, 139, .18);
+  border-radius: 999px;
+  font-size: 12px;
   font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+button.state-badge {
+  min-height: 24px;
+  cursor: pointer;
+}
+
+.state-badge.is-clearable:focus-visible {
+  outline: 2px solid rgba(238, 243, 245, .72);
+  outline-offset: 2px;
 }
 
 .item.is-sending .state-badge {
@@ -648,7 +664,8 @@ button:disabled {
     padding: 12px;
   }
 
-  .meta span {
+  .meta span,
+  .meta .state-badge {
     min-height: 23px;
     padding: 2px 7px;
   }

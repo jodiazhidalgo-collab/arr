@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 JOB_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{8,80}$")
 ACTIVE_STATES = {"queued", "running"}
+DISMISSABLE_STATES = {"done", "error", "interrupted"}
 
 
 class PersistentJobStore:
@@ -82,6 +83,33 @@ class PersistentJobStore:
             if not job or (kind and job.get("kind") != kind):
                 return None
             return job
+
+    def dismiss(
+        self,
+        job_id: str,
+        kind: str = "",
+        states: set[str] | None = None,
+    ) -> dict:
+        try:
+            path = self._path(job_id)
+        except ValueError:
+            return {"removed": False, "reason": "invalid_id"}
+        with self.lock:
+            if not path.exists():
+                return {"removed": False, "reason": "missing"}
+            job = self._read_path_unlocked(path)
+            if not job:
+                return {"removed": False, "reason": "invalid_job"}
+            if kind and job.get("kind") != kind:
+                return {"removed": False, "reason": "kind_mismatch", "state": str(job.get("state") or "")}
+            state = str(job.get("state") or "")
+            if state in ACTIVE_STATES:
+                return {"removed": False, "reason": "active", "state": state}
+            allowed = states or DISMISSABLE_STATES
+            if state not in allowed:
+                return {"removed": False, "reason": "state_not_allowed", "state": state}
+            path.unlink(missing_ok=True)
+            return {"removed": True, "reason": "dismissed", "state": state}
 
     def _find_reusable_unlocked(
         self,

@@ -2327,5 +2327,16 @@ def api_download_job_get(job_id: str):
     return jsonify({"ok": True, "job": public_job(job)})
 
 
+@app.post("/api/jobs/download/<job_id>/dismiss")
+def api_download_job_dismiss(job_id: str):
+    result = ui_jobs.dismiss(job_id, "download", {"done", "error", "interrupted"})
+    reason = str(result.get("reason") or "")
+    if result.get("removed") or reason == "missing":
+        return jsonify({"ok": True, **result})
+    if reason == "active":
+        return jsonify({"ok": False, **result, "error": "envio activo"}), 409
+    return jsonify({"ok": False, **result, "error": "envio no descartable"}), 400
+
+
 if __name__ == "__main__":
     create_app().run(host="0.0.0.0", port=PORT)
