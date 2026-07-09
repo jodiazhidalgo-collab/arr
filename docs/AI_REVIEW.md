@@ -2,13 +2,39 @@
 
 Este documento es la guia publica y segura para revisar ARR desde GitHub, ChatGPT, Codex o cualquier sandbox externa.
 
+## Mapa tecnico del proyecto
+
+ARR es el proyecto de automatizacion local para busquedas, descargas, diagnostico y postproceso de peliculas, series y trailers.
+
+Puntos de entrada:
+
+- Panel: definido por `ARR_PANEL_URL` en `.env`
+- Compose local: `${ARR_ROOT}/docker-compose.yaml`
+- Orquestador: `services/arr-orchestrator`
+- Buscador puente: `services/buscador-puente-arr`
+- Panel web: `services/media-panel`
+- Worker media: `services/media-worker`
+
+La verdad canonica del motor es:
+
+1. `config/arr-orchestrator/orchestrator.db`
+2. tabla `job_events`
+3. `job_detail()`
+4. traza viva `diagnostics/arr/...`
+5. ZIP final `diagnosticos_codex/*.zip`
+
+No se deben crear fuentes paralelas para estados, tiempos, decisiones o errores si pueden derivarse de `job_events`.
+
+Para revisar un fallo, empieza por el Informe Codex del job y despues contrasta con la traza viva y `job_events`.
+
 ## Que debe mirar primero una IA
 
-1. `README.md`: puntos de entrada y verdad canonica del flujo.
-2. `README_DIAGNOSTICO_CODEX.md`: orden recomendado para leer informes Codex, trazas y errores.
-3. `.github/workflows/ci.yml`: pruebas automaticas que GitHub ejecuta en cada push o pull request.
-4. Artefacto `arr-pytest-evidence` de GitHub Actions: informe JUnit de pytest descargable.
-5. `docs/evidencia-pytest-y-validacion-local.md`: como reproducir las pruebas desde cero.
+1. `README.md`: portada minima del repositorio.
+2. `AGENTS.md`: reglas operativas locales del proyecto.
+3. `README_DIAGNOSTICO_CODEX.md`: orden recomendado para leer informes Codex, trazas y errores.
+4. `.github/workflows/ci.yml`: pruebas automaticas que GitHub ejecuta en cada push o pull request.
+5. Artefacto `arr-pytest-evidence` de GitHub Actions: informe JUnit de pytest descargable.
+6. `docs/evidencia-pytest-y-validacion-local.md`: como reproducir las pruebas desde cero.
 
 ## Verdad tecnica del flujo
 

@@ -10,18 +10,46 @@ def read(relative: str) -> str:
     return (PROJECT_ROOT / relative).read_text(encoding="utf-8")
 
 
-def test_root_readme_declares_arr_truth_source_and_entrypoints():
+def test_root_readme_stays_minimal_and_points_to_review_docs():
     text = read("README.md")
 
     for expected in (
+        "AGENTS.md",
+        "docs/AI_REVIEW.md",
+        "README_DIAGNOSTICO_CODEX.md",
+    ):
+        assert expected in text
+
+    for hidden_from_front_page in (
         "ARR_PANEL_URL",
+        "services/arr-orchestrator",
         "config/arr-orchestrator/orchestrator.db",
         "job_events",
         "job_detail()",
         "diagnostics/arr",
         "diagnosticos_codex",
     ):
+        assert hidden_from_front_page not in text
+
+
+def test_ai_review_declares_arr_truth_source_and_entrypoints():
+    text = read("docs/AI_REVIEW.md")
+
+    for expected in (
+        "ARR_PANEL_URL",
+        "services/arr-orchestrator",
+        "services/buscador-puente-arr",
+        "services/media-panel",
+        "services/media-worker",
+        "config/arr-orchestrator/orchestrator.db",
+        "job_events",
+        "job_detail()",
+        "diagnostics/arr",
+        "diagnosticos_codex",
+        "AGENTS.md",
+    ):
         assert expected in text
+
 
 def test_diagnostic_readme_is_bridge_not_parallel_norm():
     text = read("README_DIAGNOSTICO_CODEX.md")
