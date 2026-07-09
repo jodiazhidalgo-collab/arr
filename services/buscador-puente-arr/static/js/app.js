@@ -56,7 +56,6 @@ let selectedTrackers = new Set(readSavedTrackers());
 let minSeeders = readSavedNumber("arr_min_seeders", 1);
 let minPeers = readSavedNumber("arr_min_peers", 0);
 const PAGE_SIZE = 30;
-const ACCEPTED_BADGE_AUTO_CLEAR_MS = 1600;
 const ACTIVE_RESET_CHECK_MS = 1400;
 let currentPage = Math.max(1, readSavedNumber("arr_page", 1));
 let searchTimer = 0;
@@ -208,6 +207,17 @@ function forgetSendJob(itemId, jobId = "") {
   return true;
 }
 
+function clearSendJobMemory() {
+  Object.values(sendClearTimers).forEach((timerId) => clearTimeout(timerId));
+  Object.values(sendJobs).forEach((entry) => {
+    const jobId = typeof entry === "string" ? entry : String(entry && entry.jobId || "");
+    if (jobId) dismissSendJob(jobId);
+  });
+  sendJobs = {};
+  sendClearTimers = {};
+  localStorage.removeItem("arr_send_jobs");
+}
+
 function status(text) {
   statusBox.textContent = text || "";
 }
@@ -229,6 +239,7 @@ function setActiveSearchJob(jobId) {
 function clearSearchMemory() {
   clearTimeout(searchTimer);
   clearTimeout(searchPollTimer);
+  clearSendJobMemory();
   setActiveSearchJob("");
   searchSoundJobId = "";
   lastResults = [];
@@ -301,6 +312,7 @@ async function pollSearchJob(jobId) {
 
 async function startSearchJob(q) {
   const jobId = newJobId();
+  clearSendJobMemory();
   setActiveSearchJob(jobId);
   localStorage.setItem("arr_query", q);
   currentPage = 1;
@@ -675,14 +687,6 @@ function clearSendState(item, row, jobId, announce = true) {
   if (announce) status("Envio limpiado");
 }
 
-function scheduleAcceptedBadgeClear(item, row, jobId) {
-  clearFinalSendTimer(item.id);
-  sendClearTimers[item.id] = setTimeout(() => {
-    if (!row.isConnected || sendJobIdFor(item.id) !== jobId) return;
-    clearSendState(item, row, jobId, false);
-  }, ACCEPTED_BADGE_AUTO_CLEAR_MS);
-}
-
 function showCardBadge(row, text, options = {}) {
   let badge = row.querySelector(".state-badge");
   const tag = options.clearable ? "button" : "span";
@@ -724,7 +728,7 @@ function acceptedSendTone(job) {
 }
 
 function acceptedSendLabel(job) {
-  return acceptedSendTone(job) === "qbit" ? "qB aceptado" : "RD aceptado";
+  return acceptedSendTone(job) === "qbit" ? "OK qB" : "OK RD";
 }
 
 function runningSendLabel(job) {
@@ -766,9 +770,9 @@ function applySendJob(job, item, row, announce = false) {
   if (job.state === "done") {
     const tone = acceptedSendTone(job);
     const label = acceptedSendLabel(job);
+    clearFinalSendTimer(item.id);
     showCardBadge(row, label);
     setCardState(row, label, `is-queued is-${tone} is-accepted`);
-    scheduleAcceptedBadgeClear(item, row, job.id);
     if (announce) {
       playFinishSound();
       status(`${label}: ${item.title}`);
