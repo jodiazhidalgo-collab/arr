@@ -46,6 +46,17 @@ class MediaWorkerClient:
             self._trailer_payload(job_id, source_path, movies_root, review_root, reports_root),
         )
 
+    def normalize_bluray(
+        self,
+        job_id: str,
+        source_path: Path,
+        reports_root: Path,
+    ) -> Dict[str, object]:
+        return self._post(
+            "/normalize-bluray",
+            self._bluray_payload(job_id, source_path, reports_root),
+        )
+
     def preview_process_movie(
         self,
         job_id: str,
@@ -70,6 +81,17 @@ class MediaWorkerClient:
         return self._preview(
             "/process-trailer",
             self._trailer_payload(job_id, source_path, movies_root, review_root, reports_root),
+        )
+
+    def preview_normalize_bluray(
+        self,
+        job_id: str,
+        source_path: Path,
+        reports_root: Path,
+    ) -> Dict[str, object]:
+        return self._preview(
+            "/normalize-bluray",
+            self._bluray_payload(job_id, source_path, reports_root),
         )
 
     def _callback_url(self, job_id: str) -> str:
@@ -105,6 +127,19 @@ class MediaWorkerClient:
             "source_path": str(source_path),
             "movies_root": str(movies_root),
             "review_root": str(review_root),
+            "reports_root": str(reports_root),
+            "callback_url": self._callback_url(job_id),
+        }
+
+    def _bluray_payload(
+        self,
+        job_id: str,
+        source_path: Path,
+        reports_root: Path,
+    ) -> Dict[str, object]:
+        return {
+            "job_id": job_id,
+            "source_path": str(source_path),
             "reports_root": str(reports_root),
             "callback_url": self._callback_url(job_id),
         }

@@ -1,8 +1,30 @@
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-from .core import process_movie, process_trailer
+from .core import normalize_bluray, process_movie, process_trailer
+
+
+def _allowed_roots() -> list[Path]:
+    configured = os.environ.get("MEDIA_WORKER_ALLOWED_ROOTS", "/data")
+    return [
+        Path(item).resolve()
+        for item in configured.split(os.pathsep)
+        if item.strip()
+    ]
+
+
+def _validated_normalize_payload(payload: dict) -> dict:
+    source_text = str(payload.get("source_path") or "").strip()
+    if not source_text:
+        raise ValueError("source_path es obligatorio")
+    source = Path(source_text).resolve(strict=True)
+    if not source.is_dir():
+        raise ValueError("source_path debe ser una carpeta")
+    if not any(source == root or source.is_relative_to(root) for root in _allowed_roots()):
+        raise ValueError("source_path queda fuera de los volumenes permitidos")
+    return {**payload, "source_path": str(source)}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -38,6 +60,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if self.path == "/process-trailer":
                 self._json(200, process_trailer(payload))
+                return
+            if self.path == "/normalize-bluray":
+                self._json(200, normalize_bluray(_validated_normalize_payload(payload)))
                 return
             self._json(404, {"error": "not_found"})
         except Exception as error:

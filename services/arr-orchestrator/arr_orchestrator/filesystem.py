@@ -264,6 +264,44 @@ def media_files(root: Path) -> List[Path]:
     ]
 
 
+def _child_named(folder: Path, name: str) -> Optional[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return None
+    wanted = name.casefold()
+    try:
+        return next(
+            (child for child in folder.iterdir() if child.name.casefold() == wanted),
+            None,
+        )
+    except OSError:
+        return None
+
+
+def is_full_bluray_folder(path: Path) -> bool:
+    bdmv = _child_named(path, "BDMV")
+    playlist = _child_named(bdmv, "PLAYLIST") if bdmv else None
+    return bool(
+        playlist
+        and playlist.is_dir()
+        and any(
+            item.is_file() and item.suffix.casefold() == ".mpls"
+            for item in playlist.iterdir()
+        )
+    )
+
+
+def full_bluray_folders(path: Path) -> List[Path]:
+    if not path.exists() or not path.is_dir():
+        return []
+    matches = [path] if is_full_bluray_folder(path) else []
+    matches.extend(
+        child
+        for child in sorted(path.iterdir(), key=lambda item: item.name.casefold())
+        if child.is_dir() and is_full_bluray_folder(child)
+    )
+    return matches
+
+
 def _semantic_name_for_filebot(source_path: Path, job_name: str, media: List[Path]) -> str:
     if job_name:
         candidate = Path(job_name).stem if Path(job_name).suffix else job_name
@@ -293,6 +331,16 @@ def prepare_filebot_input(source_path: Path, job_root: Path, job_name: str) -> P
         return destination_root
     if not is_technical_root:
         return source_path
+
+    if is_full_bluray_folder(source_path):
+        media = media_files(source_path)
+        destination_root = unique_destination(
+            job_root / "filebot_input" / _semantic_name_for_filebot(source_path, job_name, media)
+        )
+        destination_root.mkdir(parents=True, exist_ok=True)
+        for item in sorted(source_path.iterdir(), key=lambda child: child.name.lower()):
+            shutil.move(str(item), str(unique_destination(destination_root / item.name)))
+        return destination_root
 
     children = sorted(source_path.iterdir(), key=lambda item: item.name.lower())
     media = media_files(source_path)

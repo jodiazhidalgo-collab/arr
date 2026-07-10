@@ -17,6 +17,7 @@ from .filesystem import (
     clean_junk,
     extract_archives,
     extraction_command_previews,
+    full_bluray_folders,
     manifest,
     matching_root,
     media_files,
@@ -1028,6 +1029,15 @@ class Engine:
                 "legacy",
                 "TMDB_API_TOKEN no configurado; se mantiene AMC",
             )
+        if job["category"] == "movies" and full_bluray_folders(input_root):
+            normalized_input = self._normalize_bluray_before_filebot(
+                job,
+                job_root,
+                input_root,
+            )
+            if normalized_input is None:
+                return
+            input_root = normalized_input
         output_root = (
             job_root / "filebot_output"
             if job["category"] == "movies"
@@ -1255,6 +1265,141 @@ class Engine:
             "verify",
             f"Salida verificada: {len(output_media) or len(moves)} elementos",
             result_json=json.dumps(result, ensure_ascii=False),
+        )
+
+    def _normalize_bluray_before_filebot(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        input_root: Path,
+    ) -> Optional[Path]:
+        job_id = str(job["job_id"])
+        preview = self._bluray_worker_command_preview(job_id, input_root)
+        self.db.add_event(
+            job_id,
+            "bluray",
+            "command",
+            "Llamada al normalizador Blu-ray preparada",
+            {
+                "event_name": "bluray_normalization_requested",
+                "command_preview": preview,
+            },
+        )
+        try:
+            result = self.media_worker.normalize_bluray(
+                job_id,
+                input_root,
+                self.config.media_reports_root,
+            )
+        except Exception as error:
+            result = {
+                "status": "unexpected_error",
+                "reason": str(error),
+                "normalized": False,
+                "source_removed": False,
+            }
+        status = str(result.get("status") or "unexpected_error")
+        if status != "normalized":
+            self._send_bluray_review(job, job_root, result)
+            return None
+
+        normalized_file = Path(str(result.get("result_file") or ""))
+        valid = (
+            normalized_file.exists()
+            and normalized_file.is_file()
+            and normalized_file.suffix.lower() == ".mkv"
+            and not full_bluray_folders(input_root)
+        )
+        if not valid:
+            self._send_bluray_review(
+                job,
+                job_root,
+                {
+                    **result,
+                    "status": "verification_failed",
+                    "reason": "El resultado Blu-ray no deja un unico MKV utilizable",
+                },
+            )
+            return None
+
+        recalculated = prepare_filebot_input(
+            normalized_file,
+            job_root,
+            str(job.get("name") or normalized_file.stem),
+        )
+        recalculated_media = media_files(recalculated)
+        if (
+            len(recalculated_media) != 1
+            or recalculated_media[0].suffix.lower() != ".mkv"
+            or any(
+                part.casefold() in {"bdmv", "stream", "extra", "extras"}
+                for part in recalculated_media[0].parts
+            )
+        ):
+            self._send_bluray_review(
+                job,
+                job_root,
+                {
+                    **result,
+                    "status": "verification_failed",
+                    "reason": "El input recalculado para FileBot no es un MKV aislado",
+                },
+            )
+            return None
+        self.db.add_event(
+            job_id,
+            "bluray",
+            "finished",
+            "Input de FileBot recalculado desde el MKV verificado",
+            {
+                "event_name": "bluray_filebot_input_ready",
+                "input_path": str(recalculated),
+                "media_file": str(recalculated_media[0]),
+            },
+        )
+        return recalculated
+
+    def _send_bluray_review(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        result: Dict[str, object],
+    ) -> None:
+        status = str(result.get("status") or "unexpected_error")
+        ambiguity = status in {"ambiguous", "no_safe_playlist"}
+        destination = move_job_to_review_clean(
+            job_root,
+            self.config.review_dir,
+            str(job["name"]),
+        )
+        reason_file = "Revision manual.txt" if ambiguity else "Error de proceso.txt"
+        reason = str(result.get("reason") or status)
+        write_reason(
+            destination,
+            {
+                "job_id": job["job_id"],
+                "phase": "bluray",
+                "reason": status,
+                "details": result,
+                "timestamp": time.time(),
+            },
+            reason_file,
+            [
+                "La estructura Blu-ray no se proceso automaticamente.",
+                reason,
+                "El origen se conserva para revision.",
+            ],
+        )
+        self._cleanup_clients(job, strict=False)
+        self.db.transition(
+            str(job["job_id"]),
+            "manual_review" if ambiguity else "error_terminal",
+            "bluray",
+            "Blu-ray enviado a revision" if ambiguity else "Normalizacion Blu-ray fallida",
+            stage_path=str(destination),
+            last_error_code=f"bluray_{status}",
+            last_error_message=reason,
+            result_json=json.dumps(result, ensure_ascii=False, default=str),
         )
 
     def _move_duplicate_to_review(self, job: Dict[str, object], job_root: Path) -> Path:
@@ -1600,6 +1745,32 @@ class Engine:
             "service": "media-worker",
             "endpoint": endpoint,
             "payload": payload,
+            "timeout_sec": 14400,
+        }
+
+    def _bluray_worker_command_preview(
+        self,
+        job_id: str,
+        source: Path,
+    ) -> Dict[str, object]:
+        preview = getattr(self.media_worker, "preview_normalize_bluray", None)
+        if callable(preview):
+            return dict(
+                preview(
+                    job_id,
+                    source,
+                    self.config.media_reports_root,
+                )
+            )
+        return {
+            "method": "POST",
+            "service": "media-worker",
+            "endpoint": "/normalize-bluray",
+            "payload": {
+                "job_id": job_id,
+                "source_path": str(source),
+                "reports_root": str(self.config.media_reports_root),
+            },
             "timeout_sec": 14400,
         }
 

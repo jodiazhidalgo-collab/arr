@@ -6,6 +6,7 @@ import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from . import bluray
 from .legacy import detector, planificador, procesador, rescate_subtitulos, trailer_runner, verificador
 from .legacy.reglas import valor
 
@@ -79,6 +80,46 @@ def _reports(job_id: str, reports_root: Path) -> Path:
     path = reports_root / job_id
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def normalize_bluray(payload: Dict[str, object]) -> Dict[str, object]:
+    job_id = str(payload["job_id"])
+    source = Path(str(payload["source_path"]))
+    reports_root = Path(str(payload.get("reports_root") or "/logs/media-worker"))
+    callback_url = str(payload.get("callback_url") or "")
+    reports_dir = _reports(job_id, reports_root)
+
+    def record(
+        event_name: str,
+        event_type: str,
+        message: str,
+        structured: Dict[str, object],
+    ) -> None:
+        _emit_event(
+            callback_url,
+            "bluray",
+            event_type,
+            message,
+            {"job_id": job_id, "event_name": event_name, **structured},
+        )
+
+    try:
+        result = bluray.normalize_bluray_folder(source, event_callback=record)
+    except Exception as error:
+        result = {
+            "status": "unexpected_error",
+            "normalized": False,
+            "source_removed": False,
+            "reason": str(error),
+        }
+        record(
+            "bluray_normalization_failed",
+            "error",
+            "Error inesperado normalizando Blu-ray",
+            result,
+        )
+    _write_json(reports_dir / "bluray_result.json", result)
+    return {**result, "job_id": job_id, "reports_dir": str(reports_dir)}
 
 
 def _emit_event(
@@ -397,6 +438,44 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
             {"job_id": job_id, "phase": "media_core", "source": str(source)},
         )
 
+    bluray_result = (
+        normalize_bluray(payload)
+        if bluray.find_full_bluray_folders(source)
+        else {"status": "not_bluray", "normalized": False, "source_removed": False}
+    )
+    normalized_video: Optional[Path] = None
+    if bluray_result.get("status") == "normalized":
+        normalized_video = Path(str(bluray_result.get("result_file") or ""))
+        if not normalized_video.exists() or normalized_video.suffix.lower() != ".mkv":
+            bluray_result = {
+                **bluray_result,
+                "status": "verification_failed",
+                "normalized": False,
+                "source_removed": False,
+                "reason": "El MKV normalizado no esta disponible para continuar",
+            }
+    if bluray_result.get("status") not in {"not_bluray", "normalized"}:
+        status = str(bluray_result.get("status") or "unexpected_error")
+        ambiguity = status in {"ambiguous", "no_safe_playlist"}
+        reason_file = "Revision manual.txt" if ambiguity else "Error de proceso.txt"
+        return _move_to_review(
+            source,
+            review_root,
+            job_id,
+            reason_file,
+            [
+                "No se normalizo automaticamente la estructura Blu-ray.",
+                str(bluray_result.get("reason") or status),
+                "El origen BDMV se conserva para revision.",
+            ],
+            {
+                "job_id": job_id,
+                "phase": "bluray",
+                "source": str(source),
+                "bluray": bluray_result,
+            },
+        )
+
     early_duplicate = _review_if_final_exists(
         source, final_root, review_root, job_id, "media_prefilter"
     )
@@ -410,7 +489,7 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         )
         return early_duplicate
 
-    videos = _video_files(source)
+    videos = [normalized_video] if normalized_video else _video_files(source)
     if len(videos) != 1:
         _emit_event(
             callback_url,

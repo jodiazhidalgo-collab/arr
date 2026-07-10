@@ -323,6 +323,7 @@ services:
       MEDIA_AUTO_TEMP: "/config/media-worker/temp"
       MEDIA_RESCATE_REPORTES: "/config/media-worker/runtime"
       MEDIA_RESCATE_TEMP: "/config/media-worker/temp/rescue"
+      MEDIA_WORKER_ALLOWED_ROOTS: "/data"
     volumes:
       - ${ARR_ROOT}/config:/config
       - ${ARR_DATA_ROOT}:/data
