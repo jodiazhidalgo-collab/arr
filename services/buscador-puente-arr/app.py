@@ -16,6 +16,7 @@ import requests
 from flask import Flask, jsonify, render_template, request
 from modulos.arr_trace import ArrTrace
 from modulos.persistent_jobs import PersistentJobStore
+from modulos.search_history import SearchHistoryStore
 from modulos.submission_store import SubmissionStore, submission_key
 
 
@@ -41,6 +42,7 @@ MONITOR_STATE_PATH = DATA_DIR / "monitor_state.json"
 RESULT_CACHE_PATH = DATA_DIR / "result_cache.json"
 UI_JOBS_DIR = DATA_DIR / "ui_jobs"
 SUBMISSIONS_PATH = DATA_DIR / "submissions.sqlite3"
+SEARCH_HISTORY_PATH = DATA_DIR / "search_history.sqlite3"
 VIDEO_EXT_RE = re.compile(r"\.(mkv|mp4|avi|mov|m4v|wmv|ts|m2ts)$", re.I)
 ENGINE_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.Lock()
@@ -68,6 +70,13 @@ logger.addHandler(handler)
 app = Flask(__name__)
 ui_jobs = PersistentJobStore(UI_JOBS_DIR, logger)
 submissions = SubmissionStore(SUBMISSIONS_PATH, logger)
+search_history = SearchHistoryStore(
+    SEARCH_HISTORY_PATH,
+    logger,
+    retention_days=int(os.getenv("SEARCH_HISTORY_RETENTION_DAYS", "30")),
+    max_searches=int(os.getenv("SEARCH_HISTORY_MAX_SEARCHES", "300")),
+    page_size=int(os.getenv("SEARCH_HISTORY_PAGE_SIZE", "25")),
+)
 arr_trace = ArrTrace(ARR_DIAGNOSTICS_ROOT, logger)
 
 DEFAULT_SETTINGS = {
@@ -859,6 +868,10 @@ def search_response(query: str, indexers: list[str], category: str = "auto", met
     try:
         results = search_jackett_many(query, indexers, category, metadata)
         cache_results(results)
+        try:
+            search_history.record(query, category or "auto", results, "done")
+        except Exception as history_error:
+            logger.warning("search history record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "done", {"count": len(results)})
         logger.info("search q=%s indexers=%s category=%s results=%s", query, ",".join(indexers) or "all", category or "auto", len(results))
         return jsonify({
@@ -871,6 +884,10 @@ def search_response(query: str, indexers: list[str], category: str = "auto", met
             "results": results,
         })
     except Exception as exc:
+        try:
+            search_history.record(query, category or "auto", [], "error")
+        except Exception as history_error:
+            logger.warning("search history error record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "error", error=str(exc)[:500])
         logger.exception("search failed")
         return jsonify({"ok": False, "error": str(exc)}), 500
@@ -949,8 +966,16 @@ def run_search_job(
     try:
         results = search_jackett_many(query, indexers, category, metadata)
         cache_results(results)
+        try:
+            search_history.record(query, category or "auto", results, "done")
+        except Exception as history_error:
+            logger.warning("search job history record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "done", {"count": len(results)})
     except Exception as exc:
+        try:
+            search_history.record(query, category or "auto", [], "error")
+        except Exception as history_error:
+            logger.warning("search job history error record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "error", error=str(exc)[:500])
         raise
     logger.info(
@@ -2246,6 +2271,23 @@ def api_engine_status():
         "submissions": submissions.stats(),
         "recent_submissions": submissions.recent(10),
     })
+
+
+@app.get("/api/history/searches")
+def api_search_history():
+    return jsonify({"ok": True, "history": search_history.overview()})
+
+
+@app.get("/api/history/searches/<int:search_id>/results")
+def api_search_history_results(search_id: int):
+    try:
+        page = max(1, int(request.args.get("page") or 1))
+    except (TypeError, ValueError):
+        page = 1
+    payload = search_history.results_page(search_id, page)
+    if payload is None:
+        return jsonify({"ok": False, "error": "busqueda no encontrada"}), 404
+    return jsonify({"ok": True, **payload})
 
 
 @app.post("/api/test/rdt")

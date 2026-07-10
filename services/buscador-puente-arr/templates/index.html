@@ -4,13 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Buscador puente arr</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=10">
+  <link rel="stylesheet" href="/static/css/app.css?v=11">
 </head>
 <body>
   <main class="shell">
     <section class="toolbar">
       <div class="titlebar">
-        <button id="settingsToggle" class="gear-button" type="button" aria-label="Abrir ajustes">⚙️</button>
+        <div class="title-actions">
+          <button id="settingsToggle" class="gear-button" type="button" aria-label="Abrir ajustes">⚙️</button>
+          <button id="historyToggle" class="gear-button history-button" type="button" aria-label="Abrir historial">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 3.5h8l3 3v14h-11z"/><path d="M14.5 3.5v3h3M9 11h6M9 14h6M9 17h4"/></svg>
+          </button>
+        </div>
         <div>
           <h1>Buscador puente arr</h1>
           <p id="status">Listo</p>
@@ -59,6 +64,14 @@
     </section>
 
     <section id="results" class="results"></section>
+
+    <section id="historyView" class="history-view" hidden>
+      <div class="history-head">
+        <h2>Historial</h2>
+        <button id="historyRefresh" class="history-refresh" type="button" aria-label="Actualizar historial">↻</button>
+      </div>
+      <div id="historyList" class="history-list"></div>
+    </section>
 
     <section id="settingsView" class="settings-view" hidden>
       <div class="settings-tabs" role="tablist" aria-label="Ajustes">
@@ -139,6 +152,6 @@
       </div>
     </section>
   </main>
-  <script src="/static/js/app.js?v=16"></script>
+  <script src="/static/js/app.js?v=17"></script>
 </body>
 </html>

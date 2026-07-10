@@ -18,8 +18,12 @@ const resultsBox = document.getElementById("results");
 const searchBtn = document.getElementById("searchBtn");
 const clearSearchBtn = document.getElementById("clearSearchBtn");
 const settingsToggle = document.getElementById("settingsToggle");
+const historyToggle = document.getElementById("historyToggle");
 const mainView = document.getElementById("mainView");
 const settingsView = document.getElementById("settingsView");
+const historyView = document.getElementById("historyView");
+const historyList = document.getElementById("historyList");
+const historyRefresh = document.getElementById("historyRefresh");
 const saveSettingsBtn = document.getElementById("saveSettings");
 const saveSettingsQbitBtn = document.getElementById("saveSettingsQbit");
 const cancelSettingsBtn = document.getElementById("cancelSettings");
@@ -68,6 +72,9 @@ let sendJobs = readSavedObject("arr_send_jobs");
 let sendClearTimers = {};
 let settings = null;
 let defaultSettings = null;
+let historyCache = null;
+let historyState = readSavedObject("arr_history_state");
+if (!historyState.pages || typeof historyState.pages !== "object") historyState.pages = {};
 let finishSound = null;
 const finishSoundUrl = "/static/sounds/applepay.mp3";
 const finishSoundVolume = 0.55;
@@ -280,6 +287,7 @@ function applySearchJob(job) {
   searchBtn.disabled = false;
   if (job.state === "done") {
     lastResults = job.result && Array.isArray(job.result.results) ? job.result.results : [];
+    historyCache = null;
     render(lastResults);
     restoreSavedScroll();
     if (searchSoundJobId === job.id) {
@@ -409,20 +417,35 @@ function askMinimum(label, currentValue) {
   return Math.floor(value);
 }
 
-function showSettings(open) {
-  mainView.hidden = open;
-  resultsBox.hidden = open;
-  settingsView.hidden = !open;
-  settingsToggle.classList.toggle("is-active", open);
-  settingsToggle.setAttribute("aria-label", open ? "Volver a búsqueda" : "Abrir ajustes");
-  localStorage.setItem("arr_view", open ? "settings" : "main");
-  if (open) {
+function showView(view) {
+  const target = ["main", "settings", "history"].includes(view) ? view : "main";
+  mainView.hidden = target !== "main";
+  resultsBox.hidden = target !== "main";
+  settingsView.hidden = target !== "settings";
+  historyView.hidden = target !== "history";
+  settingsToggle.classList.toggle("is-active", target === "settings");
+  historyToggle.classList.toggle("is-active", target === "history");
+  settingsToggle.setAttribute("aria-label", target === "settings" ? "Volver a búsqueda" : "Abrir ajustes");
+  historyToggle.setAttribute("aria-label", target === "history" ? "Volver a búsqueda" : "Abrir historial");
+  localStorage.setItem("arr_view", target);
+  if (target === "settings") {
     status("Ajustes del motor");
+  } else if (target === "history") {
+    status("Historial");
+    loadHistory(false);
   } else if (lastResults.length) {
     status(`${filteredAndSorted(lastResults).length} resultados`);
   } else {
     status("Listo");
   }
+}
+
+function showSettings(open) {
+  showView(open ? "settings" : "main");
+}
+
+function showHistory(open) {
+  showView(open ? "history" : "main");
 }
 
 async function loadSettings() {
@@ -911,6 +934,215 @@ function renderPagination(pageCount) {
   resultsBox.appendChild(nav);
 }
 
+function saveHistoryState() {
+  const pageEntries = Object.entries(historyState.pages || {}).slice(-100);
+  historyState.pages = Object.fromEntries(pageEntries);
+  localStorage.setItem("arr_history_state", JSON.stringify(historyState));
+}
+
+function compactPageSequence(current, pageCount) {
+  if (pageCount <= 5) return Array.from({ length: pageCount }, (_item, index) => index + 1);
+  const values = new Set([1, pageCount, current - 1, current, current + 1]);
+  const ordered = [...values].filter((page) => page >= 1 && page <= pageCount).sort((a, b) => a - b);
+  const out = [];
+  for (const page of ordered) {
+    if (out.length && page - out[out.length - 1] > 1) out.push("...");
+    out.push(page);
+  }
+  return out;
+}
+
+async function copyHistoryLink(value, button) {
+  const text = String(value || "");
+  if (!text) return;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand("copy");
+      input.remove();
+    }
+    button.classList.add("is-copied");
+    button.textContent = "✓";
+    status("Enlace copiado");
+    setTimeout(() => {
+      if (!button.isConnected) return;
+      button.classList.remove("is-copied");
+      button.textContent = "⧉";
+    }, 950);
+  } catch (_error) {
+    button.classList.add("is-copy-error");
+    setTimeout(() => button.classList.remove("is-copy-error"), 900);
+  }
+}
+
+function historyPageButton(label, page, current, pageCount, searchId, target) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "history-page-button";
+  button.textContent = label;
+  button.disabled = page === current || page < 1 || page > pageCount;
+  if (page === current) button.classList.add("is-current");
+  button.addEventListener("click", () => loadHistoryResults(searchId, page, target));
+  return button;
+}
+
+function renderHistoryResults(payload, target) {
+  target.textContent = "";
+  if (!payload.results.length) {
+    const empty = document.createElement("div");
+    empty.className = "history-empty";
+    empty.textContent = "Sin resultados";
+    target.appendChild(empty);
+    return;
+  }
+  const rows = document.createElement("div");
+  rows.className = "history-results";
+  for (const item of payload.results) {
+    const row = document.createElement("div");
+    row.className = "history-result";
+    const title = document.createElement("span");
+    title.className = "history-result-title";
+    title.textContent = item.title;
+    title.title = item.title;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "history-copy-button";
+    copy.textContent = "⧉";
+    copy.setAttribute("aria-label", `Copiar enlace de ${item.title}`);
+    copy.disabled = !item.download_url;
+    copy.addEventListener("click", () => copyHistoryLink(item.download_url, copy));
+    row.append(title, copy);
+    rows.appendChild(row);
+  }
+  target.appendChild(rows);
+  if (payload.page_count > 1) {
+    const nav = document.createElement("nav");
+    nav.className = "history-pagination";
+    nav.setAttribute("aria-label", "Páginas del historial");
+    nav.appendChild(historyPageButton("‹", payload.page - 1, payload.page, payload.page_count, payload.search_id, target));
+    for (const page of compactPageSequence(payload.page, payload.page_count)) {
+      if (page === "...") {
+        const dots = document.createElement("span");
+        dots.textContent = "···";
+        nav.appendChild(dots);
+      } else {
+        nav.appendChild(historyPageButton(String(page), page, payload.page, payload.page_count, payload.search_id, target));
+      }
+    }
+    nav.appendChild(historyPageButton("›", payload.page + 1, payload.page, payload.page_count, payload.search_id, target));
+    target.appendChild(nav);
+  }
+}
+
+async function loadHistoryResults(searchId, page, target) {
+  target.classList.add("is-loading");
+  try {
+    const response = await fetch(`/api/history/searches/${encodeURIComponent(searchId)}/results?page=${encodeURIComponent(page)}`);
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "fallo historial");
+    historyState.pages[String(searchId)] = data.page;
+    saveHistoryState();
+    renderHistoryResults(data, target);
+  } catch (_error) {
+    target.innerHTML = '<div class="history-empty">No disponible</div>';
+  } finally {
+    target.classList.remove("is-loading");
+  }
+}
+
+function closeOtherHistoryDetails(selector, active) {
+  document.querySelectorAll(selector).forEach((node) => {
+    if (node !== active) node.open = false;
+  });
+}
+
+function renderHistoryOverview(history) {
+  historyList.textContent = "";
+  const days = history && Array.isArray(history.days) ? history.days : [];
+  if (!days.length) {
+    historyList.innerHTML = '<div class="history-empty">Sin historial</div>';
+    return;
+  }
+  for (const day of days) {
+    const dayCard = document.createElement("details");
+    dayCard.className = "history-day";
+    dayCard.open = String(historyState.day || "") === String(day.date);
+    const daySummary = document.createElement("summary");
+    daySummary.innerHTML = `<span>${day.label || day.date}</span><b>${day.searches.length}</b>`;
+    dayCard.appendChild(daySummary);
+    const searches = document.createElement("div");
+    searches.className = "history-searches";
+    for (const search of day.searches) {
+      const searchCard = document.createElement("details");
+      searchCard.className = "history-search";
+      searchCard.open = String(historyState.search || "") === String(search.id);
+      const summary = document.createElement("summary");
+      const main = document.createElement("span");
+      main.className = "history-search-name";
+      main.innerHTML = `<b>${search.time}</b><span>${search.query || "(sin texto)"}</span>`;
+      const count = document.createElement("em");
+      count.textContent = String(search.result_count || 0);
+      summary.append(main, count);
+      const body = document.createElement("div");
+      body.className = "history-search-body";
+      searchCard.append(summary, body);
+      searchCard.addEventListener("toggle", () => {
+        if (searchCard.open) {
+          closeOtherHistoryDetails(".history-search", searchCard);
+          historyState.search = String(search.id);
+          const page = Number(historyState.pages[String(search.id)] || 1);
+          loadHistoryResults(search.id, page, body);
+        } else if (String(historyState.search || "") === String(search.id)) {
+          historyState.search = "";
+        }
+        saveHistoryState();
+      });
+      searches.appendChild(searchCard);
+      if (searchCard.open) {
+        const page = Number(historyState.pages[String(search.id)] || 1);
+        loadHistoryResults(search.id, page, body);
+      }
+    }
+    dayCard.appendChild(searches);
+    dayCard.addEventListener("toggle", () => {
+      if (dayCard.open) {
+        closeOtherHistoryDetails(".history-day", dayCard);
+        historyState.day = String(day.date);
+      } else if (String(historyState.day || "") === String(day.date)) {
+        historyState.day = "";
+        historyState.search = "";
+      }
+      saveHistoryState();
+    });
+    historyList.appendChild(dayCard);
+  }
+}
+
+async function loadHistory(force = false) {
+  if (force) historyCache = null;
+  if (historyCache) {
+    renderHistoryOverview(historyCache);
+    return;
+  }
+  historyList.innerHTML = '<div class="history-empty">Cargando…</div>';
+  try {
+    const response = await fetch("/api/history/searches", { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "fallo historial");
+    historyCache = data.history || {};
+    renderHistoryOverview(historyCache);
+  } catch (_error) {
+    historyList.innerHTML = '<div class="history-empty">No disponible</div>';
+  }
+}
+
 function resetPageAndRender(items) {
   currentPage = 1;
   saveNumber("arr_page", currentPage);
@@ -933,10 +1165,7 @@ function render(items) {
   for (const item of pageItems) {
     const row = document.createElement("article");
     row.className = "item";
-    row.tabIndex = 0;
-    row.role = "button";
     row.dataset.busy = "0";
-    row.setAttribute("aria-label", `Enviar ${item.title}`);
 
     const info = document.createElement("div");
     info.className = "item-main";
@@ -952,14 +1181,13 @@ function render(items) {
     }
 
     info.append(title, meta);
-    row.addEventListener("click", () => send(item, row));
-    row.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        send(item, row);
-      }
-    });
-    row.append(info);
+    const sendButton = document.createElement("button");
+    sendButton.type = "button";
+    sendButton.className = "send-button";
+    sendButton.textContent = "↓";
+    sendButton.setAttribute("aria-label", `Enviar ${item.title}`);
+    sendButton.addEventListener("click", () => send(item, row));
+    row.append(info, sendButton);
     resultsBox.appendChild(row);
     restoreSendState(item, row);
   }
@@ -1056,6 +1284,8 @@ peerMinButton.addEventListener("click", () => {
 });
 
 settingsToggle.addEventListener("click", () => showSettings(settingsView.hidden));
+historyToggle.addEventListener("click", () => showHistory(historyView.hidden));
+historyRefresh.addEventListener("click", () => loadHistory(true));
 cancelSettingsBtn.addEventListener("click", () => {
   renderSettings(settings);
   showSettings(false);
@@ -1119,5 +1349,5 @@ loadIndexers();
 updateCategoryButton();
 updateSortButtons();
 updateLimitButtons();
-showSettings(localStorage.getItem("arr_view") === "settings");
+showView(localStorage.getItem("arr_view") || "main");
 if (activeSearchJobId) pollSearchJob(activeSearchJobId);
