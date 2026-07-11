@@ -1280,6 +1280,70 @@ class CoreTests(unittest.TestCase):
             self.assertTrue((review_path / "reason.json").exists())
             database.close()
 
+    def test_run_extract_keeps_direct_mkv_flow_ready_for_filebot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-direct-mkv"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            (original / "Movie Direct (2026).mkv").write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:direct-mkv",
+                "fs",
+                "movies",
+                "Movie Direct (2026).mkv",
+                state="ready_extract",
+                stage_path=str(job_root),
+                source_path=str(original),
+            )
+
+            engine._run_extract(job)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "ready_filebot")
+            self.assertEqual(Path(updated["source_path"]), original)
+            self.assertFalse((job_root / "extracted" / "layer_01").exists())
+            database.close()
+
+    def test_recover_interrupted_extracting_job_returns_to_ready_extract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-recovery-extract"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            (original / "movie.rar").write_bytes(b"archive")
+            job = database.create_job(
+                "fs:movies:recover-extract",
+                "fs",
+                "movies",
+                "Movie Recovery.rar",
+                state="extracting",
+                stage_path=str(job_root),
+                source_path=str(original),
+            )
+
+            engine._recover_interrupted_jobs()
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "ready_extract")
+            recovery_events = [
+                event
+                for event in database.job_detail(job["job_id"])["timeline"]
+                if event["phase"] == "recovery"
+            ]
+            self.assertEqual(len(recovery_events), 1)
+            database.close()
+
     def test_real_torrent_fixture_when_available(self) -> None:
         fixture = Path(tempfile.gettempdir()) / "arr-test-big-buck-bunny.torrent"
         fixture.write_bytes(

@@ -5,8 +5,9 @@ import re
 import shutil
 import subprocess
 import time
+import math
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 from .name_parser import parse_release_name
 
@@ -14,6 +15,8 @@ from .name_parser import parse_release_name
 MEDIA_EXTENSIONS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts"}
 TRAILER_VIDEO_EXTENSIONS = MEDIA_EXTENSIONS | {".webm"}
 ARCHIVE_EXTENSIONS = {".rar", ".zip", ".7z", ".001"}
+MULTIPART_RAR_PATTERN = re.compile(r"\.part\d+\.rar$", re.IGNORECASE)
+MULTIPART_RAR_FIRST_PATTERN = re.compile(r"\.part0*1\.rar$", re.IGNORECASE)
 JUNK_EXTENSIONS = {".url", ".nfo", ".sfv", ".txt"}
 REASON_TEXT_FILES = {
     "Pelicula repetida.txt",
@@ -23,6 +26,38 @@ REASON_TEXT_FILES = {
     "Revision manual.txt",
 }
 SIDECAR_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".idx"}
+MAX_EXTRACTION_LAYERS = 3
+EXTRACTION_LAYER_MARKER = ".arr-extraction-layer.json"
+DEFAULT_EXTRACTION_TIMEOUT_SECONDS = 7200
+# Un trabajo completo dispone de tres horas: conserva las dos horas históricas
+# por comando sin permitir que tres capas acumulen seis horas sin control.
+DEFAULT_TOTAL_EXTRACTION_TIMEOUT_SECONDS = 10800
+# Un torrent normal rara vez contiene tantos paquetes independientes en una capa.
+MAX_ARCHIVE_CANDIDATES_PER_LAYER = 32
+# Los archivos multimedia apenas comprimen: se reserva un 25 % adicional y 512 MiB.
+EXTRACTION_SPACE_MARGIN_RATIO = 1.25
+EXTRACTION_SPACE_RESERVE_BYTES = 512 * 1024 * 1024
+
+
+class ExtractionError(RuntimeError):
+    def __init__(self, code: str, message: str, **details: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = {
+            "error_code": code,
+            "error_message": message,
+            "classified_reason": code,
+            "extract_layer": None,
+            "archive": None,
+            "tool": None,
+            "return_code": None,
+            "output_tail": "",
+            "input_root": None,
+            "output_root": None,
+            "duration_sec": 0.0,
+            **details,
+        }
 
 
 def manifest(path: Path) -> Tuple[str, List[Dict[str, object]]]:
@@ -195,19 +230,22 @@ def archive_candidates(root: Path) -> List[Path]:
             continue
         name = path.name.lower()
         suffix = path.suffix.lower()
-        if name.endswith(".part1.rar"):
+        if MULTIPART_RAR_FIRST_PATTERN.search(name):
             candidates.append(path)
-        elif suffix == ".rar" and not re.search(r"\.part\d+\.rar$", name):
+        elif suffix == ".rar" and not MULTIPART_RAR_PATTERN.search(name):
             candidates.append(path)
         elif suffix in {".zip", ".7z", ".001"}:
             candidates.append(path)
     return sorted(set(candidates))
 
 
-def extraction_command_previews(job_root: Path, timeout_seconds: int = 7200) -> List[Dict[str, object]]:
+def extraction_command_previews(
+    job_root: Path,
+    timeout_seconds: int = DEFAULT_EXTRACTION_TIMEOUT_SECONDS,
+) -> List[Dict[str, object]]:
     original_root = job_root / "original"
     archives = archive_candidates(original_root)
-    extracted_root = job_root / "extracted"
+    extracted_root = job_root / "extracted" / "layer_01.tmp"
     return [
         {
             "argv": _extract_command(archive, extracted_root),
@@ -220,37 +258,436 @@ def extraction_command_previews(job_root: Path, timeout_seconds: int = 7200) -> 
     ]
 
 
-def extract_archives(job_root: Path, timeout_seconds: int = 7200) -> Path:
+def extract_archives(
+    job_root: Path,
+    timeout_seconds: int = DEFAULT_EXTRACTION_TIMEOUT_SECONDS,
+    total_timeout_seconds: int = DEFAULT_TOTAL_EXTRACTION_TIMEOUT_SECONDS,
+    event_callback: Optional[Callable[[str, str, Dict[str, object]], None]] = None,
+) -> Path:
     original_root = job_root / "original"
-    archives = archive_candidates(original_root)
-    if not archives:
-        return original_root
     extracted_root = job_root / "extracted"
     extracted_root.mkdir(parents=True, exist_ok=True)
-    for archive in archives:
-        command = _extract_command(archive, extracted_root)
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"extracción fallida ({result.returncode}) {archive.name}: "
-                f"{(result.stderr or result.stdout)[-2000:]}"
+    _cleanup_incomplete_layers(extracted_root)
+
+    started_at = time.monotonic()
+    scan_root = original_root
+    for layer in range(1, MAX_EXTRACTION_LAYERS + 1):
+        if media_files(scan_root):
+            return scan_root
+        archives = archive_candidates(scan_root)
+        if not archives:
+            raise ExtractionError(
+                "extract_no_media",
+                "la extracción terminó sin producir archivos multimedia",
+                extract_layer=layer,
+                input_root=str(scan_root),
+                duration_sec=round(time.monotonic() - started_at, 3),
             )
-    if not media_files(extracted_root):
-        raise RuntimeError("la extracción terminó sin producir archivos multimedia")
-    return extracted_root
+        if len(archives) > MAX_ARCHIVE_CANDIDATES_PER_LAYER:
+            raise ExtractionError(
+                "extract_too_many_candidates",
+                f"la capa contiene {len(archives)} iniciadores; máximo permitido: "
+                f"{MAX_ARCHIVE_CANDIDATES_PER_LAYER}",
+                extract_layer=layer,
+                candidate_count=len(archives),
+                candidate_limit=MAX_ARCHIVE_CANDIDATES_PER_LAYER,
+                input_root=str(scan_root),
+                duration_sec=round(time.monotonic() - started_at, 3),
+            )
+
+        layer_root = extracted_root / f"layer_{layer:02d}"
+        layer_tmp = extracted_root / f"layer_{layer:02d}.tmp"
+        signature = _layer_input_signature(scan_root, archives)
+        input_size = sum(int(item["size"]) for item in signature["input_files"])
+        required_space = math.ceil(input_size * EXTRACTION_SPACE_MARGIN_RATIO) + EXTRACTION_SPACE_RESERVE_BYTES
+        free_space = shutil.disk_usage(extracted_root).free
+        reused = _layer_marker_matches(layer_root, layer, signature)
+        layer_started_at = time.monotonic()
+        if event_callback:
+            preview_outputs = [
+                layer_tmp
+                if len(archives) == 1
+                else layer_tmp / _archive_output_key(scan_root, archive)
+                for archive in archives
+            ]
+            previews = [
+                {
+                    "argv": _sanitized_command_preview(
+                        job_root,
+                        _extract_command(archive, output_root),
+                    ),
+                    "archive": _job_path_alias(job_root, archive),
+                    "output_root": _job_path_alias(job_root, output_root),
+                }
+                for archive, output_root in zip(archives, preview_outputs)
+            ]
+            tools = sorted({str(preview["argv"][0]) for preview in previews})
+            total_remaining = max(0.0, total_timeout_seconds - (time.monotonic() - started_at))
+            event_callback(
+                "command",
+                f"Capa de extracción {layer} preparada",
+                {
+                    "extract_layer": layer,
+                    "scan_root": _job_path_alias(job_root, scan_root),
+                    "selected_archives": [
+                        _job_path_alias(job_root, archive) for archive in archives
+                    ],
+                    "tool": tools[0] if len(tools) == 1 else "multiple",
+                    "command_preview": previews,
+                    "cwd": "<JOB_ROOT>",
+                    "timeout_sec": round(min(float(timeout_seconds), total_remaining), 3),
+                    "total_budget_remaining_sec": round(total_remaining, 3),
+                    "available_space_bytes": free_space,
+                    "required_space_bytes": required_space,
+                    "input_size_bytes": input_size,
+                    "reused": reused,
+                },
+            )
+        if not reused and free_space < required_space:
+            raise ExtractionError(
+                "extract_no_space",
+                "no existe espacio libre suficiente para iniciar la capa de extracción",
+                extract_layer=layer,
+                input_size_bytes=input_size,
+                required_space_bytes=required_space,
+                available_space_bytes=free_space,
+                input_root=str(scan_root),
+                output_root=str(layer_tmp),
+                duration_sec=round(time.monotonic() - started_at, 3),
+            )
+        if not reused:
+            _invalidate_layers_from(extracted_root, layer)
+            layer_tmp.mkdir(parents=True, exist_ok=True)
+            for archive in archives:
+                output_root = layer_tmp
+                if len(archives) > 1:
+                    output_root = layer_tmp / _archive_output_key(scan_root, archive)
+                    output_root.mkdir(parents=True, exist_ok=True)
+                command = _extract_command(archive, output_root)
+                elapsed = time.monotonic() - started_at
+                remaining_total = total_timeout_seconds - elapsed
+                if remaining_total <= 0:
+                    raise ExtractionError(
+                        "extract_timeout",
+                        "se agotó el presupuesto total de extracción",
+                        extract_layer=layer,
+                        archive=str(archive),
+                        tool=command[0],
+                        timeout_scope="total",
+                        total_timeout_sec=total_timeout_seconds,
+                        duration_sec=round(elapsed, 3),
+                        input_root=str(scan_root),
+                        output_root=str(output_root),
+                    )
+                command_timeout = min(float(timeout_seconds), remaining_total)
+                command_started = time.monotonic()
+                try:
+                    result = subprocess.run(
+                        command,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=command_timeout,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    duration = time.monotonic() - command_started
+                    output_tail = _timeout_output_tail(error)
+                    raise ExtractionError(
+                        "extract_timeout",
+                        f"la herramienta superó el timeout de {round(command_timeout, 3)} segundos",
+                        extract_layer=layer,
+                        archive=str(archive),
+                        tool=command[0],
+                        timeout_scope="command",
+                        timeout_sec=round(command_timeout, 3),
+                        duration_sec=round(duration, 3),
+                        output_tail=output_tail,
+                        input_root=str(scan_root),
+                        output_root=str(output_root),
+                    ) from error
+                except OSError as error:
+                    duration = time.monotonic() - command_started
+                    raise ExtractionError(
+                        "extract_tool_failed",
+                        f"no se pudo ejecutar {command[0]}: {error}",
+                        extract_layer=layer,
+                        archive=str(archive),
+                        tool=command[0],
+                        return_code=None,
+                        output_tail=str(error)[-2000:],
+                        input_root=str(scan_root),
+                        output_root=str(output_root),
+                        duration_sec=round(duration, 3),
+                    ) from error
+                if result.returncode != 0:
+                    duration = time.monotonic() - command_started
+                    output_tail = _combined_output_tail(result.stdout, result.stderr)
+                    error_code = _classify_extraction_failure(command[0], result.returncode, output_tail)
+                    raise ExtractionError(
+                        error_code,
+                        f"extracción fallida ({result.returncode}) {archive.name}",
+                        extract_layer=layer,
+                        archive=str(archive),
+                        tool=command[0],
+                        return_code=result.returncode,
+                        output_tail=output_tail,
+                        input_root=str(scan_root),
+                        output_root=str(output_root),
+                        duration_sec=round(duration, 3),
+                    )
+
+            marker = {
+                "schema": "arr-extraction-layer-v1",
+                "extract_layer": layer,
+                "selected_archives": [str(path.relative_to(scan_root)) for path in archives],
+                "input_files": signature["input_files"],
+                "input_fingerprint": signature["input_fingerprint"],
+                "tools": sorted({_extract_command(path, layer_tmp)[0] for path in archives}),
+                "result": "complete",
+            }
+            (layer_tmp / EXTRACTION_LAYER_MARKER).write_text(
+                json.dumps(marker, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            layer_tmp.replace(layer_root)
+
+        produced_media = media_files(layer_root)
+        nested_archives = archive_candidates(layer_root)
+        if event_callback:
+            event_callback(
+                "finished",
+                f"Capa de extracción {layer} terminada",
+                {
+                    "extract_layer": layer,
+                    "reused": reused,
+                    "produced_files": _file_count(layer_root),
+                    "produced_media": len(produced_media),
+                    "new_archives": len(nested_archives),
+                    "output_root": _job_path_alias(job_root, layer_root),
+                    "duration_sec": round(time.monotonic() - layer_started_at, 3),
+                    "return_code": 0,
+                    "decision": "finish" if produced_media else "continue" if nested_archives else "fail",
+                },
+            )
+        if produced_media:
+            return layer_root
+        if not nested_archives:
+            raise ExtractionError(
+                "extract_no_media",
+                "la extracción terminó sin producir archivos multimedia",
+                extract_layer=layer,
+                input_root=str(scan_root),
+                output_root=str(layer_root),
+                duration_sec=round(time.monotonic() - started_at, 3),
+            )
+        if layer == MAX_EXTRACTION_LAYERS:
+            raise ExtractionError(
+                "extract_depth_limit",
+                f"se alcanzó el límite de {MAX_EXTRACTION_LAYERS} capas de extracción",
+                extract_layer=layer,
+                input_root=str(scan_root),
+                output_root=str(layer_root),
+                new_archives=len(nested_archives),
+                duration_sec=round(time.monotonic() - started_at, 3),
+            )
+        scan_root = layer_root
+
+    raise ExtractionError(
+        "extract_depth_limit",
+        f"se alcanzó el límite de {MAX_EXTRACTION_LAYERS} capas de extracción",
+        extract_layer=MAX_EXTRACTION_LAYERS,
+        duration_sec=round(time.monotonic() - started_at, 3),
+    )
+
+
+def _cleanup_incomplete_layers(extracted_root: Path) -> None:
+    for layer in range(1, MAX_EXTRACTION_LAYERS + 1):
+        temporary = extracted_root / f"layer_{layer:02d}.tmp"
+        if temporary.exists():
+            shutil.rmtree(temporary)
+
+
+def _invalidate_layers_from(extracted_root: Path, first_layer: int) -> None:
+    for layer in range(first_layer, MAX_EXTRACTION_LAYERS + 1):
+        for path in (
+            extracted_root / f"layer_{layer:02d}",
+            extracted_root / f"layer_{layer:02d}.tmp",
+        ):
+            if path.exists():
+                shutil.rmtree(path)
+
+
+def _layer_input_signature(scan_root: Path, archives: List[Path]) -> Dict[str, object]:
+    input_files: List[Dict[str, object]] = []
+    all_files = sorted(
+        {member for archive in archives for member in _archive_set_members(archive)},
+        key=lambda path: str(path).casefold(),
+    )
+    for path in all_files:
+        stat = path.stat()
+        input_files.append(
+            {
+                "path": str(path.relative_to(scan_root)),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    encoded = json.dumps(input_files, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return {
+        "input_files": input_files,
+        "input_fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def _archive_set_members(archive: Path) -> List[Path]:
+    name = archive.name
+    multipart = re.match(r"^(?P<prefix>.+\.part)(?P<number>\d+)(?P<suffix>\.rar)$", name, re.IGNORECASE)
+    if multipart:
+        prefix = multipart.group("prefix").casefold()
+        suffix = multipart.group("suffix").casefold()
+        return sorted(
+            path
+            for path in archive.parent.iterdir()
+            if path.is_file()
+            and (match := re.match(r"^(?P<prefix>.+\.part)(?P<number>\d+)(?P<suffix>\.rar)$", path.name, re.IGNORECASE))
+            and match.group("prefix").casefold() == prefix
+            and match.group("suffix").casefold() == suffix
+        )
+    if archive.suffix.casefold() == ".rar":
+        stem = archive.stem.casefold()
+        members = [archive]
+        members.extend(
+            path
+            for path in archive.parent.iterdir()
+            if path.is_file() and re.fullmatch(re.escape(stem) + r"\.r\d+", path.name.casefold())
+        )
+        return sorted(set(members), key=lambda path: path.name.casefold())
+    if archive.suffix.casefold() == ".001":
+        prefix = archive.name[:-3].casefold()
+        return sorted(
+            path
+            for path in archive.parent.iterdir()
+            if path.is_file() and re.fullmatch(re.escape(prefix) + r"\d{3}", path.name.casefold())
+        )
+    return [archive]
+
+
+def _layer_marker_matches(layer_root: Path, layer: int, signature: Dict[str, object]) -> bool:
+    marker_path = layer_root / EXTRACTION_LAYER_MARKER
+    if not marker_path.is_file():
+        return False
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(
+        marker.get("result") == "complete"
+        and marker.get("extract_layer") == layer
+        and marker.get("input_fingerprint") == signature["input_fingerprint"]
+    )
+
+
+def _archive_output_key(scan_root: Path, archive: Path) -> str:
+    relative = str(archive.relative_to(scan_root)).replace("\\", "/")
+    digest = hashlib.sha256(relative.casefold().encode("utf-8")).hexdigest()[:10]
+    return f"{safe_folder_name(archive.stem)[:80]}__{digest}"
+
+
+def _file_count(root: Path) -> int:
+    return sum(1 for path in root.rglob("*") if path.is_file() and path.name != EXTRACTION_LAYER_MARKER)
+
+
+def _job_path_alias(job_root: Path, path: Path) -> str:
+    try:
+        relative = path.resolve().relative_to(job_root.resolve())
+    except (OSError, ValueError):
+        return path.name
+    suffix = relative.as_posix()
+    return "<JOB_ROOT>" if not suffix else f"<JOB_ROOT>/{suffix}"
+
+
+def _sanitized_command_preview(job_root: Path, command: List[str]) -> List[str]:
+    root_text = str(job_root)
+    return [str(value).replace(root_text, "<JOB_ROOT>").replace("\\", "/") for value in command]
 
 
 def _extract_command(archive: Path, extracted_root: Path) -> List[str]:
     suffix = archive.suffix.lower()
-    if suffix == ".rar" or archive.name.lower().endswith(".part1.rar"):
-        return ["unrar", "x", "-o+", "-idq", str(archive), str(extracted_root) + os.sep]
-    return ["7z", "x", "-y", f"-o{extracted_root}", str(archive)]
+    if suffix == ".rar":
+        return [
+            "unrar",
+            "x",
+            "-o+",
+            "-idq",
+            "-p-",
+            "-y",
+            str(archive),
+            str(extracted_root) + os.sep,
+        ]
+    return ["7z", "x", "-y", "-p-", f"-o{extracted_root}", str(archive)]
+
+
+def _timeout_output_tail(error: subprocess.TimeoutExpired) -> str:
+    output = error.stderr or error.stdout or ""
+    if isinstance(output, bytes):
+        output = output.decode("utf-8", errors="replace")
+    return str(output)[-2000:]
+
+
+def _combined_output_tail(stdout: object, stderr: object) -> str:
+    parts: List[str] = []
+    for value in (stdout, stderr):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="replace")
+        if value:
+            parts.append(str(value))
+    return "\n".join(parts)[-2000:]
+
+
+def _classify_extraction_failure(tool: str, return_code: int, output: str) -> str:
+    text = output.casefold()
+    password_patterns = (
+        "wrong password",
+        "incorrect password",
+        "password is incorrect",
+        "enter password",
+        "password required",
+        "encrypted file",
+        "encrypted archive",
+        "can not open encrypted",
+        "cannot open encrypted",
+    )
+    volume_patterns = (
+        "cannot find volume",
+        "can't find volume",
+        "missing volume",
+        "next volume is required",
+        "insert disk with",
+        "you need to start extraction from a previous volume",
+    )
+    corrupt_patterns = (
+        "checksum error",
+        "crc failed",
+        "crc error",
+        "data error",
+        "unexpected end of archive",
+        "unexpected end of data",
+        "archive is corrupt",
+        "corrupt archive",
+        "broken archive",
+        "headers error",
+        "bad archive",
+    )
+    if any(pattern in text for pattern in password_patterns):
+        return "extract_password_required"
+    if any(pattern in text for pattern in volume_patterns):
+        return "extract_volume_missing"
+    if any(pattern in text for pattern in corrupt_patterns):
+        return "extract_archive_corrupt"
+    if tool == "unrar" and return_code == 3:
+        return "extract_archive_corrupt"
+    return "extract_tool_failed"
 
 
 def media_files(root: Path) -> List[Path]:
@@ -315,12 +752,7 @@ def _semantic_name_for_filebot(source_path: Path, job_name: str, media: List[Pat
 
 
 def prepare_filebot_input(source_path: Path, job_root: Path, job_name: str) -> Path:
-    technical_roots = {job_root / "original", job_root / "extracted"}
-    is_technical_root = any(
-        source_path.resolve() == root.resolve()
-        for root in technical_roots
-        if root.exists()
-    )
+    is_technical_root = _is_filebot_technical_root(source_path, job_root)
     if source_path.is_file():
         media = media_files(source_path)
         destination_root = unique_destination(
@@ -342,7 +774,10 @@ def prepare_filebot_input(source_path: Path, job_root: Path, job_name: str) -> P
             shutil.move(str(item), str(unique_destination(destination_root / item.name)))
         return destination_root
 
-    children = sorted(source_path.iterdir(), key=lambda item: item.name.lower())
+    children = sorted(
+        (item for item in source_path.iterdir() if item.name != EXTRACTION_LAYER_MARKER),
+        key=lambda item: item.name.lower(),
+    )
     media = media_files(source_path)
     media_dirs = [
         item
@@ -364,6 +799,24 @@ def prepare_filebot_input(source_path: Path, job_root: Path, job_name: str) -> P
     for item in children:
         shutil.move(str(item), str(unique_destination(destination_root / item.name)))
     return destination_root
+
+
+def _is_filebot_technical_root(source_path: Path, job_root: Path) -> bool:
+    if not source_path.exists():
+        return False
+    resolved = source_path.resolve()
+    original_root = (job_root / "original").resolve()
+    extracted_root = (job_root / "extracted").resolve()
+    if resolved in {original_root, extracted_root}:
+        return True
+    try:
+        relative = resolved.relative_to(extracted_root)
+    except ValueError:
+        return False
+    return bool(
+        len(relative.parts) == 1
+        and re.fullmatch(r"layer_0[1-3]", relative.parts[0], re.IGNORECASE)
+    )
 
 
 def media_worker_source(root: Path) -> Path:
@@ -427,6 +880,56 @@ def move_job_to_review_clean(job_root: Path, destination_root: Path, name: str) 
 
     shutil.rmtree(job_root, ignore_errors=True)
     return destination
+
+
+def move_extraction_failure_to_review(
+    job_root: Path,
+    destination_root: Path,
+    name: str,
+) -> Tuple[Path, Dict[str, object]]:
+    destination_root.mkdir(parents=True, exist_ok=True)
+    destination = numbered_destination(destination_root / safe_folder_name(name))
+    destination.mkdir(parents=True, exist_ok=True)
+
+    preservation_errors: List[str] = []
+    preserved: Dict[str, bool] = {"original": False, "extracted": False}
+    for folder_name in ("original", "extracted"):
+        source = job_root / folder_name
+        if not source.exists():
+            continue
+        try:
+            shutil.move(str(source), str(destination / folder_name))
+            preserved[folder_name] = True
+        except OSError as error:
+            detail = error.strerror or error.__class__.__name__
+            preservation_errors.append(f"{folder_name}: {detail}")
+
+    preserved_total_bytes = _tree_size(destination / "original") + _tree_size(destination / "extracted")
+    residual_job_root = job_root.exists() and any(job_root.iterdir())
+    if job_root.exists() and not residual_job_root:
+        job_root.rmdir()
+    return destination, {
+        "preserved_original": preserved["original"],
+        "preserved_extracted": preserved["extracted"],
+        "preserved_total_bytes": preserved_total_bytes,
+        "preservation_errors": preservation_errors,
+        "residual_job_root": str(job_root) if residual_job_root else None,
+    }
+
+
+def _tree_size(root: Path) -> int:
+    if not root.exists():
+        return 0
+    total = 0
+    files = [root] if root.is_file() else root.rglob("*")
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def _review_content_root(job_root: Path) -> Path:

@@ -14,14 +14,15 @@ from .codex_diagnostics import create_codex_diagnostic
 from .db import Database
 from .filebot import FileBotRunner
 from .filesystem import (
+    ExtractionError,
     clean_junk,
     extract_archives,
-    extraction_command_previews,
     full_bluray_folders,
     manifest,
     matching_root,
     media_files,
     media_worker_source,
+    move_extraction_failure_to_review,
     move_into_job,
     move_job_to_review_clean,
     move_tv_job_to_review,
@@ -62,6 +63,22 @@ PROCESSABLE_STATES = {
     "verifying_output",
     "ready_cleanup",
 }
+
+
+def _sanitize_extraction_details(job_root: Path, details: Dict[str, object]) -> Dict[str, object]:
+    root_text = str(job_root)
+
+    def sanitize(value: object) -> object:
+        if isinstance(value, dict):
+            return {str(key): sanitize(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [sanitize(item) for item in list(value)[:32]]
+        if isinstance(value, str):
+            cleaned = value.replace(root_text, "<JOB_ROOT>").replace("\\", "/")
+            return cleaned[-2000:] if len(cleaned) > 2000 else cleaned
+        return value
+
+    return sanitize(details)  # type: ignore[return-value]
 COMPLETE_CATEGORIES = ("movies", "tv", "manual", "movies_automatizacion", "trailers_automatizacion")
 IGNORED_COMPLETE_SUFFIXES = (".delay-audio-part",)
 
@@ -875,52 +892,95 @@ class Engine:
 
     def _run_extract(self, job: Dict[str, object]) -> None:
         job_root = Path(str(job["stage_path"]))
-        self.db.transition(str(job["job_id"]), "extracting", "extract", "Extracción iniciada")
-        previews = extraction_command_previews(job_root)
-        if previews:
+        job_id = str(job["job_id"])
+        self.db.transition(job_id, "extracting", "extract", "Extracción iniciada")
+
+        def record_extract_event(
+            event_type: str,
+            message: str,
+            structured: Dict[str, object],
+        ) -> None:
             self.db.add_event(
-                str(job["job_id"]),
+                job_id,
                 "extract",
-                "command",
-                "Comando de extraccion preparado",
-                {
-                    "command_preview": previews,
-                    "cwd": str(job_root),
-                    "timeout_sec": 7200,
-                },
+                event_type,
+                message,
+                structured,
             )
         try:
-            input_root = extract_archives(job_root)
+            input_root = extract_archives(job_root, event_callback=record_extract_event)
             clean_junk(input_root)
+        except ExtractionError as error:
+            self._finish_extraction_failure(job, job_root, error)
+            return
         except Exception as error:
-            failed = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
-            write_reason(
-                failed,
-                {
-                    "job_id": job["job_id"],
-                    "phase": "extract",
-                    "error": str(error),
-                    "timestamp": time.time(),
-                },
-                "Error de extraccion.txt",
-                [str(error)],
-            )
-            self.db.transition(
-                str(job["job_id"]),
-                "error_terminal",
-                "extract",
-                f"Extracción fallida: {error}",
-                stage_path=str(failed),
-                last_error_code="extract_failed",
-                last_error_message=str(error),
+            self._finish_extraction_failure(
+                job,
+                job_root,
+                ExtractionError(
+                    "extract_tool_failed", str(error), output_tail=str(error)[-2000:]
+                ),
             )
             return
         self.db.transition(
-            str(job["job_id"]),
+            job_id,
             "ready_filebot",
             "extract",
             "Extracción terminada",
             source_path=str(input_root),
+        )
+
+    def _finish_extraction_failure(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        error: ExtractionError,
+    ) -> None:
+        job_id = str(job["job_id"])
+        error_details = _sanitize_extraction_details(job_root, error.details)
+        self.db.add_event(
+            job_id,
+            "extract",
+            "error",
+            f"Extracción fallida: {error.message}",
+            error_details,
+        )
+        failed, preservation = move_extraction_failure_to_review(
+            job_root,
+            self.config.review_dir,
+            str(job["name"]),
+        )
+        preservation = _sanitize_extraction_details(job_root, preservation)
+        reason = {
+            "job_id": job_id,
+            "phase": "extract",
+            "error": error.message,
+            **error_details,
+            **preservation,
+            "timestamp": time.time(),
+        }
+        write_reason(
+            failed,
+            reason,
+            "Error de extraccion.txt",
+            [error.message],
+        )
+        self.db.add_event(
+            job_id,
+            "extract",
+            "decision",
+            "Material técnico de extracción conservado para revisión",
+            preservation,
+        )
+        self.db.transition(
+            job_id,
+            "error_terminal",
+            "extract",
+            f"Extracción fallida: {error.message}",
+            stage_path=str(failed),
+            last_error_code=error.code,
+            last_error_message=error.message,
+            result_json=json.dumps(reason, ensure_ascii=False, default=str),
         )
 
     def _run_filebot(self, job: Dict[str, object]) -> None:

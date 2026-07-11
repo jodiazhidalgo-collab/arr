@@ -322,10 +322,10 @@ def test_zip_normal_mantiene_extraccion_existente(tmp_path, monkeypatch):
     archive = original / "Las vacaciones de Mr. Bean (2007).zip"
     archive.write_bytes(b"zip")
 
-    def fake_run(_command, **_kwargs):
-        extracted = job_root / "extracted"
-        extracted.mkdir(parents=True, exist_ok=True)
-        (extracted / "Las vacaciones de Mr. Bean (2007).mkv").write_bytes(b"movie")
+    def fake_run(command, **_kwargs):
+        output = Path(next(value[2:] for value in command if value.startswith("-o")))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "Las vacaciones de Mr. Bean (2007).mkv").write_bytes(b"movie")
         return subprocess.CompletedProcess([], 0, "", "")
 
     monkeypatch.setattr("arr_orchestrator.filesystem.subprocess.run", fake_run)
