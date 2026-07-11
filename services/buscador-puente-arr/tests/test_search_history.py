@@ -111,11 +111,15 @@ class SearchHistoryFrontendContractTests(unittest.TestCase):
         script = (service_root / "static" / "js" / "app.js").read_text(encoding="utf-8")
         styles = (service_root / "static" / "css" / "app.css").read_text(encoding="utf-8")
 
-        self.assertIn('document.querySelectorAll(".history-result-title-scroll")', script)
+        self.assertIn('rows.querySelectorAll(".history-result-title-scroll")', script)
         self.assertIn('row.append(titleScroll, copy)', script)
         self.assertIn('equalizeHistoryTitleWidths(rows)', script)
+        self.assertIn('bindHistoryResultsPan(rows)', script)
+        self.assertIn('event.target.closest("button")', script)
         self.assertIn('historyState = { day: "", search: "", pages: {} }', script)
         self.assertIn(".history-result-title-scroll", styles)
+        self.assertIn(".history-results.is-dragging", styles)
+        self.assertIn("pointer-events: none", styles)
         self.assertIn(".history-page-button:disabled", styles)
         self.assertIn("cursor: default", styles)
 

@@ -995,46 +995,55 @@ function historyPageButton(label, page, current, pageCount, searchId, target) {
   return button;
 }
 
-function syncHistoryTitleScroll(source) {
+function setHistoryTitleScroll(value, rows) {
   if (historyScrollSyncing) return;
   historyScrollSyncing = true;
-  historyTitleScrollLeft = source.scrollLeft;
-  document.querySelectorAll(".history-result-title-scroll").forEach((node) => {
-    if (node !== source && Math.abs(node.scrollLeft - historyTitleScrollLeft) > 1) {
-      node.scrollLeft = historyTitleScrollLeft;
-    }
+  historyTitleScrollLeft = Math.max(0, value);
+  rows.querySelectorAll(".history-result-title-scroll").forEach((node) => {
+    node.scrollLeft = historyTitleScrollLeft;
   });
   historyScrollSyncing = false;
 }
 
-function bindHistoryTitleScroll(scroller) {
-  scroller.scrollLeft = historyTitleScrollLeft;
-  scroller.addEventListener("scroll", () => syncHistoryTitleScroll(scroller), { passive: true });
-  let dragging = false;
+function bindHistoryResultsPan(rows) {
+  let pointerId = null;
+  let axis = "";
   let startX = 0;
+  let startY = 0;
   let startScroll = 0;
-  scroller.addEventListener("pointerdown", (event) => {
-    if (event.pointerType !== "mouse" || event.button !== 0) return;
-    dragging = true;
+  rows.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    pointerId = event.pointerId;
+    axis = "";
     startX = event.clientX;
-    startScroll = scroller.scrollLeft;
-    scroller.classList.add("is-dragging");
-    scroller.setPointerCapture(event.pointerId);
+    startY = event.clientY;
+    startScroll = historyTitleScrollLeft;
   });
-  scroller.addEventListener("pointermove", (event) => {
-    if (!dragging) return;
-    const distance = event.clientX - startX;
-    if (Math.abs(distance) > 2) event.preventDefault();
-    scroller.scrollLeft = startScroll - distance;
+  rows.addEventListener("pointermove", (event) => {
+    if (pointerId !== event.pointerId) return;
+    const distanceX = event.clientX - startX;
+    const distanceY = event.clientY - startY;
+    if (!axis && Math.max(Math.abs(distanceX), Math.abs(distanceY)) >= 5) {
+      axis = Math.abs(distanceX) > Math.abs(distanceY) ? "horizontal" : "vertical";
+      if (axis === "horizontal") {
+        rows.classList.add("is-dragging");
+        rows.setPointerCapture(event.pointerId);
+      }
+    }
+    if (axis !== "horizontal") return;
+    event.preventDefault();
+    setHistoryTitleScroll(startScroll - distanceX, rows);
   });
-  const stopDragging = (event) => {
-    if (!dragging) return;
-    dragging = false;
-    scroller.classList.remove("is-dragging");
-    if (scroller.hasPointerCapture(event.pointerId)) scroller.releasePointerCapture(event.pointerId);
+  const stopPan = (event) => {
+    if (pointerId !== event.pointerId) return;
+    rows.classList.remove("is-dragging");
+    if (rows.hasPointerCapture(event.pointerId)) rows.releasePointerCapture(event.pointerId);
+    pointerId = null;
+    axis = "";
   };
-  scroller.addEventListener("pointerup", stopDragging);
-  scroller.addEventListener("pointercancel", stopDragging);
+  rows.addEventListener("pointerup", stopPan);
+  rows.addEventListener("pointercancel", stopPan);
 }
 
 function equalizeHistoryTitleWidths(rows) {
@@ -1072,7 +1081,6 @@ function renderHistoryResults(payload, target) {
     title.textContent = item.title;
     title.title = item.title;
     titleScroll.appendChild(title);
-    bindHistoryTitleScroll(titleScroll);
     const copy = document.createElement("button");
     copy.type = "button";
     copy.className = "history-copy-button";
@@ -1085,6 +1093,7 @@ function renderHistoryResults(payload, target) {
   }
   target.appendChild(rows);
   equalizeHistoryTitleWidths(rows);
+  bindHistoryResultsPan(rows);
   if (payload.page_count > 1) {
     const nav = document.createElement("nav");
     nav.className = "history-pagination";
