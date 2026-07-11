@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import logging
@@ -7,6 +8,7 @@ import threading
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
@@ -381,6 +383,23 @@ def text_value(value: Any) -> str:
     return str(value or "")
 
 
+def normalize_info_hash(value: Any) -> str:
+    raw = str(value or "").strip()
+    if re.fullmatch(r"[a-fA-F0-9]{40}", raw):
+        return raw.lower()
+    if re.fullmatch(r"[a-zA-Z2-7]{32}", raw):
+        try:
+            return base64.b32decode(raw.upper()).hex()
+        except Exception:
+            return ""
+    return ""
+
+
+def magnet_hash(magnet: str) -> str:
+    match = re.search(r"btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})", str(magnet or ""))
+    return normalize_info_hash(match.group(1)) if match else ""
+
+
 def torrent_info(raw: bytes) -> dict:
     root, _pos = bdecode_item(raw, 0)
     if not isinstance(root, dict):
@@ -431,36 +450,50 @@ def selected_manual_files(raw: bytes) -> str:
 
 
 def result_cache_id(row: dict) -> str:
-    payload = {
-        "title": clean_text(str(row.get("title") or "")),
-        "tracker_id": str(row.get("tracker_id") or ""),
-        "size": str(row.get("size") or ""),
-        "download_url": str(row.get("download_url") or row.get("magnet") or ""),
-    }
+    info_hash = normalize_info_hash(row.get("info_hash") or row.get("infohash"))
+    payload = (
+        {"info_hash": info_hash}
+        if info_hash
+        else {
+            "title": clean_text(str(row.get("title") or "")),
+            "tracker_id": str(row.get("tracker_id") or ""),
+            "size": str(row.get("size") or ""),
+            "download_url": str(row.get("download_url") or row.get("magnet") or ""),
+        }
+    )
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
 
 
-def normalize_result(row: dict) -> dict:
+def normalized_source(row: dict) -> dict:
     link = str(row.get("download_url") or row.get("magnet") or "").strip()
-    title = clean_text(str(row.get("title") or "Sin titulo").strip())
-    size = str(row.get("size") or "").strip()
-    tracker = clean_text(str(row.get("tracker") or "").strip())
-    tracker_id = str(row.get("tracker_id") or "").strip()
-    out = {
-        "title": title,
-        "size": size,
-        "size_text": str(row.get("size_text") or human_size(size)),
+    info_hash = normalize_info_hash(row.get("info_hash") or row.get("infohash")) or magnet_hash(link)
+    return {
+        "title": clean_text(str(row.get("title") or "Sin titulo").strip()),
+        "size": str(row.get("size") or "").strip(),
+        "size_text": str(row.get("size_text") or human_size(row.get("size"))),
         "seeders": int_value(row.get("seeders")),
         "peers": int_value(row.get("peers")),
         "leechers": int_value(row.get("leechers", row.get("peers"))),
-        "tracker": tracker,
-        "tracker_id": tracker_id,
+        "tracker": clean_text(str(row.get("tracker") or "").strip()),
+        "tracker_id": str(row.get("tracker_id") or "").strip(),
         "download_url": link,
+        "info_hash": info_hash,
+        "identity_checked": bool(row.get("identity_checked") or info_hash),
         "type": "magnet" if link.startswith("magnet:") else "torrent",
-        "magnet": link if link.startswith("magnet:") else None,
         "is_magnet": link.startswith("magnet:"),
     }
+
+
+def normalize_result(row: dict) -> dict:
+    out = normalized_source(row)
+    link = out["download_url"]
+    sources = [normalized_source(source) for source in row.get("sources", []) if isinstance(source, dict)]
+    source_count = max(1, int_value(row.get("source_count")), len(sources))
+    out["magnet"] = link if link.startswith("magnet:") else None
+    out["source_count"] = source_count
+    if sources:
+        out["sources"] = sources
     out["id"] = str(row.get("id") or result_cache_id(out))
     return out
 
@@ -476,6 +509,9 @@ def parse_results(xml_text: str) -> list[dict]:
         tracker = clean_text(((tracker_node.text if tracker_node is not None else "") or attrs.get("tracker", "") or "").strip())
         tracker_id = (tracker_node.attrib.get("id", "") if tracker_node is not None else "").strip()
         link = absolute_jackett_url((item.findtext("link") or "").strip())
+        guid = (item.findtext("guid") or "").strip()
+        magnet_url = attrs.get("magneturl", "").strip()
+        info_hash = normalize_info_hash(attrs.get("infohash")) or magnet_hash(magnet_url) or magnet_hash(link) or magnet_hash(guid)
         size = item.findtext("size") or ""
         seeders = attrs.get("seeders", "")
         peers = attrs.get("peers", "")
@@ -490,6 +526,7 @@ def parse_results(xml_text: str) -> list[dict]:
             "tracker": tracker,
             "tracker_id": tracker_id,
             "download_url": link,
+            "info_hash": info_hash,
         }))
     return rows
 
@@ -781,6 +818,174 @@ def selected_indexers_from_payload(payload: dict) -> list[str]:
     return selected_indexers(",".join(values))
 
 
+def result_identity_key(row: dict) -> str:
+    return "::".join(
+        (
+            str(row.get("tracker_id") or "").strip().lower(),
+            compact_search_text(str(row.get("title") or "")),
+            str(row.get("size") or "").strip(),
+        )
+    )
+
+
+def cached_info_hashes() -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for entry in load_result_cache().values():
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        if not isinstance(result, dict):
+            continue
+        candidates = [result]
+        candidates.extend(source for source in result.get("sources", []) if isinstance(source, dict))
+        for source in candidates:
+            info_hash = normalize_info_hash(source.get("info_hash") or source.get("infohash"))
+            key = result_identity_key(source)
+            if info_hash and key:
+                lookup[key] = info_hash
+    return lookup
+
+
+def cached_identity_checks() -> set[str]:
+    checked: set[str] = set()
+    for entry in load_result_cache().values():
+        if not isinstance(entry, dict):
+            continue
+        result = entry.get("result")
+        if not isinstance(result, dict):
+            continue
+        candidates = [result]
+        candidates.extend(source for source in result.get("sources", []) if isinstance(source, dict))
+        for source in candidates:
+            if source.get("identity_checked"):
+                checked.add(result_identity_key(source))
+    return checked
+
+
+def resolve_result_info_hash(row: dict) -> str:
+    info_hash = normalize_info_hash(row.get("info_hash") or row.get("infohash"))
+    if info_hash:
+        return info_hash
+    target = absolute_jackett_url(str(row.get("download_url") or row.get("magnet") or "").strip())
+    direct_hash = magnet_hash(target)
+    if direct_hash:
+        return direct_hash
+    if not target.startswith(("http://", "https://")):
+        return ""
+    try:
+        for _redirect in range(2):
+            response = requests.get(target, timeout=(1, 1), allow_redirects=False)
+            if 300 <= response.status_code < 400:
+                location = (response.headers.get("Location") or "").strip()
+                redirect_hash = magnet_hash(location)
+                if redirect_hash:
+                    return redirect_hash
+                if not location:
+                    return ""
+                target = urljoin(target, location)
+                continue
+            response.raise_for_status()
+            content = response.content or b""
+            text = content[:4096].decode("utf-8", errors="ignore").strip()
+            text_hash = magnet_hash(text.splitlines()[0] if text else "")
+            if text_hash:
+                return text_hash
+            if content.startswith(b"d"):
+                return normalize_info_hash(torrent_info(content).get("hash"))
+            return ""
+    except Exception:
+        return ""
+    return ""
+
+
+def sizes_may_match(left: Any, right: Any) -> bool:
+    left_size = int_value(left)
+    right_size = int_value(right)
+    if left_size <= 0 or right_size <= 0:
+        return False
+    tolerance = max(16 * 1024 * 1024, int(max(left_size, right_size) * 0.001))
+    return abs(left_size - right_size) <= tolerance
+
+
+def enrich_candidate_info_hashes(rows: list[dict]) -> list[dict]:
+    normalized = [normalize_result(row) for row in rows]
+    cached = cached_info_hashes()
+    checked = cached_identity_checks()
+    for row in normalized:
+        if not row.get("info_hash"):
+            identity_key = result_identity_key(row)
+            row["info_hash"] = cached.get(identity_key, "")
+            row["identity_checked"] = identity_key in checked
+
+    by_title: dict[str, list[dict]] = {}
+    for row in normalized:
+        title_key = compact_search_text(str(row.get("title") or ""))
+        if title_key:
+            by_title.setdefault(title_key, []).append(row)
+    candidates: list[dict] = []
+    for group in by_title.values():
+        known = [row for row in group if row.get("info_hash")]
+        if not known:
+            continue
+        candidates.extend(
+            row
+            for row in group
+            if not row.get("info_hash")
+            and not row.get("identity_checked")
+            and any(sizes_may_match(row.get("size"), other.get("size")) for other in known)
+        )
+    if candidates:
+        workers = min(24, len(candidates))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="torrent-identity") as executor:
+            hashes = executor.map(resolve_result_info_hash, candidates)
+            for row, info_hash in zip(candidates, hashes):
+                row["info_hash"] = normalize_info_hash(info_hash)
+                row["identity_checked"] = True
+    return normalized
+
+
+def source_rank(row: dict) -> tuple[int, int, int, str]:
+    return (
+        int_value(row.get("seeders")),
+        int_value(row.get("peers")),
+        1 if str(row.get("download_url") or "").startswith("magnet:") else 0,
+        str(row.get("tracker") or "").lower(),
+    )
+
+
+def deduplicate_exact_results(rows: list[dict]) -> list[dict]:
+    buckets: list[list[dict]] = []
+    by_hash: dict[str, list[dict]] = {}
+    for row in enrich_candidate_info_hashes(rows):
+        info_hash = normalize_info_hash(row.get("info_hash"))
+        if not info_hash:
+            buckets.append([row])
+            continue
+        bucket = by_hash.get(info_hash)
+        if bucket is None:
+            bucket = []
+            by_hash[info_hash] = bucket
+            buckets.append(bucket)
+        bucket.append(row)
+
+    results: list[dict] = []
+    for bucket in buckets:
+        unique_sources: dict[str, dict] = {}
+        for row in bucket:
+            source_key = str(row.get("tracker_id") or row.get("tracker") or row.get("download_url") or row.get("id"))
+            current = unique_sources.get(source_key)
+            if current is None or source_rank(row) > source_rank(current):
+                unique_sources[source_key] = row
+        sources = sorted(unique_sources.values(), key=source_rank, reverse=True)
+        primary = dict(sources[0])
+        primary.pop("id", None)
+        if len(sources) > 1:
+            primary["source_count"] = len(sources)
+            primary["sources"] = [normalized_source(source) for source in sources]
+        results.append(normalize_result(primary))
+    return results
+
+
 def search_jackett_many(query: str, indexers: list[str], category: str = "auto", metadata: dict | None = None) -> list[dict]:
     intent = parse_query_intent(query, category, metadata)
     rows = []
@@ -797,8 +1002,8 @@ def search_jackett_many(query: str, indexers: list[str], category: str = "auto",
                 rows.append(row)
         filtered = filter_search_results(rows, query, intent)
         if filtered:
-            return filtered
-    return filter_search_results(rows, query, intent)
+            return deduplicate_exact_results(filtered)
+    return deduplicate_exact_results(filter_search_results(rows, query, intent))
 
 
 def load_result_cache() -> dict:
@@ -1548,11 +1753,6 @@ def qbit_add_torrent(raw: bytes, title: str, category: str, cleanup: bool = Fals
     if cleanup:
         qbit_delete(session, info["hash"])
     return {"engine": "qBittorrent", "hash": info["hash"], "cleaned": cleanup}
-
-
-def magnet_hash(magnet: str) -> str:
-    match = re.search(r"btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})", magnet)
-    return match.group(1).lower() if match else ""
 
 
 def qbit_add_magnet(magnet: str, category: str, cleanup: bool = False) -> dict:

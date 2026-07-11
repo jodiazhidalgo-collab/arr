@@ -671,7 +671,8 @@ function scheduleSearch() {
 
 function metaText(item) {
   const parts = [];
-  if (item.tracker) parts.push(item.tracker);
+  const sourceCount = Math.max(1, numberValue(item.source_count));
+  if (item.tracker) parts.push(sourceCount > 1 ? `${item.tracker} +${sourceCount - 1}` : item.tracker);
   if (item.size_text) parts.push(item.size_text);
   if (item.seeders) parts.push(`${item.seeders} semillas`);
   if (item.peers) parts.push(`${item.peers} pares`);
