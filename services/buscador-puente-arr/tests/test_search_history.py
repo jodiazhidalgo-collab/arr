@@ -105,5 +105,20 @@ class SearchHistoryApiTests(unittest.TestCase):
         self.assertEqual(searches[0]["result_count"], 1)
 
 
+class SearchHistoryFrontendContractTests(unittest.TestCase):
+    def test_mobile_history_keeps_copy_buttons_fixed_and_syncs_title_scroll(self) -> None:
+        service_root = Path(__file__).resolve().parents[1]
+        script = (service_root / "static" / "js" / "app.js").read_text(encoding="utf-8")
+        styles = (service_root / "static" / "css" / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn('document.querySelectorAll(".history-result-title-scroll")', script)
+        self.assertIn('row.append(titleScroll, copy)', script)
+        self.assertIn('equalizeHistoryTitleWidths(rows)', script)
+        self.assertIn('historyState = { day: "", search: "", pages: {} }', script)
+        self.assertIn(".history-result-title-scroll", styles)
+        self.assertIn(".history-page-button:disabled", styles)
+        self.assertIn("cursor: default", styles)
+
+
 if __name__ == "__main__":
     unittest.main()

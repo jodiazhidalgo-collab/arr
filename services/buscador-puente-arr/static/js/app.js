@@ -75,6 +75,8 @@ let defaultSettings = null;
 let historyCache = null;
 let historyState = readSavedObject("arr_history_state");
 if (!historyState.pages || typeof historyState.pages !== "object") historyState.pages = {};
+let historyTitleScrollLeft = 0;
+let historyScrollSyncing = false;
 let finishSound = null;
 const finishSoundUrl = "/static/sounds/applepay.mp3";
 const finishSoundVolume = 0.55;
@@ -993,6 +995,60 @@ function historyPageButton(label, page, current, pageCount, searchId, target) {
   return button;
 }
 
+function syncHistoryTitleScroll(source) {
+  if (historyScrollSyncing) return;
+  historyScrollSyncing = true;
+  historyTitleScrollLeft = source.scrollLeft;
+  document.querySelectorAll(".history-result-title-scroll").forEach((node) => {
+    if (node !== source && Math.abs(node.scrollLeft - historyTitleScrollLeft) > 1) {
+      node.scrollLeft = historyTitleScrollLeft;
+    }
+  });
+  historyScrollSyncing = false;
+}
+
+function bindHistoryTitleScroll(scroller) {
+  scroller.scrollLeft = historyTitleScrollLeft;
+  scroller.addEventListener("scroll", () => syncHistoryTitleScroll(scroller), { passive: true });
+  let dragging = false;
+  let startX = 0;
+  let startScroll = 0;
+  scroller.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "mouse" || event.button !== 0) return;
+    dragging = true;
+    startX = event.clientX;
+    startScroll = scroller.scrollLeft;
+    scroller.classList.add("is-dragging");
+    scroller.setPointerCapture(event.pointerId);
+  });
+  scroller.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const distance = event.clientX - startX;
+    if (Math.abs(distance) > 2) event.preventDefault();
+    scroller.scrollLeft = startScroll - distance;
+  });
+  const stopDragging = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    scroller.classList.remove("is-dragging");
+    if (scroller.hasPointerCapture(event.pointerId)) scroller.releasePointerCapture(event.pointerId);
+  };
+  scroller.addEventListener("pointerup", stopDragging);
+  scroller.addEventListener("pointercancel", stopDragging);
+}
+
+function equalizeHistoryTitleWidths(rows) {
+  const scrollers = [...rows.querySelectorAll(".history-result-title-scroll")];
+  const titles = scrollers
+    .map((scroller) => scroller.querySelector(".history-result-title"))
+    .filter(Boolean);
+  const sharedWidth = Math.max(0, ...titles.map((title) => Math.ceil(title.scrollWidth)));
+  if (!sharedWidth) return;
+  titles.forEach((title) => {
+    title.style.minWidth = `${sharedWidth}px`;
+  });
+}
+
 function renderHistoryResults(payload, target) {
   target.textContent = "";
   if (!payload.results.length) {
@@ -1002,15 +1058,21 @@ function renderHistoryResults(payload, target) {
     target.appendChild(empty);
     return;
   }
+  historyTitleScrollLeft = 0;
   const rows = document.createElement("div");
   rows.className = "history-results";
   for (const item of payload.results) {
     const row = document.createElement("div");
     row.className = "history-result";
+    const titleScroll = document.createElement("div");
+    titleScroll.className = "history-result-title-scroll";
+    titleScroll.setAttribute("data-allow-horizontal-scroll", "history-results");
     const title = document.createElement("span");
     title.className = "history-result-title";
     title.textContent = item.title;
     title.title = item.title;
+    titleScroll.appendChild(title);
+    bindHistoryTitleScroll(titleScroll);
     const copy = document.createElement("button");
     copy.type = "button";
     copy.className = "history-copy-button";
@@ -1018,10 +1080,11 @@ function renderHistoryResults(payload, target) {
     copy.setAttribute("aria-label", `Copiar enlace de ${item.title}`);
     copy.disabled = !item.download_url;
     copy.addEventListener("click", () => copyHistoryLink(item.download_url, copy));
-    row.append(title, copy);
+    row.append(titleScroll, copy);
     rows.appendChild(row);
   }
   target.appendChild(rows);
+  equalizeHistoryTitleWidths(rows);
   if (payload.page_count > 1) {
     const nav = document.createElement("nav");
     nav.className = "history-pagination";
@@ -1126,7 +1189,12 @@ function renderHistoryOverview(history) {
 }
 
 async function loadHistory(force = false) {
-  if (force) historyCache = null;
+  if (force) {
+    historyCache = null;
+    historyState = { day: "", search: "", pages: {} };
+    historyTitleScrollLeft = 0;
+    saveHistoryState();
+  }
   if (historyCache) {
     renderHistoryOverview(historyCache);
     return;

@@ -749,13 +749,35 @@ button.state-badge {
   background: linear-gradient(90deg, rgba(35,91,111,.32), rgba(15,22,27,.9));
 }
 
-.history-result-title {
+.history-result-title-scroll {
   min-width: 0;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: none;
+  touch-action: pan-x pan-y;
+  cursor: grab;
+  -webkit-overflow-scrolling: touch;
+}
+
+.history-result-title-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.history-result-title-scroll.is-dragging {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.history-result-title {
+  display: block;
+  width: max-content;
+  min-width: 100%;
   color: #e7eef1;
   font-size: 12.25px;
   line-height: 1.12;
-  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -817,6 +839,14 @@ button.state-badge {
   border-color: #4fb2d2;
   background: #247e9b;
   color: #fff;
+}
+
+.history-page-button:disabled {
+  cursor: default;
+}
+
+.history-page-button.is-current:disabled {
+  opacity: 1;
 }
 
 .history-pagination > span {
