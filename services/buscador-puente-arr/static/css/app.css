@@ -640,6 +640,12 @@ button.state-badge {
   box-shadow: none;
 }
 
+.history-search.is-wolfmax {
+  border-color: rgba(181, 148, 67, .43);
+  background: linear-gradient(105deg, rgba(181, 148, 67, .105), rgba(16, 24, 30, .98) 42%);
+  box-shadow: inset 2px 0 0 rgba(207, 171, 79, .68);
+}
+
 .history-day > summary,
 .history-search > summary {
   position: relative;
@@ -714,6 +720,33 @@ button.state-badge {
   font-size: 11.5px;
 }
 
+.history-search.is-wolfmax .history-search-name b {
+  color: #d5bd79;
+}
+
+.history-source-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border: 1px solid rgba(211, 176, 87, .46);
+  border-radius: 5px;
+  background: rgba(185, 148, 57, .13);
+  color: #e1ca8a;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.history-search.is-wolfmax > summary em {
+  border-color: rgba(202, 167, 81, .44);
+  background: rgba(181, 148, 67, .13);
+  color: #e3ce94;
+}
+
 .history-search-name span {
   min-width: 0;
   overflow: hidden;
@@ -754,6 +787,16 @@ button.state-badge {
 .history-result:focus-within {
   border-color: rgba(79,176,210,.52);
   background: linear-gradient(90deg, rgba(35,91,111,.32), rgba(15,22,27,.9));
+}
+
+.history-search.is-wolfmax .history-result {
+  border-color: rgba(202, 170, 91, .13);
+  background: linear-gradient(90deg, rgba(144, 115, 45, .15), rgba(15, 22, 27, .88));
+}
+
+.history-search.is-wolfmax .history-result:focus-within {
+  border-color: rgba(211, 178, 93, .46);
+  background: linear-gradient(90deg, rgba(157, 126, 50, .22), rgba(15, 22, 27, .91));
 }
 
 .history-result-title-scroll {
@@ -806,6 +849,12 @@ button.state-badge {
 .history-copy-button.is-copy-error {
   border-color: #c65a5a;
   background: #632f35;
+}
+
+.history-search.is-wolfmax .history-copy-button:not(.is-copied):not(.is-copy-error) {
+  border-color: rgba(173, 143, 72, .52);
+  background: linear-gradient(145deg, #4a4029, #29291f);
+  color: #ead79f;
 }
 
 .history-copy-button:disabled {

@@ -15,7 +15,7 @@ from typing import Any, Callable
 from urllib.parse import quote, urljoin
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, redirect, render_template, request
 from modulos.arr_trace import ArrTrace
 from modulos.persistent_jobs import PersistentJobStore
 from modulos.search_history import SearchHistoryStore
@@ -496,6 +496,17 @@ def normalize_result(row: dict) -> dict:
         out["sources"] = sources
     out["id"] = str(row.get("id") or result_cache_id(out))
     return out
+
+
+def search_history_source(indexers: list[str], metadata: dict | None = None) -> str:
+    metadata = metadata if isinstance(metadata, dict) else {}
+    explicit = str(metadata.get("source") or metadata.get("origin") or "").strip().lower()
+    if explicit in {"wolfmax", "wolfmax4k"}:
+        return "wolfmax"
+    tracker_ids = {str(value or "").strip().lower() for value in indexers or []}
+    if "wolfmax4k" in tracker_ids and str(metadata.get("section") or "").strip():
+        return "wolfmax"
+    return "bridge"
 
 
 def parse_results(xml_text: str) -> list[dict]:
@@ -1074,7 +1085,13 @@ def search_response(query: str, indexers: list[str], category: str = "auto", met
         results = search_jackett_many(query, indexers, category, metadata)
         cache_results(results)
         try:
-            search_history.record(query, category or "auto", results, "done")
+            search_history.record(
+                query,
+                category or "auto",
+                results,
+                "done",
+                search_history_source(indexers, metadata),
+            )
         except Exception as history_error:
             logger.warning("search history record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "done", {"count": len(results)})
@@ -1090,7 +1107,13 @@ def search_response(query: str, indexers: list[str], category: str = "auto", met
         })
     except Exception as exc:
         try:
-            search_history.record(query, category or "auto", [], "error")
+            search_history.record(
+                query,
+                category or "auto",
+                [],
+                "error",
+                search_history_source(indexers, metadata),
+            )
         except Exception as history_error:
             logger.warning("search history error record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "error", error=str(exc)[:500])
@@ -1172,13 +1195,25 @@ def run_search_job(
         results = search_jackett_many(query, indexers, category, metadata)
         cache_results(results)
         try:
-            search_history.record(query, category or "auto", results, "done")
+            search_history.record(
+                query,
+                category or "auto",
+                results,
+                "done",
+                search_history_source(indexers, metadata),
+            )
         except Exception as history_error:
             logger.warning("search job history record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "done", {"count": len(results)})
     except Exception as exc:
         try:
-            search_history.record(query, category or "auto", [], "error")
+            search_history.record(
+                query,
+                category or "auto",
+                [],
+                "error",
+                search_history_source(indexers, metadata),
+            )
         except Exception as history_error:
             logger.warning("search job history error record failed error=%s", str(history_error)[:180])
         arr_trace.finish("search", trace_id, "error", error=str(exc)[:500])
@@ -2487,7 +2522,43 @@ def api_search_history_results(search_id: int):
     payload = search_history.results_page(search_id, page)
     if payload is None:
         return jsonify({"ok": False, "error": "busqueda no encontrada"}), 404
+    for item in payload["results"]:
+        internal_url = str(item.pop("download_url", "") or "").strip()
+        if internal_url.startswith("magnet:"):
+            item["copy_value"] = internal_url
+        elif internal_url:
+            item["copy_value"] = (
+                f"{request.url_root.rstrip('/')}/api/history/results/{int(item['result_id'])}/torrent"
+            )
+        else:
+            item["copy_value"] = ""
     return jsonify({"ok": True, **payload})
+
+
+@app.get("/api/history/results/<int:result_id>/torrent")
+def api_search_history_torrent(result_id: int):
+    item = search_history.result(result_id)
+    if item is None:
+        return jsonify({"ok": False, "error": "resultado no encontrado"}), 404
+    internal_url = str(item.get("download_url") or "").strip()
+    if not internal_url:
+        return jsonify({"ok": False, "error": "resultado sin enlace"}), 404
+    if internal_url.startswith("magnet:"):
+        return redirect(internal_url, code=302)
+    try:
+        raw, resolved_magnet = download_torrent_payload(internal_url)
+    except Exception as exc:
+        logger.warning("history torrent proxy failed result_id=%s error=%s", result_id, str(exc)[:180])
+        return jsonify({"ok": False, "error": "no se ha podido recuperar el torrent"}), 502
+    if resolved_magnet:
+        return redirect(resolved_magnet, code=302)
+    title = clean_text(str(item.get("title") or "descarga"))
+    ascii_name = unicodedata.normalize("NFKD", title).encode("ascii", errors="ignore").decode("ascii")
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_name).strip("._")[:120] or "descarga"
+    response = Response(raw, content_type="application/x-bittorrent")
+    response.headers["Content-Disposition"] = f'attachment; filename="{ascii_name}.torrent"'
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
 
 
 @app.post("/api/test/rdt")

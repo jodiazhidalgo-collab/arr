@@ -42,6 +42,7 @@ class SearchHistoryStore:
                     created_at INTEGER NOT NULL,
                     query TEXT NOT NULL,
                     category TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'bridge',
                     state TEXT NOT NULL,
                     result_count INTEGER NOT NULL DEFAULT 0
                 );
@@ -57,6 +58,25 @@ class SearchHistoryStore:
                 CREATE INDEX IF NOT EXISTS idx_search_results_search ON search_results(search_id, position);
                 """
             )
+            columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(searches)").fetchall()}
+            if "source" not in columns:
+                conn.execute("ALTER TABLE searches ADD COLUMN source TEXT NOT NULL DEFAULT 'bridge'")
+                conn.execute(
+                    """
+                    UPDATE searches
+                    SET source = 'wolfmax'
+                    WHERE source = 'bridge'
+                      AND EXISTS (
+                          SELECT 1 FROM search_results
+                          WHERE search_results.search_id = searches.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM search_results
+                          WHERE search_results.search_id = searches.id
+                            AND LOWER(search_results.download_url) NOT LIKE '%/dl/wolfmax4k/%'
+                      )
+                    """
+                )
             self._prune(conn, int(time.time()))
 
     def _prune(self, conn: sqlite3.Connection, now: int) -> None:
@@ -72,11 +92,19 @@ class SearchHistoryStore:
             (self.max_searches,),
         )
 
-    def record(self, query: str, category: str, results: list[dict[str, Any]], state: str = "done") -> int:
+    def record(
+        self,
+        query: str,
+        category: str,
+        results: list[dict[str, Any]],
+        state: str = "done",
+        source: str = "bridge",
+    ) -> int:
         now = int(time.time())
         clean_query = str(query or "").strip()[:300]
         clean_category = str(category or "auto").strip()[:24] or "auto"
         clean_state = str(state or "done").strip()[:24] or "done"
+        clean_source = "wolfmax" if str(source or "").strip().lower() == "wolfmax" else "bridge"
         rows: list[tuple[int, str, str]] = []
         for position, item in enumerate(results or [], start=1):
             if not isinstance(item, dict):
@@ -86,8 +114,8 @@ class SearchHistoryStore:
             rows.append((position, title, download_url))
         with self.lock, self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO searches(created_at, query, category, state, result_count) VALUES (?, ?, ?, ?, ?)",
-                (now, clean_query, clean_category, clean_state, len(rows)),
+                "INSERT INTO searches(created_at, query, category, source, state, result_count) VALUES (?, ?, ?, ?, ?, ?)",
+                (now, clean_query, clean_category, clean_source, clean_state, len(rows)),
             )
             search_id = int(cursor.lastrowid)
             if rows:
@@ -102,7 +130,7 @@ class SearchHistoryStore:
         with self.lock, self._connect() as conn:
             self._prune(conn, int(time.time()))
             rows = conn.execute(
-                "SELECT id, created_at, query, category, state, result_count FROM searches ORDER BY created_at DESC, id DESC"
+                "SELECT id, created_at, query, category, source, state, result_count FROM searches ORDER BY created_at DESC, id DESC"
             ).fetchall()
         days: list[dict[str, Any]] = []
         by_date: dict[str, dict[str, Any]] = {}
@@ -120,6 +148,7 @@ class SearchHistoryStore:
                     "time": stamp.strftime("%H:%M"),
                     "query": str(row["query"]),
                     "category": str(row["category"]),
+                    "source": str(row["source"]),
                     "state": str(row["state"]),
                     "result_count": int(row["result_count"]),
                 }
@@ -135,7 +164,7 @@ class SearchHistoryStore:
         page = max(1, int(page or 1))
         with self.lock, self._connect() as conn:
             search = conn.execute(
-                "SELECT id, query, result_count FROM searches WHERE id = ?", (int(search_id),)
+                "SELECT id, query, source, result_count FROM searches WHERE id = ?", (int(search_id),)
             ).fetchone()
             if search is None:
                 return None
@@ -145,7 +174,7 @@ class SearchHistoryStore:
             offset = (page - 1) * self.page_size
             rows = conn.execute(
                 """
-                SELECT position, title, download_url
+                SELECT id, position, title, download_url
                 FROM search_results
                 WHERE search_id = ?
                 ORDER BY position
@@ -156,16 +185,37 @@ class SearchHistoryStore:
         return {
             "search_id": int(search["id"]),
             "query": str(search["query"]),
+            "source": str(search["source"]),
             "page": page,
             "page_count": page_count,
             "page_size": self.page_size,
             "total": total,
             "results": [
                 {
+                    "result_id": int(row["id"]),
                     "position": int(row["position"]),
                     "title": str(row["title"]),
                     "download_url": str(row["download_url"]),
                 }
                 for row in rows
             ],
+        }
+
+    def result(self, result_id: int) -> dict[str, Any] | None:
+        with self.lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, search_id, title, download_url
+                FROM search_results
+                WHERE id = ?
+                """,
+                (int(result_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "result_id": int(row["id"]),
+            "search_id": int(row["search_id"]),
+            "title": str(row["title"]),
+            "download_url": str(row["download_url"]),
         }

@@ -1087,8 +1087,8 @@ function renderHistoryResults(payload, target) {
     copy.className = "history-copy-button";
     copy.textContent = "⧉";
     copy.setAttribute("aria-label", `Copiar enlace de ${item.title}`);
-    copy.disabled = !item.download_url;
-    copy.addEventListener("click", () => copyHistoryLink(item.download_url, copy));
+    copy.disabled = !item.copy_value;
+    copy.addEventListener("click", () => copyHistoryLink(item.copy_value, copy));
     row.append(titleScroll, copy);
     rows.appendChild(row);
   }
@@ -1155,11 +1155,25 @@ function renderHistoryOverview(history) {
     for (const search of day.searches) {
       const searchCard = document.createElement("details");
       searchCard.className = "history-search";
+      if (search.source === "wolfmax") searchCard.classList.add("is-wolfmax");
       searchCard.open = String(historyState.search || "") === String(search.id);
       const summary = document.createElement("summary");
       const main = document.createElement("span");
       main.className = "history-search-name";
-      main.innerHTML = `<b>${search.time}</b><span>${search.query || "(sin texto)"}</span>`;
+      const time = document.createElement("b");
+      time.textContent = search.time;
+      main.appendChild(time);
+      if (search.source === "wolfmax") {
+        const sourceMark = document.createElement("i");
+        sourceMark.className = "history-source-mark";
+        sourceMark.textContent = "W";
+        sourceMark.title = "Wolfmax";
+        sourceMark.setAttribute("aria-label", "Wolfmax");
+        main.appendChild(sourceMark);
+      }
+      const query = document.createElement("span");
+      query.textContent = search.query || "(sin texto)";
+      main.appendChild(query);
       const count = document.createElement("em");
       count.textContent = String(search.result_count || 0);
       summary.append(main, count);

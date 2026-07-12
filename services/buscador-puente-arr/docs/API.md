@@ -16,6 +16,8 @@ La web externa solo hace dos cosas:
 2. Enviar el resultado elegido con `/api/download`.
 
 Esos dos endpoints sincronicos se mantienen por compatibilidad con webs externas como Wolfmax.
+
+Las búsquedas del historial conservan su origen. Las iniciadas por Wolfmax se identifican como `wolfmax` y las realizadas desde Puente ARR como `bridge`.
 La UI incluida en este proyecto usa los endpoints asincronos `/api/jobs/search` y `/api/jobs/download`
 para no bloquear la pantalla mientras busca o envia.
 
@@ -236,6 +238,14 @@ Errores posibles:
 Cuando `/api/search` devuelve resultados, el motor guarda los `id` durante unas horas para que `/api/download` pueda recibir solo `result_id`.
 
 Si una web tarda demasiado o el motor se reinicia, puede mandar el resultado completo en vez de solo `result_id`.
+
+## Historial
+
+`GET /api/history/searches` devuelve las búsquedas agrupadas por día e incluye el campo `source`.
+
+`GET /api/history/searches/<search_id>/results?page=1` devuelve resultados paginados. Los magnets se entregan como `copy_value`; los enlaces internos de Jackett se sustituyen por una URL segura de Puente ARR, sin exponer el host Docker ni la clave de Jackett.
+
+`GET /api/history/results/<result_id>/torrent` recupera y entrega el `.torrent` correspondiente mientras la entrada siga conservada en el historial.
 
 ## Jobs asincronos
 
