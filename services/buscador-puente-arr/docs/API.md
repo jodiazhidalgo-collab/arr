@@ -247,6 +247,8 @@ Si una web tarda demasiado o el motor se reinicia, puede mandar el resultado com
 
 `GET /api/history/results/<result_id>/torrent` recupera y entrega el `.torrent` correspondiente mientras la entrada siga conservada en el historial.
 
+`POST /api/history/results/<result_id>/magnet` convierte bajo demanda un torrent público en un magnet mínimo (`btih` y nombre). La conversión se ejecuta solo al pulsar copiar, realiza una única recuperación del torrent y guarda el resultado en la misma fila del historial. Los torrents privados no se convierten y conservan como alternativa su URL segura `.torrent`.
+
 ## Jobs asincronos
 
 Estos endpoints son los recomendados para interfaces interactivas:

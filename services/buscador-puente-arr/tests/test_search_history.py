@@ -66,6 +66,12 @@ class SearchHistoryStoreTests(unittest.TestCase):
         self.assertEqual(overview["days"][0]["searches"][0]["source"], "wolfmax")
         self.assertEqual(page["source"], "wolfmax")
         self.assertEqual(result["search_id"], search_id)
+        self.assertEqual(result["copy_magnet"], "")
+
+        magnet = "magnet:?xt=urn:btih:" + "c" * 40 + "&dn=Olivia"
+        self.assertTrue(self.store.cache_magnet(result["result_id"], magnet))
+        self.assertEqual(self.store.result(result["result_id"])["copy_magnet"], magnet)
+        self.assertEqual(self.store.results_page(search_id, 1)["results"][0]["copy_magnet"], magnet)
 
     def test_migrates_and_marks_legacy_wolfmax_searches(self) -> None:
         legacy_path = Path(self.temporary.name) / "legacy.sqlite3"
@@ -97,6 +103,9 @@ class SearchHistoryStoreTests(unittest.TestCase):
         legacy_store = SearchHistoryStore(legacy_path, app_module.logger)
 
         self.assertEqual(legacy_store.overview()["days"][0]["searches"][0]["source"], "wolfmax")
+        with sqlite3.connect(legacy_path) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(search_results)")}
+        self.assertIn("copy_magnet", columns)
 
     def test_prunes_to_maximum_searches(self) -> None:
         for index in range(5):
@@ -149,9 +158,14 @@ class SearchHistoryApiTests(unittest.TestCase):
         self.assertEqual(page.get_json()["source"], "wolfmax")
         self.assertNotIn("download_url", item)
         self.assertNotIn("jackett_apikey", item["copy_value"])
+        self.assertEqual(item["copy_kind"], "torrent")
         self.assertEqual(
             item["copy_value"],
             f"http://localhost/api/history/results/{item['result_id']}/torrent",
+        )
+        self.assertEqual(
+            item["convert_url"],
+            f"http://localhost/api/history/results/{item['result_id']}/magnet",
         )
 
         with patch.object(app_module, "download_torrent_payload", return_value=(b"d4:infodee", "")):
@@ -162,6 +176,55 @@ class SearchHistoryApiTests(unittest.TestCase):
         self.assertEqual(torrent.mimetype, "application/x-bittorrent")
         self.assertIn(".torrent", torrent.headers["Content-Disposition"])
         self.assertEqual(torrent.headers["Cache-Control"], "private, no-store")
+
+    def test_converts_public_torrent_once_and_reuses_the_cached_magnet(self) -> None:
+        raw = b"d4:infod6:lengthi1e4:name4:testee"
+        search_id = app_module.search_history.record(
+            "Pelicula",
+            "movies",
+            [{"title": "Pelicula", "download_url": "http://gluetun:9117/dl/test/?path=x"}],
+        )
+        client = app_module.app.test_client()
+        item = client.get(f"/api/history/searches/{search_id}/results?page=1").get_json()["results"][0]
+
+        with patch.object(app_module, "download_torrent_payload", return_value=(raw, "")) as download:
+            first = client.post(f"/api/history/results/{item['result_id']}/magnet")
+            second = client.post(f"/api/history/results/{item['result_id']}/magnet")
+
+        first_payload = first.get_json()
+        second_payload = second.get_json()
+        self.assertEqual(first.status_code, 200)
+        self.assertTrue(first_payload["magnet"].startswith("magnet:?xt=urn:btih:"))
+        self.assertIn("&dn=test", first_payload["magnet"])
+        self.assertFalse(first_payload["cached"])
+        self.assertEqual(second_payload["magnet"], first_payload["magnet"])
+        self.assertTrue(second_payload["cached"])
+        self.assertEqual(download.call_count, 1)
+
+        refreshed = client.get(f"/api/history/searches/{search_id}/results?page=1").get_json()["results"][0]
+        self.assertEqual(refreshed["copy_kind"], "magnet")
+        self.assertEqual(refreshed["copy_value"], first_payload["magnet"])
+        self.assertEqual(refreshed["convert_url"], "")
+
+    def test_private_torrent_keeps_the_safe_torrent_fallback(self) -> None:
+        raw = b"d4:infod6:lengthi1e4:name7:private7:privatei1eee"
+        search_id = app_module.search_history.record(
+            "Privado",
+            "movies",
+            [{"title": "Privado", "download_url": "http://gluetun:9117/dl/private/?path=x"}],
+        )
+        client = app_module.app.test_client()
+        item = client.get(f"/api/history/searches/{search_id}/results?page=1").get_json()["results"][0]
+
+        with patch.object(app_module, "download_torrent_payload", return_value=(raw, "")):
+            response = client.post(f"/api/history/results/{item['result_id']}/magnet")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertFalse(response.get_json()["convertible"])
+        self.assertEqual(
+            app_module.search_history.result(item["result_id"])["copy_magnet"],
+            "",
+        )
 
     def test_history_keeps_magnets_as_the_copy_value(self) -> None:
         magnet = "magnet:?xt=urn:btih:" + "b" * 40
@@ -174,6 +237,8 @@ class SearchHistoryApiTests(unittest.TestCase):
         payload = app_module.app.test_client().get(f"/api/history/searches/{search_id}/results?page=1").get_json()
 
         self.assertEqual(payload["results"][0]["copy_value"], magnet)
+        self.assertEqual(payload["results"][0]["copy_kind"], "magnet")
+        self.assertEqual(payload["results"][0]["convert_url"], "")
         self.assertNotIn("download_url", payload["results"][0])
 
     def test_async_search_job_records_the_history_used_by_the_ui(self) -> None:
@@ -211,6 +276,9 @@ class SearchHistoryFrontendContractTests(unittest.TestCase):
         self.assertIn('bindHistoryResultsPan(rows)', script)
         self.assertIn('event.target.closest("button")', script)
         self.assertIn('item.copy_value', script)
+        self.assertIn('copyHistoryItem(item, copy)', script)
+        self.assertIn('status("Preparando magnet…")', script)
+        self.assertIn('message = "Magnet copiado"', script)
         self.assertIn('searchCard.classList.add("is-wolfmax")', script)
         self.assertIn('sourceMark.textContent = "W"', script)
         self.assertIn('historyState = { day: "", search: "", pages: {} }', script)
@@ -218,6 +286,7 @@ class SearchHistoryFrontendContractTests(unittest.TestCase):
         self.assertIn(".history-results.is-dragging", styles)
         self.assertIn(".history-search.is-wolfmax", styles)
         self.assertIn(".history-source-mark", styles)
+        self.assertIn(".history-copy-button.is-converting", styles)
         self.assertIn("pointer-events: none", styles)
         self.assertIn(".history-page-button:disabled", styles)
         self.assertIn("cursor: default", styles)

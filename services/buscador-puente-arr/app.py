@@ -433,7 +433,19 @@ def torrent_info(raw: bytes) -> dict:
         "hash": hashlib.sha1(info_raw).hexdigest().lower(),
         "name": text_value(info_obj.get(b"name")) or "torrent",
         "files": files,
+        "private": int(info_obj.get(b"private") or 0) == 1,
     }
+
+
+def torrent_to_magnet(raw: bytes) -> str:
+    info = torrent_info(raw)
+    if info.get("private"):
+        raise ValueError("torrent privado")
+    info_hash = normalize_info_hash(info.get("hash"))
+    if not info_hash:
+        raise ValueError("torrent sin hash")
+    name = str(info.get("name") or "torrent").strip() or "torrent"
+    return f"magnet:?xt=urn:btih:{info_hash}&dn={quote(name, safe='')}"
 
 
 def selected_manual_files(raw: bytes) -> str:
@@ -1259,10 +1271,11 @@ def result_from_download_payload(payload: dict) -> dict:
     return result
 
 
-def download_torrent_payload(url: str) -> tuple[bytes, str]:
+def download_torrent_payload(url: str, attempts: int = 4) -> tuple[bytes, str]:
     target = absolute_jackett_url(url)
     last_error = None
-    for attempt in range(4):
+    attempt_count = max(1, min(int(attempts or 1), 4))
+    for attempt in range(attempt_count):
         try:
             for _redirect in range(6):
                 response = requests.get(target, timeout=(15, 90), allow_redirects=False)
@@ -1286,7 +1299,8 @@ def download_torrent_payload(url: str) -> tuple[bytes, str]:
             return content, ""
         except requests.RequestException as exc:
             last_error = exc
-            time.sleep(3 + attempt * 3)
+            if attempt + 1 < attempt_count:
+                time.sleep(3 + attempt * 3)
     raise RuntimeError(f"No he podido descargar el .torrent: {str(last_error)[:180]}")
 
 
@@ -2524,14 +2538,27 @@ def api_search_history_results(search_id: int):
         return jsonify({"ok": False, "error": "busqueda no encontrada"}), 404
     for item in payload["results"]:
         internal_url = str(item.pop("download_url", "") or "").strip()
+        cached_magnet = str(item.pop("copy_magnet", "") or "").strip()
         if internal_url.startswith("magnet:"):
             item["copy_value"] = internal_url
+            item["copy_kind"] = "magnet"
+            item["convert_url"] = ""
+        elif cached_magnet.startswith("magnet:"):
+            item["copy_value"] = cached_magnet
+            item["copy_kind"] = "magnet"
+            item["convert_url"] = ""
         elif internal_url:
             item["copy_value"] = (
                 f"{request.url_root.rstrip('/')}/api/history/results/{int(item['result_id'])}/torrent"
             )
+            item["copy_kind"] = "torrent"
+            item["convert_url"] = (
+                f"{request.url_root.rstrip('/')}/api/history/results/{int(item['result_id'])}/magnet"
+            )
         else:
             item["copy_value"] = ""
+            item["copy_kind"] = "empty"
+            item["convert_url"] = ""
     return jsonify({"ok": True, **payload})
 
 
@@ -2559,6 +2586,32 @@ def api_search_history_torrent(result_id: int):
     response.headers["Content-Disposition"] = f'attachment; filename="{ascii_name}.torrent"'
     response.headers["Cache-Control"] = "private, no-store"
     return response
+
+
+@app.post("/api/history/results/<int:result_id>/magnet")
+def api_search_history_magnet(result_id: int):
+    item = search_history.result(result_id)
+    if item is None:
+        return jsonify({"ok": False, "error": "resultado no encontrado"}), 404
+    internal_url = str(item.get("download_url") or "").strip()
+    cached_magnet = str(item.get("copy_magnet") or "").strip()
+    if internal_url.startswith("magnet:"):
+        return jsonify({"ok": True, "magnet": internal_url, "cached": True})
+    if cached_magnet.startswith("magnet:"):
+        return jsonify({"ok": True, "magnet": cached_magnet, "cached": True})
+    if not internal_url:
+        return jsonify({"ok": False, "error": "resultado sin enlace"}), 404
+    try:
+        raw, resolved_magnet = download_torrent_payload(internal_url, attempts=1)
+        magnet = resolved_magnet or torrent_to_magnet(raw)
+    except ValueError as exc:
+        return jsonify({"ok": False, "convertible": False, "error": str(exc)}), 409
+    except Exception as exc:
+        logger.warning("history magnet conversion failed result_id=%s error=%s", result_id, str(exc)[:180])
+        return jsonify({"ok": False, "error": "no se ha podido convertir el torrent"}), 502
+    if not search_history.cache_magnet(result_id, magnet):
+        logger.warning("history magnet cache failed result_id=%s", result_id)
+    return jsonify({"ok": True, "magnet": magnet, "cached": False})
 
 
 @app.post("/api/test/rdt")

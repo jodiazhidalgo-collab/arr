@@ -955,7 +955,7 @@ function compactPageSequence(current, pageCount) {
   return out;
 }
 
-async function copyHistoryLink(value, button) {
+async function copyHistoryLink(value, button, message = "Enlace copiado") {
   const text = String(value || "");
   if (!text) return;
   try {
@@ -973,7 +973,7 @@ async function copyHistoryLink(value, button) {
     }
     button.classList.add("is-copied");
     button.textContent = "✓";
-    status("Enlace copiado");
+    status(message);
     setTimeout(() => {
       if (!button.isConnected) return;
       button.classList.remove("is-copied");
@@ -983,6 +983,38 @@ async function copyHistoryLink(value, button) {
     button.classList.add("is-copy-error");
     setTimeout(() => button.classList.remove("is-copy-error"), 900);
   }
+}
+
+async function copyHistoryItem(item, button) {
+  if (button.classList.contains("is-converting")) return;
+  if (item.copy_kind !== "torrent" || !item.convert_url) {
+    await copyHistoryLink(item.copy_value, button, item.copy_kind === "magnet" ? "Magnet copiado" : "Enlace copiado");
+    return;
+  }
+  button.classList.add("is-converting");
+  button.setAttribute("aria-busy", "true");
+  button.textContent = "…";
+  status("Preparando magnet…");
+  let value = item.copy_value;
+  let message = "Torrent copiado";
+  try {
+    const response = await fetch(item.convert_url, { method: "POST", cache: "no-store" });
+    const data = await response.json();
+    if (response.ok && data.ok && String(data.magnet || "").startsWith("magnet:")) {
+      value = String(data.magnet);
+      message = "Magnet copiado";
+      item.copy_value = value;
+      item.copy_kind = "magnet";
+      item.convert_url = "";
+    }
+  } catch (_error) {
+    message = "Torrent copiado";
+  } finally {
+    button.classList.remove("is-converting");
+    button.removeAttribute("aria-busy");
+  }
+  button.textContent = "⧉";
+  await copyHistoryLink(value, button, message);
 }
 
 function historyPageButton(label, page, current, pageCount, searchId, target) {
@@ -1087,8 +1119,8 @@ function renderHistoryResults(payload, target) {
     copy.className = "history-copy-button";
     copy.textContent = "⧉";
     copy.setAttribute("aria-label", `Copiar enlace de ${item.title}`);
-    copy.disabled = !item.copy_value;
-    copy.addEventListener("click", () => copyHistoryLink(item.copy_value, copy));
+    copy.disabled = !item.copy_value && !item.convert_url;
+    copy.addEventListener("click", () => copyHistoryItem(item, copy));
     row.append(titleScroll, copy);
     rows.appendChild(row);
   }

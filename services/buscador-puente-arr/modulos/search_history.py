@@ -52,6 +52,7 @@ class SearchHistoryStore:
                     position INTEGER NOT NULL,
                     title TEXT NOT NULL,
                     download_url TEXT NOT NULL,
+                    copy_magnet TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(search_id) REFERENCES searches(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS idx_searches_created ON searches(created_at DESC, id DESC);
@@ -77,6 +78,11 @@ class SearchHistoryStore:
                       )
                     """
                 )
+            result_columns = {
+                str(row["name"]) for row in conn.execute("PRAGMA table_info(search_results)").fetchall()
+            }
+            if "copy_magnet" not in result_columns:
+                conn.execute("ALTER TABLE search_results ADD COLUMN copy_magnet TEXT NOT NULL DEFAULT ''")
             self._prune(conn, int(time.time()))
 
     def _prune(self, conn: sqlite3.Connection, now: int) -> None:
@@ -105,13 +111,14 @@ class SearchHistoryStore:
         clean_category = str(category or "auto").strip()[:24] or "auto"
         clean_state = str(state or "done").strip()[:24] or "done"
         clean_source = "wolfmax" if str(source or "").strip().lower() == "wolfmax" else "bridge"
-        rows: list[tuple[int, str, str]] = []
+        rows: list[tuple[int, str, str, str]] = []
         for position, item in enumerate(results or [], start=1):
             if not isinstance(item, dict):
                 continue
             title = str(item.get("title") or "Sin titulo").strip()[:500] or "Sin titulo"
             download_url = str(item.get("download_url") or item.get("magnet") or "").strip()
-            rows.append((position, title, download_url))
+            copy_magnet = download_url if download_url.startswith("magnet:") else ""
+            rows.append((position, title, download_url, copy_magnet))
         with self.lock, self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO searches(created_at, query, category, source, state, result_count) VALUES (?, ?, ?, ?, ?, ?)",
@@ -120,8 +127,14 @@ class SearchHistoryStore:
             search_id = int(cursor.lastrowid)
             if rows:
                 conn.executemany(
-                    "INSERT INTO search_results(search_id, position, title, download_url) VALUES (?, ?, ?, ?)",
-                    [(search_id, position, title, download_url) for position, title, download_url in rows],
+                    """
+                    INSERT INTO search_results(search_id, position, title, download_url, copy_magnet)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (search_id, position, title, download_url, copy_magnet)
+                        for position, title, download_url, copy_magnet in rows
+                    ],
                 )
             self._prune(conn, now)
             return search_id
@@ -174,7 +187,7 @@ class SearchHistoryStore:
             offset = (page - 1) * self.page_size
             rows = conn.execute(
                 """
-                SELECT id, position, title, download_url
+                SELECT id, position, title, download_url, copy_magnet
                 FROM search_results
                 WHERE search_id = ?
                 ORDER BY position
@@ -196,6 +209,7 @@ class SearchHistoryStore:
                     "position": int(row["position"]),
                     "title": str(row["title"]),
                     "download_url": str(row["download_url"]),
+                    "copy_magnet": str(row["copy_magnet"]),
                 }
                 for row in rows
             ],
@@ -205,7 +219,7 @@ class SearchHistoryStore:
         with self.lock, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, search_id, title, download_url
+                SELECT id, search_id, title, download_url, copy_magnet
                 FROM search_results
                 WHERE id = ?
                 """,
@@ -218,4 +232,16 @@ class SearchHistoryStore:
             "search_id": int(row["search_id"]),
             "title": str(row["title"]),
             "download_url": str(row["download_url"]),
+            "copy_magnet": str(row["copy_magnet"]),
         }
+
+    def cache_magnet(self, result_id: int, magnet: str) -> bool:
+        clean_magnet = str(magnet or "").strip()
+        if not clean_magnet.startswith("magnet:?") or len(clean_magnet) > 4096:
+            return False
+        with self.lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE search_results SET copy_magnet = ? WHERE id = ?",
+                (clean_magnet, int(result_id)),
+            )
+            return int(cursor.rowcount or 0) == 1
