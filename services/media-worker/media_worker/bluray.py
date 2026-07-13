@@ -21,6 +21,20 @@ REMUX_TIMEOUT_SECONDS = 4 * 60 * 60
 VERIFY_TIMEOUT_SECONDS = 4 * 60 * 60
 MAX_DIAGNOSTIC_CANDIDATES = 20
 MAX_LOG_CHARS = 12000
+MPLS_AUDIO_CODING_TYPES = {
+    0x03,
+    0x04,
+    0x80,
+    0x81,
+    0x82,
+    0x83,
+    0x84,
+    0x85,
+    0x86,
+    0xA1,
+    0xA2,
+}
+MPLS_SUBTITLE_CODING_TYPES = {0x90, 0x91, 0x92}
 
 CommandRunner = Callable[[List[str], int], subprocess.CompletedProcess]
 EventCallback = Callable[[str, str, str, Dict[str, object]], None]
@@ -61,6 +75,145 @@ def _playlist_files(folder: Path) -> List[Path]:
         ),
         key=lambda path: path.name.casefold(),
     )
+
+
+def _stream_pid(value: object) -> Optional[int]:
+    try:
+        return int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _language_code(value: bytes | str | None) -> Optional[str]:
+    try:
+        text = value.decode("ascii") if isinstance(value, bytes) else str(value or "")
+    except UnicodeDecodeError:
+        return None
+    text = text.casefold()
+    return text if re.fullmatch(r"[a-z]{3}", text) else None
+
+
+def _mpls_stream_language(coding_info: bytes) -> tuple[Optional[str], Optional[str]]:
+    if not coding_info:
+        return None, None
+    coding_type = coding_info[0]
+    if coding_type in MPLS_AUDIO_CODING_TYPES and len(coding_info) >= 5:
+        return "audio", _language_code(coding_info[2:5])
+    if coding_type in {0x90, 0x91} and len(coding_info) >= 4:
+        return "subtitle", _language_code(coding_info[1:4])
+    if coding_type == 0x92 and len(coding_info) >= 5:
+        return "subtitle", _language_code(coding_info[2:5])
+    return None, None
+
+
+def read_playlist_stream_languages(
+    playlist_path: Path,
+    expected_streams: Iterable[Dict[str, object]],
+) -> Dict[str, object]:
+    expected_by_pid: Dict[int, str] = {}
+    for stream in expected_streams:
+        codec_type = str(stream.get("codec_type") or "")
+        pid = _stream_pid(stream.get("pid"))
+        if codec_type in {"audio", "subtitle"} and pid is not None:
+            expected_by_pid[pid] = codec_type
+    if not expected_by_pid:
+        return {"status": "stream_ids_unavailable", "streams": [], "conflicts": []}
+
+    try:
+        data = Path(playlist_path).read_bytes()
+    except OSError as error:
+        return {"status": "read_failed", "streams": [], "conflicts": [], "reason": str(error)}
+    if len(data) < 8 or not data.startswith(b"MPLS"):
+        return {"status": "invalid_playlist", "streams": [], "conflicts": []}
+
+    languages_by_pid: Dict[int, set[str]] = {}
+    for offset in range(8, len(data) - 2):
+        entry_length = data[offset]
+        if entry_length < 3 or entry_length > 32:
+            continue
+        entry_start = offset + 1
+        entry_end = entry_start + entry_length
+        if entry_end >= len(data):
+            continue
+        stream_type = data[entry_start]
+        if stream_type == 1 and entry_length >= 3:
+            pid_offset = entry_start + 1
+        elif stream_type == 2 and entry_length >= 5:
+            pid_offset = entry_start + 3
+        elif stream_type in {3, 4} and entry_length >= 4:
+            pid_offset = entry_start + 2
+        else:
+            continue
+        pid = int.from_bytes(data[pid_offset : pid_offset + 2], "big")
+        expected_type = expected_by_pid.get(pid)
+        if not expected_type:
+            continue
+        coding_length = data[entry_end]
+        coding_start = entry_end + 1
+        coding_end = coding_start + coding_length
+        if coding_length < 1 or coding_end > len(data):
+            continue
+        codec_type, language = _mpls_stream_language(data[coding_start:coding_end])
+        if codec_type == expected_type and language:
+            languages_by_pid.setdefault(pid, set()).add(language)
+
+    conflicts = [
+        {"pid": f"0x{pid:04x}", "languages": sorted(languages)}
+        for pid, languages in sorted(languages_by_pid.items())
+        if len(languages) > 1
+    ]
+    streams = [
+        {
+            "pid": f"0x{pid:04x}",
+            "codec_type": expected_by_pid[pid],
+            "language": next(iter(languages)),
+        }
+        for pid, languages in sorted(languages_by_pid.items())
+        if len(languages) == 1
+    ]
+    return {
+        "status": "parsed" if streams else "no_languages",
+        "streams": streams,
+        "conflicts": conflicts,
+    }
+
+
+def _merge_playlist_languages(
+    streams: List[Dict[str, object]],
+    playlist_languages: Dict[str, object],
+) -> List[Dict[str, object]]:
+    by_pid = {
+        _stream_pid(item.get("pid")): str(item.get("language") or "")
+        for item in (playlist_languages.get("streams") or [])
+        if isinstance(item, dict)
+    }
+    type_indexes = {"audio": 0, "subtitle": 0}
+    metadata: List[Dict[str, object]] = []
+    for stream in streams:
+        codec_type = str(stream.get("codec_type") or "")
+        if codec_type not in type_indexes:
+            continue
+        type_index = type_indexes[codec_type]
+        type_indexes[codec_type] += 1
+        language = _language_code(str(stream.get("language") or ""))
+        source = "ffprobe" if language else ""
+        if not language:
+            language = _language_code(by_pid.get(_stream_pid(stream.get("pid"))))
+            source = "mpls" if language else ""
+        if not language:
+            continue
+        stream["language"] = language
+        stream["language_source"] = source
+        metadata.append(
+            {
+                "codec_type": codec_type,
+                "type_index": type_index,
+                "pid": stream.get("pid"),
+                "language": language,
+                "source": source,
+            }
+        )
+    return metadata
 
 
 def is_full_bluray_folder(path: Path) -> bool:
@@ -131,6 +284,7 @@ def _probe_summary(data: Dict[str, object]) -> Dict[str, object]:
         "streams": [
             {
                 "index": item.get("index"),
+                "pid": item.get("id"),
                 "codec_type": item.get("codec_type"),
                 "codec_name": item.get("codec_name"),
                 "channels": item.get("channels"),
@@ -244,6 +398,12 @@ def select_main_playlist(
             )
             continue
         summary = _probe_summary(probe)
+        playlist_languages = read_playlist_stream_languages(playlist, summary["streams"])
+        summary["stream_languages"] = _merge_playlist_languages(
+            summary["streams"],
+            playlist_languages,
+        )
+        summary["playlist_language_metadata"] = playlist_languages
         if int(summary["video_streams"]) < 1:
             rejected.append({"playlist": playlist.name, "playlist_id": playlist_id, "reason": "no_video", **summary})
             continue
@@ -300,8 +460,13 @@ def select_main_playlist(
     return {"status": "selected", "selected": _public_candidates([selected])[0], **base}
 
 
-def build_remux_command(bluray_root: Path, playlist_id: int, output_tmp: Path) -> List[str]:
-    return [
+def build_remux_command(
+    bluray_root: Path,
+    playlist_id: int,
+    output_tmp: Path,
+    stream_languages: Optional[Iterable[Dict[str, object]]] = None,
+) -> List[str]:
+    argv = [
         "ffmpeg",
         "-hide_banner",
         "-nostdin",
@@ -326,8 +491,20 @@ def build_remux_command(bluray_root: Path, playlist_id: int, output_tmp: Path) -
         "-dn",
         "-c",
         "copy",
-        str(output_tmp),
     ]
+    stream_specifiers = {"audio": "a", "subtitle": "s"}
+    for item in stream_languages or []:
+        codec_type = str(item.get("codec_type") or "")
+        language = _language_code(str(item.get("language") or ""))
+        try:
+            type_index = int(item.get("type_index", -1))
+        except (TypeError, ValueError):
+            continue
+        specifier = stream_specifiers.get(codec_type)
+        if specifier and type_index >= 0 and language:
+            argv.extend([f"-metadata:s:{specifier}:{type_index}", f"language={language}"])
+    argv.append(str(output_tmp))
+    return argv
 
 
 def _sanitize_command(argv: Iterable[str], root: Path, output: Path) -> List[str]:
@@ -343,6 +520,7 @@ def remux_playlist_to_mkv(
     bluray_root: Path,
     playlist_id: int,
     output_tmp: Path,
+    stream_languages: Optional[Iterable[Dict[str, object]]] = None,
     runner: CommandRunner = _run_command,
     timeout_seconds: int = REMUX_TIMEOUT_SECONDS,
 ) -> Dict[str, object]:
@@ -350,7 +528,8 @@ def remux_playlist_to_mkv(
     output_tmp = Path(output_tmp)
     if output_tmp.exists():
         return {"status": "remux_failed", "reason": "temporary_output_exists", "returncode": None}
-    argv = build_remux_command(bluray_root, playlist_id, output_tmp)
+    language_metadata = list(stream_languages or [])
+    argv = build_remux_command(bluray_root, playlist_id, output_tmp, language_metadata)
     started = time.monotonic()
     try:
         completed = runner(argv, timeout_seconds)
@@ -375,6 +554,7 @@ def remux_playlist_to_mkv(
             "mapped_streams": ["video", "audio", "subtitle"],
             "chapters_mapped": True,
             "data_streams_excluded": True,
+            "language_tags": language_metadata,
         },
         "output_size": output_tmp.stat().st_size if output_tmp.exists() else 0,
     }
@@ -418,6 +598,7 @@ def verify_bluray_remux(
     output_tmp: Path,
     expected_duration: float,
     expected_chapters: int,
+    expected_stream_languages: Optional[Iterable[Dict[str, object]]] = None,
     runner: CommandRunner = _run_command,
     probe_timeout_seconds: int = PROBE_TIMEOUT_SECONDS,
     read_timeout_seconds: int = VERIFY_TIMEOUT_SECONDS,
@@ -470,6 +651,40 @@ def verify_bluray_remux(
     if expected_chapters > 0 and int(summary["chapter_count"]) < 1:
         problems.append("chapters_missing")
 
+    language_checks: List[Dict[str, object]] = []
+    output_by_type = {
+        codec_type: [
+            stream
+            for stream in summary["streams"]
+            if stream.get("codec_type") == codec_type
+        ]
+        for codec_type in ("audio", "subtitle")
+    }
+    for expected in expected_stream_languages or []:
+        codec_type = str(expected.get("codec_type") or "")
+        expected_language = _language_code(str(expected.get("language") or ""))
+        try:
+            type_index = int(expected.get("type_index", -1))
+        except (TypeError, ValueError):
+            continue
+        typed_streams = output_by_type.get(codec_type, [])
+        actual_language = None
+        if 0 <= type_index < len(typed_streams):
+            actual_language = _language_code(str(typed_streams[type_index].get("language") or ""))
+        passed = bool(expected_language and actual_language == expected_language)
+        language_checks.append(
+            {
+                "codec_type": codec_type,
+                "type_index": type_index,
+                "pid": expected.get("pid"),
+                "expected": expected_language,
+                "actual": actual_language,
+                "passed": passed,
+            }
+        )
+        if not passed:
+            problems.append("stream_language_mismatch")
+
     read_result: Optional[subprocess.CompletedProcess] = None
     if not problems:
         read_argv = _verify_read_command(output_tmp)
@@ -496,6 +711,14 @@ def verify_bluray_remux(
             if expected_chapters > 0
             else "not_enforced_source_ffprobe_reported_zero"
         ),
+        "language_check": (
+            "preserved"
+            if language_checks and all(item["passed"] for item in language_checks)
+            else "mismatch"
+            if language_checks
+            else "not_enforced_no_source_languages"
+        ),
+        "language_checks": language_checks,
         "probe_summary": summary,
         "ffprobe_returncode": probe_result.returncode,
         "ffprobe_stderr_tail": _tail(probe_result.stderr),
@@ -619,6 +842,7 @@ def normalize_bluray_folder(
         return result
 
     selected = dict(selection["selected"])
+    stream_languages = list(selected.get("stream_languages") or [])
     _event(
         event_callback,
         "bluray_playlist_selected",
@@ -645,12 +869,17 @@ def normalize_bluray_folder(
         "bluray_remux_started",
         "started",
         "Remux Blu-ray iniciado",
-        {"playlist_id": selected["playlist_id"], "temporary_file": output_tmp.name},
+        {
+            "playlist_id": selected["playlist_id"],
+            "temporary_file": output_tmp.name,
+            "language_tags": stream_languages,
+        },
     )
     remux = remux_playlist_to_mkv(
         bluray_root,
         int(selected["playlist_id"]),
         output_tmp,
+        stream_languages=stream_languages,
         runner=runner,
     )
     _event(
@@ -681,6 +910,7 @@ def normalize_bluray_folder(
         output_tmp,
         float(selected["duration"]),
         int(selected["chapter_count"]),
+        expected_stream_languages=stream_languages,
         runner=runner,
     )
     verification_event = "bluray_verification_passed" if verification.get("status") == "verification_passed" else "bluray_verification_failed"

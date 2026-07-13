@@ -16,11 +16,26 @@ def probe_payload(
 ):
     streams = []
     for index in range(videos):
-        streams.append({"index": index, "codec_type": "video", "codec_name": "h264"})
+        streams.append({"index": index, "id": f"0x{0x1011 + index:04x}", "codec_type": "video", "codec_name": "h264"})
     for index in range(audios):
-        streams.append({"index": 10 + index, "codec_type": "audio", "codec_name": "dts", "channels": 6})
+        streams.append(
+            {
+                "index": 10 + index,
+                "id": f"0x{0x1100 + index:04x}",
+                "codec_type": "audio",
+                "codec_name": "dts",
+                "channels": 6,
+            }
+        )
     for index in range(subtitles):
-        streams.append({"index": 20 + index, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"})
+        streams.append(
+            {
+                "index": 20 + index,
+                "id": f"0x{0x1200 + index:04x}",
+                "codec_type": "subtitle",
+                "codec_name": "hdmv_pgs_subtitle",
+            }
+        )
     return {
         "format": {"duration": str(duration)},
         "streams": streams,
@@ -94,6 +109,25 @@ def make_bluray(root: Path, playlists=(1,), certificate=True) -> Path:
     return root
 
 
+def mpls_stream_record(pid, codec_type, language):
+    stream_entry = bytes([1]) + int(pid).to_bytes(2, "big") + (b"\x00" * 6)
+    coding_type = 0x86 if codec_type == "audio" else 0x90
+    coding_info = (
+        bytes([coding_type, 0x61]) + language.encode("ascii")
+        if codec_type == "audio"
+        else bytes([coding_type]) + language.encode("ascii")
+    )
+    return bytes([len(stream_entry)]) + stream_entry + bytes([len(coding_info)]) + coding_info
+
+
+def write_mpls_languages(path, entries):
+    path.write_bytes(
+        b"MPLS0200"
+        + b"\x00" * 24
+        + b"".join(mpls_stream_record(*entry) for entry in entries)
+    )
+
+
 def test_detecta_bdmv_valido_y_certificate_opcional(tmp_path):
     with_certificate = make_bluray(tmp_path / "con-certificado")
     without_certificate = make_bluray(tmp_path / "sin-certificado", certificate=False)
@@ -153,6 +187,46 @@ def test_playlist_first_no_inspecciona_el_m2ts_mas_grande(tmp_path):
     assert all(".m2ts" not in " ".join(call) for call in runner.calls)
 
 
+def test_lee_idiomas_de_playlist_mpls_por_pid(tmp_path):
+    root = make_bluray(tmp_path / "Release", playlists=(1,))
+    playlist = root / "BDMV" / "PLAYLIST" / "00001.mpls"
+    write_mpls_languages(
+        playlist,
+        [
+            (0x1100, "audio", "eng"),
+            (0x1101, "audio", "spa"),
+            (0x1200, "subtitle", "eng"),
+            (0x1201, "subtitle", "spa"),
+        ],
+    )
+    summary = bluray._probe_summary(probe_payload(audios=2, subtitles=2))
+    result = bluray.read_playlist_stream_languages(playlist, summary["streams"])
+    assert result["status"] == "parsed"
+    assert result["conflicts"] == []
+    assert [(item["pid"], item["language"]) for item in result["streams"]] == [
+        ("0x1100", "eng"),
+        ("0x1101", "spa"),
+        ("0x1200", "eng"),
+        ("0x1201", "spa"),
+    ]
+
+
+def test_no_etiqueta_pid_mpls_con_idiomas_conflictivos(tmp_path):
+    root = make_bluray(tmp_path / "Release", playlists=(1,))
+    playlist = root / "BDMV" / "PLAYLIST" / "00001.mpls"
+    write_mpls_languages(
+        playlist,
+        [(0x1100, "audio", "eng"), (0x1100, "audio", "spa")],
+    )
+    summary = bluray._probe_summary(probe_payload(audios=1, subtitles=0))
+    result = bluray.read_playlist_stream_languages(playlist, summary["streams"])
+    assert result["status"] == "no_languages"
+    assert result["streams"] == []
+    assert result["conflicts"] == [
+        {"pid": "0x1100", "languages": ["eng", "spa"]}
+    ]
+
+
 def test_orden_ffmpeg_usa_temporal_stream_copy_y_mapas(tmp_path):
     root = make_bluray(tmp_path / "Release")
     temporary = root / "Release.arr-bluray.tmp.mkv"
@@ -165,6 +239,25 @@ def test_orden_ffmpeg_usa_temporal_stream_copy_y_mapas(tmp_path):
     assert "0:s?" in command
     assert command[command.index("-map_chapters") + 1] == "0"
     assert command[-1].endswith(".arr-bluray.tmp.mkv")
+
+
+def test_orden_ffmpeg_escribe_idiomas_en_audio_y_subtitulos(tmp_path):
+    root = make_bluray(tmp_path / "Release")
+    temporary = root / "Release.arr-bluray.tmp.mkv"
+    languages = [
+        {"codec_type": "audio", "type_index": 0, "pid": "0x1100", "language": "eng"},
+        {"codec_type": "audio", "type_index": 1, "pid": "0x1101", "language": "spa"},
+        {"codec_type": "subtitle", "type_index": 0, "pid": "0x1200", "language": "spa"},
+    ]
+    command = bluray.build_remux_command(root, 1, temporary, languages)
+    assert [
+        "-metadata:s:a:0",
+        "language=eng",
+        "-metadata:s:a:1",
+        "language=spa",
+        "-metadata:s:s:0",
+        "language=spa",
+    ] == command[command.index("-metadata:s:a:0") : -1]
 
 
 @pytest.mark.parametrize(
@@ -190,6 +283,39 @@ def test_verificador_lee_hasta_el_final(tmp_path):
     result = bluray.verify_bluray_remux(output, 5400, 8, runner=FakeRunner(read_code=1))
     assert result["status"] == "verification_failed"
     assert "full_read_failed" in result["problems"]
+
+
+def test_verificador_exige_los_idiomas_declarados_en_mpls(tmp_path):
+    output = tmp_path / "temp.mkv"
+    output.write_bytes(b"x" * (bluray.MIN_REMUX_SIZE_BYTES + 1))
+    expected = [
+        {"codec_type": "audio", "type_index": 0, "pid": "0x1100", "language": "eng"},
+        {"codec_type": "subtitle", "type_index": 0, "pid": "0x1200", "language": "spa"},
+    ]
+    missing = bluray.verify_bluray_remux(
+        output,
+        5400,
+        8,
+        expected_stream_languages=expected,
+        runner=FakeRunner(output_probe=probe_payload(audios=1, subtitles=1)),
+    )
+    assert missing["status"] == "verification_failed"
+    assert missing["language_check"] == "mismatch"
+    assert "stream_language_mismatch" in missing["problems"]
+
+    tagged_probe = probe_payload(audios=1, subtitles=1)
+    tagged_probe["streams"][1]["tags"] = {"language": "eng"}
+    tagged_probe["streams"][2]["tags"] = {"language": "spa"}
+    tagged = bluray.verify_bluray_remux(
+        output,
+        5400,
+        8,
+        expected_stream_languages=expected,
+        runner=FakeRunner(output_probe=tagged_probe),
+    )
+    assert tagged["status"] == "verification_passed"
+    assert tagged["language_check"] == "preserved"
+    assert all(item["passed"] for item in tagged["language_checks"])
 
 
 def test_normalizacion_exitosa_conserva_sidecars_y_emite_eventos(tmp_path):
@@ -224,6 +350,50 @@ def test_normalizacion_exitosa_conserva_sidecars_y_emite_eventos(tmp_path):
         "bluray_source_removed",
         "bluray_normalization_completed",
     } <= names
+
+
+def test_normalizacion_mpls_conserva_idiomas_antes_de_borrar(tmp_path):
+    release = make_bluray(tmp_path / "Release", playlists=(1,))
+    write_mpls_languages(
+        release / "BDMV" / "PLAYLIST" / "00001.mpls",
+        [(0x1100, "audio", "eng"), (0x1200, "subtitle", "spa")],
+    )
+    source_probe = probe_payload(audios=1, subtitles=1)
+    output_probe = probe_payload(audios=1, subtitles=1)
+    output_probe["streams"][1]["tags"] = {"language": "eng"}
+    output_probe["streams"][2]["tags"] = {"language": "spa"}
+    runner = FakeRunner(playlists={1: source_probe}, output_probe=output_probe)
+
+    result = bluray.normalize_bluray_folder(release, runner=runner)
+
+    assert result["status"] == "normalized"
+    assert result["verification"]["language_check"] == "preserved"
+    assert not (release / "BDMV").exists()
+    remux_call = next(call for call in runner.calls if call[0] == "ffmpeg" and "-playlist" in call)
+    assert "-metadata:s:a:0" in remux_call
+    assert "language=eng" in remux_call
+    assert "-metadata:s:s:0" in remux_call
+    assert "language=spa" in remux_call
+
+
+def test_normalizacion_no_borra_bdmv_si_el_mkv_pierde_idiomas(tmp_path):
+    release = make_bluray(tmp_path / "Release", playlists=(1,))
+    write_mpls_languages(
+        release / "BDMV" / "PLAYLIST" / "00001.mpls",
+        [(0x1100, "audio", "eng"), (0x1200, "subtitle", "spa")],
+    )
+    runner = FakeRunner(
+        playlists={1: probe_payload(audios=1, subtitles=1)},
+        output_probe=probe_payload(audios=1, subtitles=1),
+    )
+
+    result = bluray.normalize_bluray_folder(release, runner=runner)
+
+    assert result["status"] == "verification_failed"
+    assert result["verification"]["language_check"] == "mismatch"
+    assert (release / "BDMV").exists()
+    assert (release / "CERTIFICATE").exists()
+    assert not (release / "Release.mkv").exists()
 
 
 def test_no_elimina_origen_si_ffmpeg_falla(tmp_path):
