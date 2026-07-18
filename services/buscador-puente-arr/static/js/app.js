@@ -748,8 +748,8 @@ function acceptedSendTone(job) {
   const result = job.result || {};
   const engine = String(result.engine || "").toLowerCase();
   const state = String(result.submission_state || "").toLowerCase();
-  if (engine.includes("qbit") || state === "submitted_qbit" || result.hash) return "qbit";
   if (engine.includes("rdt") || state === "rdt_monitoring" || state === "transport_done" || result.rdt_id) return "rd";
+  if (engine.includes("qbit") || state === "submitted_qbit") return "qbit";
   return "qbit";
 }
 

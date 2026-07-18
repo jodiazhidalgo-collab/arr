@@ -255,5 +255,21 @@ class DeliveryTracingTests(unittest.TestCase):
         self.assertFalse(path.exists())
 
 
+class DeliveryFrontendContractTests(unittest.TestCase):
+    def test_rdt_result_with_hash_is_classified_as_rd_before_qbit(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "static" / "js" / "app.js").read_text(encoding="utf-8")
+        start = script.index("function acceptedSendTone(job)")
+        end = script.index("\n}\n\nfunction acceptedSendLabel", start)
+        function_body = script[start:end]
+
+        rdt_condition = 'if (engine.includes("rdt") || state === "rdt_monitoring" || state === "transport_done" || result.rdt_id) return "rd";'
+        qbit_condition = 'if (engine.includes("qbit") || state === "submitted_qbit") return "qbit";'
+
+        self.assertIn(rdt_condition, function_body)
+        self.assertIn(qbit_condition, function_body)
+        self.assertLess(function_body.index(rdt_condition), function_body.index(qbit_condition))
+        self.assertNotIn("result.hash", function_body)
+
+
 if __name__ == "__main__":
     unittest.main()
