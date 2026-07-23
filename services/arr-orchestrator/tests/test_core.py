@@ -3,10 +3,11 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from arr_orchestrator.config import Config
 from arr_orchestrator.db import Database
-from arr_orchestrator.engine import Engine
+from arr_orchestrator.engine import Engine, WORKER_ACTIVE_MAX_SECONDS
 from arr_orchestrator.filebot import MOVE_PATTERN, is_duplicate_output
 from arr_orchestrator.filesystem import (
     extraction_command_previews,
@@ -24,7 +25,11 @@ from arr_orchestrator.filesystem import (
     trailer_ready_source,
     write_reason,
 )
-from arr_orchestrator.media_worker import MediaWorkerClient
+from arr_orchestrator.media_worker import (
+    MediaWorkerClient,
+    MediaWorkerError,
+    MediaWorkerTransportError,
+)
 from arr_orchestrator.torrent import torrent_info
 from arr_orchestrator.name_resolver import ResolvedIdentity, ResolverUnavailable
 from arr_orchestrator.name_resolver import ResolverAmbiguous
@@ -727,7 +732,14 @@ class CoreTests(unittest.TestCase):
                     }
 
                 def process_movie(self, *_args):
-                    return {"status": "done"}
+                    final_video = config.movies_final / "Movie Ready" / "Movie Ready.mkv"
+                    final_video.parent.mkdir(parents=True)
+                    final_video.write_bytes(b"movie")
+                    return {
+                        "status": "done",
+                        "job_id": job["job_id"],
+                        "final": {"final_video": str(final_video)},
+                    }
 
             engine.media_worker = FakeMediaWorker()
             engine._run_media_postprocess(job)
@@ -740,6 +752,837 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(command_events), 1)
             self.assertEqual(command_events[0]["structured"]["command_preview"]["endpoint"], "/process-movie")
             self.assertEqual(database.get_job(job["job_id"])["state"], "ready_cleanup")
+            database.close()
+
+    def test_worker_http_failure_finishes_movie_and_trailer_in_manual_review(self) -> None:
+        for phase in ("media", "trailer"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = test_config(root)
+                config.ensure_directories()
+                database = Database(root / "test.db")
+                database.initialize()
+                engine = Engine(config, database)
+                stage = config.workshop_root / f"job-{phase}"
+                source = stage / "original"
+                source.mkdir(parents=True)
+                (source / "material.mkv").write_bytes(b"media")
+                state = "media_postprocess_ready" if phase == "media" else "trailer_ready"
+                job = database.create_job(
+                    f"fs:{phase}:worker-http-error",
+                    "fs",
+                    "movies" if phase == "media" else "trailers_automatizacion",
+                    f"Worker {phase}",
+                    state=state,
+                    source_path=str(source),
+                    stage_path=str(stage),
+                )
+
+                class FailingWorker:
+                    def process_movie(self, *_args):
+                        raise MediaWorkerError(
+                            "No existe la carpeta de media",
+                            endpoint="/process-movie",
+                            status_code=500,
+                            error_code="media_source_missing",
+                            result={"status": "error", "job_id": job["job_id"]},
+                        )
+
+                    def process_trailer(self, *_args):
+                        raise MediaWorkerError(
+                            "Fallo controlado de trailer",
+                            endpoint="/process-trailer",
+                            status_code=500,
+                            error_code="trailer_worker_exception",
+                            result={"status": "error", "job_id": job["job_id"]},
+                        )
+
+                engine.media_worker = FailingWorker()
+                if phase == "media":
+                    engine._run_media_postprocess(job)
+                else:
+                    engine._run_trailer(job)
+
+                updated = database.get_job(job["job_id"])
+                detail = database.job_detail(job["job_id"])
+                self.assertEqual(updated["state"], "manual_review")
+                self.assertNotIn(updated["state"], {"media_postprocess_running", "trailer_running"})
+                self.assertTrue(source.exists())
+                self.assertTrue(stage.exists())
+                self.assertTrue(
+                    any(
+                        event["phase"] == phase and event["event_type"] == "error"
+                        for event in detail["timeline"]
+                    )
+                )
+                database.close()
+
+    def test_worker_errors_are_sanitized_before_job_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            message = engine._safe_worker_error(
+                f"{config.data_root}/private.mkv Authorization: Bearer hidden "
+                "magnet:?xt=urn:btih:hidden "
+                "download_url=https://private.local/file?token=hidden "
+                "/home/user/private.mkv"
+            )
+            self.assertIn("<DATA>", message)
+            self.assertNotIn("hidden", message)
+            self.assertNotIn("magnet:?", message)
+            self.assertNotIn("private.local", message)
+            self.assertNotIn("/home/user", message)
+            database.close()
+
+    def test_transport_timeout_checks_active_job_without_second_post(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-active"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            job = database.create_job(
+                "fs:movies:worker-active",
+                "fs",
+                "movies",
+                "Worker Active",
+                state="media_postprocess_ready",
+                source_path=str(source),
+                stage_path=str(stage),
+            )
+
+            class ActiveWorker:
+                def __init__(self):
+                    self.posts = 0
+                    self.status_calls = 0
+
+                def process_movie(self, *_args):
+                    self.posts += 1
+                    raise MediaWorkerTransportError(
+                        "timeout",
+                        endpoint="/process-movie",
+                        status_code=None,
+                        error_code="media_worker_timeout",
+                        retryable=True,
+                    )
+
+                def job_status(self, *_args):
+                    self.status_calls += 1
+                    return {"status": "active", "job_id": job["job_id"]}
+
+            worker = ActiveWorker()
+            engine.media_worker = worker
+            engine._run_media_postprocess(job)
+            engine._process_job(database.get_job(job["job_id"]))
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "media_postprocess_running")
+            self.assertEqual(updated["last_error_code"], "media_worker_active")
+            self.assertEqual(worker.posts, 1)
+            self.assertEqual(worker.status_calls, 1)
+            database.close()
+
+    def test_stale_active_worker_stops_safely_without_second_post(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-stale-active"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            (source / "material.mkv").write_bytes(b"media")
+            job = database.create_job(
+                "fs:movies:worker-stale-active",
+                "fs",
+                "movies",
+                "Worker Stale Active",
+                state="media_postprocess_running",
+                source_path=str(source),
+                stage_path=str(stage),
+            )
+
+            class StaleWorker:
+                posts = 0
+
+                def process_movie(self, *_args):
+                    self.posts += 1
+                    raise AssertionError("No debe repetirse el POST")
+
+                def job_status(self, *_args):
+                    return {
+                        "status": "active",
+                        "job_id": job["job_id"],
+                        "started_at": time.time() - WORKER_ACTIVE_MAX_SECONDS - 1,
+                    }
+
+            worker = StaleWorker()
+            engine.media_worker = worker
+            engine._reconcile_running_worker(job, "media", recovery=True)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "manual_review")
+            self.assertEqual(updated["last_error_code"], "media_worker_active_timeout")
+            self.assertEqual(worker.posts, 0)
+            self.assertTrue((source / "material.mkv").exists())
+            database.close()
+
+    def test_bluray_timeout_active_preserves_workshop_without_second_post(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-bluray-active"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            (source / "disc.iso").write_bytes(b"bluray")
+            job = database.create_job(
+                "fs:movies:bluray-active",
+                "fs",
+                "movies",
+                "Blu-ray Active",
+                state="ready_filebot",
+                source_path=str(source),
+                stage_path=str(stage),
+            )
+
+            class ActiveBlurayWorker:
+                def __init__(self):
+                    self.posts = 0
+                    self.status_calls = 0
+
+                def normalize_bluray(self, *_args):
+                    self.posts += 1
+                    raise MediaWorkerTransportError(
+                        "timeout",
+                        endpoint="/normalize-bluray",
+                        status_code=None,
+                        error_code="media_worker_timeout",
+                        retryable=True,
+                    )
+
+                def job_status(self, *_args):
+                    self.status_calls += 1
+                    if self.status_calls > 1:
+                        normalized = source / "Movie.mkv"
+                        normalized.write_bytes(b"movie")
+                        return {
+                            "status": "terminal",
+                            "job_id": job["job_id"],
+                            "result": {
+                                "status": "normalized",
+                                "job_id": job["job_id"],
+                                "kind": "bluray",
+                                "result_file": str(normalized),
+                            },
+                        }
+                    return {
+                        "status": "active",
+                        "job_id": job["job_id"],
+                        "started_at": time.time(),
+                    }
+
+            worker = ActiveBlurayWorker()
+            engine.media_worker = worker
+            result = engine._normalize_bluray_before_filebot(job, stage, source)
+            self.assertIsNone(result)
+            self.assertEqual(database.get_job(job["job_id"])["state"], "bluray_running")
+            self.assertEqual(worker.posts, 1)
+            self.assertEqual(worker.status_calls, 1)
+            self.assertTrue((source / "disc.iso").exists())
+
+            engine._worker_status_checked_at.pop(job["job_id"], None)
+            engine._process_job(database.get_job(job["job_id"]))
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "ready_filebot")
+            self.assertEqual(Path(updated["source_path"]), source / "Movie.mkv")
+            self.assertEqual(worker.posts, 1)
+            self.assertEqual(worker.status_calls, 2)
+
+            filebot_calls = []
+
+            def run_filebot_once(current):
+                filebot_calls.append(current["job_id"])
+                database.transition(
+                    current["job_id"],
+                    "done",
+                    "filebot",
+                    "FileBot simulado terminado",
+                )
+
+            engine._run_filebot = run_filebot_once
+            engine._process_job(database.get_job(job["job_id"]))
+            engine._process_job(database.get_job(job["job_id"]))
+            self.assertEqual(filebot_calls, [job["job_id"]])
+            database.close()
+
+    def test_bluray_status_unavailable_keeps_running_and_preserves_workshop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-bluray-unavailable"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            (source / "disc.iso").write_bytes(b"bluray")
+            job = database.create_job(
+                "fs:movies:bluray-unavailable",
+                "fs",
+                "movies",
+                "Blu-ray Unavailable",
+                state="bluray_running",
+                source_path=str(source),
+                stage_path=str(stage),
+            )
+
+            class UnavailableWorker:
+                posts = 0
+
+                def normalize_bluray(self, *_args):
+                    self.posts += 1
+                    raise AssertionError("No debe repetirse la normalización")
+
+                def job_status(self, *_args):
+                    raise MediaWorkerTransportError(
+                        "sin conexión",
+                        endpoint="/jobs/status",
+                        status_code=None,
+                        error_code="media_worker_transport_error",
+                        retryable=True,
+                    )
+
+            worker = UnavailableWorker()
+            engine.media_worker = worker
+            engine._reconcile_bluray_running(job, recovery=True)
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "bluray_running")
+            self.assertEqual(updated["last_error_code"], "bluray_worker_status_unavailable")
+            self.assertEqual(worker.posts, 0)
+            self.assertTrue((source / "disc.iso").exists())
+            database.close()
+
+    def test_bluray_unavailable_deadline_uses_immutable_start_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-bluray-deadline"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            (source / "disc.iso").write_bytes(b"bluray")
+            job = database.create_job(
+                "fs:movies:bluray-deadline",
+                "fs",
+                "movies",
+                "Blu-ray Deadline",
+                state="bluray_running",
+                source_path=str(source),
+                stage_path=str(stage),
+            )
+
+            class UnavailableWorker:
+                def job_status(self, *_args):
+                    raise MediaWorkerTransportError(
+                        "sin conexión",
+                        endpoint="/jobs/status",
+                        status_code=None,
+                        error_code="media_worker_transport_error",
+                        retryable=True,
+                    )
+
+            engine.media_worker = UnavailableWorker()
+            immutable_start = 1000.0
+            engine._worker_started_at[job["job_id"]] = immutable_start
+            with patch(
+                "arr_orchestrator.engine.time.time",
+                return_value=immutable_start + WORKER_ACTIVE_MAX_SECONDS - 1,
+            ):
+                engine._reconcile_bluray_running(job, recovery=True)
+            self.assertEqual(database.get_job(job["job_id"])["state"], "bluray_running")
+
+            with patch(
+                "arr_orchestrator.engine.time.time",
+                return_value=immutable_start + WORKER_ACTIVE_MAX_SECONDS + 1,
+            ):
+                engine._reconcile_bluray_running(
+                    database.get_job(job["job_id"]),
+                    recovery=True,
+                )
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "manual_review")
+            self.assertEqual(updated["last_error_code"], "bluray_worker_active_timeout")
+            self.assertTrue((source / "disc.iso").exists())
+            database.close()
+
+    def test_bluray_recovery_uses_terminal_result_without_second_post(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-bluray-terminal"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            normalized = source / "Movie.mkv"
+            normalized.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:bluray-terminal",
+                "fs",
+                "movies",
+                "Blu-ray Terminal",
+                state="bluray_running",
+                source_path=str(source),
+                stage_path=str(stage),
+                last_error_code="engine_exception",
+            )
+            reports = config.media_reports_root / job["job_id"]
+            reports.mkdir(parents=True)
+            (reports / "bluray_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "normalized",
+                        "job_id": job["job_id"],
+                        "kind": "bluray",
+                        "result_file": str(normalized),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class WorkerMustNotRun:
+                def normalize_bluray(self, *_args):
+                    raise AssertionError("No debe repetirse la normalización")
+
+                def job_status(self, *_args):
+                    raise AssertionError("El resultado local es prioritario")
+
+            engine.media_worker = WorkerMustNotRun()
+            engine._recover_interrupted_jobs()
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "ready_filebot")
+            self.assertIsNone(updated["last_error_code"])
+            self.assertTrue(normalized.exists())
+            database.close()
+
+    def test_bluray_terminal_failure_moves_only_after_worker_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-bluray-failed"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            (source / "BDMV.txt").write_bytes(b"bluray")
+            job = database.create_job(
+                "fs:movies:bluray-failed",
+                "fs",
+                "movies",
+                "Blu-ray Failed",
+                state="bluray_running",
+                source_path=str(source),
+                stage_path=str(stage),
+            )
+            reports = config.media_reports_root / job["job_id"]
+            reports.mkdir(parents=True)
+            (reports / "bluray_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "verification_failed",
+                        "job_id": job["job_id"],
+                        "kind": "bluray",
+                        "reason": "fallo controlado",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class WorkerMustNotRun:
+                def job_status(self, *_args):
+                    raise AssertionError("El resultado local es prioritario")
+
+            engine.media_worker = WorkerMustNotRun()
+            engine._recover_interrupted_jobs()
+
+            updated = database.get_job(job["job_id"])
+            review = Path(updated["stage_path"])
+            self.assertEqual(updated["state"], "error_terminal")
+            self.assertFalse(stage.exists())
+            self.assertTrue((review / "BDMV.txt").exists())
+            self.assertTrue((review / "Error de proceso.txt").exists())
+            database.close()
+
+    def test_recovery_uses_durable_movie_result_and_never_posts_again(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-durable"
+            stage.mkdir(parents=True)
+            final_video = config.movies_final / "Durable (2026)" / "Durable (2026).mkv"
+            final_video.parent.mkdir(parents=True)
+            final_video.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:worker-durable",
+                "fs",
+                "movies",
+                "Durable (2026)",
+                state="media_postprocess_running",
+                source_path=str(stage / "original"),
+                stage_path=str(stage),
+                last_error_code="engine_exception",
+                last_error_message="old error",
+            )
+            reports = config.media_reports_root / job["job_id"]
+            reports.mkdir(parents=True)
+            (reports / "media_result.json").write_text(
+                json.dumps(
+                    {
+                        "status": "done",
+                        "job_id": job["job_id"],
+                        "final": {"final_video": str(final_video)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class WorkerMustNotRun:
+                def process_movie(self, *_args):
+                    raise AssertionError("Media Worker no debe repetirse")
+
+                def job_status(self, *_args):
+                    raise AssertionError("El resultado local es prioritario")
+
+            engine.media_worker = WorkerMustNotRun()
+            engine._recover_interrupted_jobs()
+            first_event_count = len(database.job_detail(job["job_id"])["timeline"])
+            engine._recover_interrupted_jobs()
+
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "ready_cleanup")
+            self.assertIsNone(updated["last_error_code"])
+            self.assertIsNone(updated["last_error_message"])
+            self.assertEqual(len(database.job_detail(job["job_id"])["timeline"]), first_event_count)
+            database.close()
+
+    def test_invalid_done_from_file_or_status_never_cleans_workshop(self) -> None:
+        for source_kind in ("file", "status"):
+            with self.subTest(source_kind=source_kind), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = test_config(root)
+                config.ensure_directories()
+                database = Database(root / "test.db")
+                database.initialize()
+                engine = Engine(config, database)
+                stage = config.workshop_root / f"job-invalid-{source_kind}"
+                source = stage / "original"
+                source.mkdir(parents=True)
+                (source / "only-copy.mkv").write_bytes(b"only material")
+                job = database.create_job(
+                    f"fs:movies:worker-invalid:{source_kind}",
+                    "fs",
+                    "movies",
+                    "Invalid terminal",
+                    state="media_postprocess_running",
+                    source_path=str(source),
+                    stage_path=str(stage),
+                )
+                invalid = {
+                    "status": "done",
+                    "job_id": job["job_id"],
+                    "kind": "movie",
+                    "final": {
+                        "final_video": str(config.movies_final / "Missing" / "Missing.mkv")
+                    },
+                }
+                if source_kind == "file":
+                    reports = config.media_reports_root / job["job_id"]
+                    reports.mkdir(parents=True)
+                    (reports / "media_result.json").write_text(
+                        json.dumps(invalid),
+                        encoding="utf-8",
+                    )
+
+                class InvalidWorker:
+                    def __init__(self):
+                        self.status_calls = 0
+
+                    def job_status(self, *_args):
+                        self.status_calls += 1
+                        return {
+                            "status": "terminal",
+                            "job_id": job["job_id"],
+                            "result": invalid,
+                        }
+
+                worker = InvalidWorker()
+                engine.media_worker = worker
+                engine._recover_interrupted_jobs()
+
+                updated = database.get_job(job["job_id"])
+                self.assertEqual(updated["state"], "manual_review")
+                self.assertEqual(updated["last_error_code"], "media_worker_invalid_terminal")
+                self.assertTrue(stage.exists())
+                self.assertTrue((source / "only-copy.mkv").exists())
+                self.assertEqual(worker.status_calls, 0 if source_kind == "file" else 1)
+                database.close()
+
+    def test_worker_terminal_paths_must_stay_inside_owned_roots(self) -> None:
+        for status in ("done", "review"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = test_config(root)
+                config.ensure_directories()
+                database = Database(root / "test.db")
+                database.initialize()
+                engine = Engine(config, database)
+                stage = config.workshop_root / f"job-outside-{status}"
+                source = stage / "original"
+                source.mkdir(parents=True)
+                (source / "material.mkv").write_bytes(b"media")
+                job = database.create_job(
+                    f"fs:movies:worker-outside:{status}",
+                    "fs",
+                    "movies",
+                    "Outside terminal",
+                    state="media_postprocess_running",
+                    source_path=str(source),
+                    stage_path=str(stage),
+                )
+                outside = root / "outside"
+                outside.mkdir()
+                if status == "done":
+                    delivered = outside / "movie.mkv"
+                    delivered.write_bytes(b"movie")
+                    result = {
+                        "status": "done",
+                        "job_id": job["job_id"],
+                        "kind": "movie",
+                        "final": {"final_video": str(delivered)},
+                    }
+                else:
+                    result = {
+                        "status": "review",
+                        "job_id": job["job_id"],
+                        "kind": "movie",
+                        "review_path": str(outside),
+                        "reason_file": "Error de proceso.txt",
+                    }
+
+                engine._apply_worker_result(job, "media", result, recovery=True)
+
+                updated = database.get_job(job["job_id"])
+                self.assertEqual(updated["state"], "manual_review")
+                self.assertEqual(updated["last_error_code"], "media_worker_invalid_terminal")
+                self.assertTrue((source / "material.mkv").exists())
+                database.close()
+
+    def test_recovery_without_worker_evidence_is_terminal_and_idempotent(self) -> None:
+        for material_exists in (True, False):
+            with self.subTest(material_exists=material_exists), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = test_config(root)
+                config.ensure_directories()
+                database = Database(root / "test.db")
+                database.initialize()
+                engine = Engine(config, database)
+                stage = config.workshop_root / "job-inconclusive"
+                source = stage / "original"
+                if material_exists:
+                    source.mkdir(parents=True)
+                    (source / "movie.mkv").write_bytes(b"media")
+                job = database.create_job(
+                    f"fs:movies:worker-missing:{material_exists}",
+                    "fs",
+                    "movies",
+                    "Worker Missing",
+                    state="media_postprocess_running",
+                    source_path=str(source),
+                    stage_path=str(stage),
+                )
+
+                class MissingWorker:
+                    def __init__(self):
+                        self.posts = 0
+                        self.status_calls = 0
+
+                    def process_movie(self, *_args):
+                        self.posts += 1
+                        raise AssertionError("No debe repetirse el POST")
+
+                    def job_status(self, *_args):
+                        self.status_calls += 1
+                        return {
+                            "status": "not_found",
+                            "error_code": "media_job_not_found",
+                        }
+
+                worker = MissingWorker()
+                engine.media_worker = worker
+                engine._recover_interrupted_jobs()
+                first_event_count = len(database.job_detail(job["job_id"])["timeline"])
+                engine._recover_interrupted_jobs()
+
+                updated = database.get_job(job["job_id"])
+                expected = "media_recovery_inconclusive" if material_exists else "media_recovery_source_missing"
+                self.assertEqual(updated["state"], "manual_review")
+                self.assertEqual(updated["last_error_code"], expected)
+                self.assertEqual(worker.posts, 0)
+                self.assertEqual(worker.status_calls, 1)
+                self.assertEqual(len(database.job_detail(job["job_id"])["timeline"]), first_event_count)
+                if material_exists:
+                    self.assertTrue(source.exists())
+                database.close()
+
+    def test_recovery_reconciles_trailer_and_review_terminal_results(self) -> None:
+        cases = ("trailer_done", "movie_review")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = test_config(root)
+                config.ensure_directories()
+                database = Database(root / "test.db")
+                database.initialize()
+                engine = Engine(config, database)
+                stage = config.workshop_root / case
+                source = stage / "original"
+                source.mkdir(parents=True)
+                phase = "trailer" if case == "trailer_done" else "media"
+                state = "trailer_running" if phase == "trailer" else "media_postprocess_running"
+                job = database.create_job(
+                    f"fs:{case}:terminal",
+                    "fs",
+                    "trailers_automatizacion" if phase == "trailer" else "movies",
+                    case,
+                    state=state,
+                    source_path=str(source),
+                    stage_path=str(stage),
+                )
+                reports = config.media_reports_root / job["job_id"]
+                reports.mkdir(parents=True)
+                if phase == "trailer":
+                    destination = config.movies_final / "Movie" / "trailer.mp4"
+                    destination.parent.mkdir(parents=True)
+                    destination.write_bytes(b"trailer")
+                    result = {
+                        "status": "done",
+                        "job_id": job["job_id"],
+                        "destination": str(destination),
+                    }
+                    filename = "trailer_result.json"
+                else:
+                    review = config.review_dir / "Movie Duplicate"
+                    review.mkdir(parents=True)
+                    result = {
+                        "status": "review",
+                        "job_id": job["job_id"],
+                        "review_path": str(review),
+                        "reason_file": str(review / "Pelicula repetida.txt"),
+                    }
+                    filename = "media_result.json"
+                (reports / filename).write_text(json.dumps(result), encoding="utf-8")
+
+                class WorkerMustNotRun:
+                    def job_status(self, *_args):
+                        raise AssertionError("No debe consultar con resultado durable")
+
+                engine.media_worker = WorkerMustNotRun()
+                engine._recover_interrupted_jobs()
+
+                updated = database.get_job(job["job_id"])
+                self.assertEqual(
+                    updated["state"],
+                    "ready_cleanup" if phase == "trailer" else "duplicate",
+                )
+                database.close()
+
+    def test_foreign_result_cannot_close_job_and_late_result_can_reconcile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            stage = config.workshop_root / "job-foreign"
+            source = stage / "original"
+            source.mkdir(parents=True)
+            job = database.create_job(
+                "fs:movies:worker-foreign",
+                "fs",
+                "movies",
+                "Foreign",
+                state="media_postprocess_running",
+                source_path=str(source),
+                stage_path=str(stage),
+            )
+            reports = config.media_reports_root / job["job_id"]
+            reports.mkdir(parents=True)
+            final_video = config.movies_final / "Foreign" / "Foreign.mkv"
+            final_video.parent.mkdir(parents=True)
+            final_video.write_bytes(b"movie")
+            result_path = reports / "media_result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "status": "done",
+                        "job_id": "different-job",
+                        "final": {"final_video": str(final_video)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class MissingWorker:
+                def job_status(self, *_args):
+                    return {"status": "not_found"}
+
+            engine.media_worker = MissingWorker()
+            engine._recover_interrupted_jobs()
+            self.assertEqual(database.get_job(job["job_id"])["state"], "manual_review")
+
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "status": "done",
+                        "job_id": job["job_id"],
+                        "final": {"final_video": str(final_video)},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine._reconcile_late_worker_results()
+            updated = database.get_job(job["job_id"])
+            self.assertEqual(updated["state"], "ready_cleanup")
+            self.assertIsNone(updated["last_error_code"])
             database.close()
 
     def test_run_filebot_tv_keeps_tv_output_but_not_original_input(self) -> None:

@@ -296,6 +296,7 @@ services:
       ARR_ROOT_UNC: "${ARR_ROOT_UNC:-}"
     volumes:
       - ${ARR_ROOT}/config/arr-orchestrator:/config
+      - ${ARR_ROOT}/config/media-worker:/config/media-worker:ro
       - ${ARR_DATA_ROOT}:/data
       - ${ARR_ROOT}/diagnosticos_codex:/diagnosticos_codex
       - ${ARR_ROOT}/diagnostics:/diagnostics
@@ -323,7 +324,11 @@ services:
       MEDIA_AUTO_TEMP: "/config/media-worker/temp"
       MEDIA_RESCATE_REPORTES: "/config/media-worker/runtime"
       MEDIA_RESCATE_TEMP: "/config/media-worker/temp/rescue"
-      MEDIA_WORKER_ALLOWED_ROOTS: "/data"
+      MEDIA_WORKER_REPORT_ROOT: "/config/media-worker"
+      MEDIA_WORKER_MOVIES_ROOT: "/data/media/movies"
+      MEDIA_WORKER_REVIEW_ROOT: "/data/media/repetidas_vs_error"
+      MEDIA_WORKER_CALLBACK_ORIGIN: "http://arr-orchestrator:8787"
+      MEDIA_WORKER_ALLOWED_ROOTS: "/data/downloads/torrents/complete/taller"
     volumes:
       - ${ARR_ROOT}/config:/config
       - ${ARR_DATA_ROOT}:/data

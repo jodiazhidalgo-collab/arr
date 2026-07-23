@@ -150,12 +150,14 @@ class NormalizingWorker:
             "timeout_sec": 14400,
         }
 
-    def normalize_bluray(self, _job_id, source_path, _reports_root):
+    def normalize_bluray(self, job_id, source_path, _reports_root):
         source = Path(source_path)
         self.calls.append(source)
         if self.status != "normalized":
             return {
                 "status": self.status,
+                "job_id": job_id,
+                "kind": "bluray",
                 "reason": "controlled bluray result",
                 "source_removed": False,
             }
@@ -165,6 +167,8 @@ class NormalizingWorker:
         result.write_bytes(b"normalized movie")
         return {
             "status": "normalized",
+            "job_id": job_id,
+            "kind": "bluray",
             "normalized": True,
             "source_removed": True,
             "result_file": str(result),

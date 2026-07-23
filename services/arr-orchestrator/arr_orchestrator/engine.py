@@ -35,7 +35,12 @@ from .filesystem import (
     trailer_ready_source,
     write_reason,
 )
-from .media_worker import MediaWorkerClient
+from .media_worker import (
+    MediaWorkerClient,
+    MediaWorkerError,
+    MediaWorkerJobActive,
+    MediaWorkerTransportError,
+)
 from .name_resolver import (
     NameResolver,
     ResolutionError,
@@ -58,6 +63,7 @@ PROCESSABLE_STATES = {
     "ready_filebot",
     "identity_retry",
     "filebot_running",
+    "bluray_running",
     "media_postprocess_ready",
     "media_postprocess_running",
     "trailer_ready",
@@ -84,6 +90,9 @@ def _sanitize_extraction_details(job_root: Path, details: Dict[str, object]) -> 
 COMPLETE_CATEGORIES = ("movies", "tv", "manual", "movies_automatizacion", "trailers_automatizacion")
 WATCHER_RULES_SETTING_KEY = "watcher.movies.ignored_suffixes"
 DEFAULT_IGNORED_MOVIES_SUFFIXES = (".delay-audio-part",)
+WORKER_STATUS_POLL_SECONDS = 5.0
+WORKER_ACTIVE_MAX_SECONDS = 4 * 60 * 60 + 5 * 60
+MAX_WORKER_RESULT_BYTES = 16 * 1024 * 1024
 
 
 class Engine:
@@ -118,6 +127,9 @@ class Engine:
         self.observer = Observer()
         self._stable: Dict[str, Tuple[str, float]] = {}
         self._stable_log_at: Dict[str, float] = {}
+        self._worker_status_log_at: Dict[str, float] = {}
+        self._worker_status_checked_at: Dict[str, float] = {}
+        self._worker_started_at: Dict[str, float] = {}
         self._last_reconcile = 0.0
         self._last_heartbeat = 0.0
         self.running = True
@@ -442,6 +454,7 @@ class Engine:
         self._reconcile_qbt()
         self._reconcile_rdt()
         self._reconcile_complete()
+        self._reconcile_late_worker_results()
 
     def _reconcile_watch_inbox(self) -> None:
         for path in self.config.watch_inbox.rglob("*.torrent"):
@@ -931,6 +944,15 @@ class Engine:
 
     def _process_job(self, job: Dict[str, object]) -> None:
         source_path = Path(str(job.get("source_path") or ""))
+        if job["state"] == "media_postprocess_running":
+            self._reconcile_running_worker(job, "media")
+            return
+        if job["state"] == "trailer_running":
+            self._reconcile_running_worker(job, "trailer")
+            return
+        if job["state"] == "bluray_running":
+            self._reconcile_bluray_running(job)
+            return
         if job["state"] == "identity_retry":
             retry_at = float(job.get("identity_retry_at") or 0)
             if time.time() < retry_at:
@@ -1585,47 +1607,133 @@ class Engine:
                 "command_preview": preview,
             },
         )
+        started = self.db.transition(
+            job_id,
+            "bluray_running",
+            "bluray",
+            "Normalización Blu-ray iniciada",
+        )
+        self._worker_started_at[job_id] = float(started.get("updated_at") or time.time())
+        current = self.db.get_job(job_id) or job
         try:
             result = self.media_worker.normalize_bluray(
                 job_id,
                 input_root,
                 self.config.media_reports_root,
             )
+        except (MediaWorkerJobActive, MediaWorkerTransportError) as error:
+            return self._reconcile_bluray_running(current, call_error=error)
+        except MediaWorkerError as error:
+            if isinstance(error.result, dict):
+                result = dict(error.result)
+            else:
+                self._finish_worker_failure(
+                    current,
+                    "bluray",
+                    error,
+                    error_code="bluray_worker_transport_unknown",
+                )
+                return None
         except Exception as error:
-            result = {
-                "status": "unexpected_error",
-                "reason": str(error),
-                "normalized": False,
-                "source_removed": False,
-            }
-        status = str(result.get("status") or "unexpected_error")
+            self._finish_worker_failure(
+                current,
+                "bluray",
+                error,
+                error_code="bluray_worker_exception",
+            )
+            return None
+        return self._apply_bluray_result(current, result, recovery=False)
+
+    def _apply_bluray_result(
+        self,
+        job: Dict[str, object],
+        result: Dict[str, object],
+        *,
+        recovery: bool,
+    ) -> Optional[Path]:
+        job_id = str(job["job_id"])
+        self._worker_status_checked_at.pop(job_id, None)
+        self._worker_started_at.pop(job_id, None)
+        kind = str(result.get("kind") or "")
+        status = str(result.get("status") or "")
+        if (
+            str(result.get("job_id") or "") != job_id
+            or (kind and kind != "bluray")
+            or not status
+            or status in {"active", "terminal"}
+        ):
+            self._finish_worker_failure(
+                job,
+                "bluray",
+                ValueError("El resultado terminal Blu-ray no es válido para el trabajo"),
+                error_code="bluray_worker_invalid_terminal",
+                recovery=recovery,
+            )
+            return None
+
+        current = self.db.get_job(job_id) or job
+        job_root = Path(str(current.get("stage_path") or ""))
+        input_root = Path(str(current.get("source_path") or ""))
         if status != "normalized":
-            self._send_bluray_review(job, job_root, result)
+            if not job_root.exists() or not self._inside_workshop(job_root):
+                self._finish_worker_failure(
+                    current,
+                    "bluray",
+                    RuntimeError(str(result.get("reason") or status)),
+                    error_code=f"bluray_{status}",
+                    recovery=recovery,
+                )
+                return None
+            normalized_failure = dict(result)
+            if status == "error":
+                normalized_failure["status"] = "unexpected_error"
+                normalized_failure.setdefault("reason", result.get("error"))
+            self._send_bluray_review(current, job_root, normalized_failure)
             return None
 
         normalized_file = Path(str(result.get("result_file") or ""))
         valid = (
-            normalized_file.exists()
+            job_root.exists()
+            and self._inside_workshop(job_root)
             and normalized_file.is_file()
             and normalized_file.suffix.lower() == ".mkv"
+            and self._path_is_inside(normalized_file, job_root)
             and not full_bluray_folders(input_root)
         )
         if not valid:
-            self._send_bluray_review(
-                job,
-                job_root,
-                {
-                    **result,
-                    "status": "verification_failed",
-                    "reason": "El resultado Blu-ray no deja un unico MKV utilizable",
-                },
+            self._finish_worker_failure(
+                current,
+                "bluray",
+                ValueError("El resultado Blu-ray no deja un único MKV válido en el taller"),
+                error_code="bluray_worker_invalid_terminal",
+                recovery=recovery,
             )
             return None
+
+        if recovery:
+            self.db.add_event(
+                job_id,
+                "recovery",
+                "decision",
+                "Resultado Blu-ray durable reconciliado sin repetir la normalización",
+                {"status": status},
+            )
+            self.db.transition(
+                job_id,
+                "ready_filebot",
+                "bluray",
+                "Normalización Blu-ray recuperada; FileBot puede continuar",
+                source_path=str(normalized_file),
+                last_error_code=None,
+                last_error_message=None,
+                result_json=json.dumps(result, ensure_ascii=False, default=str),
+            )
+            return normalized_file
 
         recalculated = prepare_filebot_input(
             normalized_file,
             job_root,
-            str(job.get("name") or normalized_file.stem),
+            str(current.get("name") or normalized_file.stem),
         )
         recalculated_media = media_files(recalculated)
         if (
@@ -1636,14 +1744,11 @@ class Engine:
                 for part in recalculated_media[0].parts
             )
         ):
-            self._send_bluray_review(
-                job,
-                job_root,
-                {
-                    **result,
-                    "status": "verification_failed",
-                    "reason": "El input recalculado para FileBot no es un MKV aislado",
-                },
+            self._finish_worker_failure(
+                current,
+                "bluray",
+                ValueError("El input recalculado para FileBot no es un MKV aislado"),
+                error_code="bluray_worker_invalid_terminal",
             )
             return None
         self.db.add_event(
@@ -1658,6 +1763,117 @@ class Engine:
             },
         )
         return recalculated
+
+    def _bluray_started_timestamp(self, job: Dict[str, object]) -> float:
+        job_id = str(job["job_id"])
+        cached = self._worker_started_at.get(job_id)
+        if cached:
+            return cached
+        detail = self.db.job_detail(job_id) or {}
+        timeline = list(detail.get("timeline") or [])
+        for event in reversed(timeline):
+            if not isinstance(event, dict) or event.get("phase") != "bluray":
+                continue
+            structured = event.get("structured")
+            state = structured.get("state") if isinstance(structured, dict) else None
+            if state == "bluray_running" or event.get("message") == "Normalización Blu-ray iniciada":
+                try:
+                    started_at = float(event.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    started_at = 0.0
+                if started_at:
+                    self._worker_started_at[job_id] = started_at
+                    return started_at
+        fallback = float(job.get("updated_at") or time.time())
+        self._worker_started_at[job_id] = fallback
+        return fallback
+
+    def _reconcile_bluray_running(
+        self,
+        job: Dict[str, object],
+        *,
+        call_error: Optional[object] = None,
+        recovery: bool = False,
+    ) -> Optional[Path]:
+        job_id = str(job["job_id"])
+        now = time.time()
+        if not call_error and not recovery:
+            last_checked = self._worker_status_checked_at.get(job_id, 0.0)
+            if now - last_checked < WORKER_STATUS_POLL_SECONDS:
+                return None
+        self._worker_status_checked_at[job_id] = now
+        try:
+            result = self._load_worker_result(job, "bluray")
+        except (OSError, TypeError, ValueError) as error:
+            self._finish_worker_failure(
+                job,
+                "bluray",
+                error,
+                error_code="bluray_worker_invalid_terminal",
+                recovery=recovery,
+            )
+            return None
+        if result is not None:
+            return self._apply_bluray_result(job, result, recovery=True)
+        try:
+            worker_status = self.media_worker.job_status(job_id, "bluray")
+        except Exception as status_error:
+            active_age = max(0.0, now - self._bluray_started_timestamp(job))
+            if active_age > WORKER_ACTIVE_MAX_SECONDS:
+                self._finish_worker_failure(
+                    job,
+                    "bluray",
+                    call_error or status_error,
+                    error_code="bluray_worker_active_timeout",
+                    recovery=recovery,
+                )
+            else:
+                self._record_worker_wait(
+                    job,
+                    "bluray",
+                    "status_unavailable",
+                    call_error or status_error,
+                )
+            return None
+        status = str(worker_status.get("status") or "")
+        if status == "terminal" and isinstance(worker_status.get("result"), dict):
+            return self._apply_bluray_result(
+                job,
+                dict(worker_status["result"]),
+                recovery=True,
+            )
+        if status == "active":
+            try:
+                started_at = float(worker_status.get("started_at") or 0.0)
+            except (TypeError, ValueError):
+                started_at = 0.0
+            active_age = max(0.0, now - started_at) if started_at else 0.0
+            if started_at and active_age > WORKER_ACTIVE_MAX_SECONDS:
+                self._finish_worker_failure(
+                    job,
+                    "bluray",
+                    RuntimeError("La normalización Blu-ray superó el plazo máximo"),
+                    error_code="bluray_worker_active_timeout",
+                    recovery=recovery,
+                )
+            else:
+                self._record_worker_wait(
+                    job,
+                    "bluray",
+                    "active",
+                    call_error or RuntimeError("La normalización Blu-ray sigue activa"),
+                )
+            return None
+        self._finish_worker_failure(
+            job,
+            "bluray",
+            call_error or RuntimeError("No hay actividad ni resultado Blu-ray terminal"),
+            error_code=(
+                "bluray_recovery_inconclusive" if recovery else "bluray_worker_not_found"
+            ),
+            recovery=recovery,
+        )
+        return None
 
     def _send_bluray_review(
         self,
@@ -2063,14 +2279,21 @@ class Engine:
             "Llamada a Media Worker preparada",
             {"command_preview": command_preview},
         )
-        result = self.media_worker.process_movie(
-            str(job["job_id"]),
-            source,
-            self.config.movies_final,
-            self.config.review_dir,
-            self.config.media_reports_root,
-        )
-        self._finish_worker_result(job, result, "media")
+        try:
+            result = self.media_worker.process_movie(
+                str(job["job_id"]),
+                source,
+                self.config.movies_final,
+                self.config.review_dir,
+                self.config.media_reports_root,
+            )
+            self._apply_worker_result(job, "media", result, recovery=False)
+        except MediaWorkerJobActive as error:
+            self._record_worker_wait(job, "media", "active", error)
+        except MediaWorkerTransportError as error:
+            self._reconcile_running_worker(job, "media", call_error=error)
+        except Exception as error:
+            self._finish_worker_failure(job, "media", error)
 
     def _run_trailer(self, job: Dict[str, object]) -> None:
         source = Path(str(job["source_path"]))
@@ -2092,14 +2315,424 @@ class Engine:
             "Llamada a Media Worker preparada para trailer",
             {"command_preview": command_preview},
         )
-        result = self.media_worker.process_trailer(
-            str(job["job_id"]),
-            source,
-            self.config.movies_final,
-            self.config.review_dir,
-            self.config.media_reports_root,
+        try:
+            result = self.media_worker.process_trailer(
+                str(job["job_id"]),
+                source,
+                self.config.movies_final,
+                self.config.review_dir,
+                self.config.media_reports_root,
+            )
+            self._apply_worker_result(job, "trailer", result, recovery=False)
+        except MediaWorkerJobActive as error:
+            self._record_worker_wait(job, "trailer", "active", error)
+        except MediaWorkerTransportError as error:
+            self._reconcile_running_worker(job, "trailer", call_error=error)
+        except Exception as error:
+            self._finish_worker_failure(job, "trailer", error)
+
+    @staticmethod
+    def _worker_kind(phase: str) -> str:
+        if phase == "trailer":
+            return "trailer"
+        if phase == "bluray":
+            return "bluray"
+        return "movie"
+
+    def _worker_result_path(self, job_id: str, phase: str) -> Path:
+        if phase == "trailer":
+            filename = "trailer_result.json"
+        elif phase == "bluray":
+            filename = "bluray_result.json"
+        else:
+            filename = "media_result.json"
+        return self.config.media_reports_root / job_id / filename
+
+    def _safe_worker_error(self, error: object) -> str:
+        message = str(error or "Error desconocido de Media Worker")
+        replacements = (
+            (str(self.config.data_root), "<DATA>"),
+            (str(self.config.config_dir), "<CONFIG>"),
+            (str(self.config.diagnostics_root), "<DIAGNOSTICS>"),
+            (str(self.config.codex_diag_root), "<CODEX_DIAGS>"),
         )
-        self._finish_worker_result(job, result, "trailer")
+        for raw, alias in replacements:
+            if raw:
+                message = message.replace(raw, alias)
+                message = message.replace(raw.replace("\\", "/"), alias)
+        message = re.sub(
+            r"(?i)\bauthorization\s*[:=]\s*(?:bearer\s+)?[^\s,;]+",
+            "Authorization: <REDACTED>",
+            message,
+        )
+        message = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer <REDACTED>", message)
+        message = re.sub(
+            r"(?i)(token|password|passwd|secret|auth)\s*[:=]\s*([^\s&,;]+)",
+            r"\1=<REDACTED>",
+            message,
+        )
+        message = re.sub(
+            r"(?i)\bdownload_url\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+            "download_url=<REDACTED>",
+            message,
+        )
+        message = re.sub(r"(?i)magnet:\?[^\s]+", "<MAGNET_REDACTED>", message)
+        message = re.sub(r"(?i)https?://[^\s]+", "<URL_REDACTED>", message)
+        message = re.sub(r"(?i)(?:[A-Z]:[\\/]|\\\\)[^\s,;]+", "<PATH_REDACTED>", message)
+        message = re.sub(r"(?<![>\w])/(?:[^/\s]+/)*[^\s,;]*", "<PATH_REDACTED>", message)
+        return message[-1200:]
+
+    def _load_worker_result(
+        self,
+        job: Dict[str, object],
+        phase: str,
+    ) -> Optional[Dict[str, object]]:
+        job_id = str(job["job_id"])
+        result_path = self._worker_result_path(job_id, phase)
+        if not result_path.exists() and phase == "trailer":
+            reports_dir = result_path.parent
+            if reports_dir.exists():
+                for candidate in sorted(reports_dir.glob("*.json")):
+                    if candidate.name == result_path.name:
+                        continue
+                    try:
+                        if candidate.stat().st_size > MAX_WORKER_RESULT_BYTES:
+                            continue
+                        legacy = json.loads(candidate.read_text(encoding="utf-8"))
+                    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    destination = str(legacy.get("moved_to") or "") if isinstance(legacy, dict) else ""
+                    if destination and Path(destination).exists():
+                        return {
+                            "status": "done",
+                            "job_id": job_id,
+                            "destination": destination,
+                            "reports_dir": str(reports_dir),
+                            "legacy_report": candidate.name,
+                        }
+            return None
+        if not result_path.exists():
+            return None
+        try:
+            if result_path.stat().st_size > MAX_WORKER_RESULT_BYTES:
+                raise ValueError("El resultado durable supera el límite permitido")
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("El resultado durable no se puede leer") from error
+        if not isinstance(result, dict):
+            raise ValueError("El resultado durable no es un objeto JSON")
+        return result
+
+    @staticmethod
+    def _path_is_inside(path: Path, root: Path) -> bool:
+        try:
+            path.resolve(strict=True).relative_to(root.resolve(strict=True))
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def _validate_worker_result(
+        self,
+        job: Dict[str, object],
+        phase: str,
+        result: Dict[str, object],
+    ) -> None:
+        job_id = str(job["job_id"])
+        if str(result.get("job_id") or "") != job_id:
+            raise ValueError("El resultado terminal no pertenece al trabajo")
+        expected_kind = self._worker_kind(phase)
+        result_kind = str(result.get("kind") or "")
+        if result_kind and result_kind != expected_kind:
+            raise ValueError("El resultado terminal pertenece a otro tipo de trabajo")
+        status = str(result.get("status") or "")
+        if status == "done":
+            if phase == "trailer":
+                delivered = str(result.get("destination") or "")
+            else:
+                final = result.get("final")
+                delivered = str(final.get("final_video") or "") if isinstance(final, dict) else ""
+            delivered_path = Path(delivered) if delivered else Path()
+            if (
+                not delivered
+                or not delivered_path.is_file()
+                or not self._path_is_inside(delivered_path, self.config.movies_final)
+            ):
+                raise ValueError(
+                    "El resultado indica terminado, pero la entrega válida no existe"
+                )
+        elif status == "review":
+            review_path = str(result.get("review_path") or "")
+            review = Path(review_path) if review_path else Path()
+            if (
+                not review_path
+                or not review.is_dir()
+                or not self._path_is_inside(review, self.config.review_dir)
+            ):
+                raise ValueError(
+                    "El resultado de revisión no conserva un destino válido"
+                )
+        elif status != "error":
+            raise ValueError("El resultado terminal tiene un estado inesperado")
+
+    def _record_worker_wait(
+        self,
+        job: Dict[str, object],
+        phase: str,
+        reason: str,
+        error: object,
+    ) -> None:
+        job_id = str(job["job_id"])
+        key = f"{job_id}:{reason}"
+        now = time.time()
+        if now - self._worker_status_log_at.get(key, 0.0) < 30:
+            return
+        self._worker_status_log_at[key] = now
+        message = self._safe_worker_error(error)
+        self.db.update_job(
+            job_id,
+            last_error_code=f"{phase}_worker_{reason}",
+            last_error_message=message,
+        )
+        self.db.add_event(
+            job_id,
+            phase,
+            "warning",
+            f"Media Worker pendiente: {reason}",
+            {
+                "reason": reason,
+                "error": message,
+                "source_exists": Path(str(job.get("source_path") or "")).exists(),
+                "stage_exists": Path(str(job.get("stage_path") or "")).exists(),
+            },
+        )
+
+    def _finish_worker_failure(
+        self,
+        job: Dict[str, object],
+        phase: str,
+        error: object,
+        *,
+        error_code: Optional[str] = None,
+        recovery: bool = False,
+    ) -> None:
+        job_id = str(job["job_id"])
+        current = self.db.get_job(job_id) or job
+        if str(current.get("state") or "") in {"done", "duplicate", "error_terminal"}:
+            return
+        message = self._safe_worker_error(error)
+        typed_code = str(getattr(error, "error_code", "") or "")
+        code = error_code or typed_code or f"{phase}_worker_exception"
+        self._worker_status_checked_at.pop(job_id, None)
+        self._worker_started_at.pop(job_id, None)
+        structured = {
+            "error_code": code,
+            "error": message,
+            "exception_type": type(error).__name__,
+            "http_status": getattr(error, "status_code", None),
+            "source_exists": Path(str(current.get("source_path") or "")).exists(),
+            "stage_exists": Path(str(current.get("stage_path") or "")).exists(),
+            "terminal_report_exists": self._worker_result_path(job_id, phase).exists(),
+            "recovery": recovery,
+        }
+        self.db.add_event(
+            job_id,
+            phase,
+            "error",
+            f"Media Worker detenido de forma segura: {message}",
+            structured,
+        )
+        self.db.transition(
+            job_id,
+            "manual_review",
+            phase,
+            "Media Worker requiere revisión manual; el material se conserva",
+            last_error_code=code,
+            last_error_message=message,
+        )
+
+    def _apply_worker_result(
+        self,
+        job: Dict[str, object],
+        phase: str,
+        result: Dict[str, object],
+        *,
+        recovery: bool,
+    ) -> None:
+        self._worker_status_checked_at.pop(str(job["job_id"]), None)
+        try:
+            self._validate_worker_result(job, phase, result)
+        except (OSError, TypeError, ValueError) as error:
+            self._finish_worker_failure(
+                job,
+                phase,
+                error,
+                error_code=f"{phase}_worker_invalid_terminal",
+                recovery=recovery,
+            )
+            return
+        if str(result.get("status") or "") == "error":
+            error = MediaWorkerError(
+                str(result.get("error") or "Media Worker terminó con error"),
+                endpoint=f"/{self._worker_kind(phase)}",
+                status_code=None,
+                error_code=str(result.get("error_code") or f"{phase}_worker_exception"),
+                result=result,
+            )
+            self._finish_worker_failure(job, phase, error, recovery=recovery)
+            return
+        if recovery:
+            self.db.add_event(
+                str(job["job_id"]),
+                "recovery",
+                "decision",
+                "Resultado durable de Media Worker reconciliado sin repetir el proceso",
+                {"phase": phase, "status": result.get("status")},
+            )
+        self._finish_worker_result(job, result, phase)
+
+    def _reconcile_running_worker(
+        self,
+        job: Dict[str, object],
+        phase: str,
+        *,
+        call_error: Optional[object] = None,
+        recovery: bool = False,
+    ) -> None:
+        job_id = str(job["job_id"])
+        now = time.time()
+        if not call_error and not recovery:
+            last_checked = self._worker_status_checked_at.get(job_id, 0.0)
+            if now - last_checked < WORKER_STATUS_POLL_SECONDS:
+                return
+        self._worker_status_checked_at[job_id] = now
+        try:
+            result = self._load_worker_result(job, phase)
+        except (OSError, TypeError, ValueError) as error:
+            self._finish_worker_failure(
+                job,
+                phase,
+                error,
+                error_code=f"{phase}_worker_invalid_terminal",
+                recovery=recovery,
+            )
+            return
+        if result is not None:
+            self._apply_worker_result(job, phase, result, recovery=recovery)
+            return
+        try:
+            status = self.media_worker.job_status(
+                job_id,
+                self._worker_kind(phase),
+            )
+        except Exception as status_error:
+            source_exists = Path(str(job.get("source_path") or "")).exists()
+            stage_exists = Path(str(job.get("stage_path") or "")).exists()
+            if recovery:
+                unavailable_code = (
+                    f"{phase}_recovery_inconclusive"
+                    if source_exists or stage_exists
+                    else f"{phase}_recovery_source_missing"
+                )
+            else:
+                unavailable_code = f"{phase}_worker_transport_unknown"
+            self._finish_worker_failure(
+                job,
+                phase,
+                call_error or status_error,
+                error_code=unavailable_code,
+                recovery=recovery,
+            )
+            return
+        worker_status = str(status.get("status") or "")
+        if worker_status == "terminal" and isinstance(status.get("result"), dict):
+            terminal = dict(status["result"])
+            if str(terminal.get("job_id") or "") != job_id:
+                self._finish_worker_failure(
+                    job,
+                    phase,
+                    RuntimeError("Media Worker devolvió el resultado de otro trabajo"),
+                    error_code=f"{phase}_worker_foreign_result",
+                    recovery=recovery,
+                )
+                return
+            self._apply_worker_result(job, phase, terminal, recovery=recovery)
+            return
+        if worker_status == "active":
+            try:
+                started_at = float(status.get("started_at") or 0.0)
+            except (TypeError, ValueError):
+                started_at = 0.0
+            active_seconds = max(0.0, time.time() - started_at) if started_at else 0.0
+            if started_at and active_seconds > WORKER_ACTIVE_MAX_SECONDS:
+                self._finish_worker_failure(
+                    job,
+                    phase,
+                    RuntimeError("Media Worker superó el plazo máximo de ejecución"),
+                    error_code=f"{phase}_worker_active_timeout",
+                    recovery=recovery,
+                )
+                return
+            self._record_worker_wait(
+                job,
+                phase,
+                "active",
+                call_error or RuntimeError("El trabajo sigue activo en Media Worker"),
+            )
+            return
+        source_exists = Path(str(job.get("source_path") or "")).exists()
+        stage_exists = Path(str(job.get("stage_path") or "")).exists()
+        recovery_code = (
+            f"{phase}_recovery_inconclusive"
+            if source_exists or stage_exists
+            else f"{phase}_recovery_source_missing"
+        )
+        self._finish_worker_failure(
+            job,
+            phase,
+            call_error or RuntimeError("Media Worker no conserva actividad ni resultado terminal"),
+            error_code=recovery_code if recovery else f"{phase}_worker_not_found",
+            recovery=recovery,
+        )
+
+    def _reconcile_late_worker_results(self) -> None:
+        recoverable_codes = {
+            "media_worker_transport_unknown",
+            "trailer_worker_transport_unknown",
+            "media_worker_invalid_terminal",
+            "trailer_worker_invalid_terminal",
+            "media_worker_active_timeout",
+            "trailer_worker_active_timeout",
+            "media_recovery_inconclusive",
+            "trailer_recovery_inconclusive",
+            "media_recovery_source_missing",
+            "trailer_recovery_source_missing",
+            "bluray_worker_transport_unknown",
+            "bluray_worker_status_unavailable",
+            "bluray_worker_active_timeout",
+            "bluray_worker_not_found",
+            "bluray_worker_invalid_terminal",
+            "bluray_recovery_inconclusive",
+        }
+        for job in self.db.jobs_in_states(["manual_review"], 500):
+            error_code = str(job.get("last_error_code") or "")
+            if error_code not in recoverable_codes:
+                continue
+            if error_code.startswith("bluray"):
+                try:
+                    bluray_result = self._load_worker_result(job, "bluray")
+                except (OSError, TypeError, ValueError):
+                    continue
+                if bluray_result is not None:
+                    self._apply_bluray_result(job, bluray_result, recovery=True)
+                continue
+            phase = "trailer" if error_code.startswith("trailer") else "media"
+            try:
+                result = self._load_worker_result(job, phase)
+            except (OSError, TypeError, ValueError):
+                continue
+            if result is None or str(result.get("status") or "") == "error":
+                continue
+            self._apply_worker_result(job, phase, result, recovery=True)
 
     def _filebot_command_preview(
         self,
@@ -2200,19 +2833,26 @@ class Engine:
         }
 
     def _finish_worker_result(self, job: Dict[str, object], result: Dict[str, object], phase: str) -> None:
+        current = self.db.get_job(str(job["job_id"])) or job
         status = str(result.get("status") or "")
-        job_root = Path(str(job.get("stage_path") or ""))
+        job_root = Path(str(current.get("stage_path") or ""))
         if status == "done":
+            if str(current.get("state") or "") in {"ready_cleanup", "done"}:
+                return
             self.db.transition(
                 str(job["job_id"]),
                 "ready_cleanup",
                 phase,
                 f"{phase} terminado correctamente",
+                last_error_code=None,
+                last_error_message=None,
                 result_json=json.dumps(result, ensure_ascii=False),
             )
             return
         if status == "review":
-            self._cleanup_clients(job, strict=False)
+            if str(current.get("state") or "") in {"duplicate", "error_terminal"}:
+                return
+            self._cleanup_clients(current, strict=False)
             if job_root.exists() and self._inside_workshop(job_root):
                 shutil.rmtree(job_root, ignore_errors=True)
             reason_file = str(result.get("reason_file") or "")
@@ -2284,6 +2924,7 @@ class Engine:
                 "staging",
                 "extracting",
                 "filebot_running",
+                "bluray_running",
                 "media_postprocess_running",
                 "trailer_running",
                 "verifying_output",
@@ -2293,14 +2934,28 @@ class Engine:
         for job in interrupted:
             job_root = Path(str(job.get("stage_path") or ""))
             source = Path(str(job.get("source_path") or ""))
+            if job["state"] == "media_postprocess_running":
+                self._reconcile_running_worker(job, "media", recovery=True)
+                updated = self.db.get_job(str(job["job_id"]))
+                if updated and updated.get("state") in TERMINAL_STATES - {"discarded"}:
+                    self._create_terminal_diagnostic(updated)
+                continue
+            if job["state"] == "trailer_running":
+                self._reconcile_running_worker(job, "trailer", recovery=True)
+                updated = self.db.get_job(str(job["job_id"]))
+                if updated and updated.get("state") in TERMINAL_STATES - {"discarded"}:
+                    self._create_terminal_diagnostic(updated)
+                continue
+            if job["state"] == "bluray_running":
+                self._reconcile_bluray_running(job, recovery=True)
+                updated = self.db.get_job(str(job["job_id"]))
+                if updated and updated.get("state") in TERMINAL_STATES - {"discarded"}:
+                    self._create_terminal_diagnostic(updated)
+                continue
             if job["state"] == "staging":
                 target = "ready_extract" if job_root.exists() else "ready_stage"
             elif job["state"] == "extracting":
                 target = "ready_extract"
-            elif job["state"] == "media_postprocess_running":
-                target = "media_postprocess_ready"
-            elif job["state"] == "trailer_running":
-                target = "trailer_ready"
             else:
                 target = "ready_filebot"
             if target == "ready_stage" and not source.exists():
