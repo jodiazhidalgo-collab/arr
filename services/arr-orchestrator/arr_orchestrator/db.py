@@ -170,6 +170,25 @@ class Database:
             connection.close()
             self._local.connection = None
 
+    def get_setting(self, key: str) -> Optional[str]:
+        row = self.connect().execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        connection = self.connect()
+        connection.execute(
+            """
+            INSERT INTO settings(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        connection.commit()
+
     def create_job(
         self,
         source_uid: str,

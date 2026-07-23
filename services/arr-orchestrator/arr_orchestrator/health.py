@@ -13,12 +13,16 @@ def start_health_server(
     event_recorder: Optional[Callable[[str, str, str, str, Optional[Dict[str, object]]], None]] = None,
     follow_provider: Optional[Callable[[str], Dict[str, object]]] = None,
     diagnostic_creator: Optional[Callable[[str, bool], Dict[str, object]]] = None,
+    watcher_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
+    watcher_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
             if path == "/health":
                 self._json(200, status_provider())
+            elif path == "/settings/watcher" and watcher_rules_provider:
+                self._json(200, watcher_rules_provider())
             elif path == "/jobs":
                 self._json(200, jobs_provider())
             elif path.startswith("/jobs/") and path.endswith("/follow") and follow_provider:
@@ -37,6 +41,10 @@ def start_health_server(
 
         def do_POST(self) -> None:
             path = self.path.split("?", 1)[0]
+            if path == "/settings/watcher" and watcher_rules_updater:
+                result = watcher_rules_updater(self._read_json())
+                self._json(200 if result.get("ok") else 400, result)
+                return
             if path.startswith("/jobs/") and path.endswith("/events") and event_recorder:
                 job_id = unquote(
                     path.removeprefix("/jobs/").removesuffix("/events")

@@ -53,6 +53,8 @@ def main() -> int:
         database.add_event,
         follow,
         diagnostic,
+        engine.watcher_rules,
+        engine.update_watcher_rules,
     )
 
     def stop(_signum: int, _frame: object) -> None:

@@ -143,6 +143,48 @@ class ArrFollowTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_health_server_exposes_and_updates_watcher_rules(self) -> None:
+        state = {"ignored_suffixes": [".delay-audio-part"]}
+
+        def watcher_provider():
+            return {"ok": True, "rules": dict(state), "rules_path": "test:settings"}
+
+        def watcher_updater(payload):
+            rules = payload.get("rules") or {}
+            state["ignored_suffixes"] = list(rules.get("ignored_suffixes") or [])
+            result = watcher_provider()
+            result["saved"] = True
+            return result
+
+        server = start_health_server(
+            0,
+            lambda: {"status": "ok"},
+            lambda: [],
+            watcher_rules_provider=watcher_provider,
+            watcher_rules_updater=watcher_updater,
+        )
+        try:
+            port = server.server_address[1]
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/settings/watcher", timeout=5
+            ) as response:
+                initial = json.loads(response.read().decode("utf-8"))
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/settings/watcher",
+                data=b'{"rules":{"ignored_suffixes":[".personal"]}}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                updated = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(initial["rules"]["ignored_suffixes"], [".delay-audio-part"])
+            self.assertEqual(updated["rules"]["ignored_suffixes"], [".personal"])
+            self.assertTrue(updated["saved"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

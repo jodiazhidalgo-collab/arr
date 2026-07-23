@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1110,6 +1111,219 @@ class CoreTests(unittest.TestCase):
             engine._reconcile_complete()
 
             self.assertEqual(database.latest_jobs(), [])
+            database.close()
+
+    def test_nested_delay_audio_temp_ignores_movies_folder_until_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+
+            class FakeQbt:
+                def torrents(self, _torrent_filter):
+                    return []
+
+            engine.qbt = FakeQbt()
+            item = config.complete_root / "movies" / "Pelicula"
+            video = item / "contenido" / "Pelicula.mkv"
+            ignored = item / "temporales" / "audio" / "Pelicula.DELAY-AUDIO-PART"
+            video.parent.mkdir(parents=True)
+            ignored.parent.mkdir(parents=True)
+            video.write_bytes(b"movie")
+            ignored.write_bytes(b"partial")
+
+            engine._handle_complete_path(ignored)
+            engine._reconcile_complete()
+            self.assertEqual(database.latest_jobs(), [])
+
+            ignored.unlink()
+            engine._handle_complete_path(ignored)
+            jobs = database.latest_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["source_path"], str(item))
+            self.assertEqual(jobs[0]["state"], "waiting_stable")
+            database.close()
+
+    def test_watcher_rules_are_configurable_persistent_and_allow_empty_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+
+            result = engine.update_watcher_rules(
+                {"rules": {"ignored_suffixes": [".CUSTOM", ".custom", "-final"]}}
+            )
+            self.assertTrue(result["saved"])
+            self.assertEqual(result["rules"]["ignored_suffixes"], [".custom", "-final"])
+
+            restarted = Engine(config, database)
+            self.assertEqual(
+                restarted.watcher_rules()["rules"]["ignored_suffixes"],
+                [".custom", "-final"],
+            )
+            item = config.complete_root / "movies" / "Personalizada"
+            blocked = item / "interior" / "archivo.CUSTOM"
+            blocked.parent.mkdir(parents=True)
+            blocked.write_bytes(b"partial")
+            self.assertTrue(restarted._ignored_movies_item(item))
+
+            emptied = restarted.update_watcher_rules({"rules": {"ignored_suffixes": []}})
+            self.assertEqual(emptied["rules"]["ignored_suffixes"], [])
+            empty_restarted = Engine(config, database)
+            self.assertEqual(empty_restarted.watcher_rules()["rules"]["ignored_suffixes"], [])
+            self.assertFalse(empty_restarted._ignored_movies_item(item))
+            database.close()
+
+    def test_watcher_rule_scope_is_only_complete_movies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+
+            class FakeQbt:
+                def torrents(self, _torrent_filter):
+                    return []
+
+            engine.qbt = FakeQbt()
+            tv_item = config.complete_root / "tv" / "Serie"
+            blocked = tv_item / "interior" / "episodio.delay-audio-part"
+            blocked.parent.mkdir(parents=True)
+            blocked.write_bytes(b"partial")
+
+            engine._reconcile_complete()
+            jobs = database.latest_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["category"], "tv")
+            self.assertEqual(jobs[0]["source_path"], str(tv_item))
+            database.close()
+
+    def test_late_nested_ignored_file_pauses_only_jobs_under_effective_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+
+            old_item = config.complete_root / "movies" / "Anterior"
+            old_item.mkdir(parents=True)
+            old_job = database.create_job(
+                "fs:movies:anterior",
+                "fs",
+                "movies",
+                old_item.name,
+                state="waiting_stable",
+                source_path=str(old_item),
+            )
+            engine.update_watcher_rules({"rules": {"ignored_suffixes": [".bloqueo"]}})
+            (old_item / "interior.bloqueo").write_bytes(b"partial")
+            self.assertFalse(engine._ignored_movies_job(old_job, old_item))
+
+            future_item = config.complete_root / "movies" / "Posterior"
+            future_item.mkdir(parents=True)
+            future_job = database.create_job(
+                "fs:movies:posterior",
+                "fs",
+                "movies",
+                future_item.name,
+                state="waiting_stable",
+                source_path=str(future_item),
+            )
+            ignored = future_item / "profundo" / "temporal.BLOQUEO"
+            ignored.parent.mkdir(parents=True)
+            ignored.write_bytes(b"partial")
+            self.assertTrue(engine._ignored_movies_job(future_job, future_item))
+
+            engine.update_watcher_rules({"rules": {"ignored_suffixes": [".otra"]}})
+            self.assertTrue(engine._ignored_movies_job(future_job, future_item))
+            restarted = Engine(config, database)
+            self.assertTrue(restarted._ignored_movies_job(future_job, future_item))
+
+            restarted._stable[str(future_job["job_id"])] = ("old", time.time() - 20)
+            restarted._process_job(future_job)
+            self.assertEqual(database.get_job(future_job["job_id"])["state"], "waiting_stable")
+            self.assertNotIn(str(future_job["job_id"]), restarted._stable)
+
+            ignored.unlink()
+            restarted._process_job(database.get_job(future_job["job_id"]))
+            self.assertIn(str(future_job["job_id"]), restarted._stable)
+            database.close()
+
+    def test_top_level_folder_name_keeps_previous_ignore_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            item = config.complete_root / "movies" / "Carpeta.delay-audio-part"
+            item.mkdir(parents=True)
+            (item / "Pelicula.mkv").write_bytes(b"movie")
+
+            engine._reconcile_complete()
+
+            self.assertEqual(database.latest_jobs(), [])
+            database.close()
+
+    def test_qbt_paths_ignore_nested_movie_rule_without_creating_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            item = config.complete_root / "movies" / "Qbt"
+            content = item / "Qbt.mkv"
+            ignored = item / "temp" / "Qbt.delay-audio-part"
+            content.parent.mkdir(parents=True)
+            ignored.parent.mkdir(parents=True)
+            content.write_bytes(b"movie")
+            ignored.write_bytes(b"partial")
+            infohash = "b" * 40
+            torrent = {
+                "hash": infohash,
+                "category": "movies",
+                "name": "Qbt",
+                "content_path": str(content),
+                "progress": 1,
+                "completion_on": 123,
+                "added_on": 100,
+            }
+
+            class FakeQbt:
+                def torrents(self, _torrent_filter):
+                    return [torrent]
+
+                def torrent(self, _infohash):
+                    return torrent
+
+            engine.qbt = FakeQbt()
+            engine._reconcile_qbt()
+            self.assertEqual(database.latest_jobs(), [])
+
+            event_path = config.event_dir / "qbt.event"
+            event_path.write_text(f"hash={infohash}\n", encoding="utf-8")
+            engine._handle_qbt_event(event_path)
+            self.assertEqual(database.latest_jobs(), [])
+            self.assertFalse(event_path.exists())
+
+            ignored.unlink()
+            engine._reconcile_qbt()
+            jobs = database.latest_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["source_path"], str(item))
             database.close()
 
     def test_terminal_codex_diagnostic_is_written_in_category_folder(self) -> None:

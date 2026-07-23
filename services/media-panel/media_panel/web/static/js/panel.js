@@ -3,7 +3,9 @@ const title = document.getElementById("title");
 const tabs = [...document.querySelectorAll(".tabs button")];
 
 let rulesState = null;
-let currentRuleSection = "entrada";
+let watcherRulesState = null;
+const RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
+let currentRuleSection = readStoredRuleSection();
 
 const RULE_SECTIONS = {
   entrada: {
@@ -180,8 +182,40 @@ const RULE_SECTIONS = {
         ]
       }
     ]
+  },
+  vigilante: {
+    title: "Vigilante ARR",
+    help: "Finales de nombre que ARR ignora en la carpeta complete/movies.",
+    source: "watcher",
+    groups: [
+      {
+        title: "Carpeta movies",
+        note: "Si un archivo, incluso dentro de una carpeta, termina así, ARR ignora la carpeta completa.",
+        controls: [
+          { type: "list", path: "ignored_suffixes", label: "Extensiones o finales ignorados" }
+        ]
+      }
+    ]
   }
 };
+
+if (!RULE_SECTIONS[currentRuleSection]) currentRuleSection = "entrada";
+
+function readStoredRuleSection() {
+  try {
+    return localStorage.getItem(RULE_SECTION_STORAGE_KEY) || "entrada";
+  } catch (_error) {
+    return "entrada";
+  }
+}
+
+function storeRuleSection(section) {
+  try {
+    localStorage.setItem(RULE_SECTION_STORAGE_KEY, section);
+  } catch (_error) {
+    return;
+  }
+}
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -406,12 +440,34 @@ async function showReglas() {
   setActive("reglas");
   title.textContent = "Motor de reglas";
   app.innerHTML = `<section class="panel">Cargando reglas...</section>`;
-  rulesState = await api("/api/rules");
+  const [mediaRules, watcherResult] = await Promise.all([
+    api("/api/rules"),
+    api("/api/watcher-rules")
+      .then(data => ({ data }))
+      .catch(error => ({ error }))
+  ]);
+  rulesState = mediaRules;
+  watcherRulesState = watcherResult.data || {
+    ok: false,
+    rules: { ignored_suffixes: [] },
+    rules_path: "ARR Orchestrator",
+    error: watcherResult.error?.message || "No se pudo cargar el vigilante."
+  };
   renderRules();
 }
 
-function renderRules() {
+function currentRulesDocument() {
+  return RULE_SECTIONS[currentRuleSection]?.source === "watcher" ? watcherRulesState : rulesState;
+}
+
+function renderRules(statusMessage = "") {
   const section = RULE_SECTIONS[currentRuleSection];
+  const documentState = currentRulesDocument();
+  const statusText = statusMessage || (
+    documentState?.ok === false
+      ? `Error cargando: ${documentState.error || "orquestador no disponible"}`
+      : `Archivo: ${documentState?.rules_path || "-"}`
+  );
   const sectionButtons = Object.entries(RULE_SECTIONS).map(([key, value]) =>
     `<button class="${key === currentRuleSection ? "active" : ""}" data-rule-section="${key}">${esc(value.title)}</button>`
   ).join("");
@@ -426,16 +482,17 @@ function renderRules() {
           </div>
           <div class="toolbar-actions">
             <button class="btn ghost" id="reload-rules">Recargar</button>
-            <button class="btn primary" id="save-rules">Guardar reglas</button>
+            <button class="btn primary" id="save-rules" ${documentState?.ok === false ? "disabled" : ""}>Guardar reglas</button>
           </div>
         </div>
-        <div id="rules-status" class="status">Archivo: ${esc(rulesState.rules_path)}</div>
+        <div id="rules-status" class="status">${esc(statusText)}</div>
         <div id="rules-editor">${section.groups.map(renderGroup).join("")}</div>
       </div>
     </section>`;
 
   document.querySelectorAll("[data-rule-section]").forEach(btn => btn.addEventListener("click", () => {
     currentRuleSection = btn.dataset.ruleSection;
+    storeRuleSection(currentRuleSection);
     renderRules();
   }));
   document.getElementById("reload-rules").addEventListener("click", showReglas);
@@ -451,7 +508,7 @@ function renderGroup(group) {
 }
 
 function renderControl(control) {
-  const value = getPath(rulesState.rules, control.path);
+  const value = getPath(currentRulesDocument()?.rules || {}, control.path);
   const id = `field-${control.path.replace(/[^a-z0-9]+/gi, "-")}`;
   const hint = control.suffix ? `<span class="hint">${esc(control.suffix)}</span>` : "";
   let input = "";
@@ -474,7 +531,7 @@ function renderControl(control) {
 }
 
 function collectRules() {
-  const rules = clone(rulesState.rules);
+  const rules = clone(currentRulesDocument().rules);
   document.querySelectorAll("[data-path]").forEach(input => {
     const path = input.dataset.path;
     const type = input.dataset.type;
@@ -509,13 +566,22 @@ async function saveRules() {
   btn.disabled = true;
   status.textContent = "Guardando...";
   try {
+    const savingSection = currentRuleSection;
+    const savingSource = RULE_SECTIONS[savingSection]?.source || "media";
+    const savingEndpoint = savingSource === "watcher" ? "/api/watcher-rules" : "/api/rules";
     const rules = collectRules();
-    rulesState = await api("/api/rules", {
+    const savedState = await api(savingEndpoint, {
       method: "POST",
       body: JSON.stringify({ rules })
     });
-    status.textContent = "Reglas guardadas correctamente.";
-    renderRules();
+    if (savingSource === "watcher") {
+      watcherRulesState = savedState;
+    } else {
+      rulesState = savedState;
+    }
+    if (currentRuleSection === savingSection) {
+      renderRules("Reglas guardadas correctamente.");
+    }
   } catch (error) {
     status.textContent = `Error guardando: ${error.message}`;
   } finally {

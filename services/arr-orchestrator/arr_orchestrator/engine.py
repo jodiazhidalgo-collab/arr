@@ -80,12 +80,8 @@ def _sanitize_extraction_details(job_root: Path, details: Dict[str, object]) -> 
 
     return sanitize(details)  # type: ignore[return-value]
 COMPLETE_CATEGORIES = ("movies", "tv", "manual", "movies_automatizacion", "trailers_automatizacion")
-IGNORED_COMPLETE_SUFFIXES = (".delay-audio-part",)
-
-
-def ignored_complete_item(item: Path) -> bool:
-    name = item.name.lower()
-    return any(name.endswith(suffix) for suffix in IGNORED_COMPLETE_SUFFIXES)
+WATCHER_RULES_SETTING_KEY = "watcher.movies.ignored_suffixes"
+DEFAULT_IGNORED_MOVIES_SUFFIXES = (".delay-audio-part",)
 
 
 class Engine:
@@ -118,6 +114,162 @@ class Engine:
         self._last_heartbeat = 0.0
         self.running = True
         self.dependencies: Dict[str, str] = {}
+        self._watcher_rules_snapshot = self._load_ignored_movies_suffixes()
+
+    @staticmethod
+    def _normalize_ignored_movies_suffixes(values: object) -> Tuple[str, ...]:
+        if not isinstance(values, list):
+            raise ValueError("La lista de finales ignorados no es valida.")
+        normalized: List[str] = []
+        seen = set()
+        for value in values:
+            if not isinstance(value, str):
+                raise ValueError("Cada final ignorado debe ser texto.")
+            suffix = value.strip().casefold()
+            if not suffix:
+                continue
+            if len(suffix) > 255 or "\x00" in suffix:
+                raise ValueError("Hay un final ignorado no valido.")
+            if suffix not in seen:
+                seen.add(suffix)
+                normalized.append(suffix)
+        if len(normalized) > 256:
+            raise ValueError("Hay demasiados finales ignorados.")
+        return tuple(normalized)
+
+    def _load_ignored_movies_suffixes(
+        self,
+    ) -> Tuple[
+        Tuple[str, ...],
+        float,
+        Tuple[Tuple[float, Tuple[str, ...]], ...],
+    ]:
+        stored = self.db.get_setting(WATCHER_RULES_SETTING_KEY)
+        if stored is None:
+            return (
+                DEFAULT_IGNORED_MOVIES_SUFFIXES,
+                0.0,
+                ((0.0, DEFAULT_IGNORED_MOVIES_SUFFIXES),),
+            )
+        try:
+            payload = json.loads(stored)
+            if isinstance(payload, list):
+                suffixes = self._normalize_ignored_movies_suffixes(payload)
+                return suffixes, 0.0, ((0.0, suffixes),)
+            if not isinstance(payload, dict):
+                raise ValueError("Formato de reglas no valido.")
+            suffixes = self._normalize_ignored_movies_suffixes(payload.get("ignored_suffixes"))
+            effective_at = max(0.0, float(payload.get("effective_at") or 0.0))
+            history: List[Tuple[float, Tuple[str, ...]]] = []
+            raw_history = payload.get("history")
+            if raw_history is not None:
+                if not isinstance(raw_history, list):
+                    raise ValueError("Historial de reglas no valido.")
+                for entry in raw_history:
+                    if not isinstance(entry, dict):
+                        raise ValueError("Historial de reglas no valido.")
+                    entry_at = max(0.0, float(entry.get("effective_at") or 0.0))
+                    entry_suffixes = self._normalize_ignored_movies_suffixes(
+                        entry.get("ignored_suffixes")
+                    )
+                    history.append((entry_at, entry_suffixes))
+            if not history:
+                history.append((0.0, DEFAULT_IGNORED_MOVIES_SUFFIXES))
+            if history[-1] != (effective_at, suffixes):
+                history.append((effective_at, suffixes))
+            history.sort(key=lambda entry: entry[0])
+            return suffixes, effective_at, tuple(history)
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            self.log.warning(
+                "Reglas del vigilante invalidas; se usa el valor por defecto: %s",
+                error,
+            )
+            return (
+                DEFAULT_IGNORED_MOVIES_SUFFIXES,
+                0.0,
+                ((0.0, DEFAULT_IGNORED_MOVIES_SUFFIXES),),
+            )
+
+    def watcher_rules(self) -> Dict[str, object]:
+        suffixes, _effective_at, _history = self._watcher_rules_snapshot
+        return {
+            "ok": True,
+            "rules": {"ignored_suffixes": list(suffixes)},
+            "rules_path": f"{self.db.path}:settings/{WATCHER_RULES_SETTING_KEY}",
+            "scope": str(self.config.complete_root / "movies"),
+        }
+
+    def update_watcher_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
+        rules = payload.get("rules") if isinstance(payload, dict) else None
+        if not isinstance(rules, dict) or "ignored_suffixes" not in rules:
+            return {"ok": False, "error": "Payload de reglas no valido."}
+        try:
+            suffixes = self._normalize_ignored_movies_suffixes(rules["ignored_suffixes"])
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
+        effective_at = time.time()
+        _current_suffixes, _current_effective_at, current_history = (
+            self._watcher_rules_snapshot
+        )
+        history = current_history + ((effective_at, suffixes),)
+        self.db.set_setting(
+            WATCHER_RULES_SETTING_KEY,
+            json.dumps(
+                {
+                    "ignored_suffixes": list(suffixes),
+                    "effective_at": effective_at,
+                    "history": [
+                        {
+                            "effective_at": entry_at,
+                            "ignored_suffixes": list(entry_suffixes),
+                        }
+                        for entry_at, entry_suffixes in history
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        self._watcher_rules_snapshot = (suffixes, effective_at, history)
+        result = self.watcher_rules()
+        result["saved"] = True
+        return result
+
+    def _ignored_movies_item(
+        self,
+        item: Path,
+        suffixes: Optional[Tuple[str, ...]] = None,
+    ) -> bool:
+        if suffixes is None:
+            suffixes, _effective_at, _history = self._watcher_rules_snapshot
+        if not suffixes:
+            return False
+        movies_root = self.config.complete_root / "movies"
+        try:
+            item.resolve().relative_to(movies_root.resolve())
+        except (OSError, ValueError):
+            return False
+        # Conserva la regla historica del elemento superior, sea archivo o carpeta.
+        if item.name.casefold().endswith(suffixes):
+            return True
+        if not item.is_dir():
+            return False
+        try:
+            for candidate in item.rglob("*"):
+                if candidate.is_file() and candidate.name.casefold().endswith(suffixes):
+                    return True
+        except OSError as error:
+            self.log.warning("No se pudo revisar el contenido de %s: %s", item, error)
+        return False
+
+    def _ignored_movies_job(self, job: Dict[str, object], source_path: Path) -> bool:
+        _current_suffixes, _effective_at, history = self._watcher_rules_snapshot
+        created_at = float(job.get("created_at") or 0.0)
+        suffixes = DEFAULT_IGNORED_MOVIES_SUFFIXES
+        for entry_at, entry_suffixes in history:
+            if entry_at > created_at:
+                break
+            suffixes = entry_suffixes
+        return self._ignored_movies_item(source_path, suffixes)
 
     def start(self) -> None:
         self._check_dependencies()
@@ -282,6 +434,8 @@ class Engine:
             if not source_path:
                 continue
             job = self._job_for_qbt_content(infohash, source_path, content_path)
+            if not job and self._ignored_movies_item(source_path):
+                continue
             if not job:
                 job = self.db.create_job(
                     self._new_source_uid("qbt", infohash),
@@ -476,6 +630,9 @@ class Engine:
             )
             return
         job = self._job_for_qbt_content(infohash, source_path, content_path)
+        if not job and self._ignored_movies_item(source_path):
+            path.unlink(missing_ok=True)
+            return
         if not job:
             job = self.db.create_job(
                 self._new_source_uid("qbt", infohash),
@@ -505,15 +662,11 @@ class Engine:
             root = self.config.complete_root / category
             item = top_level_item(root, path)
             if item:
-                if ignored_complete_item(item):
-                    return
                 self._register_materialized(category, item)
                 return
 
     def _register_materialized(self, category: str, item: Path) -> None:
         if not item.exists():
-            return
-        if ignored_complete_item(item):
             return
         if category == "trailers_automatizacion":
             ready_source = trailer_ready_source(item)
@@ -523,6 +676,8 @@ class Engine:
         job = self.db.get_job_by_source_path(str(item))
         if not job:
             job = self._job_for_materialized(category, item)
+        if not job and self._ignored_movies_item(item):
+            return
         if not job:
             source_uid = self._new_source_uid(f"fs:{category}", item.name)
             job = self.db.create_job(
@@ -739,6 +894,11 @@ class Engine:
             job = self.db.get_job(str(job["job_id"]))
         if job["state"] == "waiting_stable":
             if not source_path.exists():
+                return
+            if self._ignored_movies_job(job, source_path):
+                job_id = str(job["job_id"])
+                self._stable_log_at.pop(job_id, None)
+                self._stable.pop(job_id, None)
                 return
             if job["category"] == "trailers_automatizacion":
                 signature, entries = trailer_package_manifest(source_path)

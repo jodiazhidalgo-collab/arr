@@ -296,6 +296,14 @@ def _save_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _watcher_rules_payload() -> Dict[str, Any]:
+    return _upstream_json(f"{ORCH_URL}/settings/watcher")
+
+
+def _save_watcher_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _upstream_post_json(f"{ORCH_URL}/settings/watcher", payload)
+
+
 def _status_payload() -> Dict[str, Any]:
     orch = _upstream_json(f"{ORCH_URL}/health")
     worker = _upstream_json(f"{WORKER_URL}/health")
@@ -486,6 +494,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/rules":
             self._json(200, _rules_payload())
             return
+        if path == "/api/watcher-rules":
+            result = _watcher_rules_payload()
+            self._json(200 if result.get("ok") else 502, result)
+            return
         if path == "/api/review":
             self._json(200, _review_payload())
             return
@@ -524,6 +536,13 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/rules":
             try:
                 self._json(200, _save_rules(self._read_payload()))
+            except Exception as error:
+                self._json(500, {"ok": False, "error": str(error)})
+            return
+        if parsed.path == "/api/watcher-rules":
+            try:
+                result = _save_watcher_rules(self._read_payload())
+                self._json(200 if result.get("ok") else 400, result)
             except Exception as error:
                 self._json(500, {"ok": False, "error": str(error)})
             return

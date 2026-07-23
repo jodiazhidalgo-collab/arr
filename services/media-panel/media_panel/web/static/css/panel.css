@@ -214,6 +214,7 @@ h3 {
   min-height: 28px;
   color: var(--muted);
   margin-bottom: 12px;
+  overflow-wrap: anywhere;
 }
 
 .rule-group {
