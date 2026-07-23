@@ -2517,11 +2517,18 @@ class Engine:
     ) -> None:
         job_id = str(job["job_id"])
         current = self.db.get_job(job_id) or job
-        if str(current.get("state") or "") in {"done", "duplicate", "error_terminal"}:
-            return
         message = self._safe_worker_error(error)
         typed_code = str(getattr(error, "error_code", "") or "")
         code = error_code or typed_code or f"{phase}_worker_exception"
+        current_state = str(current.get("state") or "")
+        if current_state in {"done", "duplicate", "error_terminal"}:
+            return
+        if (
+            current_state == "manual_review"
+            and str(current.get("last_error_code") or "") == code
+            and str(current.get("last_error_message") or "") == message
+        ):
+            return
         self._worker_status_checked_at.pop(job_id, None)
         self._worker_started_at.pop(job_id, None)
         structured = {

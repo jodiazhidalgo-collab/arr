@@ -1353,6 +1353,12 @@ class CoreTests(unittest.TestCase):
                 self.assertTrue(stage.exists())
                 self.assertTrue((source / "only-copy.mkv").exists())
                 self.assertEqual(worker.status_calls, 0 if source_kind == "file" else 1)
+                first_event_count = len(database.job_detail(job["job_id"])["timeline"])
+                engine._reconcile_late_worker_results()
+                self.assertEqual(
+                    len(database.job_detail(job["job_id"])["timeline"]),
+                    first_event_count,
+                )
                 database.close()
 
     def test_worker_terminal_paths_must_stay_inside_owned_roots(self) -> None:
@@ -1568,6 +1574,12 @@ class CoreTests(unittest.TestCase):
             engine.media_worker = MissingWorker()
             engine._recover_interrupted_jobs()
             self.assertEqual(database.get_job(job["job_id"])["state"], "manual_review")
+            first_event_count = len(database.job_detail(job["job_id"])["timeline"])
+            engine._reconcile_late_worker_results()
+            self.assertEqual(
+                len(database.job_detail(job["job_id"])["timeline"]),
+                first_event_count,
+            )
 
             result_path.write_text(
                 json.dumps(

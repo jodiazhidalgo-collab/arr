@@ -66,6 +66,102 @@ class FileBotRuleCommandTests(unittest.TestCase):
                 ],
             )
 
+    def test_default_guided_tv_command_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_root = root / "input"
+            output_root = root / "output"
+            runner = FileBotRunner("/opt/filebot/filebot", root)
+
+            preview = runner.preview_command(
+                "job-default-tv", "tv", input_root, output_root, identity("tv")
+            )
+
+            self.assertEqual(
+                preview["argv"],
+                [
+                    "/opt/filebot/filebot",
+                    "-no-xattr",
+                    "-rename",
+                    "-r",
+                    str(input_root),
+                    "--log-file",
+                    str(root / "filebot-job-default-tv.log"),
+                    "--db",
+                    "TheMovieDB::TV",
+                    "--q",
+                    "1396",
+                    "--lang",
+                    "es",
+                    "--output",
+                    str(output_root),
+                    "--action",
+                    "move",
+                    "--conflict",
+                    "skip",
+                    "-non-strict",
+                    "--format",
+                    "{n}/Season {s.pad(2)}/{n} - {s00e00}",
+                ],
+            )
+
+    def test_default_legacy_movie_and_tv_commands_are_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_root = root / "input"
+            output_root = root / "output"
+            runner = FileBotRunner("/opt/filebot/filebot", root)
+
+            common = [
+                "/opt/filebot/filebot",
+                "-no-xattr",
+                "-script",
+                "fn:amc",
+                str(input_root),
+                "--log-file",
+            ]
+            common_tail = [
+                "--output",
+                str(output_root),
+                "--action",
+                "move",
+                "--conflict",
+                "skip",
+                "-non-strict",
+                "--lang",
+                "es",
+                "--def",
+                "clean=y",
+                "music=n",
+                "artwork=n",
+                "excludeList=/dev/null",
+            ]
+            movie = runner.preview_command(
+                "legacy-movie", "movies", input_root, output_root
+            )["argv"]
+            tv = runner.preview_command(
+                "legacy-tv", "tv", input_root, output_root
+            )["argv"]
+
+            self.assertEqual(
+                movie,
+                common
+                + [str(root / "filebot-legacy-movie.log")]
+                + common_tail
+                + ["ut_label=movie", "movieFormat={n} ({y})/{n} ({y})"],
+            )
+            self.assertEqual(
+                tv,
+                common
+                + [str(root / "filebot-legacy-tv.log")]
+                + common_tail
+                + [
+                    "ut_label=TV",
+                    "minLengthMS=300000",
+                    "seriesFormat={n}/Season {s.pad(2)}/{n} - {s00e00}",
+                ],
+            )
+
     def test_safe_styles_keep_canonical_roots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
