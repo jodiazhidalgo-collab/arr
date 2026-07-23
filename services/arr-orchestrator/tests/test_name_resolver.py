@@ -8,6 +8,7 @@ from arr_orchestrator.name_resolver import (
     NameResolver,
     ResolvedIdentity,
     ResolverAmbiguous,
+    ResolverCandidate,
 )
 
 
@@ -38,7 +39,7 @@ def movie_payload(tmdb_id, title, original_title, year):
         "id": tmdb_id,
         "title": title,
         "original_title": original_title,
-        "release_date": f"{year}-01-01",
+        "release_date": f"{year}-01-01" if year else "",
         "alternative_titles": {"titles": []},
         "translations": {"translations": []},
     }
@@ -110,6 +111,25 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(identity.year, 1996)
         self.assertGreaterEqual(identity.score, 75)
 
+    def test_rules_defaults_keep_constructor_language_and_region(self):
+        correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
+        routes = {
+            "/search/movie": {"results": [correct]},
+            "/movie/9279": correct,
+        }
+        resolver, session = self.resolver(routes)
+        resolver.configure_rules({})
+        input_root = self.input_file("Un.padre.en.apuros.1996.mkv")
+
+        resolver.resolve(
+            {"category": "movies", "name": "Un.padre.en.apuros.1996"},
+            input_root,
+        )
+
+        search_call = next(call for call in session.calls if "/search/movie" in call[0])
+        self.assertEqual(search_call[1]["language"], "es-ES")
+        self.assertEqual(search_call[1]["region"], "ES")
+
     def test_cache_avoids_second_tmdb_query(self):
         correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
         routes = {
@@ -127,6 +147,293 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(first.tmdb_id, second.tmdb_id)
         self.assertEqual(len(session.calls), call_count)
         self.assertEqual(second.source, "cache")
+
+    def test_cache_signature_uses_resolution_rules_but_ignores_formatting(self):
+        correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
+        routes = {
+            "/search/movie": {"results": [correct]},
+            "/movie/9279": correct,
+        }
+        resolver, session = self.resolver(routes)
+        input_root = self.input_file("Un padre en apuros.1996.mkv")
+        job = {"category": "movies", "name": "Un padre en apuros.1996"}
+
+        resolver.configure_rules(
+            {"movies": {"language": "es-ES", "region": "ES", "format": "A"}}
+        )
+        resolver.resolve(job, input_root)
+        first_call_count = len(session.calls)
+        resolver.configure_rules(
+            {"movies": {"language": "es-ES", "region": "ES", "format": "B"}}
+        )
+        cached = resolver.resolve(job, input_root)
+
+        self.assertEqual(cached.source, "cache")
+        self.assertEqual(len(session.calls), first_call_count)
+
+        resolver.configure_rules(
+            {"movies": {"language": "en-US", "region": "ES", "format": "B"}}
+        )
+        refreshed = resolver.resolve(job, input_root)
+
+        self.assertNotEqual(refreshed.source, "cache")
+        self.assertGreater(len(session.calls), first_call_count)
+
+    def test_the_visitors_merges_languages_and_selects_exact_year(self):
+        correct_es = movie_payload(11687, "Los visitantes", "Les Visiteurs", 1993)
+        correct_en = movie_payload(11687, "The Visitors", "Les Visiteurs", 1993)
+        wrong = movie_payload(1554591, "The Visitors", "The Visitors", None)
+        older = movie_payload(102699, "The Visitors", "The Visitors", 1972)
+
+        def search(params):
+            if params.get("language") == "en-US" and params.get("year") == 1993:
+                return {"results": [correct_en]}
+            if params.get("year") == 1993:
+                return {"results": [correct_es]}
+            return {"results": [wrong, older]}
+
+        routes = {
+            "/search/movie": search,
+            "/movie/11687": correct_es,
+            "/movie/1554591": wrong,
+            "/movie/102699": older,
+        }
+        resolver, session = self.resolver(routes)
+        input_root = self.input_file(
+            "The.Visitors.1993.FRENCH.REMASTERED.1080p.BluRay.H264.AAC-VXT.mp4"
+        )
+
+        identity = resolver.resolve(
+            {
+                "category": "movies",
+                "name": "The.Visitors.1993.FRENCH.REMASTERED.1080p.BluRay.H264.AAC-VXT",
+            },
+            input_root,
+        )
+
+        self.assertEqual(identity.tmdb_id, 11687)
+        self.assertEqual(identity.year, 1993)
+        self.assertIn("The Visitors", identity.aliases)
+        self.assertIn("Los visitantes", identity.aliases)
+        search_calls = [call for call in session.calls if "/search/movie" in call[0]]
+        self.assertGreaterEqual(len(search_calls), 3)
+        detail_calls = [call for call in session.calls if "/movie/" in call[0]]
+        self.assertLessEqual(len(detail_calls), 3)
+
+    def test_movie_with_year_never_early_stops_on_yearless_candidate(self):
+        missing_year = movie_payload(1554591, "The Visitors", "The Visitors", None)
+        correct = movie_payload(11687, "The Visitors", "Les Visiteurs", 1993)
+        search_number = 0
+
+        def search(_params):
+            nonlocal search_number
+            search_number += 1
+            return {"results": [missing_year if search_number == 1 else correct]}
+
+        routes = {
+            "/search/movie": search,
+            "/movie/11687": correct,
+            "/movie/1554591": missing_year,
+        }
+        resolver, session = self.resolver(routes)
+        resolver.configure_rules(
+            {"movies": {"query_aliases": ["The Visitors | The Visitors"]}}
+        )
+        input_root = self.input_file("The.Visitors.1993.mkv")
+
+        identity = resolver.resolve(
+            {"category": "movies", "name": "The.Visitors.1993"}, input_root
+        )
+
+        self.assertEqual(identity.tmdb_id, 11687)
+        search_calls = [call for call in session.calls if "/search/movie" in call[0]]
+        self.assertGreaterEqual(len(search_calls), 2)
+
+    def test_missing_movie_year_has_fixed_safety_penalty(self):
+        resolver, _ = self.resolver({})
+        candidate = ResolverCandidate(
+            tmdb_id=1554591,
+            media_type="movie",
+            title="The Visitors",
+            original_title="The Visitors",
+            year=None,
+            aliases=["The Visitors"],
+        )
+
+        score, reasons = resolver._score_candidate(
+            candidate,
+            {"title": "The Visitors", "year": 1993},
+            [],
+            False,
+        )
+
+        self.assertEqual(score, 52.0)
+        self.assertIn("ano ausente", reasons)
+
+    def test_query_alias_is_applied_without_changing_default_call_contract(self):
+        correct = movie_payload(11687, "The Visitors", "Les Visiteurs", 1993)
+
+        def search(params):
+            if params.get("query") == "The Visitors":
+                return {"results": [correct]}
+            return {"results": []}
+
+        routes = {
+            "/search/movie": search,
+            "/movie/11687": correct,
+        }
+        resolver, session = self.resolver(routes)
+        resolver.configure_rules(
+            {
+                "movies": {
+                    "language": "es-ES",
+                    "region": "ES",
+                    "query_aliases": ["Visitantes del tiempo | The Visitors"],
+                }
+            }
+        )
+        input_root = self.input_file("Visitantes.del.tiempo.1993.mkv")
+
+        identity = resolver.resolve(
+            {"category": "movies", "name": "Visitantes.del.tiempo.1993"},
+            input_root,
+        )
+
+        self.assertEqual(identity.tmdb_id, 11687)
+        self.assertTrue(
+            any(call[1].get("query") == "The Visitors" for call in session.calls)
+        )
+
+    def test_configured_query_alias_runs_before_false_automatic_winner(self):
+        correct = movie_payload(11687, "The Visitors", "Les Visiteurs", 1993)
+        false_top = movie_payload(
+            9001, "Visitantes del tiempo", "Visitantes del tiempo", 1993
+        )
+        decoy_one = movie_payload(9002, "Visitors Center", "Visitors Center", 1993)
+        decoy_two = movie_payload(9003, "A Visitor", "A Visitor", 1993)
+
+        def search(params):
+            if params.get("query") == "The Visitors":
+                return {"results": [decoy_one, correct, decoy_two]}
+            return {"results": [false_top]}
+
+        routes = {
+            "/search/movie": search,
+            "/movie/11687": correct,
+            "/movie/9001": false_top,
+            "/movie/9002": decoy_one,
+            "/movie/9003": decoy_two,
+        }
+        resolver, session = self.resolver(routes)
+        resolver.configure_rules(
+            {
+                "movies": {
+                    "query_aliases": ["Visitantes del tiempo | The Visitors"],
+                }
+            }
+        )
+        input_root = self.input_file("Visitantes.del.tiempo.1993.mkv")
+
+        identity = resolver.resolve(
+            {"category": "movies", "name": "Visitantes.del.tiempo.1993"},
+            input_root,
+        )
+
+        search_calls = [call for call in session.calls if "/search/movie" in call[0]]
+        self.assertEqual(search_calls[0][1]["query"], "The Visitors")
+        self.assertEqual(identity.tmdb_id, 11687)
+
+    def test_valid_forced_match_is_validated_through_tmdb_details(self):
+        correct = movie_payload(11687, "Los visitantes", "Les Visiteurs", 1993)
+        correct["translations"] = {
+            "translations": [{"data": {"title": "The Visitors"}}]
+        }
+        resolver, session = self.resolver({"/movie/11687": correct})
+        resolver.configure_rules(
+            {
+                "movies": {
+                    "forced_matches": ["The Visitors | 1993 | 11687"],
+                }
+            }
+        )
+        input_root = self.input_file("The.Visitors.1993.mkv")
+
+        identity = resolver.resolve(
+            {"category": "movies", "name": "The.Visitors.1993"}, input_root
+        )
+
+        self.assertEqual(identity.tmdb_id, 11687)
+        self.assertEqual(identity.source, "forced_match")
+        self.assertEqual(len(session.calls), 1)
+        self.assertIn("/movie/11687", session.calls[0][0])
+
+    def test_forced_match_rejects_tmdb_year_mismatch(self):
+        wrong_year = movie_payload(11687, "Los visitantes", "Les Visiteurs", 1992)
+        wrong_year["translations"] = {
+            "translations": [{"data": {"title": "The Visitors"}}]
+        }
+        resolver, _ = self.resolver({"/movie/11687": wrong_year})
+        resolver.configure_rules(
+            {"movies": {"forced_matches": ["The Visitors | 1993 | 11687"]}}
+        )
+        input_root = self.input_file("The.Visitors.1993.mkv")
+
+        with self.assertRaises(ResolverAmbiguous):
+            resolver.resolve(
+                {"category": "movies", "name": "The.Visitors.1993"}, input_root
+            )
+
+    def test_forced_match_rejects_wrong_tmdb_title_with_same_year(self):
+        wrong_movie = movie_payload(999, "Parque Jurasico", "Jurassic Park", 1993)
+        resolver, _ = self.resolver({"/movie/999": wrong_movie})
+        resolver.configure_rules(
+            {"movies": {"forced_matches": ["The Visitors | 1993 | 999"]}}
+        )
+        input_root = self.input_file("The.Visitors.1993.mkv")
+
+        with self.assertRaises(ResolverAmbiguous) as context:
+            resolver.resolve(
+                {"category": "movies", "name": "The.Visitors.1993"}, input_root
+            )
+
+        self.assertIn("titulos reales", str(context.exception))
+
+    def test_tv_forced_match_without_year_validates_real_alias(self):
+        correct = tv_payload(77, "La Agencia", "The Agency", 2024, seasons=2)
+        correct["alternative_titles"] = {
+            "results": [{"title": "Agency Alias"}]
+        }
+        resolver, session = self.resolver({"/tv/77": correct})
+        resolver.configure_rules(
+            {"tv": {"forced_matches": ["Agency Alias | 77"]}}
+        )
+        input_root = self.input_file("Agency.Alias.S01E01.mkv")
+
+        identity = resolver.resolve(
+            {"category": "tv", "name": "Agency.Alias.S01E01"}, input_root
+        )
+
+        self.assertEqual(identity.tmdb_id, 77)
+        self.assertEqual(identity.source, "forced_match")
+        self.assertEqual(len(session.calls), 1)
+
+    def test_embedded_tmdb_id_has_priority_over_forced_match(self):
+        explicit = movie_payload(999, "The Visitors", "The Visitors", 1993)
+        resolver, session = self.resolver({"/movie/999": explicit})
+        resolver.configure_rules(
+            {"movies": {"forced_matches": ["The Visitors | 1993 | 11687"]}}
+        )
+        input_root = self.input_file("The.Visitors.1993.tmdb-999.mkv")
+
+        identity = resolver.resolve(
+            {"category": "movies", "name": "The.Visitors.1993.tmdb-999"},
+            input_root,
+        )
+
+        self.assertEqual(identity.tmdb_id, 999)
+        self.assertEqual(identity.source, "tmdb_id")
+        self.assertEqual(len(session.calls), 1)
+        self.assertIn("/movie/999", session.calls[0][0])
 
     def test_same_title_prefers_matching_year(self):
         old = movie_payload(11224, "Cenicienta", "Cinderella", 1950)

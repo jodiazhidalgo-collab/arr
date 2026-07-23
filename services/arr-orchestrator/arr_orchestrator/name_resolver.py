@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import logging
@@ -20,6 +21,11 @@ TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_ID_PATTERN = re.compile(r"(?:tmdb|themoviedb)[-_. ]?(\d+)", re.IGNORECASE)
 IMDB_ID_PATTERN = re.compile(r"\b(tt\d{7,10})\b", re.IGNORECASE)
 TECHNICAL_NAMES = {"original", "filebot_input", "filebot_output", "extracted"}
+RESOLVER_CACHE_VERSION = 2
+MAX_TMDB_SEARCHES = 8
+MAX_DETAIL_CANDIDATES = 3
+MISSING_MOVIE_YEAR_PENALTY = 18
+FORCED_TITLE_SIMILARITY = 0.92
 
 
 class ResolutionError(RuntimeError):
@@ -111,12 +117,22 @@ class NameResolver:
         self.log = logger or logging.getLogger("arr-orchestrator.name-resolver")
         self.session = session or requests.Session()
         self._deadline = 0.0
+        self._rules_snapshot: Dict[str, object] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self.token)
 
-    def resolve(self, job: Dict[str, object], input_root: Path) -> ResolvedIdentity:
+    def configure_rules(self, rules_snapshot: Optional[Dict[str, object]]) -> None:
+        snapshot = rules_snapshot if isinstance(rules_snapshot, dict) else {}
+        self._rules_snapshot = copy.deepcopy(snapshot)
+
+    def resolve(
+        self,
+        job: Dict[str, object],
+        input_root: Path,
+        rules_snapshot: Optional[Dict[str, object]] = None,
+    ) -> ResolvedIdentity:
         if not self.enabled:
             raise ResolverUnavailable("TMDB_API_TOKEN no configurado")
 
@@ -134,6 +150,8 @@ class NameResolver:
             )
 
         media_type = "movie" if job.get("category") == "movies" else "tv"
+        active_snapshot = self._rules_snapshot if rules_snapshot is None else rules_snapshot
+        rules = self._effective_rules(category, active_snapshot)
         evidence = self._evidence(job, input_root)
         guessed = self._best_guess(evidence, media_type)
         query = str(guessed.get("title") or "").strip()
@@ -145,7 +163,20 @@ class NameResolver:
 
         direct_tmdb = self._first_match(TMDB_ID_PATTERN, evidence)
         direct_imdb = self._first_match(IMDB_ID_PATTERN, evidence)
-        cache_key = self._cache_key(media_type, evidence, guessed, direct_tmdb, direct_imdb)
+        forced_match = None
+        if not direct_tmdb and not direct_imdb:
+            forced_match = self._matching_forced_rule(guessed, rules["forced_matches"])
+        guessed = self._apply_query_aliases(guessed, rules["query_aliases"])
+        forced_tmdb = str(forced_match[2]) if forced_match else None
+        cache_key = self._cache_key(
+            media_type,
+            evidence,
+            guessed,
+            direct_tmdb,
+            direct_imdb,
+            forced_tmdb,
+            str(rules["fingerprint"]),
+        )
         cached = self.db.get_resolver_cache(cache_key)
         if cached:
             identity = ResolvedIdentity.from_dict(json.loads(str(cached["payload_json"])))
@@ -156,14 +187,29 @@ class NameResolver:
         candidates: List[ResolverCandidate]
         source = "search"
         if direct_tmdb:
-            candidate = self._details(media_type, int(direct_tmdb))
+            candidate = self._details(media_type, int(direct_tmdb), str(rules["language"]))
             candidates = [candidate]
             source = "tmdb_id"
         elif direct_imdb:
-            candidates = self._find_imdb(media_type, direct_imdb)
+            candidates = self._find_imdb(media_type, direct_imdb, str(rules["language"]))
             source = "imdb_id"
+        elif forced_match:
+            candidates = [
+                self._validated_forced_candidate(
+                    media_type,
+                    forced_match,
+                    str(rules["language"]),
+                )
+            ]
+            source = "forced_match"
         else:
-            candidates = self._search_candidates(media_type, query, guessed)
+            candidates = self._search_candidates(
+                media_type,
+                query,
+                guessed,
+                str(rules["language"]),
+                str(rules["region"]),
+            )
 
         if not candidates:
             raise ResolverAmbiguous(
@@ -171,7 +217,7 @@ class NameResolver:
                 {"evidence": evidence, "guess": guessed, "query": query},
             )
 
-        direct_identity = source in {"tmdb_id", "imdb_id"}
+        direct_identity = source in {"tmdb_id", "imdb_id", "forced_match"}
         ranked = self._rank_candidates(candidates, guessed, evidence, direct_identity)
         top = ranked[0]
         second_score = ranked[1].score if len(ranked) > 1 else 0.0
@@ -235,6 +281,186 @@ class NameResolver:
             if identity.year and year and abs(identity.year - year) > 1:
                 return False
         return True
+
+    def _effective_rules(
+        self,
+        category: str,
+        rules_snapshot: Optional[Dict[str, object]],
+    ) -> Dict[str, object]:
+        payload: Dict[str, object] = {}
+        snapshot = rules_snapshot if isinstance(rules_snapshot, dict) else {}
+        category_payload = snapshot.get(category)
+        if isinstance(category_payload, dict):
+            payload = category_payload
+        elif isinstance(snapshot.get("categories"), dict):
+            nested = snapshot["categories"].get(category)  # type: ignore[union-attr]
+            if isinstance(nested, dict):
+                payload = nested
+        elif any(
+            key in snapshot
+            for key in ("language", "region", "query_aliases", "forced_matches")
+        ):
+            payload = snapshot
+
+        language = str(payload.get("language") or self.language).strip() or self.language
+        region = str(payload.get("region") or self.region).strip().upper() or self.region
+        query_aliases = _parse_query_aliases(payload.get("query_aliases"))
+        forced_matches = _parse_forced_matches(payload.get("forced_matches"))
+        fingerprint_payload = {
+            "version": RESOLVER_CACHE_VERSION,
+            "language": language.casefold(),
+            "region": region.casefold() if category == "movies" else "",
+            "query_aliases": query_aliases,
+            "forced_matches": forced_matches,
+        }
+        serialized = json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return {
+            "language": language,
+            "region": region,
+            "query_aliases": query_aliases,
+            "forced_matches": forced_matches,
+            "fingerprint": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        }
+
+    @staticmethod
+    def _apply_query_aliases(
+        guessed: Dict[str, object], query_aliases: object
+    ) -> Dict[str, object]:
+        aliases = list(query_aliases) if isinstance(query_aliases, list) else []
+        if not aliases:
+            return guessed
+        updated = dict(guessed)
+        title_candidates = [
+            str(value).strip()
+            for value in guessed.get("_title_candidates") or []
+            if str(value or "").strip()
+        ]
+        matchable = {
+            _normalize_title(value)
+            for value in [
+                str(guessed.get("title") or ""),
+                str(guessed.get("_display_title") or ""),
+                *title_candidates,
+            ]
+            if value
+        }
+        applied: List[str] = []
+        for item in aliases:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            source, destination = str(item[0]).strip(), str(item[1]).strip()
+            if source and destination and _normalize_title(source) in matchable:
+                title_candidates.append(destination)
+                applied.append(destination)
+        updated["_title_candidates"] = _unique(title_candidates)
+        if applied:
+            updated["_rule_query_aliases"] = _unique(applied)
+        return updated
+
+    @staticmethod
+    def _matching_forced_rule(
+        guessed: Dict[str, object], forced_matches: object
+    ) -> Optional[Tuple[str, Optional[int], int]]:
+        rules = list(forced_matches) if isinstance(forced_matches, list) else []
+        titles = {
+            _normalize_title(str(value))
+            for value in [
+                guessed.get("title"),
+                guessed.get("_display_title"),
+                *(guessed.get("_title_candidates") or []),
+            ]
+            if str(value or "").strip()
+        }
+        guessed_year = _as_int(guessed.get("year"))
+        for item in rules:
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                continue
+            title = str(item[0]).strip()
+            expected_year = _as_int(item[1])
+            tmdb_id = _as_int(item[2])
+            if not title or not tmdb_id or _normalize_title(title) not in titles:
+                continue
+            if expected_year is not None and expected_year != guessed_year:
+                continue
+            return title, expected_year, tmdb_id
+        return None
+
+    def _validated_forced_candidate(
+        self,
+        media_type: str,
+        forced_match: Tuple[str, Optional[int], int],
+        language: str,
+    ) -> ResolverCandidate:
+        rule_title, expected_year, tmdb_id = forced_match
+        try:
+            candidate = self._details(media_type, tmdb_id, language)
+        except ResolverUnavailable:
+            raise
+        except ResolutionError as error:
+            raise ResolverAmbiguous(
+                "La regla forzada apunta a una identidad TMDb no valida",
+                {
+                    "rule_title": rule_title,
+                    "tmdb_id": tmdb_id,
+                    "media_type": media_type,
+                    "error": str(error),
+                },
+            ) from error
+        if candidate.tmdb_id != tmdb_id or candidate.media_type != media_type:
+            raise ResolverAmbiguous(
+                "La regla forzada no coincide con el tipo o ID consultado",
+                {
+                    "rule_title": rule_title,
+                    "tmdb_id": tmdb_id,
+                    "returned_tmdb_id": candidate.tmdb_id,
+                    "media_type": media_type,
+                    "returned_media_type": candidate.media_type,
+                },
+            )
+        real_titles = _unique(
+            [candidate.title, candidate.original_title, *candidate.aliases]
+        )
+        normalized_rule_title = _normalize_title(rule_title)
+        normalized_real_titles = [
+            _normalize_title(value) for value in real_titles if _normalize_title(value)
+        ]
+        best_title_similarity = max(
+            (
+                SequenceMatcher(None, normalized_rule_title, real_title).ratio()
+                for real_title in normalized_real_titles
+            ),
+            default=0.0,
+        )
+        # Se permite una variacion ortografica pequena, pero no usar un TMDb ID
+        # de otra obra que casualmente comparta ano y categoria.
+        if (
+            normalized_rule_title not in normalized_real_titles
+            and best_title_similarity < FORCED_TITLE_SIMILARITY
+        ):
+            raise ResolverAmbiguous(
+                "La regla forzada no coincide con los titulos reales de TMDb",
+                {
+                    "rule_title": rule_title,
+                    "tmdb_id": tmdb_id,
+                    "best_title_similarity": round(best_title_similarity, 3),
+                },
+            )
+        if expected_year is not None and candidate.year != expected_year:
+            raise ResolverAmbiguous(
+                "La regla forzada no coincide con el ano real de TMDb",
+                {
+                    "rule_title": rule_title,
+                    "tmdb_id": tmdb_id,
+                    "expected_year": expected_year,
+                    "returned_year": candidate.year,
+                },
+            )
+        return candidate
 
     def _evidence(self, job: Dict[str, object], input_root: Path) -> List[str]:
         values: List[str] = []
@@ -304,35 +530,52 @@ class NameResolver:
         return max(guesses, key=lambda item: item[0])[1] if guesses else {}
 
     def _search_candidates(
-        self, media_type: str, query: str, guessed: Dict[str, object]
+        self,
+        media_type: str,
+        query: str,
+        guessed: Dict[str, object],
+        language: Optional[str] = None,
+        region: Optional[str] = None,
     ) -> List[ResolverCandidate]:
+        effective_language = str(language or self.language)
+        effective_region = str(region or self.region)
         year = _as_int(guessed.get("year"))
         title_candidates = [str(value) for value in guessed.get("_title_candidates") or []]
         guessit_title = str(guessed.get("title") or "")
-        queries = _search_query_variants([query, *title_candidates, guessit_title])
+        configured_aliases = [
+            str(value)
+            for value in guessed.get("_rule_query_aliases") or []
+            if str(value or "").strip()
+        ]
+        # Un alias configurado es una decision explicita del usuario: su destino
+        # se consulta antes del titulo automatico para que ni el limite ni un
+        # falso ganador temprano puedan dejarlo fuera.
+        queries = _search_query_variants(
+            [*configured_aliases, query, *title_candidates, guessit_title]
+        )
         searches: List[Tuple[str, Optional[int], str]] = []
         for search_query in queries:
             if media_type == "movie":
-                searches.append((search_query, year, self.language))
-                searches.append((search_query, None, self.language))
-                if self.language.lower() != "en-us":
+                searches.append((search_query, year, effective_language))
+                searches.append((search_query, None, effective_language))
+                if effective_language.lower() != "en-us":
                     searches.append((search_query, year, "en-US"))
                     searches.append((search_query, None, "en-US"))
             else:
-                searches.append((search_query, None, self.language))
-                if self.language.lower() != "en-us":
+                searches.append((search_query, None, effective_language))
+                if effective_language.lower() != "en-us":
                     searches.append((search_query, None, "en-US"))
-        searches = searches[:8]
+        searches = searches[:MAX_TMDB_SEARCHES]
 
         raw: Dict[int, Dict[str, object]] = {}
         search_count = 0
         for search_query, search_year, language in searches:
-            if search_count >= 8:
+            if search_count >= MAX_TMDB_SEARCHES:
                 break
             endpoint = "/search/movie" if media_type == "movie" else "/search/tv"
             params: Dict[str, object] = {"query": search_query, "language": language}
             if media_type == "movie":
-                params["region"] = self.region
+                params["region"] = effective_region
                 if search_year:
                     params["year"] = search_year
             elif search_year:
@@ -342,7 +585,11 @@ class NameResolver:
             for item in list(payload.get("results") or [])[:10]:
                 candidate_id = _as_int(item.get("id"))
                 if candidate_id:
-                    raw.setdefault(candidate_id, dict(item))
+                    raw[candidate_id] = _merge_search_payload(
+                        media_type,
+                        raw.get(candidate_id),
+                        dict(item),
+                    )
             if raw:
                 ranked = self._rank_candidates(
                     [self._candidate_from_payload(media_type, item) for item in raw.values()],
@@ -351,22 +598,58 @@ class NameResolver:
                     False,
                 )
                 margin = ranked[0].score - (ranked[1].score if len(ranked) > 1 else 0)
-                if ranked[0].score >= 75 and margin >= 12:
+                top = ranked[0]
+                has_required_movie_year = (
+                    media_type != "movie" or year is None or top.year == year
+                )
+                if top.score >= 75 and margin >= 12 and has_required_movie_year:
                     break
 
         initial = [self._candidate_from_payload(media_type, item) for item in raw.values()]
         initial = self._rank_candidates(initial, guessed, [], False)
+        selected = list(initial[:2])
+        if media_type == "movie" and year is not None:
+            exact_year = next(
+                (
+                    candidate
+                    for candidate in initial
+                    if candidate.year == year
+                    and all(candidate.tmdb_id != item.tmdb_id for item in selected)
+                ),
+                None,
+            )
+            if exact_year is not None:
+                selected.append(exact_year)
+        for candidate in initial:
+            if len(selected) >= MAX_DETAIL_CANDIDATES:
+                break
+            if all(candidate.tmdb_id != item.tmdb_id for item in selected):
+                selected.append(candidate)
+
         enriched: List[ResolverCandidate] = []
-        for candidate in initial[:3]:
+        for candidate in selected[:MAX_DETAIL_CANDIDATES]:
             try:
-                enriched.append(self._details(media_type, candidate.tmdb_id))
+                detailed = self._details(media_type, candidate.tmdb_id, effective_language)
+                detailed.aliases = _unique(
+                    [
+                        detailed.title,
+                        detailed.original_title,
+                        *detailed.aliases,
+                        candidate.title,
+                        candidate.original_title,
+                        *candidate.aliases,
+                    ]
+                )
+                enriched.append(detailed)
             except ResolverUnavailable:
                 if not enriched:
                     enriched.append(candidate)
                 break
         return enriched or initial
 
-    def _find_imdb(self, media_type: str, imdb_id: str) -> List[ResolverCandidate]:
+    def _find_imdb(
+        self, media_type: str, imdb_id: str, language: Optional[str] = None
+    ) -> List[ResolverCandidate]:
         payload = self._get(f"/find/{imdb_id}", {"external_source": "imdb_id"})
         key = "movie_results" if media_type == "movie" else "tv_results"
         candidates = [
@@ -375,13 +658,18 @@ class NameResolver:
         ]
         if not candidates:
             return []
-        return [self._details(media_type, candidates[0].tmdb_id)]
+        return [self._details(media_type, candidates[0].tmdb_id, language)]
 
-    def _details(self, media_type: str, tmdb_id: int) -> ResolverCandidate:
+    def _details(
+        self, media_type: str, tmdb_id: int, language: Optional[str] = None
+    ) -> ResolverCandidate:
         endpoint = f"/movie/{tmdb_id}" if media_type == "movie" else f"/tv/{tmdb_id}"
         payload = self._get(
             endpoint,
-            {"language": self.language, "append_to_response": "translations,alternative_titles"},
+            {
+                "language": str(language or self.language),
+                "append_to_response": "translations,alternative_titles",
+            },
         )
         return self._candidate_from_payload(media_type, payload)
 
@@ -403,6 +691,7 @@ class NameResolver:
                 for key in ("title", "name")
                 if data.get(key)
             )
+        aliases.extend(str(value) for value in payload.get("_search_aliases") or [])
         return ResolverCandidate(
             tmdb_id=int(payload["id"]),
             media_type=media_type,
@@ -476,6 +765,15 @@ class NameResolver:
             score += 12
             reasons.append("alias del parser cercano")
 
+        rule_aliases = {
+            _normalize_title(str(value))
+            for value in guessed.get("_rule_query_aliases") or []
+            if str(value or "").strip()
+        }
+        if rule_aliases.intersection(aliases):
+            score += 30
+            reasons.append("alias configurado exacto")
+
         guessed_year = _as_int(guessed.get("year"))
         if guessed_year and candidate.year:
             difference = abs(guessed_year - candidate.year)
@@ -488,6 +786,9 @@ class NameResolver:
             else:
                 score -= 25
                 reasons.append("ano contradictorio")
+        elif guessed_year and candidate.media_type == "movie":
+            score -= MISSING_MOVIE_YEAR_PENALTY
+            reasons.append("ano ausente")
 
         score += 10
         reasons.append("categoria correcta")
@@ -554,19 +855,104 @@ class NameResolver:
         guessed: Dict[str, object],
         tmdb_id: Optional[str],
         imdb_id: Optional[str],
+        forced_tmdb_id: Optional[str] = None,
+        resolution_fingerprint: str = "",
     ) -> str:
         payload = json.dumps(
             {
+                "resolver_cache_version": RESOLVER_CACHE_VERSION,
                 "media_type": media_type,
                 "evidence": list(evidence),
                 "guess": _json_safe(guessed),
                 "tmdb_id": tmdb_id,
                 "imdb_id": imdb_id,
+                "forced_tmdb_id": forced_tmdb_id,
+                "resolution_fingerprint": resolution_fingerprint,
             },
             ensure_ascii=False,
             sort_keys=True,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _parse_query_aliases(value: object) -> List[Tuple[str, str]]:
+    items = value if isinstance(value, list) else []
+    result: List[Tuple[str, str]] = []
+    seen = set()
+    for item in items:
+        source = ""
+        destination = ""
+        if isinstance(item, str):
+            parts = [part.strip() for part in item.split("|", 1)]
+            if len(parts) == 2:
+                source, destination = parts
+        elif isinstance(item, dict):
+            source = str(item.get("source") or item.get("origin") or "").strip()
+            destination = str(
+                item.get("destination") or item.get("target") or ""
+            ).strip()
+        key = (_normalize_title(source), _normalize_title(destination))
+        if source and destination and key not in seen:
+            seen.add(key)
+            result.append((source, destination))
+    return result
+
+
+def _parse_forced_matches(value: object) -> List[Tuple[str, Optional[int], int]]:
+    items = value if isinstance(value, list) else []
+    result: List[Tuple[str, Optional[int], int]] = []
+    seen = set()
+    for item in items:
+        title = ""
+        expected_year: Optional[int] = None
+        tmdb_id: Optional[int] = None
+        if isinstance(item, str):
+            parts = [part.strip() for part in item.split("|")]
+            if len(parts) == 2:
+                title, raw_tmdb_id = parts
+                tmdb_id = _as_int(raw_tmdb_id)
+            elif len(parts) == 3:
+                title, raw_year, raw_tmdb_id = parts
+                expected_year = _as_int(raw_year)
+                tmdb_id = _as_int(raw_tmdb_id)
+        elif isinstance(item, dict):
+            title = str(item.get("title") or "").strip()
+            expected_year = _as_int(item.get("year"))
+            tmdb_id = _as_int(item.get("tmdb_id"))
+        if not title or not tmdb_id or tmdb_id <= 0:
+            continue
+        if expected_year is not None and not 1870 <= expected_year <= 2200:
+            continue
+        key = (_normalize_title(title), expected_year, tmdb_id)
+        if key not in seen:
+            seen.add(key)
+            result.append((title, expected_year, tmdb_id))
+    return result
+
+
+def _merge_search_payload(
+    media_type: str,
+    existing: Optional[Dict[str, object]],
+    incoming: Dict[str, object],
+) -> Dict[str, object]:
+    title_key = "title" if media_type == "movie" else "name"
+    original_key = "original_title" if media_type == "movie" else "original_name"
+    date_key = "release_date" if media_type == "movie" else "first_air_date"
+    merged = dict(existing or incoming)
+    aliases: List[str] = []
+    for payload in (existing or {}, incoming):
+        aliases.extend(
+            [
+                str(payload.get(title_key) or ""),
+                str(payload.get(original_key) or ""),
+                *(str(item) for item in payload.get("_search_aliases") or []),
+            ]
+        )
+    merged["_search_aliases"] = _unique(aliases)
+    for key in (title_key, original_key, date_key, "number_of_seasons"):
+        if not merged.get(key) and incoming.get(key):
+            merged[key] = incoming[key]
+    return merged
 
 
 def _normalize_title(value: str) -> str:

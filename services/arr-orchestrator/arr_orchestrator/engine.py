@@ -1,6 +1,7 @@
 import json
 import logging
 import queue
+import re
 import shutil
 import time
 from pathlib import Path
@@ -13,6 +14,7 @@ from .config import Config
 from .codex_diagnostics import create_codex_diagnostic
 from .db import Database
 from .filebot import FileBotRunner
+from .filebot_settings import FileBotSettingsStore
 from .filesystem import (
     ExtractionError,
     clean_junk,
@@ -96,6 +98,12 @@ class Engine:
             config.rdt_url, config.rdt_user, config.rdt_password, "RDT-Client"
         )
         self.filebot = FileBotRunner(config.filebot_bin, config.log_dir)
+        self.filebot_settings = FileBotSettingsStore(
+            database,
+            default_language=config.resolver_language,
+            default_region=config.resolver_region,
+            logger=self.log,
+        )
         self.name_resolver = NameResolver(
             config.tmdb_api_token,
             config.resolver_language,
@@ -234,6 +242,35 @@ class Engine:
         result["saved"] = True
         return result
 
+    def filebot_rules(self) -> Dict[str, object]:
+        return self.filebot_settings.payload()
+
+    def update_filebot_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return self.filebot_settings.update(payload)
+
+    def _active_filebot_rules_context(self) -> Dict[str, object]:
+        return self.filebot_settings.job_snapshot()
+
+    def _new_job_source_meta_json(self) -> str:
+        return json.dumps(
+            {"filebot_rules": self._active_filebot_rules_context()},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _filebot_rules_for_job(self, job: Dict[str, object]) -> Dict[str, object]:
+        raw_meta = job.get("source_meta_json")
+        try:
+            meta = json.loads(str(raw_meta)) if raw_meta else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            meta = {}
+        stored = meta.get("filebot_rules") if isinstance(meta, dict) else None
+        if isinstance(stored, dict) and isinstance(stored.get("rules"), dict):
+            return json.loads(json.dumps(stored, ensure_ascii=False, default=str))
+        context = self._active_filebot_rules_context()
+        context["source"] = "current_fallback"
+        return context
+
     def _ignored_movies_item(
         self,
         item: Path,
@@ -293,11 +330,16 @@ class Engine:
         self.observer.join(timeout=10)
 
     def status(self) -> Dict[str, object]:
+        filebot_rules = self.filebot_settings.payload()
         return {
             "status": "ok",
             "mode": self.config.mode,
             "heartbeat": self._last_heartbeat,
             "dependencies": self.dependencies,
+            "filebot_rules": {
+                "revision": filebot_rules.get("revision"),
+                "resolver_fingerprint": filebot_rules.get("resolver_fingerprint"),
+            },
             "queue_size": self.events.qsize(),
         }
 
@@ -447,6 +489,7 @@ class Engine:
                     qbt_hash=infohash,
                     source_path=str(source_path),
                     submitted_at=float(torrent.get("added_on") or time.time()),
+                    source_meta_json=self._new_job_source_meta_json(),
                 )
             elif job["state"] not in TERMINAL_STATES:
                 self._attach_qbt_identity(
@@ -528,6 +571,7 @@ class Engine:
                 name,
                 infohash=infohash,
                 torrent_path=str(path),
+                source_meta_json=self._new_job_source_meta_json(),
             )
         if self.config.active and job["state"] == "received":
             self._submit_rdt(job, path)
@@ -644,6 +688,7 @@ class Engine:
                 qbt_hash=infohash,
                 source_path=str(source_path),
                 submitted_at=float(torrent.get("added_on") or time.time()),
+                source_meta_json=self._new_job_source_meta_json(),
             )
         else:
             self._attach_qbt_identity(
@@ -687,6 +732,7 @@ class Engine:
                 item.name,
                 state="waiting_stable",
                 source_path=str(item),
+                source_meta_json=self._new_job_source_meta_json(),
             )
         elif job["state"] not in TERMINAL_STATES:
             self.db.update_job(
@@ -865,11 +911,16 @@ class Engine:
             )
 
     def _diagnostic_status(self) -> Dict[str, object]:
+        filebot_rules = self.filebot_settings.payload()
         return {
             "orchestrator": {
                 "status": "ok",
                 "mode": self.config.mode,
                 "dependencies": dict(self.dependencies),
+                "filebot_rules": {
+                    "revision": filebot_rules.get("revision"),
+                    "resolver_fingerprint": filebot_rules.get("resolver_fingerprint"),
+                },
             },
             "media_worker": {
                 "status": "ok"
@@ -1150,6 +1201,28 @@ class Engine:
             job_root,
             str(job.get("name") or ""),
         )
+        rules_context = self._filebot_rules_for_job(job)
+        rules_snapshot = dict(rules_context.get("rules") or {})
+        resolver_configure = getattr(self.name_resolver, "configure_rules", None)
+        if callable(resolver_configure):
+            resolver_configure(rules_snapshot)
+        filebot_configure = getattr(self.filebot, "configure_rules", None)
+        if callable(filebot_configure):
+            filebot_configure(rules_snapshot)
+        self.db.add_event(
+            str(job["job_id"]),
+            "settings",
+            "decision",
+            f"Reglas de resolucion y FileBot revision {int(rules_context.get('revision') or 0)}",
+            {
+                "revision": int(rules_context.get("revision") or 0),
+                "resolver_fingerprint": str(
+                    rules_context.get("resolver_fingerprint") or ""
+                ),
+                "source": str(rules_context.get("source") or "job_snapshot"),
+                "category": str(job.get("category") or ""),
+            },
+        )
         identity: Optional[ResolvedIdentity] = None
         media_decision = self._media_decision_for_job(job, input_root)
         self.db.add_event(
@@ -1271,6 +1344,10 @@ class Engine:
             output_root,
             identity,
         )
+        command_preview["rules_revision"] = int(rules_context.get("revision") or 0)
+        command_preview["resolver_fingerprint"] = str(
+            rules_context.get("resolver_fingerprint") or ""
+        )
         self.db.transition(
             str(job["job_id"]),
             "filebot_running",
@@ -1304,6 +1381,9 @@ class Engine:
             result = self.filebot.run(
                 str(job["job_id"]), str(job["category"]), input_root, output_root
             )
+        if result.get("timed_out"):
+            self._finish_filebot_timeout(job, job_root, input_root, output_root, result)
+            return
         if result.get("duplicate"):
             duplicate = self._move_duplicate_to_review(job, job_root)
             write_reason(
@@ -1754,6 +1834,75 @@ class Engine:
             result_json=json.dumps(reason, ensure_ascii=False, default=str),
         )
 
+    def _finish_filebot_timeout(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        input_root: Path,
+        output_root: Path,
+        result: Dict[str, object],
+    ) -> None:
+        moves = list(result.get("moves") or [])
+        output_media = list(result.get("output_media") or [])
+        recovered_outputs = 0
+        if job.get("category") == "tv":
+            # TV escribe directamente en la biblioteca final. Recuperamos solo
+            # destinos confirmados por el propio log de FileBot; nunca hacemos
+            # un barrido destructivo del arbol compartido.
+            recovered_outputs = self._quarantine_output_moves(
+                result, output_root, job_root
+            )
+            if output_media and recovered_outputs == 0:
+                self.db.add_event(
+                    str(job["job_id"]),
+                    "filebot",
+                    "warning",
+                    "Timeout con salida detectada sin inventario seguro para recuperarla",
+                    {"detected_output_media": len(output_media)},
+                )
+        input_preserved = input_root.exists() or bool(moves)
+        destination = move_job_to_review_clean(
+            job_root,
+            self.config.review_dir,
+            str(job.get("name") or "Trabajo FileBot"),
+        )
+        timeout_message = str(
+            result.get("timeout_message") or "FileBot agoto el tiempo maximo"
+        )
+        reason = {
+            "job_id": job.get("job_id"),
+            "phase": "filebot",
+            "reason": "filebot_timeout",
+            "message": timeout_message,
+            "confirmed_moves": len(moves),
+            "detected_output_media": len(output_media),
+            "recovered_outputs": recovered_outputs,
+            "input_preserved": input_preserved,
+            "timestamp": time.time(),
+        }
+        write_reason(
+            destination,
+            reason,
+            "Error de FileBot.txt",
+            [
+                timeout_message,
+                "ARR ha parado el trabajo para evitar una segunda pasada a ciegas.",
+                f"Movimientos confirmados antes del timeout: {len(moves)}.",
+                "El material recuperado queda dentro de esta carpeta para revision.",
+            ],
+        )
+        self._cleanup_clients(job, strict=False)
+        self.db.transition(
+            str(job["job_id"]),
+            "manual_review",
+            "filebot",
+            "FileBot agoto el timeout; material preservado para revision",
+            stage_path=str(destination),
+            last_error_code="filebot_timeout",
+            last_error_message=timeout_message,
+            result_json=json.dumps(result, ensure_ascii=False, default=str),
+        )
+
     def _reject_identity_output(
         self,
         job: Dict[str, object],
@@ -1813,22 +1962,54 @@ class Engine:
                 names.append(relative.parts[0])
         return names
 
-    @staticmethod
     def _quarantine_output_moves(
-        result: Dict[str, object], output_root: Path, job_root: Path
-    ) -> None:
+        self, result: Dict[str, object], output_root: Path, job_root: Path
+    ) -> int:
         quarantine = job_root / "filebot_rejected"
+        candidates: List[Path] = []
         for item in result.get("moves") or []:
-            destination = Path(str(item.get("destination") or ""))
+            if isinstance(item, dict):
+                candidates.append(Path(str(item.get("destination") or "")))
+
+        # Si el timeout corto stdout antes de la linea MOVE, FileBotRunner
+        # aporta los ficheros nuevos por mtime. Solo los recuperamos cuando la
+        # carpeta raiz coincide con la identidad TMDb confirmada del trabajo.
+        identity_payload = result.get("identity")
+        identity: Optional[ResolvedIdentity] = None
+        if result.get("timed_out") and isinstance(identity_payload, dict):
+            try:
+                identity = ResolvedIdentity.from_dict(identity_payload)
+            except (KeyError, TypeError, ValueError):
+                identity = None
+        if identity is not None:
+            for value in result.get("output_media") or []:
+                destination = Path(str(value or ""))
+                try:
+                    relative = destination.resolve().relative_to(output_root.resolve())
+                except (OSError, ValueError):
+                    continue
+                if relative.parts and self.name_resolver.output_matches(
+                    identity, [relative.parts[0]]
+                ) and self._tv_identity_matches_output(identity, relative):
+                    candidates.append(destination)
+
+        moved = 0
+        seen = set()
+        for destination in candidates:
+            key = str(destination)
+            if key in seen:
+                continue
+            seen.add(key)
             if not destination.exists():
                 continue
             try:
-                relative = destination.relative_to(output_root)
-            except ValueError:
+                relative = destination.resolve().relative_to(output_root.resolve())
+            except (OSError, ValueError):
                 continue
             target = quarantine / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(destination), str(target))
+            moved += 1
             parent = destination.parent
             while parent != output_root and parent.exists():
                 try:
@@ -1836,6 +2017,30 @@ class Engine:
                 except OSError:
                     break
                 parent = parent.parent
+        return moved
+
+    @staticmethod
+    def _tv_identity_matches_output(
+        identity: ResolvedIdentity, relative: Path
+    ) -> bool:
+        if (
+            identity.media_type != "tv"
+            or identity.season is None
+            or not identity.episodes
+            or not relative.parts
+        ):
+            return False
+        observed_codes = {
+            (int(match.group(1)), int(match.group(2)))
+            for match in re.finditer(
+                r"(?i)(?<![a-z0-9])s(\d{1,3})e(\d{1,4})(?!\d)",
+                relative.name,
+            )
+        }
+        expected_codes = {
+            (int(identity.season), int(episode)) for episode in identity.episodes
+        }
+        return bool(observed_codes.intersection(expected_codes))
 
     def _run_media_postprocess(self, job: Dict[str, object]) -> None:
         source = Path(str(job["source_path"]))

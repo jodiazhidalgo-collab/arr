@@ -15,6 +15,8 @@ def start_health_server(
     diagnostic_creator: Optional[Callable[[str, bool], Dict[str, object]]] = None,
     watcher_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
     watcher_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    filebot_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
+    filebot_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -23,6 +25,8 @@ def start_health_server(
                 self._json(200, status_provider())
             elif path == "/settings/watcher" and watcher_rules_provider:
                 self._json(200, watcher_rules_provider())
+            elif path == "/settings/filebot" and filebot_rules_provider:
+                self._json(200, filebot_rules_provider())
             elif path == "/jobs":
                 self._json(200, jobs_provider())
             elif path.startswith("/jobs/") and path.endswith("/follow") and follow_provider:
@@ -44,6 +48,18 @@ def start_health_server(
             if path == "/settings/watcher" and watcher_rules_updater:
                 result = watcher_rules_updater(self._read_json())
                 self._json(200 if result.get("ok") else 400, result)
+                return
+            if path == "/settings/filebot" and filebot_rules_updater:
+                result = filebot_rules_updater(self._read_json())
+                if result.get("ok"):
+                    status = 200
+                elif result.get("error") == "revision_conflict":
+                    status = 409
+                elif result.get("error") == "persistence_failed":
+                    status = 500
+                else:
+                    status = 400
+                self._json(status, result)
                 return
             if path.startswith("/jobs/") and path.endswith("/events") and event_recorder:
                 job_id = unquote(

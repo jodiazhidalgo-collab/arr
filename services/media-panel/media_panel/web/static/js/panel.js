@@ -2,10 +2,34 @@ const app = document.getElementById("app");
 const title = document.getElementById("title");
 const tabs = [...document.querySelectorAll(".tabs button")];
 
-let rulesState = null;
-let watcherRulesState = null;
+const rulesStates = {
+  media: null,
+  watcher: null,
+  filebot: null
+};
 const RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
 let currentRuleSection = readStoredRuleSection();
+
+const RULE_SOURCES = {
+  media: {
+    endpoint: "/api/rules",
+    label: "reglas multimedia",
+    fallbackRules: {}
+  },
+  watcher: {
+    endpoint: "/api/watcher-rules",
+    label: "Vigilante ARR",
+    fallbackRules: { ignored_suffixes: [] }
+  },
+  filebot: {
+    endpoint: "/api/filebot-rules",
+    label: "FileBot",
+    fallbackRules: {
+      movies: { language: "es-ES", region: "ES", query_aliases: [], forced_matches: [], filename_style: "title_year" },
+      tv: { language: "es-ES", query_aliases: [], forced_matches: [], filename_style: "series_sxxexx", episode_order: "Airdate" }
+    }
+  }
+};
 
 const RULE_SECTIONS = {
   entrada: {
@@ -196,6 +220,64 @@ const RULE_SECTIONS = {
         ]
       }
     ]
+  },
+  filebot_peliculas: {
+    title: "FileBot Películas",
+    help: "Resolución de identidad y nombre final de las películas.",
+    source: "filebot",
+    groups: [
+      {
+        title: "Identidad",
+        note: "Idioma, region y ayudas controladas para resolver cada pelicula.",
+        controls: [
+          { type: "text", path: "movies.language", label: "Idioma" },
+          { type: "text", path: "movies.region", label: "Region" },
+          { type: "list", path: "movies.query_aliases", label: "Alias de busqueda", format: "Formato: origen | destino" },
+          { type: "list", path: "movies.forced_matches", label: "Coincidencias TMDb forzadas", format: "Formato: titulo | año | tmdb_id" }
+        ]
+      },
+      {
+        title: "Nombre final",
+        note: "Estilo seguro aplicado sin cambiar rutas ni acciones de FileBot.",
+        controls: [
+          { type: "select", path: "movies.filename_style", label: "Estilo de nombre", options: [
+            { value: "title_year", label: "Titulo y año" },
+            { value: "title_year_quality", label: "Titulo, año y calidad" }
+          ] }
+        ]
+      }
+    ]
+  },
+  filebot_series: {
+    title: "FileBot Series",
+    help: "Resolucion de identidad, episodios y nombre final de las series.",
+    source: "filebot",
+    groups: [
+      {
+        title: "Identidad",
+        note: "Idioma y ayudas controladas para resolver cada serie.",
+        controls: [
+          { type: "text", path: "tv.language", label: "Idioma" },
+          { type: "list", path: "tv.query_aliases", label: "Alias de busqueda", format: "Formato: origen | destino" },
+          { type: "list", path: "tv.forced_matches", label: "Coincidencias TMDb forzadas", format: "Formato: titulo | año opcional | tmdb_id" }
+        ]
+      },
+      {
+        title: "Nombre final",
+        note: "Estilo seguro y orden de episodios usados por FileBot.",
+        controls: [
+          { type: "select", path: "tv.filename_style", label: "Estilo de nombre", options: [
+            { value: "series_sxxexx", label: "Serie y SxxExx" },
+            { value: "series_sxxexx_title", label: "Serie, SxxExx y titulo" }
+          ] },
+          { type: "select", path: "tv.episode_order", label: "Orden de episodios", options: [
+            { value: "Airdate", label: "Emision" },
+            { value: "DVD", label: "DVD" },
+            { value: "Absolute", label: "Absoluto" }
+          ] }
+        ]
+      }
+    ]
   }
 };
 
@@ -229,8 +311,20 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     ...options
   });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json();
+  const text = await response.text();
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch (_error) {
+    payload = null;
+  }
+  if (!response.ok) {
+    const error = new Error(payload?.message || payload?.error || text || `Error HTTP ${response.status}`);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload || {};
 }
 
 function getPath(obj, path) {
@@ -440,34 +534,58 @@ async function showReglas() {
   setActive("reglas");
   title.textContent = "Motor de reglas";
   app.innerHTML = `<section class="panel">Cargando reglas...</section>`;
-  const [mediaRules, watcherResult] = await Promise.all([
-    api("/api/rules"),
-    api("/api/watcher-rules")
-      .then(data => ({ data }))
-      .catch(error => ({ error }))
-  ]);
-  rulesState = mediaRules;
-  watcherRulesState = watcherResult.data || {
-    ok: false,
-    rules: { ignored_suffixes: [] },
-    rules_path: "ARR Orchestrator",
-    error: watcherResult.error?.message || "No se pudo cargar el vigilante."
-  };
+  const loadedSources = await Promise.all(Object.entries(RULE_SOURCES).map(async ([source, config]) => {
+    try {
+      return [source, await api(config.endpoint)];
+    } catch (error) {
+      return [source, {
+        ok: false,
+        rules: clone(config.fallbackRules),
+        rules_path: config.label,
+        error: error.message || `No se pudo cargar ${config.label}.`
+      }];
+    }
+  }));
+  loadedSources.forEach(([source, documentState]) => {
+    rulesStates[source] = documentState;
+  });
   renderRules();
 }
 
+function currentRulesSource(sectionKey = currentRuleSection) {
+  return RULE_SECTIONS[sectionKey]?.source || "media";
+}
+
 function currentRulesDocument() {
-  return RULE_SECTIONS[currentRuleSection]?.source === "watcher" ? watcherRulesState : rulesState;
+  return rulesStates[currentRulesSource()];
+}
+
+function formatSavedAt(value) {
+  if (!value) return "";
+  if (typeof value === "number") return formatTime(value);
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("es-ES");
+}
+
+function rulesStatusText(documentState, source) {
+  if (documentState?.ok === false) {
+    return `Error cargando: ${documentState.error || "orquestador no disponible"}`;
+  }
+  if (source === "filebot") {
+    const revision = documentState?.revision ?? "-";
+    const savedAt = formatSavedAt(documentState?.saved_at);
+    const fingerprint = documentState?.resolver_fingerprint || "";
+    const rulesPath = documentState?.rules_path || "";
+    return `Reglas FileBot activas · Revisión ${revision}${savedAt ? ` · Guardadas ${savedAt}` : ""}${fingerprint ? ` · Huella ${fingerprint}` : ""}${rulesPath ? ` · Origen ${rulesPath}` : ""}`;
+  }
+  return `Archivo: ${documentState?.rules_path || "-"}`;
 }
 
 function renderRules(statusMessage = "") {
   const section = RULE_SECTIONS[currentRuleSection];
+  const source = currentRulesSource();
   const documentState = currentRulesDocument();
-  const statusText = statusMessage || (
-    documentState?.ok === false
-      ? `Error cargando: ${documentState.error || "orquestador no disponible"}`
-      : `Archivo: ${documentState?.rules_path || "-"}`
-  );
+  const statusText = statusMessage || rulesStatusText(documentState, source);
   const sectionButtons = Object.entries(RULE_SECTIONS).map(([key, value]) =>
     `<button class="${key === currentRuleSection ? "active" : ""}" data-rule-section="${key}">${esc(value.title)}</button>`
   ).join("");
@@ -487,6 +605,7 @@ function renderRules(statusMessage = "") {
         </div>
         <div id="rules-status" class="status">${esc(statusText)}</div>
         <div id="rules-editor">${section.groups.map(renderGroup).join("")}</div>
+        ${source === "filebot" ? renderFileBotExtras(documentState, currentRuleSection) : ""}
       </div>
     </section>`;
 
@@ -497,6 +616,68 @@ function renderRules(statusMessage = "") {
   }));
   document.getElementById("reload-rules").addEventListener("click", showReglas);
   document.getElementById("save-rules").addEventListener("click", saveRules);
+  if (source === "filebot") {
+    document.querySelectorAll("[data-path]").forEach(input => {
+      input.addEventListener("input", updateFileBotPreview);
+      input.addEventListener("change", updateFileBotPreview);
+    });
+  }
+}
+
+function safetyLabel(key) {
+  const labels = {
+    read_only: "Solo lectura",
+    databases: "Bases de datos",
+    action: "Acción",
+    conflict: "Conflictos",
+    strictness: "Modo de resolución",
+    canonical_root_folders: "Carpetas raíz canónicas",
+    paths_editable: "Edición de rutas",
+    custom_code_editable: "Código personalizado",
+    exec_editable: "Ejecución de comandos"
+  };
+  return labels[key] || String(key || "").replace(/_/g, " ").replace(/^./, ch => ch.toUpperCase());
+}
+
+function safetyValue(value) {
+  if (value === true) return "Sí";
+  if (value === false) return "No";
+  if (Array.isArray(value)) return value.join(", ");
+  if (value && typeof value === "object") return Object.entries(value).map(([key, item]) => `${key === "movies" ? "películas" : key === "tv" ? "series" : key}: ${safetyValue(item)}`).join(" · ");
+  return String(value ?? "-");
+}
+
+function fileBotPreview(rules, sectionKey) {
+  if (sectionKey === "filebot_peliculas") {
+    const quality = getPath(rules, "movies.filename_style") === "title_year_quality" ? " [1080p]" : "";
+    return `Los visitantes (1993)/Los visitantes (1993)${quality}.mkv`;
+  }
+  const withTitle = getPath(rules, "tv.filename_style") === "series_sxxexx_title" ? " - El comienzo" : "";
+  const episodeOrder = getPath(rules, "tv.episode_order") || "Airdate";
+  return `Los visitantes/Season 01/Los visitantes - S01E01${withTitle}.mkv\nOrden: ${episodeOrder}`;
+}
+
+function renderFileBotExtras(documentState, sectionKey) {
+  const entries = Object.entries(documentState?.safety || {});
+  const protections = entries.length
+    ? entries.map(([key, value]) => `<div class="field"><label>${esc(safetyLabel(key))}</label><div class="readonly-value">${esc(safetyValue(value))}</div></div>`).join("")
+    : `<div class="muted">Las protecciones del motor no estan disponibles.</div>`;
+  return `
+    <div class="rule-group">
+      <h3>Vista previa</h3>
+      <p>Ejemplo visual. No ejecuta FileBot ni mueve archivos.</p>
+      <pre id="filebot-format-preview" class="pre">${esc(fileBotPreview(documentState?.rules || {}, sectionKey))}</pre>
+    </div>
+    <div class="rule-group">
+      <h3>Protecciones activas</h3>
+      <p>Informacion de solo lectura fijada por el motor.</p>
+      ${protections}
+    </div>`;
+}
+
+function updateFileBotPreview() {
+  const preview = document.getElementById("filebot-format-preview");
+  if (preview) preview.textContent = fileBotPreview(collectRules(), currentRuleSection);
 }
 
 function renderGroup(group) {
@@ -511,13 +692,14 @@ function renderControl(control) {
   const value = getPath(currentRulesDocument()?.rules || {}, control.path);
   const id = `field-${control.path.replace(/[^a-z0-9]+/gi, "-")}`;
   const hint = control.suffix ? `<span class="hint">${esc(control.suffix)}</span>` : "";
+  const formatHint = control.format ? `<span class="hint">${esc(control.format)}</span>` : "";
   let input = "";
   if (control.type === "boolean") {
     input = `<label class="toggle"><input id="${id}" data-path="${esc(control.path)}" data-type="boolean" type="checkbox" ${value ? "checked" : ""}> Activo</label>`;
   } else if (control.type === "number") {
     input = `<input id="${id}" data-path="${esc(control.path)}" data-type="number" type="number" value="${esc(value ?? "")}" min="${esc(control.min ?? "")}" max="${esc(control.max ?? "")}" step="${esc(control.step ?? 1)}">${hint}`;
   } else if (control.type === "list") {
-    input = `<textarea id="${id}" data-path="${esc(control.path)}" data-type="list">${esc((value || []).join("\n"))}</textarea><span class="hint">Una entrada por linea.</span>`;
+    input = `<textarea id="${id}" data-path="${esc(control.path)}" data-type="list">${esc((value || []).join("\n"))}</textarea><span class="hint">Una entrada por linea.</span>${formatHint}`;
   } else if (control.type === "kv-number" || control.type === "kv-text") {
     input = `<textarea id="${id}" data-path="${esc(control.path)}" data-type="${control.type}">${esc(Object.entries(value || {}).map(([k, v]) => `${k}: ${v}`).join("\n"))}</textarea><span class="hint">Formato: clave: valor</span>`;
   } else if (control.type === "select") {
@@ -567,23 +749,26 @@ async function saveRules() {
   status.textContent = "Guardando...";
   try {
     const savingSection = currentRuleSection;
-    const savingSource = RULE_SECTIONS[savingSection]?.source || "media";
-    const savingEndpoint = savingSource === "watcher" ? "/api/watcher-rules" : "/api/rules";
+    const savingSource = currentRulesSource(savingSection);
+    const savingEndpoint = RULE_SOURCES[savingSource].endpoint;
     const rules = collectRules();
+    const payload = { rules };
+    if (savingSource === "filebot") {
+      payload.expected_revision = rulesStates[savingSource]?.revision;
+    }
     const savedState = await api(savingEndpoint, {
       method: "POST",
-      body: JSON.stringify({ rules })
+      body: JSON.stringify(payload)
     });
-    if (savingSource === "watcher") {
-      watcherRulesState = savedState;
-    } else {
-      rulesState = savedState;
-    }
+    rulesStates[savingSource] = savedState;
     if (currentRuleSection === savingSection) {
-      renderRules("Reglas guardadas correctamente.");
+      const revision = savingSource === "filebot" ? ` · Revisión ${savedState.revision ?? "-"}` : "";
+      renderRules(`Reglas guardadas y activas${revision}.`);
     }
   } catch (error) {
-    status.textContent = `Error guardando: ${error.message}`;
+    status.textContent = error.status === 409
+      ? `Conflicto al guardar: ${error.message} Recarga las reglas y vuelve a intentarlo.`
+      : `Error guardando: ${error.message}`;
   } finally {
     btn.disabled = false;
   }

@@ -1,0 +1,97 @@
+- generic [active] [ref=f1e1]:
+  - banner [ref=f1e2]:
+    - generic [ref=f1e3]:
+      - paragraph [ref=f1e4]: ARR Media Panel
+      - heading "Motor de reglas" [level=1] [ref=f1e5]
+      - generic [ref=f1e6]: Reglas, trabajos, revision e informes del flujo nuevo.
+    - navigation "Navegacion principal" [ref=f1e7]:
+      - button "Reglas" [ref=f1e8] [cursor=pointer]
+      - button "Motor" [ref=f1e9] [cursor=pointer]
+      - button "Historial" [ref=f1e10] [cursor=pointer]
+      - button "Revision" [ref=f1e11] [cursor=pointer]
+      - button "Informes" [ref=f1e12] [cursor=pointer]
+  - main [ref=f1e13]:
+    - generic [ref=f1e14]:
+      - complementary [ref=f1e15]:
+        - button "Entrada" [ref=f1e16] [cursor=pointer]
+        - button "Video" [ref=f1e17] [cursor=pointer]
+        - button "Audio" [ref=f1e18] [cursor=pointer]
+        - button "Subtitulos" [ref=f1e19] [cursor=pointer]
+        - button "Limpieza" [ref=f1e20] [cursor=pointer]
+        - button "Trailers" [ref=f1e21] [cursor=pointer]
+        - button "Vigilante ARR" [ref=f1e22] [cursor=pointer]
+        - button "FileBot Películas" [ref=f1e23] [cursor=pointer]
+        - button "FileBot Series" [ref=f1e24] [cursor=pointer]
+      - generic [ref=f1e25]:
+        - generic [ref=f1e26]:
+          - generic [ref=f1e27]:
+            - heading "FileBot Películas" [level=2] [ref=f1e28]
+            - generic [ref=f1e29]: Resolución de identidad y nombre final de las películas.
+          - generic [ref=f1e30]:
+            - button "Recargar" [ref=f1e31] [cursor=pointer]
+            - button "Guardar reglas" [ref=f1e32] [cursor=pointer]
+        - generic [ref=f1e33]: Reglas FileBot activas · Revisión 2 · Guardadas 23/7/2026, 22:54:48 · Huella sha256:6b425ec22f6a197b9a767e579c20a211650bb950dda9d6c514c1e49516f9822e · Origen settings/filebot.rules
+        - generic [ref=f1e34]:
+          - generic [ref=f1e35]:
+            - heading "Identidad" [level=3] [ref=f1e36]
+            - paragraph [ref=f1e37]: Idioma, region y ayudas controladas para resolver cada pelicula.
+            - generic [ref=f1e38]:
+              - generic [ref=f1e39]: Idioma
+              - textbox "Idioma" [ref=f1e41]: es-ES
+            - generic [ref=f1e42]:
+              - generic [ref=f1e43]: Region
+              - textbox "Region" [ref=f1e45]: ES
+            - generic [ref=f1e46]:
+              - generic [ref=f1e47]: Alias de busqueda
+              - generic [ref=f1e48]:
+                - textbox "Alias de busqueda" [ref=f1e49]
+                - generic [ref=f1e50]: Una entrada por linea.
+                - generic [ref=f1e51]: "Formato: origen | destino"
+            - generic [ref=f1e52]:
+              - generic [ref=f1e53]: Coincidencias TMDb forzadas
+              - generic [ref=f1e54]:
+                - textbox "Coincidencias TMDb forzadas" [ref=f1e55]
+                - generic [ref=f1e56]: Una entrada por linea.
+                - generic [ref=f1e57]: "Formato: titulo | año | tmdb_id"
+          - generic [ref=f1e58]:
+            - heading "Nombre final" [level=3] [ref=f1e59]
+            - paragraph [ref=f1e60]: Estilo seguro aplicado sin cambiar rutas ni acciones de FileBot.
+            - generic [ref=f1e61]:
+              - generic [ref=f1e62]: Estilo de nombre
+              - combobox "Estilo de nombre" [ref=f1e64]:
+                - option "Titulo y año" [selected]
+                - option "Titulo, año y calidad"
+        - generic [ref=f1e65]:
+          - heading "Vista previa" [level=3] [ref=f1e66]
+          - paragraph [ref=f1e67]: Ejemplo visual. No ejecuta FileBot ni mueve archivos.
+          - generic [ref=f1e68]: Los visitantes (1993)/Los visitantes (1993).mkv
+        - generic [ref=f1e69]:
+          - heading "Protecciones activas" [level=3] [ref=f1e70]
+          - paragraph [ref=f1e71]: Informacion de solo lectura fijada por el motor.
+          - generic [ref=f1e72]:
+            - generic [ref=f1e73]: Solo lectura
+            - generic [ref=f1e74]: Sí
+          - generic [ref=f1e75]:
+            - generic [ref=f1e76]: Bases de datos
+            - generic [ref=f1e77]: "películas: TheMovieDB · series: TheMovieDB::TV"
+          - generic [ref=f1e78]:
+            - generic [ref=f1e79]: Acción
+            - generic [ref=f1e80]: move
+          - generic [ref=f1e81]:
+            - generic [ref=f1e82]: Conflictos
+            - generic [ref=f1e83]: skip
+          - generic [ref=f1e84]:
+            - generic [ref=f1e85]: Modo de resolución
+            - generic [ref=f1e86]: non-strict
+          - generic [ref=f1e87]:
+            - generic [ref=f1e88]: Carpetas raíz canónicas
+            - generic [ref=f1e89]: "películas: {n} ({y}) · series: {n}"
+          - generic [ref=f1e90]:
+            - generic [ref=f1e91]: Edición de rutas
+            - generic [ref=f1e92]: "No"
+          - generic [ref=f1e93]:
+            - generic [ref=f1e94]: Código personalizado
+            - generic [ref=f1e95]: "No"
+          - generic [ref=f1e96]:
+            - generic [ref=f1e97]: Ejecución de comandos
+            - generic [ref=f1e98]: "No"

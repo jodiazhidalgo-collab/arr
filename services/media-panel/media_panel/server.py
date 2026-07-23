@@ -9,7 +9,7 @@ import zipfile
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -171,6 +171,51 @@ def _upstream_post_json(url: str, payload: Dict[str, Any], timeout: int = 20) ->
         return {"ok": False, "error": str(error)}
 
 
+def _proxy_upstream_json(
+    url: str,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: int = 20,
+) -> Tuple[int, Dict[str, Any]]:
+    """Proxy JSON conservando el estado y el cuerpo util del upstream."""
+    request: Any = url
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        status = int(error.code or 502)
+        raw = error.read()
+    except Exception as error:
+        return 502, {"ok": False, "error": str(error), "upstream_status": 502}
+
+    try:
+        decoded = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception:
+        text = raw.decode("utf-8", errors="replace").strip()
+        return status, {
+            "ok": False,
+            "error": text or "Respuesta no valida del orquestador.",
+            "upstream_status": status,
+        }
+    if isinstance(decoded, dict):
+        return status, decoded
+    return status, {
+        "ok": False,
+        "error": "Respuesta no valida del orquestador.",
+        "upstream_status": status,
+        "upstream_body": decoded,
+    }
+
+
 def _count_children(path: Path) -> int:
     try:
         return sum(1 for _ in path.iterdir()) if path.is_dir() else 0
@@ -302,6 +347,14 @@ def _watcher_rules_payload() -> Dict[str, Any]:
 
 def _save_watcher_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _upstream_post_json(f"{ORCH_URL}/settings/watcher", payload)
+
+
+def _filebot_rules_payload() -> Tuple[int, Dict[str, Any]]:
+    return _proxy_upstream_json(f"{ORCH_URL}/settings/filebot", timeout=8)
+
+
+def _save_filebot_rules(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    return _proxy_upstream_json(f"{ORCH_URL}/settings/filebot", payload, timeout=20)
 
 
 def _status_payload() -> Dict[str, Any]:
@@ -498,6 +551,10 @@ class Handler(BaseHTTPRequestHandler):
             result = _watcher_rules_payload()
             self._json(200 if result.get("ok") else 502, result)
             return
+        if path == "/api/filebot-rules":
+            status, result = _filebot_rules_payload()
+            self._json(status, result)
+            return
         if path == "/api/review":
             self._json(200, _review_payload())
             return
@@ -543,6 +600,13 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = _save_watcher_rules(self._read_payload())
                 self._json(200 if result.get("ok") else 400, result)
+            except Exception as error:
+                self._json(500, {"ok": False, "error": str(error)})
+            return
+        if parsed.path == "/api/filebot-rules":
+            try:
+                status, result = _save_filebot_rules(self._read_payload())
+                self._json(status, result)
             except Exception as error:
                 self._json(500, {"ok": False, "error": str(error)})
             return

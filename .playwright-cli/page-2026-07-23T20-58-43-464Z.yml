@@ -1,0 +1,130 @@
+- generic [ref=f1e1]:
+  - banner [ref=f1e2]:
+    - generic [ref=f1e3]:
+      - paragraph [ref=f1e4]: ARR Media Panel
+      - heading "Estado del motor" [level=1] [ref=f1e269]
+      - generic [ref=f1e6]: Reglas, trabajos, revision e informes del flujo nuevo.
+    - navigation "Navegacion principal" [ref=f1e7]:
+      - button "Reglas" [ref=f1e8] [cursor=pointer]
+      - button "Motor" [active] [ref=f1e9] [cursor=pointer]
+      - button "Historial" [ref=f1e10] [cursor=pointer]
+      - button "Revision" [ref=f1e11] [cursor=pointer]
+      - button "Informes" [ref=f1e12] [cursor=pointer]
+  - main [ref=f1e13]:
+    - generic [ref=f1e270]:
+      - generic [ref=f1e271]:
+        - text: Orquestador
+        - generic [ref=f1e272]: OK
+        - generic [ref=f1e273]: activo
+      - generic [ref=f1e274]:
+        - text: Media Worker
+        - generic [ref=f1e275]: OK
+        - generic [ref=f1e276]: activo
+      - generic [ref=f1e277]:
+        - text: qBittorrent
+        - generic [ref=f1e278]: ok
+      - generic [ref=f1e279]:
+        - text: RDT-Client
+        - generic [ref=f1e280]: ok
+    - generic [ref=f1e281]:
+      - heading "Rutas vivas" [level=2] [ref=f1e282]
+      - generic [ref=f1e283]:
+        - generic [ref=f1e284]:
+          - text: rules
+          - generic [ref=f1e285]: "0"
+          - generic [ref=f1e286]: /config/media-rules/reglas_motor.json
+        - generic [ref=f1e287]:
+          - text: defaults
+          - generic [ref=f1e288]: "0"
+          - generic [ref=f1e289]: /defaults/reglas_motor_default.json
+        - generic [ref=f1e290]:
+          - text: reports
+          - generic [ref=f1e291]: "0"
+          - generic [ref=f1e292]: /config/media-worker
+        - generic [ref=f1e293]:
+          - text: review
+          - generic [ref=f1e294]: "19"
+          - generic [ref=f1e295]: /data/media/repetidas_vs_error
+        - generic [ref=f1e296]:
+          - text: movies_final
+          - generic [ref=f1e297]: "395"
+          - generic [ref=f1e298]: /data/media/movies
+        - generic [ref=f1e299]:
+          - text: tv_final
+          - generic [ref=f1e300]: "28"
+          - generic [ref=f1e301]: /data/media/tv
+        - generic [ref=f1e302]:
+          - text: movies_automatizacion
+          - generic [ref=f1e303]: "0"
+          - generic [ref=f1e304]: /data/downloads/torrents/complete/movies_automatizacion
+        - generic [ref=f1e305]:
+          - text: trailers_automatizacion
+          - generic [ref=f1e306]: "0"
+          - generic [ref=f1e307]: /data/downloads/torrents/complete/trailers_automatizacion
+    - generic [ref=f1e308]:
+      - heading "Ultimos trabajos" [level=2] [ref=f1e309]
+      - table [ref=f1e310]:
+        - rowgroup [ref=f1e311]:
+          - row [ref=f1e312]:
+            - columnheader "Nombre" [ref=f1e313]
+            - columnheader "Categoria" [ref=f1e314]
+            - columnheader "Estado" [ref=f1e315]
+            - columnheader "Actualizado" [ref=f1e316]
+            - columnheader "Diagnostico" [ref=f1e317]
+        - rowgroup [ref=f1e318]:
+          - row [ref=f1e319]:
+            - cell "codex_live_flow_probe_20260723_225625_serie" [ref=f1e320]
+            - cell "tv" [ref=f1e321]
+            - cell "error_terminal" [ref=f1e322]
+            - cell "23/7/2026, 22:56:37" [ref=f1e324]
+            - cell [ref=f1e325]:
+              - button "Informe Codex" [ref=f1e326] [cursor=pointer]
+          - row [ref=f1e327]:
+            - cell "codex_live_flow_probe_20260723_225625_pelicula" [ref=f1e328]
+            - cell "movies" [ref=f1e329]
+            - cell "manual_review" [ref=f1e330]
+            - cell "23/7/2026, 22:56:34" [ref=f1e332]
+            - cell [ref=f1e333]:
+              - button "Informe Codex" [ref=f1e334] [cursor=pointer]
+          - row [ref=f1e335]:
+            - cell "Resident.Evil.Extinction.2007.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT" [ref=f1e336]
+            - cell "movies" [ref=f1e337]
+            - cell "media_postprocess_running" [ref=f1e338]
+            - cell "23/7/2026, 22:52:52" [ref=f1e340]
+            - cell [ref=f1e341]:
+              - button "Informe Codex" [ref=f1e342] [cursor=pointer]
+          - row [ref=f1e343]:
+            - cell "The.Visitors.1993.FRENCH.REMASTERED.1080p.BluRay.H264.AAC-VXT" [ref=f1e344]
+            - cell "movies" [ref=f1e345]
+            - cell "manual_review" [ref=f1e346]
+            - cell "23/7/2026, 20:27:37" [ref=f1e348]
+            - cell [ref=f1e349]:
+              - button "Informe Codex" [ref=f1e350] [cursor=pointer]
+          - row [ref=f1e351]:
+            - cell "Los Visitantes No Nacieron Ayer [DVDrip][Spanish]" [ref=f1e352]
+            - cell "movies" [ref=f1e353]
+            - cell "done" [ref=f1e354]
+            - cell "23/7/2026, 20:24:11" [ref=f1e356]
+            - cell [ref=f1e357]:
+              - button "Informe Codex" [ref=f1e358] [cursor=pointer]
+          - row [ref=f1e359]:
+            - cell "He-Man y los Masters del Universo (2026) [4k 2160p][Esp]" [ref=f1e360]
+            - cell "movies" [ref=f1e361]
+            - cell "done" [ref=f1e362]
+            - cell "23/7/2026, 19:21:37" [ref=f1e364]
+            - cell [ref=f1e365]:
+              - button "Informe Codex" [ref=f1e366] [cursor=pointer]
+          - row [ref=f1e367]:
+            - cell "Turno de noche (2026) [4k 2160p][Esp]" [ref=f1e368]
+            - cell "movies" [ref=f1e369]
+            - cell "done" [ref=f1e370]
+            - cell "23/7/2026, 18:12:10" [ref=f1e372]
+            - cell [ref=f1e373]:
+              - button "Informe Codex" [ref=f1e374] [cursor=pointer]
+          - row [ref=f1e375]:
+            - cell "Resident Evil VI (2016).mkv" [ref=f1e376]
+            - cell "movies" [ref=f1e377]
+            - cell "done" [ref=f1e378]
+            - cell "23/7/2026, 5:55:36" [ref=f1e380]
+            - cell [ref=f1e381]:
+              - button "Informe Codex" [ref=f1e382] [cursor=pointer]

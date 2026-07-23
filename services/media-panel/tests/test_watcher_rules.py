@@ -26,7 +26,7 @@ class WatcherRulesProxyTests(unittest.TestCase):
         self.assertEqual(result, expected)
         upstream.assert_called_once_with(f"{server.ORCH_URL}/settings/watcher", payload)
 
-    def test_save_pins_source_before_waiting_for_response(self) -> None:
+    def test_save_pins_generic_source_before_waiting_for_response(self) -> None:
         panel_js = (
             Path(server.__file__).resolve().parent
             / "web"
@@ -36,9 +36,9 @@ class WatcherRulesProxyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("const savingSection = currentRuleSection;", panel_js)
-        self.assertIn("const savingSource = RULE_SECTIONS[savingSection]?.source", panel_js)
+        self.assertIn("const savingSource = currentRulesSource(savingSection);", panel_js)
         self.assertIn("const savedState = await api(savingEndpoint", panel_js)
-        self.assertIn('if (savingSource === "watcher")', panel_js)
+        self.assertIn("rulesStates[savingSource] = savedState;", panel_js)
 
     def test_long_rule_status_wraps_on_mobile(self) -> None:
         panel_css = (

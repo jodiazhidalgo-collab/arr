@@ -1,0 +1,100 @@
+- generic [ref=f2e1]:
+  - banner [ref=f2e2]:
+    - generic [ref=f2e3]:
+      - paragraph [ref=f2e4]: ARR Media Panel
+      - heading "Motor de reglas" [level=1] [ref=f2e128]
+      - generic [ref=f2e6]: Reglas, trabajos, revision e informes del flujo nuevo.
+    - navigation "Navegacion principal" [ref=f2e7]:
+      - button "Reglas" [active] [ref=f2e8] [cursor=pointer]
+      - button "Motor" [ref=f2e9] [cursor=pointer]
+      - button "Historial" [ref=f2e10] [cursor=pointer]
+      - button "Revision" [ref=f2e11] [cursor=pointer]
+      - button "Informes" [ref=f2e12] [cursor=pointer]
+  - main [ref=f2e13]:
+    - generic [ref=f2e129]:
+      - complementary [ref=f2e130]:
+        - button "Entrada" [ref=f2e131] [cursor=pointer]
+        - button "Video" [ref=f2e132] [cursor=pointer]
+        - button "Audio" [ref=f2e133] [cursor=pointer]
+        - button "Subtitulos" [ref=f2e134] [cursor=pointer]
+        - button "Limpieza" [ref=f2e135] [cursor=pointer]
+        - button "Trailers" [ref=f2e136] [cursor=pointer]
+        - button "Vigilante ARR" [ref=f2e137] [cursor=pointer]
+        - button "FileBot Películas" [ref=f2e138] [cursor=pointer]
+        - button "FileBot Series" [ref=f2e139] [cursor=pointer]
+      - generic [ref=f2e140]:
+        - generic [ref=f2e141]:
+          - generic [ref=f2e142]:
+            - heading "FileBot Series" [level=2] [ref=f2e143]
+            - generic [ref=f2e144]: Resolucion de identidad, episodios y nombre final de las series.
+          - generic [ref=f2e145]:
+            - button "Recargar" [ref=f2e146] [cursor=pointer]
+            - button "Guardar reglas" [ref=f2e147] [cursor=pointer]
+        - generic [ref=f2e148]: Reglas FileBot activas · Revisión 2 · Guardadas 23/7/2026, 22:54:48 · Huella sha256:6b425ec22f6a197b9a767e579c20a211650bb950dda9d6c514c1e49516f9822e · Origen settings/filebot.rules
+        - generic [ref=f2e149]:
+          - generic [ref=f2e150]:
+            - heading "Identidad" [level=3] [ref=f2e151]
+            - paragraph [ref=f2e152]: Idioma, region y ayudas controladas para resolver cada serie.
+            - generic [ref=f2e153]:
+              - generic [ref=f2e154]: Idioma
+              - textbox "Idioma" [ref=f2e156]: es-ES
+            - generic [ref=f2e157]:
+              - generic [ref=f2e158]: Alias de busqueda
+              - generic [ref=f2e159]:
+                - textbox "Alias de busqueda" [ref=f2e160]
+                - generic [ref=f2e161]: Una entrada por linea.
+                - generic [ref=f2e162]: "Formato: origen | destino"
+            - generic [ref=f2e163]:
+              - generic [ref=f2e164]: Coincidencias TMDb forzadas
+              - generic [ref=f2e165]:
+                - textbox "Coincidencias TMDb forzadas" [ref=f2e166]
+                - generic [ref=f2e167]: Una entrada por linea.
+                - generic [ref=f2e168]: "Formato: titulo | año opcional | tmdb_id"
+          - generic [ref=f2e169]:
+            - heading "Nombre final" [level=3] [ref=f2e170]
+            - paragraph [ref=f2e171]: Estilo seguro y orden de episodios usados por FileBot.
+            - generic [ref=f2e172]:
+              - generic [ref=f2e173]: Estilo de nombre
+              - combobox "Estilo de nombre" [ref=f2e175]:
+                - option "Serie y SxxExx" [selected]
+                - option "Serie, SxxExx y titulo"
+            - generic [ref=f2e176]:
+              - generic [ref=f2e177]: Orden de episodios
+              - combobox "Orden de episodios" [ref=f2e179]:
+                - option "Emision" [selected]
+                - option "DVD"
+                - option "Absoluto"
+        - generic [ref=f2e180]:
+          - heading "Vista previa" [level=3] [ref=f2e181]
+          - paragraph [ref=f2e182]: Ejemplo visual. No ejecuta FileBot ni mueve archivos.
+          - generic [ref=f2e183]: "Los visitantes/Season 01/Los visitantes - S01E01.mkv Orden: Airdate"
+        - generic [ref=f2e184]:
+          - heading "Protecciones activas" [level=3] [ref=f2e185]
+          - paragraph [ref=f2e186]: Informacion de solo lectura fijada por el motor.
+          - generic [ref=f2e187]:
+            - generic [ref=f2e188]: Solo lectura
+            - generic [ref=f2e189]: Sí
+          - generic [ref=f2e190]:
+            - generic [ref=f2e191]: Bases de datos
+            - generic [ref=f2e192]: "películas: TheMovieDB · series: TheMovieDB::TV"
+          - generic [ref=f2e193]:
+            - generic [ref=f2e194]: Acción
+            - generic [ref=f2e195]: move
+          - generic [ref=f2e196]:
+            - generic [ref=f2e197]: Conflictos
+            - generic [ref=f2e198]: skip
+          - generic [ref=f2e199]:
+            - generic [ref=f2e200]: Modo de resolución
+            - generic [ref=f2e201]: non-strict
+          - generic [ref=f2e202]:
+            - generic [ref=f2e203]: Carpetas raíz canónicas
+            - generic [ref=f2e204]: "películas: {n} ({y}) · series: {n}"
+          - generic [ref=f2e205]:
+            - generic [ref=f2e206]: Edición de rutas
+            - generic [ref=f2e207]: "No"
+          - generic [ref=f2e208]:
+            - generic [ref=f2e209]: Código personalizado
+            - generic [ref=f2e210]: "No"
+          - generic [ref=f2e211]:
+            - generic [ref=f2e212]: Ejecución de comandos
+            - generic [ref=f2e213]: "No"

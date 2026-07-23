@@ -248,6 +248,16 @@ h3 {
   font-weight: 650;
 }
 
+.readonly-value {
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid rgba(148, 163, 184, .18);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, .55);
+  color: #cbd5e1;
+  overflow-wrap: anywhere;
+}
+
 .hint {
   display: block;
   margin-top: 4px;

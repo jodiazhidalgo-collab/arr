@@ -46,15 +46,17 @@ def main() -> int:
         diagnostics_root=config.diagnostics_root,
     )
     health = start_health_server(
-        config.health_port,
-        engine.status,
-        lambda: database.latest_jobs(100),
-        database.job_detail,
-        database.add_event,
-        follow,
-        diagnostic,
-        engine.watcher_rules,
-        engine.update_watcher_rules,
+        port=config.health_port,
+        status_provider=engine.status,
+        jobs_provider=lambda: database.latest_jobs(100),
+        job_provider=database.job_detail,
+        event_recorder=database.add_event,
+        follow_provider=follow,
+        diagnostic_creator=diagnostic,
+        watcher_rules_provider=engine.watcher_rules,
+        watcher_rules_updater=engine.update_watcher_rules,
+        filebot_rules_provider=engine.filebot_rules,
+        filebot_rules_updater=engine.update_filebot_rules,
     )
 
     def stop(_signum: int, _frame: object) -> None:

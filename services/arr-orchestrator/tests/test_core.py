@@ -1,3 +1,4 @@
+import json
 import tempfile
 import time
 import unittest
@@ -1556,6 +1557,179 @@ class CoreTests(unittest.TestCase):
                 if event["phase"] == "recovery"
             ]
             self.assertEqual(len(recovery_events), 1)
+            database.close()
+
+    def test_filebot_rules_are_snapshotted_per_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+
+            before = json.loads(engine._new_job_source_meta_json())["filebot_rules"]
+            changed = engine.filebot_rules()["rules"]
+            changed["movies"]["filename_style"] = "title_year_quality"
+            saved = engine.update_filebot_rules(
+                {"rules": changed, "expected_revision": 0}
+            )
+            after = engine._active_filebot_rules_context()
+            old_job_context = engine._filebot_rules_for_job(
+                {"source_meta_json": json.dumps({"filebot_rules": before})}
+            )
+
+            self.assertTrue(saved["ok"])
+            self.assertEqual(before["revision"], 0)
+            self.assertEqual(old_job_context["revision"], 0)
+            self.assertEqual(
+                old_job_context["rules"]["movies"]["filename_style"], "title_year"
+            )
+            self.assertEqual(after["revision"], 1)
+            self.assertEqual(
+                after["rules"]["movies"]["filename_style"], "title_year_quality"
+            )
+            database.close()
+
+    def test_movie_filebot_timeout_finishes_in_review_with_material(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-timeout-movie"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Timeout Movie (2026).mkv"
+            source.write_bytes(b"movie")
+            job = database.create_job(
+                "fs:movies:timeout",
+                "fs",
+                "movies",
+                "Timeout Movie (2026)",
+                state="ready_filebot",
+                stage_path=str(job_root),
+                source_path=str(original),
+            )
+
+            class TimeoutFileBot:
+                def configure_rules(self, rules):
+                    self.rules = rules
+
+                def run(self, _job_id, _category, _input_path, output_root):
+                    partial = output_root / "Timeout Movie (2026)" / "Timeout Movie (2026).mkv"
+                    partial.parent.mkdir(parents=True, exist_ok=True)
+                    partial.write_bytes(b"partial")
+                    return {
+                        "exit_code": 124,
+                        "moves": [],
+                        "output_media": [str(partial)],
+                        "duplicate": False,
+                        "timed_out": True,
+                        "timeout_message": "FileBot agoto el timeout de prueba",
+                        "stdout_tail": "timeout",
+                    }
+
+            engine.filebot = TimeoutFileBot()
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            review = Path(updated["stage_path"])
+            self.assertEqual(updated["state"], "manual_review")
+            self.assertEqual(updated["last_error_code"], "filebot_timeout")
+            self.assertTrue((review / "reason.json").exists())
+            self.assertTrue(any(path.name.endswith(".mkv") for path in review.rglob("*.mkv")))
+            self.assertEqual(updated["last_error_message"], "FileBot agoto el timeout de prueba")
+            database.close()
+
+    def test_tv_filebot_timeout_quarantines_identity_matched_unlogged_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-timeout-tv"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            source = original / "Timeout Show S01E10.mkv"
+            source.write_bytes(b"episode")
+            job = database.create_job(
+                "fs:tv:timeout",
+                "fs",
+                "tv",
+                "Timeout Show S01E10",
+                state="ready_filebot",
+                stage_path=str(job_root),
+                source_path=str(original),
+            )
+            destination = (
+                config.tv_output
+                / "Timeout Show"
+                / "Season 01"
+                / "Timeout Show - S01E10.mkv"
+            )
+            unrelated_destination = (
+                config.tv_output
+                / "Timeout Show"
+                / "Season 01"
+                / "Timeout Show - S01E100.mkv"
+            )
+            resolved = ResolvedIdentity(
+                media_type="tv",
+                tmdb_id=999,
+                title="Timeout Show",
+                original_title="Timeout Show",
+                year=2026,
+                aliases=["Timeout Show"],
+                score=100,
+                margin=20,
+                query="Timeout Show",
+                guess={"title": "Timeout Show", "season": 1, "episode": 10},
+                source="test",
+                season=1,
+                episodes=[10],
+            )
+
+            class TimeoutFileBot:
+                def configure_rules(self, _rules):
+                    return None
+
+                def run(self, _job_id, _category, input_path, _output_root):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(b"moved")
+                    unrelated_destination.write_bytes(b"other-job")
+                    input_path.joinpath("Timeout Show S01E10.mkv").unlink(missing_ok=True)
+                    return {
+                        "exit_code": 124,
+                        "moves": [],
+                        "output_media": [
+                            str(destination),
+                            str(unrelated_destination),
+                        ],
+                        "duplicate": False,
+                        "timed_out": True,
+                        "timeout_message": "FileBot agoto el timeout de prueba",
+                        "stdout_tail": "timeout",
+                        "identity": resolved.to_dict(),
+                    }
+
+            engine.filebot = TimeoutFileBot()
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            review = Path(updated["stage_path"])
+            self.assertEqual(updated["state"], "manual_review")
+            self.assertFalse(destination.exists())
+            self.assertTrue(unrelated_destination.exists())
+            self.assertEqual(unrelated_destination.read_bytes(), b"other-job")
+            recovered = list(review.rglob("Timeout Show - S01E10.mkv"))
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(list(review.rglob("Timeout Show - S01E100.mkv")), [])
+            self.assertIn("filebot_rejected", recovered[0].parts)
             database.close()
 
     def test_real_torrent_fixture_when_available(self) -> None:
