@@ -33,5 +33,6 @@ logs/
 htmlcov/
 
 .playwright-mcp/
+.playwright-cli/
 .DS_Store
 Thumbs.db
