@@ -2069,51 +2069,67 @@ class CoreTests(unittest.TestCase):
             config.ensure_directories()
             database = Database(root / "test.db")
             database.initialize()
-            engine = Engine(config, database)
+            try:
+                engine = Engine(config, database)
 
-            old_item = config.complete_root / "movies" / "Anterior"
-            old_item.mkdir(parents=True)
-            old_job = database.create_job(
-                "fs:movies:anterior",
-                "fs",
-                "movies",
-                old_item.name,
-                state="waiting_stable",
-                source_path=str(old_item),
-            )
-            engine.update_watcher_rules({"rules": {"ignored_suffixes": [".bloqueo"]}})
-            (old_item / "interior.bloqueo").write_bytes(b"partial")
-            self.assertFalse(engine._ignored_movies_job(old_job, old_item))
+                old_item = config.complete_root / "movies" / "Anterior"
+                old_item.mkdir(parents=True)
+                old_job = database.create_job(
+                    "fs:movies:anterior",
+                    "fs",
+                    "movies",
+                    old_item.name,
+                    state="waiting_stable",
+                    source_path=str(old_item),
+                    created_at=100.0,
+                )
+                with patch("arr_orchestrator.engine.time.time", return_value=200.0):
+                    engine.update_watcher_rules(
+                        {"rules": {"ignored_suffixes": [".bloqueo"]}}
+                    )
+                (old_item / "interior.bloqueo").write_bytes(b"partial")
+                self.assertFalse(engine._ignored_movies_job(old_job, old_item))
 
-            future_item = config.complete_root / "movies" / "Posterior"
-            future_item.mkdir(parents=True)
-            future_job = database.create_job(
-                "fs:movies:posterior",
-                "fs",
-                "movies",
-                future_item.name,
-                state="waiting_stable",
-                source_path=str(future_item),
-            )
-            ignored = future_item / "profundo" / "temporal.BLOQUEO"
-            ignored.parent.mkdir(parents=True)
-            ignored.write_bytes(b"partial")
-            self.assertTrue(engine._ignored_movies_job(future_job, future_item))
+                future_item = config.complete_root / "movies" / "Posterior"
+                future_item.mkdir(parents=True)
+                future_job = database.create_job(
+                    "fs:movies:posterior",
+                    "fs",
+                    "movies",
+                    future_item.name,
+                    state="waiting_stable",
+                    source_path=str(future_item),
+                    created_at=300.0,
+                )
+                ignored = future_item / "profundo" / "temporal.BLOQUEO"
+                ignored.parent.mkdir(parents=True)
+                ignored.write_bytes(b"partial")
+                self.assertTrue(engine._ignored_movies_job(future_job, future_item))
 
-            engine.update_watcher_rules({"rules": {"ignored_suffixes": [".otra"]}})
-            self.assertTrue(engine._ignored_movies_job(future_job, future_item))
-            restarted = Engine(config, database)
-            self.assertTrue(restarted._ignored_movies_job(future_job, future_item))
+                with patch("arr_orchestrator.engine.time.time", return_value=400.0):
+                    engine.update_watcher_rules(
+                        {"rules": {"ignored_suffixes": [".otra"]}}
+                    )
+                self.assertTrue(engine._ignored_movies_job(future_job, future_item))
+                restarted = Engine(config, database)
+                self.assertTrue(restarted._ignored_movies_job(future_job, future_item))
 
-            restarted._stable[str(future_job["job_id"])] = ("old", time.time() - 20)
-            restarted._process_job(future_job)
-            self.assertEqual(database.get_job(future_job["job_id"])["state"], "waiting_stable")
-            self.assertNotIn(str(future_job["job_id"]), restarted._stable)
+                restarted._stable[str(future_job["job_id"])] = (
+                    "old",
+                    time.time() - 20,
+                )
+                restarted._process_job(future_job)
+                self.assertEqual(
+                    database.get_job(future_job["job_id"])["state"],
+                    "waiting_stable",
+                )
+                self.assertNotIn(str(future_job["job_id"]), restarted._stable)
 
-            ignored.unlink()
-            restarted._process_job(database.get_job(future_job["job_id"]))
-            self.assertIn(str(future_job["job_id"]), restarted._stable)
-            database.close()
+                ignored.unlink()
+                restarted._process_job(database.get_job(future_job["job_id"]))
+                self.assertIn(str(future_job["job_id"]), restarted._stable)
+            finally:
+                database.close()
 
     def test_top_level_folder_name_keeps_previous_ignore_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

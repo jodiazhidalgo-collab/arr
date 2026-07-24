@@ -17,10 +17,14 @@ def test_pytest_root_configuration_matches_arr_layout():
     assert "tests" in pytest_config["testpaths"]
     assert "services/arr-orchestrator/tests" in pytest_config["testpaths"]
     assert "services/buscador-puente-arr/tests" in pytest_config["testpaths"]
+    assert "services/media-worker/tests" in pytest_config["testpaths"]
+    assert "services/media-panel/tests" in pytest_config["testpaths"]
     assert pytest_config["python_files"] == "test_*.py"
     assert "-ra" in pytest_config["addopts"]
     assert "services/arr-orchestrator" in pytest_config["pythonpath"]
     assert "services/buscador-puente-arr" in pytest_config["pythonpath"]
+    assert "services/media-worker" in pytest_config["pythonpath"]
+    assert "services/media-panel" in pytest_config["pythonpath"]
 
 
 def test_requirements_dev_documents_service_scoped_dependencies():

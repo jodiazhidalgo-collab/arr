@@ -33,7 +33,7 @@ Para revisar un fallo, empieza por el Informe Codex del job y despues contrasta 
 2. `AGENTS.md`: reglas operativas locales del proyecto.
 3. `README_DIAGNOSTICO_CODEX.md`: orden recomendado para leer informes Codex, trazas y errores.
 4. `.github/workflows/ci.yml`: pruebas automaticas que GitHub ejecuta en cada push o pull request.
-5. Artefacto `arr-pytest-evidence` de GitHub Actions: informe JUnit de pytest descargable.
+5. Artefactos `arr-pytest-evidence-windows-latest` y `arr-pytest-evidence-ubuntu-latest` de GitHub Actions: informes JUnit y validaciones estaticas descargables.
 6. `docs/evidencia-pytest-y-validacion-local.md`: como reproducir las pruebas desde cero.
 
 ## Verdad tecnica del flujo
@@ -54,7 +54,8 @@ Desde la raiz del repo:
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python -m compileall -q conftest.py tests services/arr-orchestrator services/buscador-puente-arr services/media-panel
+python -m compileall -q conftest.py services tests
+node --check services/media-panel/media_panel/web/static/js/panel.js
 python -m pytest -q --junitxml _codex_runtime/artifacts/pytest-junit.xml --durations=20
 ```
 

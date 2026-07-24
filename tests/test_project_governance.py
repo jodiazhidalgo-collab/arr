@@ -84,8 +84,30 @@ def test_git_hooks_and_ci_are_present():
     codeowners = read(".github/CODEOWNERS")
 
     assert "git diff --cached --check" in hook
-    assert "compileall" in hook
+    assert "compileall -q conftest.py services tests" in hook
+    assert "node --check services/media-panel/media_panel/web/static/js/panel.js" in hook
     assert "pytest" in hook
     assert "requirements-dev.txt" in workflow
     assert "python -m pytest -q" in workflow
+    assert "compileall -q conftest.py services tests" in workflow
+    assert "node --check services/media-panel/media_panel/web/static/js/panel.js" in workflow
+    assert "windows-latest" in workflow
+    assert "ubuntu-latest" in workflow
+    assert "pytest-junit-${{ matrix.os }}.xml" in workflow
+    assert "arr-pytest-evidence-${{ matrix.os }}" in workflow
+    assert "actions/checkout@v6" in workflow
+    assert "actions/setup-python@v6" in workflow
+    assert "actions/setup-node@v6" in workflow
+    assert "actions/upload-artifact@v7" in workflow
     assert "@jodiazhidalgo-collab" in codeowners
+
+
+def test_review_docs_match_the_validation_contract():
+    ai_review = read("docs/AI_REVIEW.md")
+    evidence = read("docs/evidencia-pytest-y-validacion-local.md")
+
+    for text in (ai_review, evidence):
+        assert "compileall -q conftest.py services tests" in text
+        assert "node --check services/media-panel/media_panel/web/static/js/panel.js" in text
+        assert "arr-pytest-evidence-windows-latest" in text
+        assert "arr-pytest-evidence-ubuntu-latest" in text
