@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -14,6 +16,30 @@ BUSCADOR_DIR = PROJECT_ROOT / "services" / "buscador-puente-arr"
 PYTEST_DATA_DIR = PROJECT_ROOT / "_codex_runtime" / "test-data" / "pytest-session"
 ARR_DATA_DIR = PYTEST_DATA_DIR / "arr"
 BUSCADOR_DATA_DIR = PYTEST_DATA_DIR / "buscador"
+
+
+def _remove_pytest_session_data() -> None:
+    session_root = PYTEST_DATA_DIR.resolve()
+    for logger_object in tuple(logging.Logger.manager.loggerDict.values()):
+        if not isinstance(logger_object, logging.Logger):
+            continue
+        for handler in tuple(logger_object.handlers):
+            filename = getattr(handler, "baseFilename", None)
+            if not filename:
+                continue
+            try:
+                Path(filename).resolve().relative_to(session_root)
+            except (OSError, ValueError):
+                continue
+            logger_object.removeHandler(handler)
+            handler.close()
+    shutil.rmtree(PYTEST_DATA_DIR, ignore_errors=True)
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    if exitstatus == pytest.ExitCode.OK:
+        _remove_pytest_session_data()
+
 
 for path in (ORCHESTRATOR_DIR, BUSCADOR_DIR):
     text = str(path)
