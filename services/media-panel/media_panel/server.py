@@ -11,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from .identity_proxy import IdentityProxy
+
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
@@ -26,6 +28,16 @@ TV_ROOT = Path(os.environ.get("ARR_TV_ROOT", "/data/media/tv"))
 ORCH_URL = os.environ.get("ARR_ORCHESTRATOR_URL", "http://arr-orchestrator:8787").rstrip("/")
 WORKER_URL = os.environ.get("MEDIA_WORKER_URL", "http://media-worker:8790").rstrip("/")
 CODEX_DIAG_ROOT = Path(os.environ.get("CODEX_DIAG_ROOT", "/diagnosticos_codex"))
+IDENTITY_PROXY = IdentityProxy(ORCH_URL)
+MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+
+
+class PayloadTooLargeError(ValueError):
+    pass
+
+
+class InvalidContentLengthError(ValueError):
+    pass
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -501,13 +513,24 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _read_payload(self) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        data = self.rfile.read(min(length, 4 * 1024 * 1024)) if length else b"{}"
+        length = self._content_length()
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise PayloadTooLargeError
+        data = self.rfile.read(length) if length else b"{}"
         try:
             payload = json.loads(data.decode("utf-8"))
             return payload if isinstance(payload, dict) else {}
         except Exception:
             return {}
+
+    def _content_length(self) -> int:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except (TypeError, ValueError) as error:
+            raise InvalidContentLengthError from error
+        if length < 0:
+            raise InvalidContentLengthError
+        return length
 
     def _static(self, path: str) -> None:
         rel = path.removeprefix("/static/").strip("/")
@@ -555,6 +578,10 @@ class Handler(BaseHTTPRequestHandler):
             status, result = _filebot_rules_payload()
             self._json(status, result)
             return
+        if path == "/api/identity-rules":
+            status, result = IDENTITY_PROXY.get_rules()
+            self._json(status, result)
+            return
         if path == "/api/review":
             self._json(200, _review_payload())
             return
@@ -590,6 +617,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        try:
+            length = self._content_length()
+        except InvalidContentLengthError:
+            self._json(
+                400,
+                {
+                    "ok": False,
+                    "error": "invalid_request",
+                    "message": "Content-Length no es valido.",
+                },
+            )
+            return
+        if length > MAX_REQUEST_BODY_BYTES:
+            self._json(
+                413,
+                {
+                    "ok": False,
+                    "error": "payload_too_large",
+                    "message": "El JSON supera el limite de 4 MB.",
+                },
+            )
+            return
         if parsed.path == "/api/rules":
             try:
                 self._json(200, _save_rules(self._read_payload()))
@@ -609,6 +658,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(status, result)
             except Exception as error:
                 self._json(500, {"ok": False, "error": str(error)})
+            return
+        identity_actions = {
+            "/api/identity-rules": IDENTITY_PROXY.save_rules,
+            "/api/identity-rules/reset": IDENTITY_PROXY.reset_rules,
+            "/api/identity-rules/cache/clear": IDENTITY_PROXY.clear_cache,
+            "/api/identity-rules/test-parser": IDENTITY_PROXY.test_parser,
+            "/api/identity-rules/test-resolver": IDENTITY_PROXY.test_resolver,
+        }
+        identity_action = identity_actions.get(parsed.path)
+        if identity_action:
+            try:
+                status, result = identity_action(self._read_payload())
+                self._json(status, result)
+            except Exception as error:
+                self._json(500, {"ok": False, "error": type(error).__name__})
             return
         if parsed.path == "/api/codex-diagnostic":
             try:

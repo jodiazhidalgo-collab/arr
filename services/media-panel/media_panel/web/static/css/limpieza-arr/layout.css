@@ -1,0 +1,320 @@
+.identity-shell {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.identity-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background:
+    radial-gradient(circle at 92% 8%, rgba(56, 189, 248, .16), transparent 32%),
+    linear-gradient(135deg, #16243a 0%, #121c2e 72%);
+  box-shadow: 0 12px 30px rgba(2, 8, 23, .18);
+}
+
+.identity-hero h2,
+.identity-card-heading h3,
+.identity-schema-heading h3 {
+  margin: 2px 0 0;
+}
+
+.identity-hero p {
+  max-width: 820px;
+  margin: 8px 0 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.identity-kicker {
+  color: var(--accent-2);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+
+.identity-hero-state {
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+  min-width: 240px;
+  color: var(--muted);
+  text-align: right;
+}
+
+.identity-hero-state small {
+  max-width: 430px;
+  overflow-wrap: anywhere;
+}
+
+.identity-subtabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.identity-subtabs > button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  min-height: 64px;
+  padding: 11px 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #121c2e;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.identity-subtabs > button > span {
+  display: grid;
+  place-items: center;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: #24344f;
+  color: #bfdbfe;
+  font-weight: 900;
+}
+
+.identity-subtabs > button div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.identity-subtabs > button small {
+  color: var(--muted);
+}
+
+.identity-subtabs > button.active {
+  border-color: rgba(56, 189, 248, .72);
+  background: linear-gradient(135deg, rgba(37, 99, 235, .34), rgba(22, 78, 99, .28));
+  box-shadow: inset 0 0 0 1px rgba(56, 189, 248, .12);
+}
+
+.identity-subtabs > button.active > span {
+  background: var(--button);
+  color: white;
+}
+
+.identity-toolbar {
+  position: sticky;
+  z-index: 8;
+  top: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(15, 23, 42, .95);
+  box-shadow: 0 8px 20px rgba(2, 8, 23, .18);
+  backdrop-filter: blur(10px);
+}
+
+.identity-toolbar .identity-status {
+  flex: 1 1 320px;
+  min-width: 0;
+  min-height: auto;
+  margin: 0;
+}
+
+.identity-toolbar-actions {
+  flex: 0 1 auto;
+}
+
+.identity-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 330px);
+  gap: 14px;
+  align-items: start;
+  min-width: 0;
+}
+
+.identity-editor,
+.identity-sidebar,
+.identity-groups {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.identity-sidebar {
+  position: sticky;
+  top: 74px;
+}
+
+.identity-meta-card,
+.identity-schema-heading {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #121c2e;
+}
+
+.identity-schema-heading,
+.identity-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.identity-meta-list {
+  display: grid;
+  gap: 0;
+  margin: 12px 0 0;
+}
+
+.identity-meta-list > div {
+  display: grid;
+  grid-template-columns: minmax(82px, .7fr) minmax(0, 1.3fr);
+  gap: 10px;
+  padding: 9px 0;
+  border-top: 1px solid rgba(148, 163, 184, .16);
+}
+
+.identity-meta-list dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.identity-meta-list dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  text-align: right;
+}
+
+.identity-meta-list code,
+.identity-history code {
+  color: #bae6fd;
+  font-size: 11px;
+}
+
+.identity-history {
+  display: grid;
+  gap: 0;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.identity-history li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 0;
+  border-top: 1px solid rgba(148, 163, 184, .16);
+}
+
+.identity-history li > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.identity-history small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.identity-cache-card p {
+  margin: 10px 0 12px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.identity-empty-small {
+  padding: 16px 0 4px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.identity-loading,
+.identity-load-error {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 150px;
+}
+
+.identity-loading h2,
+.identity-loading p,
+.identity-load-error h2,
+.identity-load-error p {
+  margin: 0;
+}
+
+.identity-loading p,
+.identity-load-error p {
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.identity-load-error > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.identity-spinner {
+  width: 30px;
+  height: 30px;
+  border: 3px solid rgba(56, 189, 248, .2);
+  border-top-color: var(--accent-2);
+  border-radius: 50%;
+  animation: identity-spin .8s linear infinite;
+}
+
+@keyframes identity-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 1080px) {
+  .identity-workspace { grid-template-columns: 1fr; }
+  .identity-sidebar {
+    position: static;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .identity-history-card { grid-column: 1 / -1; }
+}
+
+@media (max-width: 760px) {
+  .identity-hero { flex-direction: column; }
+  .identity-hero-state {
+    justify-items: start;
+    min-width: 0;
+    text-align: left;
+  }
+  .identity-toolbar { position: static; }
+  .identity-toolbar,
+  .identity-toolbar-actions { align-items: stretch; }
+  .identity-toolbar-actions > .btn { flex: 1 1 42%; }
+  .identity-sidebar { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 520px) {
+  .identity-subtabs { grid-template-columns: 1fr; }
+  .identity-hero,
+  .identity-meta-card,
+  .identity-schema-heading { padding: 13px; }
+  .identity-toolbar-actions > .btn { flex-basis: 100%; }
+  .identity-meta-list > div { grid-template-columns: 1fr; gap: 3px; }
+  .identity-meta-list dd { text-align: left; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .identity-spinner { animation: none; }
+}

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,10 +7,14 @@ from arr_orchestrator.db import Database
 from arr_orchestrator.filebot import FileBotRunner
 from arr_orchestrator.name_resolver import (
     NameResolver,
+    ResolutionError,
     ResolvedIdentity,
     ResolverAmbiguous,
     ResolverCandidate,
 )
+
+
+RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
 
 
 class FakeResponse:
@@ -31,7 +36,7 @@ class FakeSession:
         path = url.split("/3", 1)[1]
         route = self.routes[path]
         payload = route(params or {}) if callable(route) else route
-        return FakeResponse(payload)
+        return payload if isinstance(payload, FakeResponse) else FakeResponse(payload)
 
 
 def movie_payload(tmdb_id, title, original_title, year):
@@ -59,7 +64,8 @@ def tv_payload(tmdb_id, title, original_title, year, seasons=10):
 
 class NameResolverTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        RUNTIME_TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        self.temporary = tempfile.TemporaryDirectory(dir=RUNTIME_TEST_ROOT)
         self.root = Path(self.temporary.name)
         self.database = Database(self.root / "test.db")
         self.database.initialize()
@@ -86,6 +92,36 @@ class NameResolverTests(unittest.TestCase):
         input_root.mkdir(parents=True)
         (input_root / name).write_bytes(b"movie")
         return input_root
+
+    def test_preview_turns_tmdb_401_into_safe_json_error(self):
+        resolver, _ = self.resolver(
+            {"/search/movie": FakeResponse({"token": "must-not-leak"}, status_code=401)}
+        )
+
+        payload = resolver.preview("Pelicula de prueba 2024", "movies")
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "TMDB_ERROR")
+        self.assertIn("HTTP 401", payload["message"])
+        self.assertEqual(payload["details"], {})
+        self.assertNotIn("must-not-leak", json.dumps(payload, ensure_ascii=False))
+
+    def test_preview_sanitizes_base_resolution_error_details(self):
+        def rejected(_params):
+            raise ResolutionError(
+                "Consulta rechazada",
+                {"token": "must-not-leak", "query": "Pelicula de prueba"},
+            )
+
+        resolver, _ = self.resolver({"/search/movie": rejected})
+
+        payload = resolver.preview("Pelicula de prueba 2024", "movies")
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "TMDB_ERROR")
+        self.assertEqual(payload["details"]["token"], "<REDACTED>")
+        self.assertEqual(payload["details"]["query"], "Pelicula de prueba")
+        self.assertNotIn("must-not-leak", json.dumps(payload, ensure_ascii=False))
 
     def test_spanish_movie_without_year_prefers_exact_title(self):
         correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
@@ -621,6 +657,27 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(identity.tmdb_id, 1)
         self.assertEqual(identity.season, 3)
         self.assertEqual(identity.episodes, [53])
+
+    def test_tv_search_with_year_control_sends_first_air_date_year(self):
+        correct = tv_payload(11, "Serie ejemplo", "Example show", 2024, seasons=2)
+        routes = {"/search/tv": {"results": [correct]}, "/tv/11": correct}
+        resolver, session = self.resolver(routes)
+        resolver.configure_rules(
+            {
+                "resolver": {
+                    "query_variants": {"with_year": True, "without_year": False}
+                }
+            }
+        )
+        input_root = self.input_file("Serie.ejemplo.2024.S01E01.mkv")
+
+        identity = resolver.resolve(
+            {"category": "tv", "name": "Serie.ejemplo.2024.S01E01"}, input_root
+        )
+
+        self.assertEqual(identity.tmdb_id, 11)
+        search_call = next(call for call in session.calls if "/search/tv" in call[0])
+        self.assertEqual(search_call[1].get("first_air_date_year"), 2024)
 
     def test_resolver_drops_torrente_release_tail_before_tmdb(self):
         correct = movie_payload(1217584, "Torrente Presidente", "Torrente Presidente", 2026)

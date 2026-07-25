@@ -15,6 +15,7 @@ from .codex_diagnostics import create_codex_diagnostic
 from .db import Database
 from .filebot import FileBotRunner
 from .filebot_settings import FileBotSettingsStore
+from .identity.controller import IdentityController
 from .filesystem import (
     ExtractionError,
     clean_junk,
@@ -42,7 +43,6 @@ from .media_worker import (
     MediaWorkerTransportError,
 )
 from .name_resolver import (
-    NameResolver,
     ResolutionError,
     ResolvedIdentity,
     ResolverAmbiguous,
@@ -113,15 +113,13 @@ class Engine:
             default_region=config.resolver_region,
             logger=self.log,
         )
-        self.name_resolver = NameResolver(
-            config.tmdb_api_token,
-            config.resolver_language,
-            config.resolver_region,
-            config.resolver_http_timeout_ms,
-            config.resolver_total_budget_ms,
+        self.identity = IdentityController(
+            config,
             database,
-            self.log,
+            self.filebot_settings,
+            logger=self.log,
         )
+        self.name_resolver = self.identity.resolver
         self.media_worker = MediaWorkerClient(config.media_worker_url, config.callback_url)
         self.events: "queue.Queue[Tuple[str, Path]]" = queue.Queue()
         self.observer = Observer()
@@ -260,12 +258,33 @@ class Engine:
     def update_filebot_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
         return self.filebot_settings.update(payload)
 
+    def identity_rules(self) -> Dict[str, object]:
+        return self.identity.payload()
+
+    def update_identity_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return self.identity.update(payload)
+
+    def reset_identity_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return self.identity.reset(payload)
+
+    def clear_identity_cache(self, _payload: Dict[str, object]) -> Dict[str, object]:
+        return self.identity.clear_cache()
+
+    def test_identity_parser(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return self.identity.test_parser(payload)
+
+    def test_identity_resolver(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return self.identity.test_resolver(payload)
+
     def _active_filebot_rules_context(self) -> Dict[str, object]:
         return self.filebot_settings.job_snapshot()
 
     def _new_job_source_meta_json(self) -> str:
         return json.dumps(
-            {"filebot_rules": self._active_filebot_rules_context()},
+            {
+                "filebot_rules": self._active_filebot_rules_context(),
+                "identity_rules": self.identity.job_snapshot(),
+            },
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -343,6 +362,7 @@ class Engine:
 
     def status(self) -> Dict[str, object]:
         filebot_rules = self.filebot_settings.payload()
+        identity_rules = self.identity.payload()
         return {
             "status": "ok",
             "mode": self.config.mode,
@@ -351,6 +371,10 @@ class Engine:
             "filebot_rules": {
                 "revision": filebot_rules.get("revision"),
                 "resolver_fingerprint": filebot_rules.get("resolver_fingerprint"),
+            },
+            "identity_rules": {
+                "revision": identity_rules.get("revision"),
+                "fingerprint": identity_rules.get("fingerprint"),
             },
             "queue_size": self.events.qsize(),
         }
@@ -925,6 +949,7 @@ class Engine:
 
     def _diagnostic_status(self) -> Dict[str, object]:
         filebot_rules = self.filebot_settings.payload()
+        identity_rules = self.identity.payload()
         return {
             "orchestrator": {
                 "status": "ok",
@@ -933,6 +958,10 @@ class Engine:
                 "filebot_rules": {
                     "revision": filebot_rules.get("revision"),
                     "resolver_fingerprint": filebot_rules.get("resolver_fingerprint"),
+                },
+                "identity_rules": {
+                    "revision": identity_rules.get("revision"),
+                    "fingerprint": identity_rules.get("fingerprint"),
                 },
             },
             "media_worker": {
@@ -1225,9 +1254,8 @@ class Engine:
         )
         rules_context = self._filebot_rules_for_job(job)
         rules_snapshot = dict(rules_context.get("rules") or {})
-        resolver_configure = getattr(self.name_resolver, "configure_rules", None)
-        if callable(resolver_configure):
-            resolver_configure(rules_snapshot)
+        identity_context = self.identity.configure_for_job(job)
+        identity_rules = dict(identity_context.get("rules") or {})
         filebot_configure = getattr(self.filebot, "configure_rules", None)
         if callable(filebot_configure):
             filebot_configure(rules_snapshot)
@@ -1235,18 +1263,26 @@ class Engine:
             str(job["job_id"]),
             "settings",
             "decision",
-            f"Reglas de resolucion y FileBot revision {int(rules_context.get('revision') or 0)}",
+            (
+                "Configuracion de identidad revision "
+                f"{int(identity_context.get('revision') or 0)} y FileBot revision "
+                f"{int(rules_context.get('revision') or 0)}"
+            ),
             {
-                "revision": int(rules_context.get("revision") or 0),
-                "resolver_fingerprint": str(
-                    rules_context.get("resolver_fingerprint") or ""
-                ),
-                "source": str(rules_context.get("source") or "job_snapshot"),
+                "identity_revision": int(identity_context.get("revision") or 0),
+                "identity_fingerprint": str(identity_context.get("fingerprint") or ""),
+                "identity_source": str(identity_context.get("source") or "job_snapshot"),
+                "filebot_revision": int(rules_context.get("revision") or 0),
+                "filebot_source": str(rules_context.get("source") or "job_snapshot"),
+                # Claves historicas conservadas para lectores de diagnosticos
+                # anteriores. Ahora apuntan a la configuracion que resuelve.
+                "revision": int(identity_context.get("revision") or 0),
+                "resolver_fingerprint": str(identity_context.get("fingerprint") or ""),
                 "category": str(job.get("category") or ""),
             },
         )
         identity: Optional[ResolvedIdentity] = None
-        media_decision = self._media_decision_for_job(job, input_root)
+        media_decision = self._media_decision_for_job(job, input_root, identity_rules)
         self.db.add_event(
             str(job["job_id"]),
             "identity",
@@ -1366,9 +1402,12 @@ class Engine:
             output_root,
             identity,
         )
-        command_preview["rules_revision"] = int(rules_context.get("revision") or 0)
+        command_preview["filebot_rules_revision"] = int(rules_context.get("revision") or 0)
+        command_preview["identity_rules_revision"] = int(identity_context.get("revision") or 0)
+        command_preview["identity_fingerprint"] = str(identity_context.get("fingerprint") or "")
+        command_preview["rules_revision"] = int(identity_context.get("revision") or 0)
         command_preview["resolver_fingerprint"] = str(
-            rules_context.get("resolver_fingerprint") or ""
+            identity_context.get("fingerprint") or ""
         )
         self.db.transition(
             str(job["job_id"]),
@@ -1923,25 +1962,18 @@ class Engine:
             return move_tv_job_to_review(job_root, self.config.review_dir, str(job["name"]))
         return move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
 
-    def _media_decision_for_job(self, job: Dict[str, object], input_root: Path) -> MediaDecision:
+    def _media_decision_for_job(
+        self,
+        job: Dict[str, object],
+        input_root: Path,
+        identity_rules: Optional[Dict[str, object]] = None,
+    ) -> MediaDecision:
         category = str(job.get("category") or "")
         sources = [str(job.get("name") or ""), input_root.name]
         files = media_files(input_root)
         files.sort(key=lambda path: path.stat().st_size if path.exists() else 0, reverse=True)
         sources.extend(path.stem for path in files[:3])
-        decisions = [decide_media(source, category) for source in sources if str(source or "").strip()]
-        if not decisions:
-            return decide_media("", category)
-        for decision in decisions:
-            if decision.block_reason == "category_conflict":
-                return decision
-        for decision in decisions:
-            if decision.media_type == category and decision.confidence in {"high", "medium"}:
-                return decision
-        for decision in decisions:
-            if decision.media_type in {"movies", "tv"}:
-                return decision
-        return decisions[0]
+        return self.identity.decide_sources(sources, category, identity_rules)
 
     @staticmethod
     def _can_continue_tv_without_identity(
@@ -1997,10 +2029,7 @@ class Engine:
         error: ResolutionError,
     ) -> None:
         retry = int(job.get("retry_filebot") or 0) + 1
-        delay = min(
-            300,
-            self.config.resolver_retry_seconds * (2 ** min(retry - 1, 3)),
-        )
+        delay = self.identity.retry_delay(job, retry)
         retry_at = time.time() + delay
         self.db.transition(
             str(job["job_id"]),
@@ -3008,11 +3037,20 @@ class Engine:
                 return relative.parts[0]
         except ValueError:
             pass
-        return self._category("", name)
+        return self._category("", name, self.identity.store.snapshot())
 
     @staticmethod
-    def _category(current: str, name: str) -> str:
-        decision = decide_media(name, current)
+    def _category(
+        current: str,
+        name: str,
+        identity_rules: Optional[Dict[str, object]] = None,
+    ) -> str:
+        parser_rules = (
+            identity_rules.get("parser")
+            if isinstance(identity_rules, dict) and isinstance(identity_rules.get("parser"), dict)
+            else None
+        )
+        decision = decide_media(name, current, rules=parser_rules)
         if current in ("movies", "tv"):
             return current
         if decision.media_type in ("movies", "tv"):

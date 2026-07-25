@@ -5,6 +5,9 @@ from typing import Callable, Dict, List, Optional
 from urllib.parse import unquote
 
 
+MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+
+
 def start_health_server(
     port: int,
     status_provider: Callable[[], Dict[str, object]],
@@ -17,6 +20,12 @@ def start_health_server(
     watcher_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
     filebot_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
     filebot_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    identity_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
+    identity_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    identity_rules_resetter: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    identity_cache_clearer: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    identity_parser_tester: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    identity_resolver_tester: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -27,6 +36,8 @@ def start_health_server(
                 self._json(200, watcher_rules_provider())
             elif path == "/settings/filebot" and filebot_rules_provider:
                 self._json(200, filebot_rules_provider())
+            elif path == "/settings/identity" and identity_rules_provider:
+                self._json(200, identity_rules_provider())
             elif path == "/jobs":
                 self._json(200, jobs_provider())
             elif path.startswith("/jobs/") and path.endswith("/follow") and follow_provider:
@@ -44,6 +55,27 @@ def start_health_server(
                 self._json(404, {"error": "not_found"})
 
         def do_POST(self) -> None:
+            length = self._content_length()
+            if length is None:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_request",
+                        "message": "Content-Length no es valido.",
+                    },
+                )
+                return
+            if length > MAX_REQUEST_BODY_BYTES:
+                self._json(
+                    413,
+                    {
+                        "ok": False,
+                        "error": "payload_too_large",
+                        "message": "El JSON supera el limite de 4 MB.",
+                    },
+                )
+                return
             path = self.path.split("?", 1)[0]
             if path == "/settings/watcher" and watcher_rules_updater:
                 result = watcher_rules_updater(self._read_json())
@@ -51,6 +83,26 @@ def start_health_server(
                 return
             if path == "/settings/filebot" and filebot_rules_updater:
                 result = filebot_rules_updater(self._read_json())
+                if result.get("ok"):
+                    status = 200
+                elif result.get("error") == "revision_conflict":
+                    status = 409
+                elif result.get("error") == "persistence_failed":
+                    status = 500
+                else:
+                    status = 400
+                self._json(status, result)
+                return
+            identity_handlers = {
+                "/settings/identity": identity_rules_updater,
+                "/settings/identity/reset": identity_rules_resetter,
+                "/settings/identity/cache/clear": identity_cache_clearer,
+                "/settings/identity/test-parser": identity_parser_tester,
+                "/settings/identity/test-resolver": identity_resolver_tester,
+            }
+            identity_handler = identity_handlers.get(path)
+            if identity_handler:
+                result = identity_handler(self._read_json())
                 if result.get("ok"):
                     status = 200
                 elif result.get("error") == "revision_conflict":
@@ -89,13 +141,20 @@ def start_health_server(
             return
 
         def _read_json(self) -> Dict[str, object]:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(min(length, 256 * 1024)) if length else b"{}"
+            length = self._content_length() or 0
+            raw = self.rfile.read(length) if length else b"{}"
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except Exception:
                 return {}
             return payload if isinstance(payload, dict) else {}
+
+        def _content_length(self) -> Optional[int]:
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except (TypeError, ValueError):
+                return None
+            return length if length >= 0 else None
 
         def _json(self, status: int, payload: object) -> None:
             body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")

@@ -189,6 +189,72 @@ class Database:
         )
         connection.commit()
 
+    def compare_and_set_setting(
+        self,
+        key: str,
+        expected_revision: int,
+        value: str,
+    ) -> bool:
+        """Actualiza un ajuste solo si su revision sigue siendo la esperada."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            current_value = str(row["value"]) if row else None
+            if _setting_revision(current_value) != expected_revision:
+                connection.rollback()
+                return False
+            connection.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+
+    def compare_and_set_setting_value(
+        self,
+        key: str,
+        expected_value: Optional[str],
+        value: str,
+    ) -> bool:
+        """CAS por contenido exacto para migrar incluso valores antiguos dañados."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (key,),
+            ).fetchone()
+            current_value = str(row["value"]) if row else None
+            if current_value != expected_value:
+                connection.rollback()
+                return False
+            connection.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+
     def create_job(
         self,
         source_uid: str,
@@ -485,6 +551,68 @@ class Database:
         )
         self.connect().commit()
         return int(cursor.rowcount)
+
+    def resolver_cache_stats(self) -> Dict[str, Any]:
+        """Resumen ligero para el panel, sin exponer claves ni payloads."""
+
+        now = time.time()
+        row = self.connect().execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN expires_at > ? THEN 1 ELSE 0 END), 0) AS active,
+                COALESCE(SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END), 0) AS expired,
+                MIN(created_at) AS oldest_created_at,
+                MAX(created_at) AS newest_created_at,
+                MIN(CASE WHEN expires_at > ? THEN expires_at END) AS next_expires_at
+            FROM resolver_cache
+            """,
+            (now, now, now),
+        ).fetchone()
+        by_media_type = {
+            str(item["media_type"]): int(item["entries"])
+            for item in self.connect().execute(
+                """
+                SELECT media_type, COUNT(*) AS entries
+                FROM resolver_cache
+                WHERE expires_at > ?
+                GROUP BY media_type
+                ORDER BY media_type
+                """,
+                (now,),
+            ).fetchall()
+        }
+        return {
+            "total": int(row["total"] or 0),
+            "active": int(row["active"] or 0),
+            "expired": int(row["expired"] or 0),
+            "oldest_created_at": row["oldest_created_at"],
+            "newest_created_at": row["newest_created_at"],
+            "next_expires_at": row["next_expires_at"],
+            "by_media_type": by_media_type,
+        }
+
+    def clear_resolver_cache(self) -> int:
+        """Elimina solo la cache derivada del resolver de identidad."""
+
+        cursor = self.connect().execute("DELETE FROM resolver_cache")
+        self.connect().commit()
+        return int(cursor.rowcount)
+
+
+def _setting_revision(value: Optional[str]) -> int:
+    if value is None:
+        return 0
+    try:
+        payload = json.loads(value)
+    except (TypeError, ValueError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    revision = payload.get("revision")
+    if isinstance(revision, int) and not isinstance(revision, bool) and revision >= 0:
+        return revision
+    return 0
 
 
 def _normalize_name(value: str) -> str:

@@ -12,12 +12,16 @@ class _CapturedHandler:
         self.path = path
         self.payload = payload or {}
         self.response = None
+        self.headers = {"Content-Length": "0"}
 
     def _json(self, status, payload) -> None:
         self.response = (status, payload)
 
     def _read_payload(self):
         return self.payload
+
+    def _content_length(self):
+        return int(self.headers["Content-Length"])
 
 
 class FileBotRulesProxyTests(unittest.TestCase):
@@ -91,19 +95,26 @@ class FileBotRulesStaticPanelTests(unittest.TestCase):
         web = Path(server.__file__).resolve().parent / "web"
         cls.panel_js = (web / "static" / "js" / "panel.js").read_text(encoding="utf-8")
 
-    def test_panel_has_both_filebot_sections_and_safe_controls(self) -> None:
+    def test_panel_keeps_filebot_focused_only_on_final_filename(self) -> None:
         for text in (
             'title: "FileBot Películas"',
             'title: "FileBot Series"',
+            'path: "movies.filename_style"',
+            'path: "tv.filename_style"',
+            'path: "tv.episode_order"',
+            "La limpieza y TMDb se configuran en Limpieza ARR.",
+        ):
+            self.assertIn(text, self.panel_js)
+        for identity_path in (
             'path: "movies.language"',
             'path: "movies.region"',
             'path: "movies.query_aliases"',
             'path: "movies.forced_matches"',
-            'path: "movies.filename_style"',
-            'path: "tv.episode_order"',
+            'path: "tv.language"',
+            'path: "tv.query_aliases"',
+            'path: "tv.forced_matches"',
         ):
-            self.assertIn(text, self.panel_js)
-        self.assertNotIn('path: "tv.region"', self.panel_js)
+            self.assertNotIn(identity_path, self.panel_js)
 
     def test_sources_use_a_map_and_load_in_parallel(self) -> None:
         self.assertIn("const RULE_SOURCES = {", self.panel_js)
@@ -122,7 +133,9 @@ class FileBotRulesStaticPanelTests(unittest.TestCase):
     def test_panel_keeps_main_and_rule_section_after_reload(self) -> None:
         self.assertIn('localStorage.getItem(RULE_SECTION_STORAGE_KEY)', self.panel_js)
         self.assertIn('localStorage.setItem(RULE_SECTION_STORAGE_KEY, section)', self.panel_js)
-        self.assertIn('location.hash = view;', self.panel_js)
+        self.assertIn('const target = view === "limpieza-arr" ? "limpieza-arr/parser" : view;', self.panel_js)
+        self.assertIn("else location.hash = target;", self.panel_js)
+        self.assertIn("function routeFromHash()", self.panel_js)
         self.assertIn('window.addEventListener("hashchange"', self.panel_js)
         self.assertIn('if (!RULE_SECTIONS[currentRuleSection]) currentRuleSection = "entrada";', self.panel_js)
 

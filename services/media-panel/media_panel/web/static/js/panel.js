@@ -223,22 +223,12 @@ const RULE_SECTIONS = {
   },
   filebot_peliculas: {
     title: "FileBot Películas",
-    help: "Resolución de identidad y nombre final de las películas.",
+    help: "Nombre final que FileBot aplica después de la identificación. La limpieza y TMDb se configuran en Limpieza ARR.",
     source: "filebot",
     groups: [
       {
-        title: "Identidad",
-        note: "Idioma, region y ayudas controladas para resolver cada pelicula.",
-        controls: [
-          { type: "text", path: "movies.language", label: "Idioma" },
-          { type: "text", path: "movies.region", label: "Region" },
-          { type: "list", path: "movies.query_aliases", label: "Alias de busqueda", format: "Formato: origen | destino" },
-          { type: "list", path: "movies.forced_matches", label: "Coincidencias TMDb forzadas", format: "Formato: titulo | año | tmdb_id" }
-        ]
-      },
-      {
         title: "Nombre final",
-        note: "Estilo seguro aplicado sin cambiar rutas ni acciones de FileBot.",
+        note: "Aquí solo se decide cómo queda escrito el archivo ya identificado.",
         controls: [
           { type: "select", path: "movies.filename_style", label: "Estilo de nombre", options: [
             { value: "title_year", label: "Titulo y año" },
@@ -250,21 +240,12 @@ const RULE_SECTIONS = {
   },
   filebot_series: {
     title: "FileBot Series",
-    help: "Resolucion de identidad, episodios y nombre final de las series.",
+    help: "Nombre y orden de episodios que FileBot aplica después de la identificación. La limpieza y TMDb se configuran en Limpieza ARR.",
     source: "filebot",
     groups: [
       {
-        title: "Identidad",
-        note: "Idioma y ayudas controladas para resolver cada serie.",
-        controls: [
-          { type: "text", path: "tv.language", label: "Idioma" },
-          { type: "list", path: "tv.query_aliases", label: "Alias de busqueda", format: "Formato: origen | destino" },
-          { type: "list", path: "tv.forced_matches", label: "Coincidencias TMDb forzadas", format: "Formato: titulo | año opcional | tmdb_id" }
-        ]
-      },
-      {
         title: "Nombre final",
-        note: "Estilo seguro y orden de episodios usados por FileBot.",
+        note: "Aquí solo se decide cómo queda escrito el episodio ya identificado.",
         controls: [
           { type: "select", path: "tv.filename_style", label: "Estilo de nombre", options: [
             { value: "series_sxxexx", label: "Serie y SxxExx" },
@@ -810,6 +791,7 @@ document.addEventListener("click", event => {
 });
 
 const routes = {
+  "limpieza-arr": () => window.ArrIdentityUI.show(),
   reglas: showReglas,
   motor: showMotor,
   historial: showHistorial,
@@ -819,15 +801,20 @@ const routes = {
 
 tabs.forEach(btn => btn.addEventListener("click", () => {
   const view = btn.dataset.view;
-  location.hash = view;
-  routes[view]();
+  const target = view === "limpieza-arr" ? "limpieza-arr/parser" : view;
+  if (location.hash === `#${target}`) routes[view]();
+  else location.hash = target;
 }));
 
+function routeFromHash() {
+  return (location.hash.replace("#", "") || "reglas").split("/", 1)[0];
+}
+
 window.addEventListener("hashchange", () => {
-  const view = location.hash.replace("#", "") || "reglas";
+  const view = routeFromHash();
   (routes[view] || showReglas)();
 });
 
-(routes[location.hash.replace("#", "")] || showReglas)().catch(error => {
+(routes[routeFromHash()] || showReglas)().catch(error => {
   app.innerHTML = `<section class="panel"><h2>Error</h2><pre class="pre">${esc(error.message)}</pre></section>`;
 });
