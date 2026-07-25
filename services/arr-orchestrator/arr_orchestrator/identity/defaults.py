@@ -130,7 +130,11 @@ def _region(value: str) -> str:
 
 
 def factory_identity_rules(
-    default_language: str = "es-ES", default_region: str = "ES"
+    default_language: str = "es-ES",
+    default_region: str = "ES",
+    resolver_http_timeout_ms: int = 2500,
+    resolver_total_budget_ms: int = 5000,
+    resolver_retry_seconds: int = 60,
 ) -> Dict[str, object]:
     """Crea los defaults completos adaptados a la configuracion de runtime."""
 
@@ -144,7 +148,46 @@ def factory_identity_rules(
     locales["movies"]["language"] = language  # type: ignore[index]
     locales["movies"]["region"] = region  # type: ignore[index]
     locales["tv"]["language"] = language  # type: ignore[index]
+    timeout_ms = _runtime_integer(
+        resolver_http_timeout_ms,
+        "resolver_http_timeout_ms",
+        100,
+        60_000,
+    )
+    total_budget_ms = _runtime_integer(
+        resolver_total_budget_ms,
+        "resolver_total_budget_ms",
+        100,
+        300_000,
+    )
+    if total_budget_ms < timeout_ms:
+        raise ValueError(
+            "resolver_total_budget_ms no puede ser menor que "
+            "resolver_http_timeout_ms"
+        )
+    retry_seconds = _runtime_integer(
+        resolver_retry_seconds,
+        "resolver_retry_seconds",
+        1,
+        86_400,
+    )
+    resolver = rules["resolver"]  # type: ignore[index]
+    resolver["http"]["timeout_ms"] = timeout_ms  # type: ignore[index]
+    resolver["http"]["total_budget_ms"] = total_budget_ms  # type: ignore[index]
+    resolver["retry"]["base_seconds"] = retry_seconds  # type: ignore[index]
+    resolver["retry"]["max_seconds"] = max(  # type: ignore[index]
+        int(resolver["retry"]["max_seconds"]),  # type: ignore[index]
+        retry_seconds,
+    )
     return rules
+
+
+def _runtime_integer(value: object, label: str, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} debe ser un entero")
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{label} debe estar entre {minimum} y {maximum}")
+    return value
 
 
 DEFAULT_IDENTITY_RULES = factory_identity_rules()

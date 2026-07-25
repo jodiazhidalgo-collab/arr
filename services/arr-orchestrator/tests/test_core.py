@@ -9,6 +9,7 @@ from arr_orchestrator.config import Config
 from arr_orchestrator.db import Database
 from arr_orchestrator.engine import Engine, WORKER_ACTIVE_MAX_SECONDS
 from arr_orchestrator.filebot import MOVE_PATTERN, is_duplicate_output
+from arr_orchestrator.identity.fingerprint import identity_fingerprint
 from arr_orchestrator.filesystem import (
     extraction_command_previews,
     matching_root,
@@ -33,6 +34,9 @@ from arr_orchestrator.media_worker import (
 from arr_orchestrator.torrent import torrent_info
 from arr_orchestrator.name_resolver import ResolvedIdentity, ResolverUnavailable
 from arr_orchestrator.name_resolver import ResolverAmbiguous
+
+
+RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
 
 
 def test_config(root: Path) -> Config:
@@ -534,6 +538,72 @@ class CoreTests(unittest.TestCase):
 
             self.assertEqual(destination.name, "Cuarto Milenio (1)")
             self.assertTrue((destination / "Season 21" / "Cuarto Milenio - S21E39.mkv").exists())
+
+    def test_tv_duplicate_review_uses_the_jobs_frozen_parser_rules(self) -> None:
+        RUNTIME_TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=RUNTIME_TEST_ROOT) as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            job_root = config.workshop_root / "job-tv-frozen-parser"
+            original = job_root / "original"
+            original.mkdir(parents=True)
+            (original / "Mi Serie Q03P07.mkv").write_bytes(b"episode")
+            identity_snapshot = engine.identity.job_snapshot()
+            identity_snapshot["rules"]["parser"]["patterns"]["series_sxe"] = (
+                r"(?i)\bQ0?(\d{1,2})P0?(\d{1,3})\b"
+            )
+            identity_snapshot["fingerprint"] = identity_fingerprint(
+                identity_snapshot["rules"]
+            )
+            job = database.create_job(
+                "fs:tv:frozen-parser",
+                "fs",
+                "tv",
+                "Mi Serie Q03P07",
+                state="ready_filebot",
+                source_path=str(original),
+                stage_path=str(job_root),
+                source_meta_json=engine._new_job_source_meta_json(
+                    identity_context=identity_snapshot
+                ),
+            )
+            frozen_context = engine.identity.rules_for_job(job)
+            self.assertEqual(
+                frozen_context["rules"]["parser"]["patterns"]["series_sxe"],
+                r"(?i)\bQ0?(\d{1,2})P0?(\d{1,3})\b",
+            )
+
+            class DuplicateFileBot:
+                def configure_rules(self, _rules):
+                    pass
+
+                def configure_identity_rules(self, _rules):
+                    pass
+
+                def run(self, *_args):
+                    return {
+                        "exit_code": 0,
+                        "moves": [],
+                        "output_media": [],
+                        "duplicate": True,
+                        "stdout_tail": "already exists",
+                    }
+
+            engine.filebot = DuplicateFileBot()
+            engine._run_filebot(job)
+
+            updated = database.get_job(job["job_id"])
+            destination = Path(updated["stage_path"])
+            self.assertEqual(updated["state"], "duplicate")
+            self.assertEqual(destination.name, "Mi Serie")
+            self.assertTrue(
+                (destination / "Season 03" / "Mi Serie - S03E07.mkv").exists()
+            )
+            database.close()
 
     def test_media_worker_source_ignores_technical_original_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1665,6 +1735,7 @@ class CoreTests(unittest.TestCase):
             original.mkdir(parents=True)
             source = original / "Un padre en apuros 4Kwebrip2160.atomohd.li.mkv"
             source.write_bytes(b"movie")
+            source_meta = engine._new_job_source_meta_json()
             job = database.create_job(
                 "fs:movies:guided",
                 "fs",
@@ -1673,7 +1744,14 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 source_path=str(original),
                 stage_path=str(job_root),
+                source_meta_json=source_meta,
             )
+            current_rules = engine.identity_rules()["rules"]
+            current_rules["resolver"]["locales"]["movies"]["language"] = "fr-FR"
+            saved = engine.update_identity_rules(
+                {"rules": current_rules, "expected_revision": 0}
+            )
+            self.assertTrue(saved["ok"])
             identity = ResolvedIdentity(
                 media_type="movie",
                 tmdb_id=9279,
@@ -1699,6 +1777,10 @@ class CoreTests(unittest.TestCase):
 
             class FakeFileBot:
                 received_identity = None
+                received_identity_rules = None
+
+                def configure_identity_rules(self, rules):
+                    self.received_identity_rules = rules
 
                 def run(self, _job_id, _category, input_path, output_root, resolved):
                     self.received_identity = resolved
@@ -1730,6 +1812,12 @@ class CoreTests(unittest.TestCase):
             updated = database.get_job(job["job_id"])
             self.assertEqual(updated["state"], "media_postprocess_ready")
             self.assertEqual(fake_filebot.received_identity.tmdb_id, 9279)
+            self.assertEqual(
+                fake_filebot.received_identity_rules["resolver"]["locales"]["movies"][
+                    "language"
+                ],
+                "es-ES",
+            )
             self.assertIn('"tmdb_id": 9279', updated["identity_json"])
             database.close()
 

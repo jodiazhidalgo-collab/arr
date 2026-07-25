@@ -28,16 +28,28 @@ class _CapturedHandler:
         self.path = path
         self.payload = payload or {}
         self.response = None
-        self.headers = {"Content-Length": "0"}
+        self.headers = {
+            "Content-Length": "0",
+            "Content-Type": "application/json; charset=utf-8",
+        }
 
     def _json(self, status, payload) -> None:
         self.response = (status, payload)
 
-    def _read_payload(self):
+    def _read_payload(self, **_kwargs):
         return self.payload
 
     def _content_length(self):
         return int(self.headers["Content-Length"])
+
+
+IDENTITY_POST_ACTIONS = {
+    "/api/identity-rules": "save_rules",
+    "/api/identity-rules/reset": "reset_rules",
+    "/api/identity-rules/cache/clear": "clear_cache",
+    "/api/identity-rules/test-parser": "test_parser",
+    "/api/identity-rules/test-resolver": "test_resolver",
+}
 
 
 class IdentityProxyTests(unittest.TestCase):
@@ -88,6 +100,8 @@ class IdentityProxyTests(unittest.TestCase):
             io.BytesIO(body),
         )
         with patch.object(
+            conflict, "close", wraps=conflict.close
+        ) as close_error, patch.object(
             identity_proxy.urllib.request, "urlopen", side_effect=conflict
         ):
             status, payload = self.proxy.save_rules(
@@ -97,6 +111,7 @@ class IdentityProxyTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"], "revision_conflict")
         self.assertEqual(payload["current_revision"], 5)
+        close_error.assert_called_once_with()
 
     def test_transport_error_is_safe_and_does_not_leak_url(self) -> None:
         with patch.object(
@@ -109,6 +124,31 @@ class IdentityProxyTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertEqual(payload["error"], "orchestrator_unavailable")
         self.assertNotIn("secret upstream details", payload["message"])
+
+    def test_resolver_timeout_follows_draft_budget_with_margin_and_cap(self) -> None:
+        cases = (
+            ({"resolver": {"http": {"total_budget_ms": 5_000}}}, 10.0),
+            ({"resolver": {"http": {"total_budget_ms": 120_000}}}, 125.0),
+            ({"resolver": {"http": {"total_budget_ms": 300_000}}}, 305.0),
+            ({"resolver": {"http": {"total_budget_ms": 999_999}}}, 305.0),
+            ({"resolver": {"http": {"total_budget_ms": "invalid"}}}, 305.0),
+            ({"resolver": {"http": {}}}, 305.0),
+            ({}, 305.0),
+            (None, 305.0),
+        )
+        for rules, expected_timeout in cases:
+            with self.subTest(rules=rules), patch.object(
+                identity_proxy.urllib.request,
+                "urlopen",
+                return_value=_Response(200, {"ok": True}),
+            ) as upstream:
+                payload: dict[str, object] = {"name": "Alien"}
+                if rules is not None:
+                    payload["rules"] = rules
+                self.proxy.test_resolver(payload)
+                self.assertEqual(
+                    upstream.call_args.kwargs["timeout"], expected_timeout
+                )
 
 
 class IdentityPanelHandlerTests(unittest.TestCase):
@@ -123,17 +163,17 @@ class IdentityPanelHandlerTests(unittest.TestCase):
         self.assertEqual(handler.response, (502, expected))
 
     def test_all_identity_post_actions_forward_payload_and_status(self) -> None:
-        actions = {
-            "/api/identity-rules": "save_rules",
-            "/api/identity-rules/reset": "reset_rules",
-            "/api/identity-rules/cache/clear": "clear_cache",
-            "/api/identity-rules/test-parser": "test_parser",
-            "/api/identity-rules/test-resolver": "test_resolver",
-        }
         payload = {"name": "Blade.Runner.1982.1080p", "category": "movies"}
-        for path, method_name in actions.items():
+        for path, method_name in IDENTITY_POST_ACTIONS.items():
             with self.subTest(path=path):
                 handler = _CapturedHandler(path, payload)
+                handler.headers.update(
+                    {
+                        "Host": "arr.local",
+                        "Origin": "http://arr.local",
+                        "Sec-Fetch-Site": "same-origin",
+                    }
+                )
                 expected = {"ok": False, "error": "invalid_rules"}
                 with patch.object(
                     server.IDENTITY_PROXY,
@@ -170,6 +210,7 @@ class IdentityPanelHandlerTests(unittest.TestCase):
         handler = object.__new__(server.Handler)
         handler.path = "/api/identity-rules/test-parser"
         handler.headers = {"Content-Length": str(len(raw))}
+        handler.headers["Content-Type"] = "application/json"
         handler.rfile = io.BytesIO(raw)
         captured = []
         handler._json = lambda status, payload: captured.append((status, payload))
@@ -203,6 +244,93 @@ class IdentityPanelHandlerTests(unittest.TestCase):
                 action.assert_not_called()
                 self.assertEqual(captured[0][0], 400)
                 self.assertEqual(captured[0][1]["error"], "invalid_request")
+
+    def test_all_identity_posts_reject_non_json_and_cross_origin_requests(self) -> None:
+        cases = (
+            (
+                {"Content-Type": "text/plain", "Host": "arr.local"},
+                415,
+                "unsupported_media_type",
+            ),
+            (
+                {
+                    "Content-Type": "application/json",
+                    "Host": "arr.local",
+                    "Origin": "http://evil.local",
+                },
+                403,
+                "cross_origin_request",
+            ),
+            (
+                {
+                    "Content-Type": "application/json",
+                    "Host": "arr.local",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+                403,
+                "cross_origin_request",
+            ),
+        )
+        for path, method_name in IDENTITY_POST_ACTIONS.items():
+            for headers, expected_status, expected_error in cases:
+                with self.subTest(path=path, headers=headers):
+                    handler = _CapturedHandler(path)
+                    handler.headers.update(headers)
+                    with patch.object(server.IDENTITY_PROXY, method_name) as action:
+                        server.Handler.do_POST(handler)
+                    action.assert_not_called()
+                    self.assertEqual(handler.response[0], expected_status)
+                    self.assertEqual(handler.response[1]["error"], expected_error)
+
+    def test_all_identity_posts_accept_same_origin_and_api_json_clients(self) -> None:
+        payload = {"confirmed": True}
+        expected = {"ok": True}
+        for path, method_name in IDENTITY_POST_ACTIONS.items():
+            for client_headers in (
+                {
+                    "Host": "arr.local",
+                    "Origin": "http://arr.local",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+                {},
+            ):
+                with self.subTest(path=path, client_headers=client_headers):
+                    handler = _CapturedHandler(path, payload)
+                    handler.headers.update(client_headers)
+                    with patch.object(
+                        server.IDENTITY_PROXY,
+                        method_name,
+                        return_value=(200, expected),
+                    ) as action:
+                        server.Handler.do_POST(handler)
+
+                    action.assert_called_once_with(payload)
+                    self.assertEqual(handler.response, (200, expected))
+
+    def test_all_identity_posts_require_a_valid_json_object(self) -> None:
+        for path, method_name in IDENTITY_POST_ACTIONS.items():
+            for raw in (b"{not-json", b"[]", b'"text"', b""):
+                with self.subTest(path=path, raw=raw):
+                    handler = object.__new__(server.Handler)
+                    handler.path = path
+                    handler.headers = {
+                        "Content-Length": str(len(raw)),
+                        "Content-Type": "application/json",
+                        "Host": "arr.local",
+                        "Origin": "http://arr.local",
+                    }
+                    handler.rfile = io.BytesIO(raw)
+                    captured = []
+                    handler._json = lambda status, payload: captured.append(
+                        (status, payload)
+                    )
+
+                    with patch.object(server.IDENTITY_PROXY, method_name) as action:
+                        server.Handler.do_POST(handler)
+
+                    action.assert_not_called()
+                    self.assertEqual(captured[0][0], 400)
+                    self.assertEqual(captured[0][1]["error"], "invalid_json")
 
 
 if __name__ == "__main__":

@@ -16,18 +16,39 @@
     try { return JSON.stringify(left) === JSON.stringify(right); } catch (_error) { return false; }
   }
 
+  function validRulesDocument(payload) {
+    return isObject(payload)
+      && payload.ok === true
+      && isObject(payload.rules)
+      && isObject(payload.rules.parser)
+      && isObject(payload.rules.resolver)
+      && isObject(payload.defaults)
+      && isObject(payload.defaults.parser)
+      && isObject(payload.defaults.resolver)
+      && isObject(payload.schema)
+      && isObject(payload.schema.parser)
+      && isObject(payload.schema.resolver)
+      && Number.isInteger(payload.revision)
+      && payload.revision >= 0;
+  }
+
+  function validCachePayload(payload) {
+    return isObject(payload)
+      && payload.ok === true
+      && isObject(payload.cache_status)
+      && Number.isFinite(Number(payload.deleted));
+  }
+
   function activeSectionFromState() {
     const fromHash = ui.sectionFromHash();
     if (location.hash.startsWith("#limpieza-arr/")) return fromHash;
-    try {
-      const stored = localStorage.getItem(SECTION_STORAGE_KEY);
-      if (stored === "parser" || stored === "resolver") return stored;
-    } catch (_error) { /* El hash sigue siendo la fuente principal. */ }
+    const stored = ui.storageGet(SECTION_STORAGE_KEY);
+    if (stored === "parser" || stored === "resolver") return stored;
     return ui.state.section === "resolver" ? "resolver" : "parser";
   }
 
   function rememberSection(section) {
-    try { localStorage.setItem(SECTION_STORAGE_KEY, section); } catch (_error) { /* opcional */ }
+    ui.storageSet(SECTION_STORAGE_KEY, section);
   }
 
   function activateMainTab() {
@@ -40,6 +61,7 @@
 
   function setNotice(message, tone = "info") {
     ui.state.notice = { message, tone };
+    if (!ui.isActiveView()) return;
     const box = document.getElementById("identity-status");
     if (!box) return;
     box.className = `status identity-status ${tone}`;
@@ -124,12 +146,14 @@
   }
 
   function renderLoading() {
+    if (!ui.isActiveView()) return;
     const app = document.getElementById("app");
     if (!app) return;
     app.innerHTML = `<section class="panel identity-loading"><span class="identity-spinner" aria-hidden="true"></span><div><h2>Limpieza ARR</h2><p>Cargando reglas del motor…</p></div></section>`;
   }
 
   function renderLoadError(error) {
+    if (!ui.isActiveView()) return;
     const app = document.getElementById("app");
     if (!app) return;
     app.innerHTML = `<section class="panel identity-load-error">
@@ -140,6 +164,7 @@
   }
 
   ui.render = function () {
+    if (!ui.isActiveView()) return;
     const app = document.getElementById("app");
     if (!app || !ui.state.document || !ui.state.draft) return;
     const section = ui.state.section === "resolver" ? "resolver" : "parser";
@@ -158,39 +183,52 @@
       </header>
 
       <nav class="identity-subtabs" role="tablist" aria-label="Configuración de Limpieza ARR">
-        <button type="button" role="tab" aria-selected="${section === "parser"}" class="${section === "parser" ? "active" : ""}" data-identity-section="parser">
+        <button id="identity-tab-parser" type="button" role="tab" aria-selected="${section === "parser"}" aria-controls="identity-panel-parser" tabindex="${section === "parser" ? "0" : "-1"}" class="${section === "parser" ? "active" : ""}" data-identity-section="parser">
           <span>1</span><div><strong>Parser</strong><small>Limpieza y lectura</small></div>
         </button>
-        <button type="button" role="tab" aria-selected="${section === "resolver"}" class="${section === "resolver" ? "active" : ""}" data-identity-section="resolver">
+        <button id="identity-tab-resolver" type="button" role="tab" aria-selected="${section === "resolver"}" aria-controls="identity-panel-resolver" tabindex="${section === "resolver" ? "0" : "-1"}" class="${section === "resolver" ? "active" : ""}" data-identity-section="resolver">
           <span>2</span><div><strong>Resolver TMDb</strong><small>Candidatos y puntuación</small></div>
         </button>
       </nav>
 
-      ${renderToolbar()}
+      <div id="identity-panel-${section}" class="identity-tabpanel" role="tabpanel" aria-labelledby="identity-tab-${section}" tabindex="0">
+        ${renderToolbar()}
 
-      <div class="identity-workspace">
-        <main class="identity-editor">
-          ${ui.renderTester(section)}
-          <section class="identity-schema-heading">
-            <div><span class="identity-kicker">Controles del motor</span><h3>${ui.esc(sectionSchema.title || "Reglas")}</h3></div>
-            <span class="pill info">Esquema dinámico</span>
-          </section>
-          <div class="identity-groups">${ui.renderGroups(sectionSchema) || `<div class="empty">No hay controles para esta sección.</div>`}</div>
-        </main>
-        <aside class="identity-sidebar">${renderMetadata()}${renderCacheCard()}${renderHistory()}</aside>
+        <div class="identity-workspace">
+          <main class="identity-editor">
+            ${ui.renderTester(section)}
+            <section class="identity-schema-heading">
+              <div><span class="identity-kicker">Controles del motor</span><h3>${ui.esc(sectionSchema.title || "Reglas")}</h3></div>
+              <span class="pill info">Esquema dinámico</span>
+            </section>
+            <div class="identity-groups">${ui.renderGroups(sectionSchema) || `<div class="empty">No hay controles para esta sección.</div>`}</div>
+          </main>
+          <aside class="identity-sidebar">${renderMetadata()}${renderCacheCard()}${renderHistory()}</aside>
+        </div>
       </div>
+      <div id="identity-panel-${section === "parser" ? "resolver" : "parser"}" class="identity-tabpanel" role="tabpanel" aria-labelledby="identity-tab-${section === "parser" ? "resolver" : "parser"}" hidden></div>
 
       <input id="identity-import-file" type="file" accept="application/json,.json" hidden>
     </section>`;
     ui.bindView();
     ui.bindControls();
     ui.bindTester();
+    if (ui.state.focusTabAfterRender) {
+      ui.state.focusTabAfterRender = false;
+      document.getElementById(`identity-tab-${section}`)?.focus();
+    }
   };
 
   ui.bindView = function () {
     document.querySelectorAll("[data-identity-section]").forEach(button => {
       if (!button.matches("button")) return;
-      button.addEventListener("click", () => ui.switchSection(button.dataset.identitySection));
+      button.addEventListener("click", () => ui.switchSection(button.dataset.identitySection, { focusTab: true }));
+      button.addEventListener("keydown", event => {
+        if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const section = event.key === "ArrowLeft" || event.key === "Home" ? "parser" : "resolver";
+        ui.switchSection(section, { focusTab: true });
+      });
     });
     document.getElementById("identity-reload")?.addEventListener("click", ui.reloadRules);
     document.getElementById("identity-reset")?.addEventListener("click", ui.resetDraft);
@@ -201,10 +239,11 @@
     document.getElementById("identity-clear-cache")?.addEventListener("click", ui.clearResolverCache);
   };
 
-  ui.switchSection = function (section) {
+  ui.switchSection = function (section, { focusTab = false } = {}) {
     if (!['parser', 'resolver'].includes(section)) return;
     ui.storeOpenGroups?.();
     ui.state.section = section;
+    ui.state.focusTabAfterRender = focusTab;
     rememberSection(section);
     const nextHash = `#limpieza-arr/${section}`;
     if (location.hash !== nextHash) location.hash = nextHash;
@@ -218,25 +257,25 @@
     if (!hadDocument) renderLoading();
     try {
       const payload = await ui.api(API_ROOT);
-      if (!isObject(payload.rules) || !isObject(payload.defaults) || !isObject(payload.schema)) {
+      if (!validRulesDocument(payload)) {
         throw new Error("El motor no devolvió el contrato completo de reglas.");
       }
       ui.state.document = payload;
       ui.state.draft = ui.clone(payload.rules);
       ui.state.dirty = false;
-      ui.state.lastResult = { parser: null, resolver: null };
+      ui.invalidateAllTestResults({ updateDom: false });
       ui.state.notice = payload.repair_required
         ? {
             message: "La configuración guardada no es válida. El motor usa valores seguros; pulsa Restablecer y después Guardar para repararla.",
             tone: "warn"
           }
         : { message: replace ? "Configuración recargada desde el motor." : "Configuración cargada.", tone: "ok" };
-      ui.render();
+      if (ui.isActiveView()) ui.render();
     } catch (error) {
       if (hadDocument) {
-        ui.render();
+        if (ui.isActiveView()) ui.render();
         setNotice(`No se pudo recargar; el borrador se conserva: ${error.message}`, "bad");
-      } else {
+      } else if (ui.isActiveView()) {
         renderLoadError(error);
       }
     } finally {
@@ -254,8 +293,9 @@
     ui.state.draft = ui.clone(ui.state.document.defaults);
     ui.state.dirty = !sameValue(ui.state.draft, ui.state.document.rules)
       || Boolean(ui.state.document.repair_required);
-    ui.state.lastResult = { parser: null, resolver: null };
+    ui.invalidateAllTestResults({ updateDom: false });
     ui.render();
+    document.getElementById("identity-reset")?.focus();
     setNotice(ui.state.dirty
       ? "Valores de fábrica cargados en el borrador. Pulsa Guardar para aplicarlos."
       : "La configuración activa ya coincide con los valores de fábrica.", ui.state.dirty ? "warn" : "ok");
@@ -274,27 +314,30 @@
           expected_revision: Number(ui.state.document.revision || 0)
         })
       });
+      if (!validRulesDocument(payload)) {
+        throw new Error("El motor confirmó HTTP 200 sin el contrato completo de reglas.");
+      }
       const changedWhileSaving = !sameValue(ui.state.draft, submittedDraft);
       const currentDraft = ui.state.draft;
       ui.state.document = payload;
       ui.state.draft = changedWhileSaving ? currentDraft : ui.clone(payload.rules);
       ui.state.dirty = changedWhileSaving && !sameValue(currentDraft, payload.rules);
-      ui.state.lastResult = { parser: null, resolver: null };
-      ui.render();
+      ui.invalidateAllTestResults({ updateDom: false });
+      if (ui.isActiveView()) ui.render();
       setNotice(changedWhileSaving
         ? "La revisión enviada se guardó; los cambios hechos durante el guardado siguen en el borrador."
         : payload.saved === false
           ? "No había cambios nuevos que guardar."
           : "Configuración guardada y versionada.", changedWhileSaving ? "warn" : "ok");
     } catch (error) {
-      ui.render();
+      if (ui.isActiveView()) ui.render();
       const conflict = error.status === 409 || error.payload?.error === "revision_conflict";
       setNotice(conflict
         ? "Otra ventana guardó una revisión nueva. Tu borrador se conserva: expórtalo o recarga antes de reintentar."
         : `No se pudo guardar; el borrador se conserva: ${error.message}`, "bad");
     } finally {
       ui.state.saving = false;
-      const save = document.getElementById("identity-save");
+      const save = ui.isActiveView() ? document.getElementById("identity-save") : null;
       if (save) {
         save.disabled = !ui.state.dirty;
         save.textContent = "Guardar";
@@ -340,7 +383,7 @@
       }
       ui.state.draft = ui.clone(rules);
       ui.state.dirty = !sameValue(ui.state.draft, ui.state.document.rules);
-      ui.state.lastResult = { parser: null, resolver: null };
+      ui.invalidateAllTestResults({ updateDom: false });
       ui.render();
       setNotice("JSON cargado en el borrador. Revísalo o pruébalo antes de Guardar.", ui.state.dirty ? "warn" : "ok");
     } catch (error) {
@@ -358,14 +401,17 @@
     if (button) { button.disabled = true; button.textContent = "Limpiando…"; }
     try {
       const payload = await ui.api(`${API_ROOT}/cache/clear`, { method: "POST", body: "{}" });
-      ui.state.document.cache_status = payload.cache_status || { available: true, total: 0, active: 0 };
-      ui.render();
+      if (!validCachePayload(payload)) {
+        throw new Error("El motor confirmó HTTP 200 sin el contrato de caché esperado.");
+      }
+      ui.state.document.cache_status = payload.cache_status;
+      if (ui.isActiveView()) ui.render();
       setNotice(`Caché del resolver limpiada: ${Number(payload.deleted || 0)} entradas eliminadas.`, "ok");
     } catch (error) {
       setNotice(`No se pudo limpiar la caché: ${error.message}`, "bad");
     } finally {
       ui.state.cacheClearing = false;
-      const current = document.getElementById("identity-clear-cache");
+      const current = ui.isActiveView() ? document.getElementById("identity-clear-cache") : null;
       if (current) { current.disabled = false; current.textContent = "Limpiar caché del resolver"; }
     }
   };

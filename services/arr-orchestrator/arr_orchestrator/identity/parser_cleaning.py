@@ -43,10 +43,17 @@ def preclean(value: str, rules: Mapping[str, Any], trace: Optional[ParserTrace] 
         text = _sub(trace, "clean.domain_www", prefix_pattern, " ", text)
     domain_pattern = parser_pattern(rules, "domain")
     if domain_pattern:
-        domain_pattern = domain_pattern.replace(
-            "{domain_tlds}", tlds or r"com|net|org|li|tv|bz"
-        )
-        text = _sub(trace, "clean.domain", domain_pattern, " ", text, flags=re.IGNORECASE)
+        if "{domain_tlds}" in domain_pattern:
+            domain_pattern = domain_pattern.replace("{domain_tlds}", tlds) if tlds else ""
+        if domain_pattern:
+            text = _sub(
+                trace,
+                "clean.domain",
+                domain_pattern,
+                " ",
+                text,
+                flags=re.IGNORECASE,
+            )
 
     for word in rules.get("site_words") or []:
         escaped = re.escape(str(word or ""))

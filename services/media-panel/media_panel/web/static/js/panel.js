@@ -9,6 +9,29 @@ const rulesStates = {
 };
 const RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
 let currentRuleSection = readStoredRuleSection();
+let viewEpoch = 0;
+
+function currentViewContext(view) {
+  return Object.freeze({ view, epoch: viewEpoch, hash: location.hash });
+}
+
+function beginViewContext(view) {
+  viewEpoch += 1;
+  return currentViewContext(view);
+}
+
+function ensureViewContext(view, context) {
+  return context?.view === view && Number.isInteger(context?.epoch)
+    ? context
+    : beginViewContext(view);
+}
+
+function isCurrentViewContext(context) {
+  return Boolean(context)
+    && context.epoch === viewEpoch
+    && context.hash === location.hash
+    && context.view === routeKeyFromHash();
+}
 
 const RULE_SOURCES = {
   media: {
@@ -340,11 +363,13 @@ function setActive(view) {
   tabs.forEach(btn => btn.classList.toggle("active", btn.dataset.view === view));
 }
 
-async function showMotor() {
+async function showMotor(context) {
+  context = ensureViewContext("motor", context);
   setActive("motor");
   title.textContent = "Estado del motor";
   app.innerHTML = `<section class="panel">Cargando motor...</section>`;
   const [status, jobs] = await Promise.all([api("/api/status"), api("/api/jobs")]);
+  if (!isCurrentViewContext(context)) return;
   const orchOk = status.orchestrator?.status === "ok";
   const workerOk = status.media_worker?.status === "ok";
   const deps = status.orchestrator?.dependencies || {};
@@ -399,20 +424,24 @@ function stateTone(state) {
   return "info";
 }
 
-async function showHistorial() {
+async function showHistorial(context) {
+  context = ensureViewContext("historial", context);
   setActive("historial");
   title.textContent = "Historial";
   app.innerHTML = `<section class="panel">Cargando historial...</section>`;
   const data = await api("/api/jobs");
+  if (!isCurrentViewContext(context)) return;
   const jobs = data.jobs || [];
   app.innerHTML = `<section class="panel"><h2>Trabajos recientes</h2>${jobsTable(jobs)}</section>`;
 }
 
-async function showRevision() {
+async function showRevision(context) {
+  context = ensureViewContext("revision", context);
   setActive("revision");
   title.textContent = "Revision";
   app.innerHTML = `<section class="panel">Cargando revision...</section>`;
   const data = await api("/api/review");
+  if (!isCurrentViewContext(context)) return;
   const items = data.items || [];
   app.innerHTML = `<section class="panel">
     <h2>repetidas_vs_error</h2>
@@ -431,11 +460,13 @@ async function showRevision() {
   </section>`;
 }
 
-async function showInformes() {
+async function showInformes(context) {
+  context = ensureViewContext("informes", context);
   setActive("informes");
   title.textContent = "Informes";
   app.innerHTML = `<section class="panel">Cargando informes...</section>`;
   const [data, codex] = await Promise.all([api("/api/reports"), api("/api/codex-diagnostics")]);
+  if (!isCurrentViewContext(context)) return;
   const files = data.files || [];
   const codexFiles = codex.files || [];
   const codexOrder = ["movies", "tv", "trailers", "repetidas_vs_error"];
@@ -505,13 +536,16 @@ async function showInformes() {
   document.querySelectorAll("[data-report]").forEach(btn => btn.addEventListener("click", async () => {
     const file = btn.dataset.report;
     const text = await fetch(`/api/report?file=${encodeURIComponent(file)}`, { cache: "no-store" }).then(r => r.text());
+    if (!isCurrentViewContext(context)) return;
     const box = document.getElementById("report-view");
+    if (!box) return;
     box.style.display = "block";
     box.querySelector("pre").textContent = text;
   }));
 }
 
-async function showReglas() {
+async function showReglas(context) {
+  context = ensureViewContext("reglas", context);
   setActive("reglas");
   title.textContent = "Motor de reglas";
   app.innerHTML = `<section class="panel">Cargando reglas...</section>`;
@@ -527,6 +561,7 @@ async function showReglas() {
       }];
     }
   }));
+  if (!isCurrentViewContext(context)) return;
   loadedSources.forEach(([source, documentState]) => {
     rulesStates[source] = documentState;
   });
@@ -595,7 +630,7 @@ function renderRules(statusMessage = "") {
     storeRuleSection(currentRuleSection);
     renderRules();
   }));
-  document.getElementById("reload-rules").addEventListener("click", showReglas);
+  document.getElementById("reload-rules").addEventListener("click", () => showReglas());
   document.getElementById("save-rules").addEventListener("click", saveRules);
   if (source === "filebot") {
     document.querySelectorAll("[data-path]").forEach(input => {
@@ -724,6 +759,7 @@ function collectRules() {
 }
 
 async function saveRules() {
+  const context = currentViewContext("reglas");
   const btn = document.getElementById("save-rules");
   const status = document.getElementById("rules-status");
   btn.disabled = true;
@@ -742,7 +778,7 @@ async function saveRules() {
       body: JSON.stringify(payload)
     });
     rulesStates[savingSource] = savedState;
-    if (currentRuleSection === savingSection) {
+    if (isCurrentViewContext(context) && currentRuleSection === savingSection) {
       const revision = savingSource === "filebot" ? ` · Revisión ${savedState.revision ?? "-"}` : "";
       renderRules(`Reglas guardadas y activas${revision}.`);
     }
@@ -791,7 +827,7 @@ document.addEventListener("click", event => {
 });
 
 const routes = {
-  "limpieza-arr": () => window.ArrIdentityUI.show(),
+  "limpieza-arr": context => window.ArrIdentityUI.show(context),
   reglas: showReglas,
   motor: showMotor,
   historial: showHistorial,
@@ -802,7 +838,7 @@ const routes = {
 tabs.forEach(btn => btn.addEventListener("click", () => {
   const view = btn.dataset.view;
   const target = view === "limpieza-arr" ? "limpieza-arr/parser" : view;
-  if (location.hash === `#${target}`) routes[view]();
+  if (location.hash === `#${target}`) dispatchRoute(view);
   else location.hash = target;
 }));
 
@@ -810,11 +846,22 @@ function routeFromHash() {
   return (location.hash.replace("#", "") || "reglas").split("/", 1)[0];
 }
 
-window.addEventListener("hashchange", () => {
+function routeKeyFromHash() {
   const view = routeFromHash();
-  (routes[view] || showReglas)();
+  return routes[view] ? view : "reglas";
+}
+
+function dispatchRoute(view = routeFromHash()) {
+  const routeKey = routes[view] ? view : "reglas";
+  const context = beginViewContext(routeKey);
+  return Promise.resolve(routes[routeKey](context)).catch(error => {
+    if (!isCurrentViewContext(context)) return;
+    app.innerHTML = `<section class="panel"><h2>Error</h2><pre class="pre">${esc(error.message)}</pre></section>`;
+  });
+}
+
+window.addEventListener("hashchange", () => {
+  dispatchRoute();
 });
 
-(routes[routeFromHash()] || showReglas)().catch(error => {
-  app.innerHTML = `<section class="panel"><h2>Error</h2><pre class="pre">${esc(error.message)}</pre></section>`;
-});
+dispatchRoute();

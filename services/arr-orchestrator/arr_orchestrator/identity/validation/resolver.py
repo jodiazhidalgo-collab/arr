@@ -154,10 +154,15 @@ def normalize_resolver(value: object) -> Dict[str, object]:
             "rules.resolver.evidence.sort_largest_first",
         ),
     }
-    if not any(
-        normalized_evidence[key]
-        for key in ("use_job_name", "use_folder_name", "use_media_files")
-    ):
+    has_effective_evidence = bool(
+        normalized_evidence["use_job_name"]
+        or normalized_evidence["use_folder_name"]
+        or (
+            normalized_evidence["use_media_files"]
+            and normalized_evidence["max_media_files"] > 0
+        )
+    )
+    if not has_effective_evidence:
         raise IdentityRulesValidationError(
             "rules.resolver.evidence requiere al menos una fuente activa."
         )

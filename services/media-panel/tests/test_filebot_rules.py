@@ -58,7 +58,11 @@ class FileBotRulesProxyTests(unittest.TestCase):
             None,
             io.BytesIO(body),
         )
-        with patch.object(server.urllib.request, "urlopen", side_effect=conflict):
+        with patch.object(
+            conflict, "close", wraps=conflict.close
+        ) as close_error, patch.object(
+            server.urllib.request, "urlopen", side_effect=conflict
+        ):
             status, payload = server._proxy_upstream_json(
                 "http://arr-orchestrator:8787/settings/filebot",
                 {"rules": {}, "expected_revision": 8},
@@ -69,6 +73,7 @@ class FileBotRulesProxyTests(unittest.TestCase):
             payload,
             {"ok": False, "error": "revision_conflict", "revision": 9},
         )
+        close_error.assert_called_once_with()
 
     def test_get_endpoint_returns_exact_upstream_status_and_body(self) -> None:
         handler = _CapturedHandler("/api/filebot-rules")

@@ -4,6 +4,14 @@
   min-width: 0;
 }
 
+.identity-tabpanel {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.identity-tabpanel[hidden] { display: none; }
+
 .identity-hero {
   display: flex;
   align-items: flex-start;

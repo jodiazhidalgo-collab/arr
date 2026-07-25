@@ -13,6 +13,28 @@ from .text import clean_release_name, prefer_parser_title, unique
 TECHNICAL_NAMES = {"original", "filebot_input", "filebot_output", "extracted"}
 
 
+def collect_name_evidence(
+    value: str, category: str, policy: Dict[str, object]
+) -> List[str]:
+    """Construye evidencia solo desde texto, sin consultar el sistema de archivos."""
+
+    text = str(value or "").strip()
+    if not text:
+        return []
+    parsed = parse_release_name(text, category, rules=policy.get("parser"))
+    return unique(
+        item.strip()
+        for item in [
+            text,
+            parsed.cleaned,
+            parsed.display_title,
+            parsed.guessit_input,
+            *parsed.title_candidates,
+        ]
+        if item.strip()
+    )
+
+
 def collect_evidence(
     job: Dict[str, object], input_root: Path, policy: Dict[str, object]
 ) -> List[str]:
@@ -20,22 +42,12 @@ def collect_evidence(
     settings = policy.get("evidence") if isinstance(policy.get("evidence"), dict) else {}
 
     def add_name(value: str) -> None:
-        text = str(value or "").strip()
-        if not text:
-            return
-        parsed = parse_release_name(
-            text,
-            str(job.get("category") or ""),
-            rules=policy.get("parser"),
-        )
         values.extend(
-            [
-                text,
-                parsed.cleaned,
-                parsed.display_title,
-                parsed.guessit_input,
-                *parsed.title_candidates,
-            ]
+            collect_name_evidence(
+                value,
+                str(job.get("category") or ""),
+                policy,
+            )
         )
 
     if bool(settings.get("use_job_name", True)):

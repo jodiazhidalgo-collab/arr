@@ -57,6 +57,7 @@ class FileBotRunner:
         self.binary = binary
         self.log_dir = log_dir
         self._rules_snapshot: Dict[str, object] = {}
+        self._identity_rules_snapshot: Dict[str, object] = {}
 
     def configure_rules(self, rules: Optional[Mapping[str, object]]) -> None:
         """Capture one normalized snapshot before previewing/running a job.
@@ -67,6 +68,13 @@ class FileBotRunner:
         """
 
         self._rules_snapshot = json.loads(
+            json.dumps(dict(rules or {}), ensure_ascii=False, default=str)
+        )
+
+    def configure_identity_rules(self, rules: Optional[Mapping[str, object]]) -> None:
+        """Captura el locale del resolver del mismo snapshot que gobierna el job."""
+
+        self._identity_rules_snapshot = json.loads(
             json.dumps(dict(rules or {}), ensure_ascii=False, default=str)
         )
 
@@ -170,7 +178,7 @@ class FileBotRunner:
             "cwd": str(input_path),
             "log_file": str(log_file),
             "timeout_sec": FILEBOT_TIMEOUT_SECONDS,
-            "rules": self._command_rules_summary(category),
+            "rules": self._command_rules_summary(category, guided=identity is not None),
         }
 
     def _legacy_amc_command(
@@ -260,7 +268,7 @@ class FileBotRunner:
             "--q",
             str(identity.tmdb_id),
             "--lang",
-            _filebot_language(str(rules.get("language") or "es-ES")),
+            self._guided_language(category, rules),
             "--output",
             str(output_root),
             "--action",
@@ -280,10 +288,31 @@ class FileBotRunner:
         value = self._rules_snapshot.get(category)
         return dict(value) if isinstance(value, dict) else {}
 
-    def _command_rules_summary(self, category: str) -> Dict[str, object]:
+    def _guided_locale(self, category: str, filebot_rules: Mapping[str, object]) -> str:
+        resolver = self._identity_rules_snapshot.get("resolver")
+        locales = resolver.get("locales") if isinstance(resolver, dict) else None
+        category_locale = locales.get(category) if isinstance(locales, dict) else None
+        language = (
+            category_locale.get("language")
+            if isinstance(category_locale, dict)
+            else None
+        )
+        return str(language or filebot_rules.get("language") or "es-ES")
+
+    def _guided_language(self, category: str, filebot_rules: Mapping[str, object]) -> str:
+        return _filebot_language(self._guided_locale(category, filebot_rules))
+
+    def _command_rules_summary(
+        self, category: str, *, guided: bool = False
+    ) -> Dict[str, object]:
         rules = self._category_rules(category)
+        language = (
+            self._guided_locale(category, rules)
+            if guided
+            else str(rules.get("language") or "es-ES")
+        )
         return {
-            "language": str(rules.get("language") or "es-ES"),
+            "language": language,
             "region": (
                 str(rules.get("region") or "ES") if category == "movies" else None
             ),

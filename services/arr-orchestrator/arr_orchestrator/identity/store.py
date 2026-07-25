@@ -112,6 +112,9 @@ class IdentitySettingsStore:
         default_region: str = "ES",
         logger: Optional[logging.Logger] = None,
         history_limit: int = IDENTITY_HISTORY_LIMIT,
+        resolver_http_timeout_ms: int = 2500,
+        resolver_total_budget_ms: int = 5000,
+        resolver_retry_seconds: int = 60,
     ) -> None:
         if (
             isinstance(history_limit, bool)
@@ -124,7 +127,13 @@ class IdentitySettingsStore:
         self._lock = threading.RLock()
         self._history_limit = history_limit
         self._defaults = normalize_identity_rules(
-            factory_identity_rules(default_language, default_region)
+            factory_identity_rules(
+                default_language,
+                default_region,
+                resolver_http_timeout_ms,
+                resolver_total_budget_ms,
+                resolver_retry_seconds,
+            )
         )
         self._rules = copy.deepcopy(self._defaults)
         self._revision = 0
@@ -378,6 +387,33 @@ class IdentitySettingsStore:
             return self._write_locked(
                 copy.deepcopy(self._defaults), expected_revision, "reset"
             )
+
+    def migrate_legacy_if_absent(self, rules: object) -> Dict[str, object]:
+        """Inicializa desde FileBot solo cuando la clave nunca fue persistida.
+
+        Un valor existente, aunque sea invalido o de un esquema futuro, queda
+        intacto para que solo una accion explicita de reparacion pueda
+        sustituirlo. El CAS por valor exacto protege tambien la carrera entre
+        el chequeo de ausencia y la escritura real de produccion.
+        """
+
+        try:
+            normalized = normalize_identity_rules(rules)
+        except IdentityRulesValidationError as error:
+            with self._lock:
+                result = self._response_locked(ok=False)
+            result.update({"error": "invalid_rules", "message": str(error)})
+            return result
+
+        with self._lock:
+            self._refresh_locked()
+            if self._stored_raw is not None:
+                result = self._response_locked()
+                result.update({"saved": False, "migrated": False, "action": "save"})
+                return result
+            result = self._write_locked(normalized, 0, "save")
+            result["migrated"] = bool(result.get("saved"))
+            return result
 
     def clear_cache(self) -> Dict[str, object]:
         """Vacia solo la cache del resolver; no altera reglas ni revision."""

@@ -963,14 +963,18 @@ def _has_review_content(root: Path) -> bool:
     return any(root.iterdir())
 
 
-def move_tv_job_to_review(job_root: Path, destination_root: Path, name: str) -> Path:
-    original_root = job_root / "original"
-    source_root = original_root if original_root.exists() else job_root
+def move_tv_job_to_review(
+    job_root: Path,
+    destination_root: Path,
+    name: str,
+    parser_rules: Optional[Dict[str, object]] = None,
+) -> Path:
+    source_root = _review_content_root(job_root)
     videos = media_files(source_root)
     if not videos:
         return move_job_to(job_root, destination_root, name)
 
-    parsed = parse_release_name(name, "tv")
+    parsed = parse_release_name(name, "tv", rules=parser_rules)
     title = safe_folder_name(parsed.display_title or Path(name).stem or name)
     destination_root.mkdir(parents=True, exist_ok=True)
     destination = numbered_destination(destination_root / title)

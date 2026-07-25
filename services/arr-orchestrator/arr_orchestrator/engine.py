@@ -279,11 +279,24 @@ class Engine:
     def _active_filebot_rules_context(self) -> Dict[str, object]:
         return self.filebot_settings.job_snapshot()
 
-    def _new_job_source_meta_json(self) -> str:
+    def _new_job_source_meta_json(
+        self,
+        *,
+        identity_context: Optional[Dict[str, object]] = None,
+        filebot_context: Optional[Dict[str, object]] = None,
+    ) -> str:
         return json.dumps(
             {
-                "filebot_rules": self._active_filebot_rules_context(),
-                "identity_rules": self.identity.job_snapshot(),
+                "filebot_rules": (
+                    filebot_context
+                    if isinstance(filebot_context, dict)
+                    else self._active_filebot_rules_context()
+                ),
+                "identity_rules": (
+                    identity_context
+                    if isinstance(identity_context, dict)
+                    else self.identity.job_snapshot()
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -505,7 +518,6 @@ class Engine:
         self.dependencies["qbittorrent"] = "ok"
         for torrent in torrents:
             infohash = str(torrent.get("hash") or "").lower()
-            category = self._category(str(torrent.get("category") or ""), str(torrent.get("name") or ""))
             content_path = Path(str(torrent.get("content_path") or ""))
             if not infohash or not content_path.exists():
                 continue
@@ -513,6 +525,17 @@ class Engine:
             if not source_path:
                 continue
             job = self._job_for_qbt_content(infohash, source_path, content_path)
+            identity_context = (
+                self.identity.rules_for_job(job)
+                if job
+                else self.identity.job_snapshot()
+            )
+            identity_rules = dict(identity_context.get("rules") or {})
+            category = self._category(
+                str(torrent.get("category") or ""),
+                str(torrent.get("name") or ""),
+                identity_rules,
+            )
             if not job and self._ignored_movies_item(source_path):
                 continue
             if not job:
@@ -526,7 +549,9 @@ class Engine:
                     qbt_hash=infohash,
                     source_path=str(source_path),
                     submitted_at=float(torrent.get("added_on") or time.time()),
-                    source_meta_json=self._new_job_source_meta_json(),
+                    source_meta_json=self._new_job_source_meta_json(
+                        identity_context=identity_context
+                    ),
                 )
             elif job["state"] not in TERMINAL_STATES:
                 self._attach_qbt_identity(
@@ -598,9 +623,11 @@ class Engine:
             infohash, name = torrent_info(path)
         except (OSError, ValueError):
             return
-        category = self._watch_category(path, name)
         job = self.db.get_active_job_by_infohash(infohash)
         if not job:
+            identity_context = self.identity.job_snapshot()
+            identity_rules = dict(identity_context.get("rules") or {})
+            category = self._watch_category(path, name, identity_rules)
             job = self.db.create_job(
                 self._new_source_uid("torrent", infohash),
                 "watch",
@@ -608,8 +635,12 @@ class Engine:
                 name,
                 infohash=infohash,
                 torrent_path=str(path),
-                source_meta_json=self._new_job_source_meta_json(),
+                source_meta_json=self._new_job_source_meta_json(
+                    identity_context=identity_context
+                ),
             )
+        else:
+            category = str(job.get("category") or "manual")
         if self.config.active and job["state"] == "received":
             self._submit_rdt(job, path)
         elif not self.config.active and job["state"] == "received":
@@ -701,7 +732,6 @@ class Engine:
             self.log.warning("Evento qB descartado porque el torrent no está completo: %s", infohash)
             path.unlink(missing_ok=True)
             return
-        category = self._category(str(torrent.get("category") or ""), str(torrent.get("name") or ""))
         content_path = Path(str(torrent.get("content_path") or ""))
         source_path = self._qbt_materialized_source(content_path) if content_path.exists() else None
         if not source_path:
@@ -711,6 +741,17 @@ class Engine:
             )
             return
         job = self._job_for_qbt_content(infohash, source_path, content_path)
+        identity_context = (
+            self.identity.rules_for_job(job)
+            if job
+            else self.identity.job_snapshot()
+        )
+        identity_rules = dict(identity_context.get("rules") or {})
+        category = self._category(
+            str(torrent.get("category") or ""),
+            str(torrent.get("name") or ""),
+            identity_rules,
+        )
         if not job and self._ignored_movies_item(source_path):
             path.unlink(missing_ok=True)
             return
@@ -725,7 +766,9 @@ class Engine:
                 qbt_hash=infohash,
                 source_path=str(source_path),
                 submitted_at=float(torrent.get("added_on") or time.time()),
-                source_meta_json=self._new_job_source_meta_json(),
+                source_meta_json=self._new_job_source_meta_json(
+                    identity_context=identity_context
+                ),
             )
         else:
             self._attach_qbt_identity(
@@ -877,6 +920,8 @@ class Engine:
         category: str,
         item: Path,
     ) -> Dict[str, object]:
+        identity_context = self.identity.rules_for_job(job)
+        identity_rules = dict(identity_context.get("rules") or {})
         try:
             torrents = self.qbt.torrents("completed")
         except Exception as error:
@@ -897,6 +942,7 @@ class Engine:
                 self._category(
                     str(torrent.get("category") or category),
                     str(torrent.get("name") or item.name),
+                    identity_rules,
                 ),
                 source_path,
                 content_path,
@@ -1259,6 +1305,11 @@ class Engine:
         filebot_configure = getattr(self.filebot, "configure_rules", None)
         if callable(filebot_configure):
             filebot_configure(rules_snapshot)
+        filebot_identity_configure = getattr(
+            self.filebot, "configure_identity_rules", None
+        )
+        if callable(filebot_identity_configure):
+            filebot_identity_configure(identity_rules)
         self.db.add_event(
             str(job["job_id"]),
             "settings",
@@ -1446,7 +1497,9 @@ class Engine:
             self._finish_filebot_timeout(job, job_root, input_root, output_root, result)
             return
         if result.get("duplicate"):
-            duplicate = self._move_duplicate_to_review(job, job_root)
+            duplicate = self._move_duplicate_to_review(
+                job, job_root, identity_rules
+            )
             write_reason(
                 duplicate,
                 {
@@ -1500,7 +1553,9 @@ class Engine:
         moves = list(result.get("moves") or [])
         remaining_media = media_files(input_root)
         if not output_media and not moves:
-            duplicate = self._move_duplicate_to_review(job, job_root)
+            duplicate = self._move_duplicate_to_review(
+                job, job_root, identity_rules
+            )
             write_reason(
                 duplicate,
                 {
@@ -1957,9 +2012,25 @@ class Engine:
             result_json=json.dumps(result, ensure_ascii=False, default=str),
         )
 
-    def _move_duplicate_to_review(self, job: Dict[str, object], job_root: Path) -> Path:
+    def _move_duplicate_to_review(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        identity_rules: Optional[Dict[str, object]] = None,
+    ) -> Path:
         if job["category"] == "tv":
-            return move_tv_job_to_review(job_root, self.config.review_dir, str(job["name"]))
+            parser_rules = (
+                identity_rules.get("parser")
+                if isinstance(identity_rules, dict)
+                and isinstance(identity_rules.get("parser"), dict)
+                else None
+            )
+            return move_tv_job_to_review(
+                job_root,
+                self.config.review_dir,
+                str(job["name"]),
+                parser_rules,
+            )
         return move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
 
     def _media_decision_for_job(
@@ -3030,14 +3101,24 @@ class Engine:
                     "Observación dry-run descartada porque el origen ya no existe",
                 )
 
-    def _watch_category(self, path: Path, name: str) -> str:
+    def _watch_category(
+        self,
+        path: Path,
+        name: str,
+        identity_rules: Optional[Dict[str, object]] = None,
+    ) -> str:
         try:
             relative = path.relative_to(self.config.watch_inbox)
             if len(relative.parts) > 1 and relative.parts[0] in ("movies", "tv", "manual"):
                 return relative.parts[0]
         except ValueError:
             pass
-        return self._category("", name, self.identity.store.snapshot())
+        rules = (
+            identity_rules
+            if isinstance(identity_rules, dict)
+            else self.identity.store.snapshot()
+        )
+        return self._category("", name, rules)
 
     @staticmethod
     def _category(

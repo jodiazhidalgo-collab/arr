@@ -19,6 +19,7 @@ def _config(**overrides):
         "tmdb_api_token": "",
         "resolver_http_timeout_ms": 2500,
         "resolver_total_budget_ms": 5000,
+        "resolver_retry_seconds": 60,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -74,6 +75,29 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(result["status"], "TMDB_UNAVAILABLE")
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
 
+    def test_revision_zero_defaults_come_from_runtime_config(self) -> None:
+        controller = IdentityController(
+            _config(
+                resolver_http_timeout_ms=1300,
+                resolver_total_budget_ms=7200,
+                resolver_retry_seconds=41,
+            ),
+            self.database,
+            _FileBotSettings(),
+        )
+
+        payload = controller.payload()
+        self.assertEqual(payload["revision"], 0)
+        self.assertEqual(payload["rules"]["resolver"]["http"]["timeout_ms"], 1300)
+        self.assertEqual(
+            payload["rules"]["resolver"]["http"]["total_budget_ms"],
+            7200,
+        )
+        self.assertEqual(
+            payload["rules"]["resolver"]["retry"]["base_seconds"],
+            41,
+        )
+
     def test_legacy_identity_fields_migrate_once_from_filebot_settings(self) -> None:
         legacy = {
             "movies": {
@@ -108,6 +132,25 @@ class IdentityControllerTests(unittest.TestCase):
             _config(), self.database, _FileBotSettings({})
         )
         self.assertEqual(restarted.payload()["revision"], 1)
+
+    def test_legacy_migration_never_overwrites_an_existing_invalid_value(self) -> None:
+        legacy = {
+            "movies": {
+                "language": "en-GB",
+                "query_aliases": ["Origen | Destination"],
+            }
+        }
+
+        for raw in ("{invalid", json.dumps({"schema_version": 99})):
+            with self.subTest(raw=raw):
+                self.database.set_setting("identity.pipeline", raw)
+                controller = IdentityController(
+                    _config(), self.database, _FileBotSettings(legacy)
+                )
+
+                self.assertEqual(self.database.get_setting("identity.pipeline"), raw)
+                self.assertEqual(controller.payload()["revision"], 0)
+                self.assertTrue(controller.payload()["repair_required"])
 
     def test_job_snapshot_is_stable_after_later_save(self) -> None:
         controller = IdentityController(_config(), self.database, _FileBotSettings())

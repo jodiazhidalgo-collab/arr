@@ -48,6 +48,14 @@ def search_candidates(
     result_limit = max(1, int(limits.get("results_per_search", 10)))
     detail_limit = max(1, int(limits.get("detail_candidates", MAX_DETAIL_CANDIDATES)))
     initial_limit = max(1, int(limits.get("initial_candidates", 2)))
+    early_stop_score = max(
+        float(acceptance.get("early_stop_score", 75)),
+        float(acceptance.get("min_score", 75)),
+    )
+    early_stop_margin = max(
+        float(acceptance.get("early_stop_margin", 12)),
+        float(acceptance.get("min_margin", 12)),
+    )
     year = as_int(guessed.get("year"))
     title_candidates = [str(value) for value in guessed.get("_title_candidates") or []]
     guessit_title = str(guessed.get("title") or "")
@@ -134,15 +142,15 @@ def search_candidates(
                 acceptance.get("early_stop_require_exact_movie_year", True)
             )
             if (
-                top.score >= float(acceptance.get("early_stop_score", 75))
-                and margin >= float(acceptance.get("early_stop_margin", 12))
+                top.score >= early_stop_score
+                and margin >= early_stop_margin
                 and (has_required_movie_year or not require_exact_year)
             ):
                 break
 
     initial = [candidate_from_payload(media_type, item) for item in raw.values()]
     initial = ranker(initial, guessed, [], False)
-    selected = list(initial[:initial_limit])
+    selected = list(initial[: min(initial_limit, detail_limit)])
     if (
         media_type == "movie"
         and year is not None
@@ -158,7 +166,10 @@ def search_candidates(
             None,
         )
         if exact_year is not None:
-            selected.append(exact_year)
+            if len(selected) >= detail_limit:
+                selected[-1] = exact_year
+            else:
+                selected.append(exact_year)
     for candidate in initial:
         if len(selected) >= detail_limit:
             break

@@ -39,6 +39,44 @@ class PayloadTooLargeError(ValueError):
 class InvalidContentLengthError(ValueError):
     pass
 
+
+class InvalidJsonPayloadError(ValueError):
+    pass
+
+
+def _is_application_json(headers: object) -> bool:
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return False
+    content_type = str(getter("Content-Type", "") or "")
+    return content_type.split(";", 1)[0].strip().lower() == "application/json"
+
+
+def _same_origin_request(headers: object) -> bool:
+    """Bloquea navegadores cross-site sin exigir cabeceras a clientes de API."""
+
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return True
+    fetch_site = str(getter("Sec-Fetch-Site", "") or "").strip().lower()
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        return False
+    host = str(getter("Host", "") or "").strip().lower()
+    origin = str(getter("Origin", "") or "").strip()
+    referer = str(getter("Referer", "") or "").strip()
+    source = origin or referer
+    if not source:
+        return True
+    try:
+        parsed = urllib.parse.urlsplit(source)
+    except ValueError:
+        return False
+    return bool(
+        host
+        and parsed.scheme.lower() in {"http", "https"}
+        and parsed.netloc.lower() == host
+    )
+
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -205,7 +243,10 @@ def _proxy_upstream_json(
             raw = response.read()
     except urllib.error.HTTPError as error:
         status = int(error.code or 502)
-        raw = error.read()
+        try:
+            raw = error.read()
+        finally:
+            error.close()
     except Exception as error:
         return 502, {"ok": False, "error": str(error), "upstream_status": 502}
 
@@ -512,15 +553,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
-    def _read_payload(self) -> Dict[str, Any]:
+    def _read_payload(self, *, strict: bool = False) -> Dict[str, Any]:
         length = self._content_length()
         if length > MAX_REQUEST_BODY_BYTES:
             raise PayloadTooLargeError
+        if strict and length == 0:
+            raise InvalidJsonPayloadError
         data = self.rfile.read(length) if length else b"{}"
         try:
             payload = json.loads(data.decode("utf-8"))
-            return payload if isinstance(payload, dict) else {}
-        except Exception:
+            if isinstance(payload, dict):
+                return payload
+            if strict:
+                raise InvalidJsonPayloadError
+            return {}
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            if strict:
+                raise InvalidJsonPayloadError from error
             return {}
 
     def _content_length(self) -> int:
@@ -668,9 +717,38 @@ class Handler(BaseHTTPRequestHandler):
         }
         identity_action = identity_actions.get(parsed.path)
         if identity_action:
+            if not _same_origin_request(self.headers):
+                self._json(
+                    403,
+                    {
+                        "ok": False,
+                        "error": "cross_origin_request",
+                        "message": "La petición debe proceder del panel ARR.",
+                    },
+                )
+                return
+            if not _is_application_json(self.headers):
+                self._json(
+                    415,
+                    {
+                        "ok": False,
+                        "error": "unsupported_media_type",
+                        "message": "Content-Type debe ser application/json.",
+                    },
+                )
+                return
             try:
-                status, result = identity_action(self._read_payload())
+                status, result = identity_action(self._read_payload(strict=True))
                 self._json(status, result)
+            except InvalidJsonPayloadError:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": "El cuerpo debe ser un objeto JSON válido.",
+                    },
+                )
             except Exception as error:
                 self._json(500, {"ok": False, "error": type(error).__name__})
             return

@@ -35,6 +35,15 @@ class IdentityController:
             default_language=str(getattr(config, "resolver_language", "es-ES")),
             default_region=str(getattr(config, "resolver_region", "ES")),
             logger=self.log,
+            resolver_http_timeout_ms=int(
+                getattr(config, "resolver_http_timeout_ms", 2500)
+            ),
+            resolver_total_budget_ms=int(
+                getattr(config, "resolver_total_budget_ms", 5000)
+            ),
+            resolver_retry_seconds=int(
+                getattr(config, "resolver_retry_seconds", 60)
+            ),
         )
         self.resolver = NameResolver(
             str(getattr(config, "tmdb_api_token", "")),
@@ -191,20 +200,17 @@ class IdentityController:
         return name, explicit_category, rules
 
     def _migrate_legacy_filebot(self, filebot_settings: object) -> None:
-        current = self.store.payload()
-        if int(current.get("revision") or 0) != 0:
-            return
         snapshot_reader = getattr(filebot_settings, "snapshot", None)
         if not callable(snapshot_reader):
             return
         legacy = snapshot_reader()
         if not isinstance(legacy, dict):
             return
-        defaults = copy.deepcopy(current["defaults"])
+        defaults = copy.deepcopy(self.store.payload()["defaults"])
         migrated = _merge_legacy_filebot(defaults, legacy)
         if migrated == defaults:
             return
-        result = self.store.update({"expected_revision": 0, "rules": migrated})
+        result = self.store.migrate_legacy_if_absent(migrated)
         if not result.get("ok"):
             self.log.warning("No se pudo migrar filebot.rules a identity.pipeline: %s", result.get("message"))
 

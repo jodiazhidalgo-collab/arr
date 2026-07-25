@@ -1,9 +1,49 @@
 """Cliente HTTP pequeño y aislado para la configuracion de identidad ARR."""
 
 import json
+import math
 import urllib.error
 import urllib.request
 from typing import Dict, Optional, Tuple
+
+
+MIN_RESOLVER_BUDGET_MS = 100
+MAX_RESOLVER_BUDGET_MS = 300_000
+RESOLVER_PROXY_MARGIN_SECONDS = 5.0
+MIN_RESOLVER_PROXY_TIMEOUT_SECONDS = 10.0
+MAX_RESOLVER_PROXY_TIMEOUT_SECONDS = (
+    MAX_RESOLVER_BUDGET_MS / 1_000 + RESOLVER_PROXY_MARGIN_SECONDS
+)
+
+
+def _resolver_proxy_timeout(payload: Dict[str, object]) -> float:
+    """Deja al motor consumir su presupuesto y un margen HTTP acotado."""
+
+    budget: object = None
+    rules = payload.get("rules")
+    if isinstance(rules, dict):
+        resolver = rules.get("resolver")
+        if isinstance(resolver, dict):
+            http = resolver.get("http")
+            if isinstance(http, dict):
+                budget = http.get("total_budget_ms", budget)
+    try:
+        numeric_budget = float(budget)
+    except (TypeError, ValueError):
+        return MAX_RESOLVER_PROXY_TIMEOUT_SECONDS
+    if not math.isfinite(numeric_budget) or isinstance(budget, bool):
+        return MAX_RESOLVER_PROXY_TIMEOUT_SECONDS
+    bounded_budget = min(
+        MAX_RESOLVER_BUDGET_MS,
+        max(MIN_RESOLVER_BUDGET_MS, numeric_budget),
+    )
+    return min(
+        MAX_RESOLVER_PROXY_TIMEOUT_SECONDS,
+        max(
+            MIN_RESOLVER_PROXY_TIMEOUT_SECONDS,
+            bounded_budget / 1_000 + RESOLVER_PROXY_MARGIN_SECONDS,
+        ),
+    )
 
 
 class IdentityProxy:
@@ -26,13 +66,17 @@ class IdentityProxy:
         return self._request("/settings/identity/test-parser", payload, 25)
 
     def test_resolver(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, object]]:
-        return self._request("/settings/identity/test-resolver", payload, 90)
+        return self._request(
+            "/settings/identity/test-resolver",
+            payload,
+            _resolver_proxy_timeout(payload),
+        )
 
     def _request(
         self,
         path: str,
         payload: Optional[Dict[str, object]],
-        timeout: int,
+        timeout: float,
     ) -> Tuple[int, Dict[str, object]]:
         data = None
         headers = {"Accept": "application/json"}
@@ -50,7 +94,10 @@ class IdentityProxy:
                 raw = response.read(4 * 1024 * 1024)
         except urllib.error.HTTPError as error:
             status = int(error.code)
-            raw = error.read(4 * 1024 * 1024)
+            try:
+                raw = error.read(4 * 1024 * 1024)
+            finally:
+                error.close()
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             return 502, {
                 "ok": False,

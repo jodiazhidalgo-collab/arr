@@ -2,9 +2,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from arr_orchestrator.db import Database
-from arr_orchestrator.filebot import FileBotRunner
+from arr_orchestrator.filebot import FileBotRunner, TV_FORMATS
 from arr_orchestrator.name_resolver import (
     NameResolver,
     ResolutionError,
@@ -123,6 +124,47 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(payload["details"]["query"], "Pelicula de prueba")
         self.assertNotIn("must-not-leak", json.dumps(payload, ensure_ascii=False))
 
+    def test_ambiguous_preview_never_reads_filesystem_evidence_or_leaks_paths(self):
+        first = movie_payload(1, "El desconocido", "Unknown", 2000)
+        second = movie_payload(2, "El desconocido", "Unknown", 2000)
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [first, second]},
+                "/movie/1": first,
+                "/movie/2": second,
+            }
+        )
+        private_path = str(self.root / "privado" / "no-debe-aparecer.mkv")
+
+        with patch(
+            "arr_orchestrator.identity.resolver.service.collect_evidence",
+            return_value=[private_path],
+        ) as filesystem_evidence:
+            payload = resolver.preview("El desconocido.2000.mkv", "movies")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        filesystem_evidence.assert_not_called()
+        self.assertNotIn(private_path, json.dumps(payload, ensure_ascii=False))
+
+    def test_preview_preserves_zero_min_score_when_classifying_rejection(self):
+        resolver, _ = self.resolver({})
+        ambiguity = ResolverAmbiguous(
+            "La identidad no supera el umbral de seguridad",
+            {
+                "top_score": 10,
+                "margin": 5,
+                "min_score": 0,
+                "min_margin": 12,
+            },
+        )
+
+        with patch.object(NameResolver, "resolve", side_effect=ambiguity):
+            payload = resolver.preview("Titulo de prueba.2024", "movies")
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(payload["details"]["min_score"], 0)
+
     def test_spanish_movie_without_year_prefers_exact_title(self):
         correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
         wrong = movie_payload(
@@ -165,6 +207,33 @@ class NameResolverTests(unittest.TestCase):
         search_call = next(call for call in session.calls if "/search/movie" in call[0])
         self.assertEqual(search_call[1]["language"], "es-ES")
         self.assertEqual(search_call[1]["region"], "ES")
+
+    def test_resolver_honors_100ms_http_timeout_without_500ms_clamp(self):
+        correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
+        session = FakeSession(
+            {
+                "/search/movie": {"results": [correct]},
+                "/movie/9279": correct,
+            }
+        )
+        resolver = NameResolver(
+            "token",
+            "es-ES",
+            "ES",
+            100,
+            5000,
+            self.database,
+            session=session,
+        )
+        input_root = self.input_file("Un.padre.en.apuros.1996.mkv")
+
+        resolver.resolve(
+            {"category": "movies", "name": "Un.padre.en.apuros.1996"},
+            input_root,
+        )
+
+        self.assertTrue(session.calls)
+        self.assertTrue(all(abs(call[2] - 0.1) < 0.001 for call in session.calls))
 
     def test_cache_avoids_second_tmdb_query(self):
         correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
@@ -586,6 +655,61 @@ class NameResolverTests(unittest.TestCase):
         self.assertIn("-rename", preview["argv"])
         self.assertEqual(preview["argv"][preview["argv"].index("--q") + 1], "9279")
         self.assertTrue(str(preview["log_file"]).endswith("filebot-job-1.log"))
+
+    def test_guided_filebot_uses_identity_locale_and_legacy_formatting_rules(self):
+        identity = ResolvedIdentity(
+            media_type="tv",
+            tmdb_id=77,
+            title="La Agencia",
+            original_title="The Agency",
+            year=2024,
+            aliases=["La Agencia", "The Agency"],
+            score=100,
+            margin=50,
+            query="La Agencia",
+            guess={"title": "La Agencia", "season": 1, "episode": 1},
+            source="search",
+            season=1,
+            episodes=[1],
+        )
+        runner = FileBotRunner("filebot", self.root)
+        runner.configure_rules(
+            {
+                "tv": {
+                    "language": "en-US",
+                    "filename_style": "series_sxxexx_title",
+                    "episode_order": "DVD",
+                }
+            }
+        )
+        runner.configure_identity_rules(
+            {"resolver": {"locales": {"tv": {"language": "fr-FR"}}}}
+        )
+
+        guided = runner.preview_command(
+            "job-guided",
+            "tv",
+            self.root / "input",
+            self.root / "output",
+            identity,
+        )
+        legacy = runner.preview_command(
+            "job-legacy",
+            "tv",
+            self.root / "input",
+            self.root / "output",
+        )
+
+        guided_argv = guided["argv"]
+        self.assertEqual(guided_argv[guided_argv.index("--lang") + 1], "fr")
+        self.assertEqual(
+            guided_argv[guided_argv.index("--format") + 1],
+            TV_FORMATS["series_sxxexx_title"],
+        )
+        self.assertEqual(guided_argv[guided_argv.index("--order") + 1], "DVD")
+        self.assertEqual(guided["rules"]["language"], "fr-FR")
+        self.assertEqual(legacy["argv"][legacy["argv"].index("--lang") + 1], "en")
+        self.assertEqual(legacy["rules"]["language"], "en-US")
 
     def test_output_validation_accepts_alias_and_rejects_wrong_title(self):
         identity = ResolvedIdentity(

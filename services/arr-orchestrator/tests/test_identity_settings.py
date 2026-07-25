@@ -156,17 +156,51 @@ class IdentityRulesTests(unittest.TestCase):
             for group in schema[section]["groups"]
             for control in group["controls"]
         }
+        compatibility_only = {"parser.normalization.smart_title"}
 
-        self.assertEqual(control_paths, _leaf_paths(rules) - {"schema_version"})
+        self.assertEqual(
+            control_paths,
+            _leaf_paths(rules) - {"schema_version"} - compatibility_only,
+        )
+        self.assertNotIn("parser.normalization.smart_title", control_paths)
+
+        rules["parser"]["normalization"]["smart_title"] = False
+        normalized = normalize_identity_rules(rules)
+        self.assertFalse(normalized["parser"]["normalization"]["smart_title"])
 
     def test_factory_uses_parser_source_of_truth_and_runtime_locales(self):
-        rules = factory_identity_rules("en-gb", "gb")
+        rules = factory_identity_rules("en-gb", "gb", 1400, 6600, 45)
 
         self.assertEqual(rules["parser"], DEFAULT_PARSER_RULES)
         self.assertIsNot(rules["parser"], DEFAULT_PARSER_RULES)
         self.assertEqual(rules["resolver"]["locales"]["movies"]["language"], "en-GB")
         self.assertEqual(rules["resolver"]["locales"]["movies"]["region"], "GB")
         self.assertEqual(rules["resolver"]["locales"]["tv"]["language"], "en-GB")
+        self.assertEqual(rules["resolver"]["http"]["timeout_ms"], 1400)
+        self.assertEqual(rules["resolver"]["http"]["total_budget_ms"], 6600)
+        self.assertEqual(rules["resolver"]["retry"]["base_seconds"], 45)
+
+    def test_factory_rejects_runtime_http_below_contract_minimum(self):
+        with self.assertRaisesRegex(ValueError, "resolver_http_timeout_ms"):
+            factory_identity_rules(resolver_http_timeout_ms=99)
+
+    def test_media_files_with_zero_limit_is_not_effective_evidence(self):
+        rules = factory_identity_rules()
+        evidence = rules["resolver"]["evidence"]
+        evidence.update(
+            {
+                "use_job_name": False,
+                "use_folder_name": False,
+                "use_media_files": True,
+                "max_media_files": 0,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            IdentityRulesValidationError,
+            "requiere al menos una fuente activa",
+        ):
+            normalize_identity_rules(rules)
 
     def test_normalization_is_strict_and_canonical(self):
         normalized = normalize_identity_rules(changed_rules())
@@ -248,7 +282,10 @@ class IdentityStoreTests(unittest.TestCase):
             for control in group["controls"]
         }
         expected = leaf_paths(payload["rules"]) - {"schema_version"}
-        self.assertEqual(expected - controls, set())
+        self.assertEqual(
+            expected - controls,
+            {"parser.normalization.smart_title"},
+        )
         self.assertEqual(payload["revision"], 0)
         self.assertIsNone(payload["saved_at"])
         self.assertEqual(payload["rules_path"], "settings/identity.pipeline")
@@ -347,6 +384,28 @@ class IdentityStoreTests(unittest.TestCase):
         self.assertEqual(loser["error"], "revision_conflict")
         self.assertEqual(loser["rules"], winner["rules"])
 
+    def test_legacy_migration_only_initializes_an_absent_setting(self):
+        rules = changed_rules()
+        absent = FakeSettingsDatabase()
+        migrated = IdentitySettingsStore(absent).migrate_legacy_if_absent(rules)
+
+        self.assertTrue(migrated["ok"])
+        self.assertTrue(migrated["migrated"])
+        self.assertEqual(migrated["revision"], 1)
+
+        for raw in ("{invalid", json.dumps({"schema_version": 99})):
+            with self.subTest(raw=raw):
+                existing = FakeSettingsDatabase()
+                existing.values[IDENTITY_SETTING_KEY] = raw
+                skipped = IdentitySettingsStore(existing).migrate_legacy_if_absent(
+                    rules
+                )
+
+                self.assertTrue(skipped["ok"])
+                self.assertFalse(skipped["migrated"])
+                self.assertTrue(skipped["repair_required"])
+                self.assertEqual(existing.values[IDENTITY_SETTING_KEY], raw)
+
 
 class IdentityDatabaseTests(unittest.TestCase):
     def setUp(self):
@@ -375,6 +434,24 @@ class IdentityDatabaseTests(unittest.TestCase):
         self.assertEqual(stats["by_media_type"], {"movie": 1})
         self.assertEqual(self.database.clear_resolver_cache(), 2)
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
+
+    def test_database_exact_value_cas_matches_production_contract(self):
+        first = "{invalid-legacy-value"
+        second = json.dumps({"revision": 1})
+
+        self.assertTrue(
+            self.database.compare_and_set_setting_value("exact", None, first)
+        )
+        self.assertFalse(
+            self.database.compare_and_set_setting_value("exact", None, second)
+        )
+        self.assertFalse(
+            self.database.compare_and_set_setting_value("exact", "wrong", second)
+        )
+        self.assertTrue(
+            self.database.compare_and_set_setting_value("exact", first, second)
+        )
+        self.assertEqual(self.database.get_setting("exact"), second)
 
     def test_invalid_old_schema_can_be_replaced_without_revision_deadlock(self):
         for schema_version in (1, 99):

@@ -112,6 +112,7 @@ def matching_forced_rule(
         if str(value or "").strip()
     }
     guessed_year = as_int(guessed.get("year"))
+    generic_match: Optional[Tuple[str, Optional[int], int]] = None
     for item in rules:
         if not isinstance(item, (list, tuple)) or len(item) != 3:
             continue
@@ -120,10 +121,13 @@ def matching_forced_rule(
         tmdb_id = as_int(item[2])
         if not title or not tmdb_id or normalize_title(title) not in titles:
             continue
-        if expected_year is not None and expected_year != guessed_year:
+        if expected_year is not None:
+            if expected_year == guessed_year:
+                return title, expected_year, tmdb_id
             continue
-        return title, expected_year, tmdb_id
-    return None
+        if generic_match is None:
+            generic_match = (title, expected_year, tmdb_id)
+    return generic_match
 
 
 def first_match(pattern: re.Pattern[str], values: Sequence[str]) -> Optional[str]:

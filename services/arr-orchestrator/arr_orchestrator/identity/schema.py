@@ -129,7 +129,6 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
                             ("replace_dots_underscores", "Puntos y guiones bajos", "Los convierte en espacios."),
                             ("strip_brackets", "Quitar corchetes", "Retira corchetes y llaves del release."),
                             ("collapse_whitespace", "Compactar espacios", "Reduce espacios repetidos."),
-                            ("smart_title", "Conservar titulo", "Mantiene el texto util sin capitalizacion destructiva."),
                         )
                     ],
                     _control(

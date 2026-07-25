@@ -24,7 +24,7 @@ from .candidate_search import (
     find_imdb,
     search_candidates,
 )
-from .evidence import TECHNICAL_NAMES, best_guess, collect_evidence
+from .evidence import TECHNICAL_NAMES, best_guess, collect_evidence, collect_name_evidence
 from .forced import FORCED_TITLE_SIMILARITY, validate_forced_candidate
 from .http_client import TMDB_BASE_URL, get_json
 from .models import (
@@ -62,6 +62,7 @@ from .text import (
 
 
 MISSING_MOVIE_YEAR_PENALTY = 18
+MIN_HTTP_TIMEOUT_MS = 100
 
 
 class NameResolver:
@@ -79,10 +80,10 @@ class NameResolver:
         self.token = token.strip()
         self.language = language.strip() or "es-ES"
         self.region = region.strip() or "ES"
-        self.http_timeout_ms = max(500, int(http_timeout_ms))
+        self.http_timeout_ms = max(MIN_HTTP_TIMEOUT_MS, int(http_timeout_ms))
         self.total_budget_ms = max(self.http_timeout_ms, int(total_budget_ms))
-        self.http_timeout = max(0.5, http_timeout_ms / 1000)
-        self.total_budget = max(self.http_timeout, total_budget_ms / 1000)
+        self.http_timeout = self.http_timeout_ms / 1000
+        self.total_budget = self.total_budget_ms / 1000
         self.db = database
         self.log = logger or logging.getLogger("arr-orchestrator.name-resolver")
         self.session = session or requests.Session()
@@ -134,10 +135,16 @@ class NameResolver:
         rules = self._effective_rules(category, active_snapshot)
         self._active_policy = rules
         http_rules = rules.get("http") if isinstance(rules.get("http"), dict) else {}
-        effective_timeout_ms = int(http_rules.get("timeout_ms") or self.http_timeout_ms)
-        effective_budget_ms = int(http_rules.get("total_budget_ms") or self.total_budget_ms)
-        self.http_timeout = max(0.5, effective_timeout_ms / 1000)
-        self.total_budget = max(self.http_timeout, effective_budget_ms / 1000)
+        effective_timeout_ms = max(
+            MIN_HTTP_TIMEOUT_MS,
+            int(http_rules.get("timeout_ms") or self.http_timeout_ms),
+        )
+        effective_budget_ms = max(
+            effective_timeout_ms,
+            int(http_rules.get("total_budget_ms") or self.total_budget_ms),
+        )
+        self.http_timeout = effective_timeout_ms / 1000
+        self.total_budget = effective_budget_ms / 1000
         evidence = self._evidence(job, input_root)
         guessed = self._best_guess(evidence, media_type)
         query = str(guessed.get("title") or "").strip()
@@ -294,7 +301,7 @@ class NameResolver:
         try:
             identity = preview.resolve(
                 {"name": str(name or "").strip(), "category": str(category or "").strip()},
-                Path(str(name or "preview")),
+                Path("preview"),
                 snapshot,
             )
             return {
@@ -304,14 +311,26 @@ class NameResolver:
                 **copy.deepcopy(preview._trace),
             }
         except ResolverAmbiguous as error:
-            details = copy.deepcopy(error.details)
+            details = sanitize_for_export(copy.deepcopy(error.details))
+            if not isinstance(details, dict):
+                details = {}
             status = "NO_CANDIDATES" if "no devolvio candidatos" in str(error).lower() else "REJECTED"
             if details.get("top_score") is not None:
                 score = float(details.get("top_score") or 0)
                 margin = float(details.get("margin") or 0)
-                if score < float(details.get("min_score") or 75):
+                min_score = (
+                    75.0
+                    if details.get("min_score") is None
+                    else float(details["min_score"])
+                )
+                min_margin = (
+                    12.0
+                    if details.get("min_margin") is None
+                    else float(details["min_margin"])
+                )
+                if score < min_score:
                     status = "REJECTED_SCORE"
-                elif margin < float(details.get("min_margin") or 12):
+                elif margin < min_margin:
                     status = "REJECTED_MARGIN"
             return {
                 "ok": True,
@@ -321,11 +340,12 @@ class NameResolver:
                 **copy.deepcopy(preview._trace),
             }
         except ResolverUnavailable as error:
+            details = sanitize_for_export(copy.deepcopy(error.details))
             return {
                 "ok": False,
                 "status": "TMDB_UNAVAILABLE",
                 "message": str(error),
-                "details": copy.deepcopy(error.details),
+                "details": details if isinstance(details, dict) else {},
                 **copy.deepcopy(preview._trace),
             }
         except ResolutionError as error:
@@ -390,6 +410,12 @@ class NameResolver:
         )
 
     def _evidence(self, job: Dict[str, object], input_root: Path) -> List[str]:
+        if self._preview_mode:
+            return collect_name_evidence(
+                str(job.get("name") or ""),
+                str(job.get("category") or ""),
+                self._active_policy,
+            )
         return collect_evidence(job, input_root, self._active_policy)
 
     def _best_guess(self, evidence: Sequence[str], media_type: str) -> Dict[str, object]:

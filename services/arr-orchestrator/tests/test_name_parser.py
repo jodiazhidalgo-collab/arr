@@ -151,6 +151,15 @@ class NameParserTests(unittest.TestCase):
         self.assertEqual(parsed.cleaned, "Mi Pelicula 2024")
         self.assertEqual(parsed.display_title, "Mi Pelicula")
 
+    def test_empty_domain_tlds_do_not_activate_a_hidden_fallback(self):
+        parsed = parse_release_name(
+            "tracker.com-Mi.Pelicula.2024.mkv",
+            rules={"domain_tlds": []},
+        )
+
+        self.assertIn("tracker com", parsed.cleaned)
+        self.assertIn("tracker com", parsed.display_title)
+
     def test_parser_accepts_nested_config_and_custom_pattern(self):
         parsed = parse_release_name(
             "Mi Serie TEMP2 CAP7.mkv",
