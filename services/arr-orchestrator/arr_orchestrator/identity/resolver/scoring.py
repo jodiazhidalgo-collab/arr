@@ -1,4 +1,4 @@
-"""Puntuacion pura y explicable de candidatos TMDb."""
+"""Puntuacion pura y desglose estructurado de candidatos TMDb."""
 
 from difflib import SequenceMatcher
 from typing import Dict, List, Sequence, Tuple
@@ -37,14 +37,23 @@ def score_candidate(
     evidence: Sequence[str],
     direct_identity: bool,
     settings: Dict[str, object] | None = None,
-) -> Tuple[float, List[str]]:
+) -> Tuple[float, List[Dict[str, object]]]:
     weights = dict(DEFAULT_SCORING)
     for key, value in dict(settings or {}).items():
         if key in weights and isinstance(value, (int, float)) and not isinstance(value, bool):
             weights[key] = float(value)
 
+    contributions: List[Tuple[str, float, float]] = []
+
+    def add(key: str, applied: float) -> None:
+        value = float(applied)
+        if abs(value) < 1e-12:
+            return
+        contributions.append((key, float(weights[key]), value))
+
     if direct_identity:
-        return weights["direct_identity"], ["identificador externo confirmado"]
+        add("direct_identity", weights["direct_identity"])
+        return _finalize_breakdown(contributions)
 
     query = str(guessed.get("title") or "")
     query_norm = normalize_title(query)
@@ -60,15 +69,14 @@ def score_candidate(
         ),
         default=0.0,
     )
-    score = (weights["title_exact"] if exact else 0.0)
-    score += ratio * weights["title_similarity_max"]
-    score += token_overlap * weights["token_overlap_max"]
-    reasons = [f"titulo ratio={ratio:.2f}", f"tokens={token_overlap:.2f}"]
     if exact:
-        reasons.append("titulo exacto")
-    elif any(normalize_title(value) in aliases for value in spanish_missing_c_variants(query)):
-        score += weights["spanish_correction"]
-        reasons.append("titulo corregido exacto")
+        add("title_exact", weights["title_exact"])
+    add("title_similarity_max", ratio * weights["title_similarity_max"])
+    add("token_overlap_max", token_overlap * weights["token_overlap_max"])
+    if not exact and any(
+        normalize_title(value) in aliases for value in spanish_missing_c_variants(query)
+    ):
+        add("spanish_correction", weights["spanish_correction"])
 
     title_candidates = [
         normalize_title(str(value))
@@ -82,11 +90,9 @@ def score_candidate(
     ]
     best_candidate_ratio = max(candidate_ratios or [0.0])
     if any(candidate_title in aliases for candidate_title in title_candidates):
-        score += weights["parser_exact"]
-        reasons.append("alias del parser exacto")
+        add("parser_exact", weights["parser_exact"])
     elif best_candidate_ratio >= weights["parser_near_min"]:
-        score += weights["parser_near"]
-        reasons.append("alias del parser cercano")
+        add("parser_near", weights["parser_near"])
 
     configured_aliases = {
         normalize_title(str(value))
@@ -94,42 +100,66 @@ def score_candidate(
         if str(value or "").strip()
     }
     if configured_aliases.intersection(aliases):
-        score += weights["configured_alias"]
-        reasons.append("alias configurado exacto")
+        add("configured_alias", weights["configured_alias"])
 
     guessed_year = as_int(guessed.get("year"))
     if guessed_year and candidate.year:
         difference = abs(guessed_year - candidate.year)
         if difference == 0:
-            score += weights["year_exact"]
-            reasons.append("ano exacto")
+            add("year_exact", weights["year_exact"])
         elif difference <= max(0, int(weights["year_tolerance"])):
-            score += weights["year_near"]
-            reasons.append("ano +/-1")
+            add("year_near", weights["year_near"])
         else:
-            score += weights["year_contradiction"]
-            reasons.append("ano contradictorio")
+            add("year_contradiction", weights["year_contradiction"])
     elif guessed_year and candidate.media_type == "movie":
-        score += weights["missing_movie_year"]
-        reasons.append("ano ausente")
+        add("missing_movie_year", weights["missing_movie_year"])
 
-    score += weights["category"]
-    reasons.append("categoria correcta")
+    add("category", weights["category"])
 
     if evidence and any(
         normalize_title(str(dict(guessit(clean_release_name(value))).get("title") or "")) in aliases
         for value in evidence
     ):
-        score += weights["origin_evidence"]
-        reasons.append("evidencia de origen")
+        add("origin_evidence", weights["origin_evidence"])
 
     if candidate.media_type == "tv":
         season = as_int(guessed.get("season"))
         if season is not None and candidate.season_count is not None:
             if 0 <= season <= candidate.season_count:
-                score += weights["season_valid"]
-                reasons.append("temporada existente")
+                add("season_valid", weights["season_valid"])
             else:
-                score += weights["season_invalid"]
-                reasons.append("temporada inexistente")
-    return round(score, 2), reasons
+                add("season_invalid", weights["season_invalid"])
+    return _finalize_breakdown(contributions)
+
+
+def _finalize_breakdown(
+    contributions: Sequence[Tuple[str, float, float]],
+) -> Tuple[float, List[Dict[str, object]]]:
+    """Redondea el total como antes y reparte los centimos sin descuadrarlo."""
+
+    raw_total = 0.0
+    displayed_total = 0.0
+    breakdown: List[Dict[str, object]] = []
+    for key, configured, raw_applied in contributions:
+        raw_total += raw_applied
+        next_displayed_total = round(raw_total, 2)
+        applied = round(next_displayed_total - displayed_total, 2)
+        displayed_total = next_displayed_total
+        breakdown.append(
+            {
+                "key": key,
+                "path": f"resolver.scoring.{key}",
+                "configured": _clean_number(configured),
+                "applied": _clean_number(applied),
+            }
+        )
+    return round(raw_total, 2), breakdown
+
+
+def _clean_number(value: float) -> int | float:
+    numeric = round(float(value), 4)
+    if abs(numeric) < 1e-12:
+        return 0
+    if numeric.is_integer():
+        return int(numeric)
+    return numeric

@@ -67,7 +67,7 @@ def rank_candidates(
 ) -> list[ResolverCandidate]:
     settings = scoring if isinstance(scoring, dict) else None
     for candidate in candidates:
-        candidate.score, candidate.reasons = score_candidate(
+        candidate.score, candidate.breakdown = score_candidate(
             candidate, guessed, evidence, direct_identity, settings
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)

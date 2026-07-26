@@ -61,7 +61,6 @@ from .text import (
 )
 
 
-MISSING_MOVIE_YEAR_PENALTY = 18
 MIN_HTTP_TIMEOUT_MS = 100
 
 
@@ -123,12 +122,20 @@ class NameResolver:
         if parsed.category_conflict:
             raise ResolverAmbiguous(
                 "Conflicto fuerte entre categoria y nombre",
-                {"parser": parsed.to_dict(), "category": category},
+                {
+                    "reason_code": "category_conflict",
+                    "parser": parsed.to_dict(),
+                    "category": category,
+                },
             )
         if category not in {"movies", "tv"}:
             raise ResolverAmbiguous(
                 "Categoria manual o no audiovisual; no se consulta TMDb",
-                {"parser": parsed.to_dict(), "category": category},
+                {
+                    "reason_code": "category_not_resolvable",
+                    "parser": parsed.to_dict(),
+                    "category": category,
+                },
             )
 
         media_type = "movie" if job.get("category") == "movies" else "tv"
@@ -151,7 +158,11 @@ class NameResolver:
         if not query:
             raise ResolverAmbiguous(
                 "GuessIt no pudo extraer un titulo util",
-                {"evidence": evidence, "guess": guessed},
+                {
+                    "reason_code": "empty_title",
+                    "evidence": evidence,
+                    "guess": guessed,
+                },
             )
 
         direct_tmdb = self._first_match(TMDB_ID_PATTERN, evidence)
@@ -208,7 +219,12 @@ class NameResolver:
         if not candidates:
             raise ResolverAmbiguous(
                 "TMDb no devolvio candidatos",
-                {"evidence": evidence, "guess": guessed, "query": query},
+                {
+                    "reason_code": "no_candidates",
+                    "evidence": evidence,
+                    "guess": guessed,
+                    "query": query,
+                },
             )
 
         direct_identity = source in {"tmdb_id", "imdb_id", "forced_match"}
@@ -224,6 +240,30 @@ class NameResolver:
             source in {"tmdb_id", "imdb_id"}
             and bool(acceptance.get("direct_ids_bypass", True))
         ) or (source == "forced_match" and bool(acceptance.get("forced_bypass", True)))
+        score_passed = top.score >= min_score
+        margin_passed = margin >= min_margin
+        decision_status = (
+            "ACCEPTED"
+            if bypass or (score_passed and margin_passed)
+            else "REJECTED_SCORE"
+            if not score_passed
+            else "REJECTED_MARGIN"
+        )
+        self._trace["decision"] = {
+            "status": decision_status,
+            "accepted": decision_status == "ACCEPTED",
+            "has_scoring": True,
+            "source": source,
+            "bypass": bypass,
+            "score": top.score,
+            "second_score": second_score,
+            "has_second_candidate": len(ranked) > 1,
+            "min_score": min_score,
+            "score_passed": score_passed,
+            "margin": margin,
+            "min_margin": min_margin,
+            "margin_passed": margin_passed,
+        }
         if not bypass and (top.score < min_score or margin < min_margin):
             raise ResolverAmbiguous(
                 "La identidad no supera el umbral de seguridad",
@@ -309,12 +349,17 @@ class NameResolver:
                 "status": "ACCEPTED",
                 "identity": identity.to_dict(),
                 **copy.deepcopy(preview._trace),
+                "decision": _preview_decision("ACCEPTED", preview._trace),
             }
         except ResolverAmbiguous as error:
             details = sanitize_for_export(copy.deepcopy(error.details))
             if not isinstance(details, dict):
                 details = {}
-            status = "NO_CANDIDATES" if "no devolvio candidatos" in str(error).lower() else "REJECTED"
+            status = (
+                "NO_CANDIDATES"
+                if details.get("reason_code") == "no_candidates"
+                else "REJECTED"
+            )
             if details.get("top_score") is not None:
                 score = float(details.get("top_score") or 0)
                 margin = float(details.get("margin") or 0)
@@ -338,6 +383,7 @@ class NameResolver:
                 "message": str(error),
                 "details": details,
                 **copy.deepcopy(preview._trace),
+                "decision": _preview_decision(status, preview._trace),
             }
         except ResolverUnavailable as error:
             details = sanitize_for_export(copy.deepcopy(error.details))
@@ -347,6 +393,7 @@ class NameResolver:
                 "message": str(error),
                 "details": details if isinstance(details, dict) else {},
                 **copy.deepcopy(preview._trace),
+                "decision": _preview_decision("TMDB_UNAVAILABLE", preview._trace),
             }
         except ResolutionError as error:
             sanitized = sanitize_for_export(copy.deepcopy(error.details))
@@ -356,6 +403,7 @@ class NameResolver:
                 "message": str(error),
                 "details": sanitized if isinstance(sanitized, dict) else {},
                 **copy.deepcopy(preview._trace),
+                "decision": _preview_decision("TMDB_ERROR", preview._trace),
             }
 
     def output_matches(self, identity: ResolvedIdentity, output_names: Iterable[str]) -> bool:
@@ -474,7 +522,7 @@ class NameResolver:
         guessed: Dict[str, object],
         evidence: Sequence[str],
         direct_identity: bool,
-    ) -> Tuple[float, List[str]]:
+    ) -> Tuple[float, List[Dict[str, object]]]:
         return score_candidate(
             candidate,
             guessed,
@@ -496,3 +544,19 @@ class NameResolver:
 
     _first_match = staticmethod(_first_match)
     _cache_key = staticmethod(_cache_key)
+
+
+def _preview_decision(status: str, trace: Dict[str, object]) -> Dict[str, object]:
+    existing = trace.get("decision")
+    if isinstance(existing, dict):
+        decision = copy.deepcopy(existing)
+        decision["status"] = status
+        decision["accepted"] = status == "ACCEPTED"
+        decision["has_scoring"] = True
+        return decision
+    return {
+        "status": status,
+        "accepted": False,
+        "has_scoring": False,
+        "bypass": False,
+    }

@@ -27,7 +27,7 @@ class ResolverCandidate:
     year: Optional[int]
     aliases: List[str] = field(default_factory=list)
     score: float = 0.0
-    reasons: List[str] = field(default_factory=list)
+    breakdown: List[Dict[str, object]] = field(default_factory=list)
     season_count: Optional[int] = None
 
     def to_dict(self) -> Dict[str, object]:

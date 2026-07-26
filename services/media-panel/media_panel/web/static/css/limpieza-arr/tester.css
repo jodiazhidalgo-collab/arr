@@ -91,33 +91,6 @@
 
 .identity-result-wide { margin-top: 8px; }
 
-.identity-decision {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-top: 12px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-left-width: 4px;
-  border-radius: 8px;
-  background: rgba(7, 16, 31, .58);
-}
-
-.identity-decision.ok { border-left-color: var(--accent); }
-.identity-decision.warn { border-left-color: var(--warn); }
-.identity-decision.bad { border-left-color: var(--bad); }
-.identity-decision > span:last-child { color: var(--muted); }
-
-.identity-result-message {
-  margin-top: 8px;
-  padding: 10px 12px;
-  border-radius: 7px;
-  background: rgba(245, 158, 11, .09);
-  color: #fde68a;
-  overflow-wrap: anywhere;
-}
-
 .identity-table-wrap {
   max-width: 100%;
   margin-top: 12px;
@@ -129,7 +102,7 @@
 }
 
 .identity-table-wrap .table {
-  min-width: 760px;
+  min-width: 620px;
   table-layout: auto;
 }
 
@@ -138,53 +111,6 @@
 .identity-table-wrap .table th,
 .identity-table-wrap .table td { min-width: 86px; }
 
-.identity-table-wrap .table td:nth-child(5) { min-width: 260px; }
-
-.identity-candidate-actions {
-  display: flex;
-  gap: 6px;
-  min-width: 210px;
-}
-
-.identity-queries {
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px solid rgba(148, 163, 184, .2);
-  border-radius: 8px;
-  background: rgba(7, 16, 31, .42);
-}
-
-.identity-queries summary {
-  cursor: pointer;
-  color: #bae6fd;
-  font-weight: 700;
-}
-
-.identity-queries ul {
-  display: grid;
-  gap: 6px;
-  margin: 10px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.identity-queries li {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 8px;
-  min-width: 0;
-  padding: 7px 0;
-  border-top: 1px solid rgba(148, 163, 184, .13);
-}
-
-.identity-queries code {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  color: #dbeafe;
-}
-
-.identity-queries li span { color: var(--muted); }
-
 @media (max-width: 920px) {
   .identity-result-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
@@ -192,8 +118,6 @@
 @media (max-width: 680px) {
   .identity-test-form { grid-template-columns: 1fr; }
   .identity-tester-heading { align-items: flex-start; }
-  .identity-decision { align-items: flex-start; flex-direction: column; }
-  .identity-queries li { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 460px) {

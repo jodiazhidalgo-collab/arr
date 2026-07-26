@@ -158,15 +158,23 @@ class IdentityController:
         try:
             name, category, rules = self._test_request(payload, allow_auto=False)
         except IdentityRulesValidationError as error:
-            return {"ok": False, "error": "invalid_rules", "message": str(error)}
+            return {
+                "ok": False,
+                "status": "INVALID_RULES",
+                "error": "invalid_rules",
+                "message": str(error),
+                "decision": _test_decision("INVALID_RULES"),
+            }
         try:
             parser = test_parser_title(name, category, rules=rules.get("parser"))
         except (IndexError, TypeError, ValueError, re.error):
             self.log.exception("Las reglas del parser fallaron durante la prueba del resolver")
             return {
                 "ok": False,
+                "status": "PARSER_ERROR",
                 "error": "parser_execution_failed",
                 "message": "Las reglas del parser no pudieron aplicarse.",
+                "decision": _test_decision("PARSER_ERROR"),
             }
         result = self.resolver.preview(name, category, rules)
         result["parser_test"] = parser
@@ -262,3 +270,12 @@ def _parser_status(result: Dict[str, object]) -> str:
     if result.get("category") == "manual":
         return "MANUAL"
     return "CLEAN"
+
+
+def _test_decision(status: str) -> Dict[str, object]:
+    return {
+        "status": status,
+        "accepted": False,
+        "has_scoring": False,
+        "bypass": False,
+    }

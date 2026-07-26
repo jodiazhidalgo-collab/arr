@@ -26,6 +26,7 @@ def validate_forced_candidate(
         raise ResolverAmbiguous(
             "La regla forzada apunta a una identidad TMDb no valida",
             {
+                "reason_code": "forced_target_invalid",
                 "rule_title": rule_title,
                 "tmdb_id": tmdb_id,
                 "media_type": media_type,
@@ -37,6 +38,7 @@ def validate_forced_candidate(
         raise ResolverAmbiguous(
             "La regla forzada no coincide con el tipo o ID consultado",
             {
+                "reason_code": "forced_type_mismatch",
                 "rule_title": rule_title,
                 "tmdb_id": tmdb_id,
                 "returned_tmdb_id": candidate.tmdb_id,
@@ -61,6 +63,7 @@ def validate_forced_candidate(
         raise ResolverAmbiguous(
             "La regla forzada no coincide con los titulos reales de TMDb",
             {
+                "reason_code": "forced_title_mismatch",
                 "rule_title": rule_title,
                 "tmdb_id": tmdb_id,
                 "best_title_similarity": round(best_title_similarity, 3),
@@ -74,6 +77,7 @@ def validate_forced_candidate(
         raise ResolverAmbiguous(
             "La regla forzada no coincide con el ano real de TMDb",
             {
+                "reason_code": "forced_year_mismatch",
                 "rule_title": rule_title,
                 "tmdb_id": tmdb_id,
                 "expected_year": expected_year,

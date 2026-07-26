@@ -73,7 +73,35 @@ class IdentityControllerTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "TMDB_UNAVAILABLE")
+        self.assertEqual(result["decision"]["status"], "TMDB_UNAVAILABLE")
+        self.assertFalse(result["decision"]["has_scoring"])
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
+
+    def test_resolver_tester_returns_human_contract_for_invalid_draft(self) -> None:
+        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        draft = controller.payload()["rules"]
+        draft["resolver"]["acceptance"]["min_margin"] = "no-es-un-numero"
+
+        result = controller.test_resolver(
+            {
+                "name": "Blade.Runner.1982.1080p.mkv",
+                "category": "movies",
+                "rules": draft,
+            }
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "INVALID_RULES")
+        self.assertEqual(result["error"], "invalid_rules")
+        self.assertEqual(
+            result["decision"],
+            {
+                "status": "INVALID_RULES",
+                "accepted": False,
+                "has_scoring": False,
+                "bypass": False,
+            },
+        )
 
     def test_revision_zero_defaults_come_from_runtime_config(self) -> None:
         controller = IdentityController(

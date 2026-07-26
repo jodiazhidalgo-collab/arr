@@ -4,7 +4,8 @@ from arr_orchestrator.identity.resolver.candidate_search import search_candidate
 from arr_orchestrator.identity.resolver.models import ResolverCandidate
 from arr_orchestrator.identity.resolver.policy import effective_policy
 from arr_orchestrator.identity.resolver.rules import matching_forced_rule
-from arr_orchestrator.identity.resolver.scoring import score_candidate
+from arr_orchestrator.identity.resolver.scoring import DEFAULT_SCORING, score_candidate
+from arr_orchestrator.identity.schema import identity_settings_schema
 
 
 class ResolverPolicyTests(unittest.TestCase):
@@ -71,8 +72,8 @@ class ResolverPolicyTests(unittest.TestCase):
         )
         guessed = {"title": "Mi pelicula", "year": 2024, "_title_candidates": []}
 
-        factory_score, factory_reasons = score_candidate(candidate, guessed, [], False)
-        custom_score, custom_reasons = score_candidate(
+        factory_score, factory_breakdown = score_candidate(candidate, guessed, [], False)
+        custom_score, custom_breakdown = score_candidate(
             candidate,
             guessed,
             [],
@@ -88,8 +89,166 @@ class ResolverPolicyTests(unittest.TestCase):
 
         self.assertEqual(factory_score, 90.0)
         self.assertEqual(custom_score, 15.0)
-        self.assertIn("titulo exacto", factory_reasons)
-        self.assertIn("ano exacto", custom_reasons)
+        self.assertIn("title_exact", self._breakdown_keys(factory_breakdown))
+        self.assertIn("year_exact", self._breakdown_keys(custom_breakdown))
+        self.assertEqual(
+            sum(float(item["applied"]) for item in factory_breakdown),
+            factory_score,
+        )
+        self.assertEqual(
+            sum(float(item["applied"]) for item in custom_breakdown),
+            custom_score,
+        )
+        custom_title = next(item for item in custom_breakdown if item["key"] == "title_exact")
+        self.assertEqual(custom_title["path"], "resolver.scoring.title_exact")
+        self.assertEqual(custom_title["configured"], 3)
+        self.assertEqual(custom_title["applied"], 3)
+
+    def test_scoring_breakdown_covers_every_kind_of_points_and_penalty(self):
+        movie = ResolverCandidate(
+            1,
+            "movie",
+            "Mi pelicula",
+            "Mi pelicula",
+            2024,
+            ["Mi pelicula"],
+        )
+        cases = []
+        cases.append(score_candidate(movie, {}, [], True))
+        cases.append(
+            score_candidate(
+                movie,
+                {
+                    "title": "Mi pelicula",
+                    "year": 2024,
+                    "_title_candidates": ["Mi pelicula"],
+                    "_rule_query_aliases": ["Mi pelicula"],
+                },
+                ["Mi.pelicula.2024.mkv"],
+                False,
+            )
+        )
+        cases.append(
+            score_candidate(
+                ResolverCandidate(2, "movie", "Satisfaccion garantizada", "", 2024, ["Satisfaccion garantizada"]),
+                {"title": "Satisfacion garantizada", "year": 2024},
+                [],
+                False,
+            )
+        )
+        cases.append(
+            score_candidate(
+                ResolverCandidate(3, "movie", "Objetivo final", "", 2025, ["Objetivo final"]),
+                {"title": "Objetivo final", "year": 2024, "_title_candidates": ["Objetivo fina"]},
+                [],
+                False,
+            )
+        )
+        cases.append(
+            score_candidate(
+                ResolverCandidate(4, "movie", "Objetivo", "", 2020, ["Objetivo"]),
+                {"title": "Objetivo", "year": 2024},
+                [],
+                False,
+            )
+        )
+        cases.append(
+            score_candidate(
+                ResolverCandidate(5, "movie", "Objetivo", "", None, ["Objetivo"]),
+                {"title": "Objetivo", "year": 2024},
+                [],
+                False,
+            )
+        )
+        cases.append(
+            score_candidate(
+                ResolverCandidate(6, "tv", "Serie", "", 2024, ["Serie"], season_count=3),
+                {"title": "Serie", "year": 2024, "season": 2},
+                [],
+                False,
+            )
+        )
+        cases.append(
+            score_candidate(
+                ResolverCandidate(7, "tv", "Serie", "", 2024, ["Serie"], season_count=3),
+                {"title": "Serie", "year": 2024, "season": 9},
+                [],
+                False,
+            )
+        )
+
+        seen = set()
+        for score, breakdown in cases:
+            seen.update(self._breakdown_keys(breakdown))
+            self.assertAlmostEqual(
+                sum(float(item["applied"]) for item in breakdown),
+                score,
+                places=2,
+            )
+            self.assertTrue(all(item["path"] == f"resolver.scoring.{item['key']}" for item in breakdown))
+
+        self.assertEqual(
+            seen,
+            set(DEFAULT_SCORING) - {"parser_near_min", "year_tolerance"},
+        )
+
+    def test_every_scoring_key_has_one_canonical_schema_label(self):
+        schema = identity_settings_schema()
+        paths = [
+            control["path"]
+            for group in schema["resolver"]["groups"]
+            for control in group["controls"]
+            if str(control["path"]).startswith("resolver.scoring.")
+        ]
+
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertEqual(
+            {path.removeprefix("resolver.scoring.") for path in paths},
+            set(DEFAULT_SCORING),
+        )
+
+    def test_zero_and_decimal_weights_keep_an_exact_additive_breakdown(self):
+        candidate = ResolverCandidate(8, "movie", "Titulo parcial", "", 2024, ["Titulo parcial"])
+        guessed = {"title": "Titulo", "year": 2024}
+        zero_settings = {
+            key: 0
+            for key in DEFAULT_SCORING
+            if key not in {"parser_near_min", "year_tolerance"}
+        }
+        zero_score, zero_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            zero_settings,
+        )
+
+        self.assertEqual(zero_score, 0)
+        self.assertEqual(zero_breakdown, [])
+
+        decimal_score, decimal_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            {
+                **zero_settings,
+                "title_similarity_max": 7.25,
+                "token_overlap_max": 2.75,
+            },
+        )
+
+        self.assertEqual(
+            sum(float(item["applied"]) for item in decimal_breakdown),
+            decimal_score,
+        )
+        self.assertTrue(
+            all(item["configured"] in {7.25, 2.75} for item in decimal_breakdown)
+        )
+
+    @staticmethod
+    def _breakdown_keys(breakdown):
+        return {str(item["key"]) for item in breakdown}
 
     def test_forced_match_prefers_exact_year_in_any_rule_order(self):
         generic = ("Cenicienta", None, 11224)

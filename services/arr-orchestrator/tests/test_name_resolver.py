@@ -103,6 +103,8 @@ class NameResolverTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["status"], "TMDB_ERROR")
+        self.assertEqual(payload["decision"]["status"], "TMDB_ERROR")
+        self.assertFalse(payload["decision"]["has_scoring"])
         self.assertIn("HTTP 401", payload["message"])
         self.assertEqual(payload["details"], {})
         self.assertNotIn("must-not-leak", json.dumps(payload, ensure_ascii=False))
@@ -144,6 +146,14 @@ class NameResolverTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(payload["decision"]["status"], "REJECTED_MARGIN")
+        self.assertTrue(payload["decision"]["score_passed"])
+        self.assertFalse(payload["decision"]["margin_passed"])
+        self.assertEqual(payload["decision"]["second_score"], payload["decision"]["score"])
+        self.assertTrue(payload["decision"]["has_second_candidate"])
+        self.assertTrue(payload["candidates"])
+        self.assertTrue(payload["candidates"][0]["breakdown"])
+        self.assertNotIn("reasons", payload["candidates"][0])
         filesystem_evidence.assert_not_called()
         self.assertNotIn(private_path, json.dumps(payload, ensure_ascii=False))
 
@@ -164,6 +174,64 @@ class NameResolverTests(unittest.TestCase):
 
         self.assertEqual(payload["status"], "REJECTED_MARGIN")
         self.assertEqual(payload["details"]["min_score"], 0)
+
+    def test_preview_direct_and_forced_id_use_structured_bypass_breakdown(self):
+        direct = movie_payload(9, "Objetivo", "Target", 2024)
+        resolver, _ = self.resolver({"/movie/9": direct})
+
+        direct_payload = resolver.preview("Objetivo.tmdb-9.2024.mkv", "movies")
+
+        self.assertEqual(direct_payload["status"], "ACCEPTED")
+        self.assertTrue(direct_payload["decision"]["bypass"])
+        self.assertEqual(direct_payload["decision"]["source"], "tmdb_id")
+        self.assertFalse(direct_payload["decision"]["has_second_candidate"])
+        self.assertEqual(
+            direct_payload["candidates"][0]["breakdown"],
+            [
+                {
+                    "key": "direct_identity",
+                    "path": "resolver.scoring.direct_identity",
+                    "configured": 200,
+                    "applied": 200,
+                }
+            ],
+        )
+
+        forced_resolver, _ = self.resolver({"/movie/9": direct})
+        forced_resolver.configure_rules(
+            {"movies": {"forced_matches": ["Objetivo | 2024 | 9"]}}
+        )
+
+        forced_payload = forced_resolver.preview("Objetivo.2024.mkv", "movies")
+
+        self.assertEqual(forced_payload["status"], "ACCEPTED")
+        self.assertTrue(forced_payload["decision"]["bypass"])
+        self.assertEqual(forced_payload["decision"]["source"], "forced_match")
+        self.assertEqual(
+            forced_payload["candidates"][0]["breakdown"][0]["key"],
+            "direct_identity",
+        )
+
+    def test_preview_score_rejection_and_no_candidates_have_distinct_decisions(self):
+        wrong = movie_payload(22, "Completamente distinto", "Completely Different", 2024)
+        resolver, _ = self.resolver(
+            {"/search/movie": {"results": [wrong]}, "/movie/22": wrong}
+        )
+
+        rejected = resolver.preview("Objetivo.2024.mkv", "movies")
+
+        self.assertEqual(rejected["status"], "REJECTED_SCORE")
+        self.assertTrue(rejected["decision"]["has_scoring"])
+        self.assertFalse(rejected["decision"]["score_passed"])
+        self.assertTrue(rejected["decision"]["margin_passed"])
+
+        empty_resolver, _ = self.resolver({"/search/movie": {"results": []}})
+        empty = empty_resolver.preview("Objetivo.2024.mkv", "movies")
+
+        self.assertEqual(empty["status"], "NO_CANDIDATES")
+        self.assertEqual(empty["details"]["reason_code"], "no_candidates")
+        self.assertFalse(empty["decision"]["has_scoring"])
+        self.assertNotIn("score", empty["decision"])
 
     def test_spanish_movie_without_year_prefers_exact_title(self):
         correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
@@ -365,7 +433,7 @@ class NameResolverTests(unittest.TestCase):
             aliases=["The Visitors"],
         )
 
-        score, reasons = resolver._score_candidate(
+        score, breakdown = resolver._score_candidate(
             candidate,
             {"title": "The Visitors", "year": 1993},
             [],
@@ -373,7 +441,14 @@ class NameResolverTests(unittest.TestCase):
         )
 
         self.assertEqual(score, 52.0)
-        self.assertIn("ano ausente", reasons)
+        missing_year = next(item for item in breakdown if item["key"] == "missing_movie_year")
+        self.assertEqual(missing_year["configured"], -18)
+        self.assertEqual(missing_year["applied"], -18)
+        self.assertAlmostEqual(
+            sum(float(item["applied"]) for item in breakdown),
+            score,
+            places=2,
+        )
 
     def test_query_alias_is_applied_without_changing_default_call_contract(self):
         correct = movie_payload(11687, "The Visitors", "Les Visiteurs", 1993)

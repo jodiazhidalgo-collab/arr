@@ -34,11 +34,19 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         css_root = cls.web / "static" / "css" / "limpieza-arr"
         cls.utils = (js_root / "utils.js").read_text(encoding="utf-8")
         cls.controls = (js_root / "controls.js").read_text(encoding="utf-8")
+        cls.resolver_result = (js_root / "resolver-result.js").read_text(
+            encoding="utf-8"
+        )
         cls.testers = (js_root / "testers.js").read_text(encoding="utf-8")
         cls.view = (js_root / "view.js").read_text(encoding="utf-8")
         cls.styles = "\n".join(
             (css_root / name).read_text(encoding="utf-8")
-            for name in ("layout.css", "controls.css", "tester.css")
+            for name in (
+                "layout.css",
+                "controls.css",
+                "tester.css",
+                "resolver-result.css",
+            )
         )
 
     def test_top_tab_and_modular_assets_are_loaded_in_order(self) -> None:
@@ -50,12 +58,18 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             "/static/css/limpieza-arr/layout.css",
             "/static/css/limpieza-arr/controls.css",
             "/static/css/limpieza-arr/tester.css",
+            "/static/css/limpieza-arr/resolver-result.css",
             "/static/js/limpieza-arr/utils.js",
             "/static/js/limpieza-arr/controls.js",
+            "/static/js/limpieza-arr/resolver-result.js",
             "/static/js/limpieza-arr/testers.js",
             "/static/js/limpieza-arr/view.js",
         ):
             self.assertIn(asset, self.index)
+        self.assertLess(
+            self.index.index("/static/js/limpieza-arr/resolver-result.js"),
+            self.index.index("/static/js/limpieza-arr/testers.js"),
+        )
         self.assertLess(
             self.index.index("/static/js/limpieza-arr/view.js"),
             self.index.index("/static/js/panel.js"),
@@ -104,17 +118,151 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.controls)
 
-    def test_title_testers_use_unsaved_draft_and_show_score_breakdown(self) -> None:
+    def test_title_testers_use_unsaved_draft_and_human_resolver_contract(self) -> None:
         self.assertIn("const submittedRules = ui.clone(ui.state.draft);", self.testers)
         self.assertIn("rules: submittedRules", self.testers)
         self.assertIn("/api/identity-rules/test-${section}", self.testers)
         self.assertIn("Probar título", self.testers)
-        self.assertIn("% del umbral", self.testers)
-        self.assertIn("candidate.reasons", self.testers)
-        self.assertIn('data-candidate-action="alias"', self.testers)
-        self.assertIn('data-candidate-action="forced"', self.testers)
+        self.assertIn("error?.payload", self.testers)
+        self.assertNotIn("% del umbral", self.testers)
+        self.assertNotIn("candidate.reasons", self.testers)
+        self.assertNotIn("identity-decision", self.testers)
+        self.assertIn('data-candidate-action="alias"', self.resolver_result)
+        self.assertIn('data-candidate-action="forced"', self.resolver_result)
+        self.assertIn("item?.path", self.resolver_result)
+        self.assertIn("resolverControlLabels", self.resolver_result)
+        self.assertIn("Configurado", self.resolver_result)
+        self.assertIn("Aplicado", self.resolver_result)
+        self.assertIn("Ventaja sobre el segundo", self.resolver_result)
+        self.assertIn("Diagnóstico técnico", self.resolver_result)
         self.assertIn("ui.bindCandidateActions();", self.testers)
         self.assertIn("if (ui.state.activeTest)", self.testers)
+        self.assertNotIn('id="identity-test-result" aria-live', self.testers)
+        self.assertIn('role="status" aria-live="polite"', self.view)
+
+    def test_resolver_renderer_covers_all_human_result_families(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            global.window = {};
+            global.location = { hash: "#limpieza-arr/resolver" };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            ui.state.document = { schema: { resolver: { groups: [{ controls: [
+              { path: "resolver.scoring.title_exact", label: "Titulo exacto" },
+              { path: "resolver.scoring.title_similarity_max", label: "Similitud de titulo" },
+              { path: "resolver.scoring.season_invalid", label: "Temporada imposible" },
+              { path: "resolver.acceptance.min_score", label: "Puntuacion minima" },
+              { path: "resolver.acceptance.min_margin", label: "Margen minimo" }
+            ] }] } } };
+            const context = { requestId: 7, category: "movies", parserTitle: "Titulo", parserYear: "2024" };
+            const candidate = {
+              tmdb_id: 10, title: "Titulo <seguro>", original_title: "Original", year: 2024, score: 55,
+              breakdown: [
+                { key: "title_exact", path: "resolver.scoring.title_exact", configured: 35, applied: 35 },
+                { key: "title_similarity_max", path: "resolver.scoring.title_similarity_max", configured: 20, applied: 20 }
+              ]
+            };
+            const decision = (status, values = {}) => ({
+              status, accepted: status === "ACCEPTED", has_scoring: true, bypass: false,
+              score: 55, second_score: 20, min_score: 75, score_passed: false,
+              margin: 35, min_margin: 12, margin_passed: true, source: "search", ...values
+            });
+            const render = payload => ui.renderResolverResult(payload, context);
+            const requireText = (html, text) => { if (!html.includes(text)) throw new Error(`Falta ${text}`); };
+            const rejectText = (html, text) => { if (html.includes(text)) throw new Error(`Sobra ${text}`); };
+
+            const accepted = render({
+              status: "ACCEPTED", ok: true,
+              decision: decision("ACCEPTED", { score: 55, min_score: 50, score_passed: true, margin: 35, margin_passed: true }),
+              candidates: [candidate],
+              queries: [
+                { endpoint: "/search/movie", params: { query: "Titulo", language: "es-ES", year: 2024 }, status_code: 200 },
+                { endpoint: "/movie/10", params: { language: "es-ES" }, status_code: 200 }
+              ]
+            });
+            ["ACEPTADA", "único candidato", "CUMPLIDA", "Titulo exacto", "Configurado", "Aplicado", "+35", "Segundo candidato", "No existe", "2 consultas · 2 correctas", "Buscar película", "Idioma es-ES · Año 2024", "Correcta"].forEach(text => requireText(accepted, text));
+            rejectText(accepted, "Ventaja sobre el segundo");
+            rejectText(accepted, "% del umbral");
+            rejectText(accepted, "HTTP 200");
+            rejectText(accepted, "<seguro>");
+            requireText(accepted, "Titulo &lt;seguro&gt;");
+
+            const tie = render({
+              status: "REJECTED_MARGIN", ok: true,
+              decision: decision("REJECTED_MARGIN", { score: 125, score_passed: true, second_score: 125, has_second_candidate: true, margin: 0, margin_passed: false }),
+              candidates: [{ ...candidate, score: 125 }, { ...candidate, tmdb_id: 11, score: 125 }]
+            });
+            ["RECHAZADA POR EMPATE", "misma puntuación", "NO CUMPLIDO"].forEach(text => requireText(tie, text));
+            rejectText(tie, "REJECTED_MARGIN");
+
+            const singleMargin = render({
+              status: "REJECTED_MARGIN",
+              decision: decision("REJECTED_MARGIN", { score: 10, min_score: 0, score_passed: true, second_score: 0, has_second_candidate: false, margin: 10, min_margin: 12, margin_passed: false }),
+              candidates: [{ ...candidate, score: 10 }]
+            });
+            ["RECHAZADA POR MARGEN", "No existe un segundo candidato", "Segundo candidato", "No existe"].forEach(text => requireText(singleMargin, text));
+            rejectText(singleMargin, "sobre el segundo");
+
+            const both = render({ status: "REJECTED_SCORE", decision: decision("REJECTED_SCORE", { margin: 0, margin_passed: false }), candidates: [candidate] });
+            requireText(both, "RECHAZADA POR PUNTUACIÓN Y MARGEN");
+
+            const bypass = render({
+              status: "ACCEPTED",
+              decision: decision("ACCEPTED", { bypass: true, source: "forced_match" }),
+              candidates: [candidate],
+              queries: [{ endpoint: "/movie/10", status_code: 200 }]
+            });
+            ["coincidencia forzada validada", "NO APLICA", "1 consulta · 1 correcta"].forEach(text => requireText(bypass, text));
+            rejectText(bypass, "1 consultas");
+
+            const season = render({
+              status: "REJECTED_SCORE",
+              decision: decision("REJECTED_SCORE"),
+              candidates: [{ ...candidate, breakdown: [{ key: "season_invalid", path: "resolver.scoring.season_invalid", configured: -100, applied: -100 }] }]
+            });
+            ["Temporada imposible", "-100"].forEach(text => requireText(season, text));
+
+            const noCandidates = render({ status: "NO_CANDIDATES", decision: { status: "NO_CANDIDATES", has_scoring: false }, candidates: [] });
+            requireText(noCandidates, "SIN CANDIDATOS");
+            rejectText(noCandidates, "Puntuación obtenida");
+
+            for (const [status, title] of [
+              ["REJECTED", "IDENTIDAD NO SEGURA"],
+              ["INVALID_RULES", "CONFIGURACIÓN NO VÁLIDA"],
+              ["PARSER_ERROR", "ERROR DEL PARSER"],
+              ["TMDB_UNAVAILABLE", "TMDB NO DISPONIBLE"],
+              ["TMDB_ERROR", "CONSULTA TMDB RECHAZADA"],
+              ["ORCHESTRATOR_UNAVAILABLE", "MOTOR NO DISPONIBLE"],
+              ["INVALID_UPSTREAM_RESPONSE", "RESPUESTA DEL MOTOR NO VÁLIDA"],
+              ["REQUEST_ERROR", "PRUEBA NO COMPLETADA"]
+            ]) {
+              const html = render({ status, decision: { status, has_scoring: false } });
+              requireText(html, title);
+              rejectText(html, "Puntuación obtenida");
+            }
+            for (const [reason_code, title] of [
+              ["category_conflict", "CATEGORÍA CONTRADICTORIA"],
+              ["category_not_resolvable", "CATEGORÍA NO RESOLUBLE"],
+              ["empty_title", "TÍTULO NO IDENTIFICADO"],
+              ["forced_target_invalid", "TMDB FORZADO NO VÁLIDO"],
+              ["forced_type_mismatch", "TIPO FORZADO INCORRECTO"],
+              ["forced_title_mismatch", "TÍTULO FORZADO INCORRECTO"],
+              ["forced_year_mismatch", "AÑO FORZADO INCORRECTO"]
+            ]) {
+              requireText(render({ status: "REJECTED", details: { reason_code }, decision: { status: "REJECTED", has_scoring: false } }), title);
+            }
+            const invalid = render({ status: "INVALID_RULES", message: "Peso <incorrecto>", decision: { status: "INVALID_RULES", has_scoring: false } });
+            requireText(invalid, "Motivo concreto:");
+            requireText(invalid, "Peso &lt;incorrecto&gt;");
+            rejectText(invalid, "Peso <incorrecto>");
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "resolver-result.js",
+        )
 
     def test_tester_actions_are_bound_to_immutable_parser_context(self) -> None:
         self.assertIn("const context = Object.freeze({", self.testers)
@@ -128,6 +276,67 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("No se puede forzar una película sin año", self.testers)
         self.assertNotIn("const raw = ui.state.testNames.resolver", self.testers)
         self.assertNotIn("`${dataset.title}", self.testers)
+
+    def test_resolver_transport_failure_uses_the_human_result_flow(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            global.window = {};
+            global.location = { hash: "#limpieza-arr/resolver" };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            const name = { value: "Titulo.2024.mkv", focus: () => {} };
+            const category = { value: "movies" };
+            const button = { disabled: false, textContent: "Probar título" };
+            const resultBox = { innerHTML: "" };
+            const statusBox = { className: "", textContent: "" };
+            global.document = {
+              getElementById: id => ({
+                "identity-test-name": name,
+                "identity-test-category": category,
+                "identity-test-button": button,
+                "identity-test-result": resultBox,
+                "identity-status": statusBox
+              }[id] || null),
+              querySelectorAll: () => [],
+              querySelector: () => null
+            };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[3], "utf8"));
+            const ui = window.ArrIdentityUI;
+            ui.state.section = "resolver";
+            ui.state.draft = {};
+            ui.state.document = { schema: { resolver: { groups: [] } } };
+            ui.api = async () => { throw new Error("Red <cortada>"); };
+
+            (async () => {
+              await ui.runTitleTest();
+              if (ui.state.lastResult.resolver?.status !== "REQUEST_ERROR") throw new Error("No se conservó el estado humano");
+              if (!resultBox.innerHTML.includes("PRUEBA NO COMPLETADA")) throw new Error("No se pintó el resultado humano");
+              if (!resultBox.innerHTML.includes("Red &lt;cortada&gt;")) throw new Error("No se mostró o escapó la causa");
+              if (resultBox.innerHTML.includes("Error de prueba")) throw new Error("Reapareció el renderer antiguo");
+              if (!statusBox.textContent.includes("PRUEBA NO COMPLETADA")) throw new Error("El resultado no se anunció");
+              if (ui.state.activeTest !== null || button.disabled) throw new Error("La prueba no liberó el bloqueo");
+              ui.api = async () => ({
+                ok: true,
+                status: "ACCEPTED",
+                decision: { status: "ACCEPTED", accepted: true, has_scoring: false, bypass: true, source: "tmdb_id" },
+                candidates: [],
+                parser_test: { result: { title: "Titulo", year: 2024, category: "movies" } }
+              });
+              await ui.runTitleTest();
+              if (!statusBox.textContent.includes("ACEPTADA")) throw new Error("La decisión correcta no se anunció");
+              if (ui.state.activeTest !== null || button.disabled) throw new Error("La segunda prueba no liberó el bloqueo");
+            })().catch(error => {
+              console.error(error.stack || error);
+              process.exitCode = 1;
+            });
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "resolver-result.js",
+            self.web / "static" / "js" / "limpieza-arr" / "testers.js",
+        )
 
     def test_form_controls_and_subtabs_have_accessible_relationships(self) -> None:
         self.assertIn('for="${ui.esc(primaryId)}"', self.controls)
@@ -269,6 +478,8 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("min-width: 0", self.styles)
         self.assertIn("@media (max-width: 520px)", self.styles)
         self.assertIn("@media (max-width: 460px)", self.styles)
+        self.assertIn(".identity-toolbar .identity-status { flex: 0 0 auto; }", self.styles)
+        self.assertIn("flex-direction: column", self.styles)
         self.assertNotIn("100vw", self.styles)
 
 

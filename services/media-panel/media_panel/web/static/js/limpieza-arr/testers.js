@@ -25,7 +25,7 @@
         </select>
         <button type="button" class="btn primary" id="identity-test-button" ${testing ? "disabled" : ""}>${testingHere ? "Probando…" : testing ? "Prueba en curso…" : "Probar título"}</button>
       </div>
-      <div id="identity-test-result" aria-live="polite">${testingHere ? `<div class="identity-test-loading">Analizando el título…</div>` : ui.renderTestResult(section, ui.state.lastResult[section], ui.state.testContext[section])}</div>
+      <div id="identity-test-result">${testingHere ? `<div class="identity-test-loading">Analizando el título…</div>` : ui.renderTestResult(section, ui.state.lastResult[section], ui.state.testContext[section])}</div>
     </section>`;
   };
 
@@ -89,10 +89,17 @@
     button.textContent = "Probando…";
     resultBox.innerHTML = `<div class="identity-test-loading">Analizando el título…</div>`;
     try {
-      const result = await ui.api(`/api/identity-rules/test-${section}`, {
-        method: "POST",
-        body: JSON.stringify({ name, category, rules: submittedRules })
-      });
+      let result;
+      try {
+        result = await ui.api(`/api/identity-rules/test-${section}`, {
+          method: "POST",
+          body: JSON.stringify({ name, category, rules: submittedRules })
+        });
+      } catch (error) {
+        const errorPayload = error?.payload;
+        if (section !== "resolver" || !errorPayload || typeof errorPayload !== "object" || Array.isArray(errorPayload)) throw error;
+        result = errorPayload;
+      }
       if (!ui.isCurrentTestRequest(section, requestId)) return;
       const parserResult = section === "parser"
         ? (result.result || result)
@@ -100,7 +107,9 @@
       const context = Object.freeze({
         requestId,
         name,
-        category: String(parserResult.category || "").trim(),
+        category: ["movies", "tv"].includes(String(parserResult.category || "").trim())
+          ? String(parserResult.category).trim()
+          : category,
         parserTitle: String(parserResult.title || "").trim(),
         parserYear: parserResult.year === null || parserResult.year === undefined
           ? ""
@@ -112,16 +121,49 @@
         const currentBox = document.getElementById("identity-test-result");
         if (currentBox) currentBox.innerHTML = ui.renderTestResult(section, result, context);
         ui.bindCandidateActions();
-        ui.status("Prueba terminada. No se ha guardado ni movido ningún archivo.", "ok");
+        const resolverAnnouncement = section === "resolver"
+          ? ui.resolverPresentation(result, ui.resolverCandidates(result)).title
+          : "";
+        ui.status(
+          `${resolverAnnouncement ? `${resolverAnnouncement}. ` : ""}${result.ok === false
+            ? "Prueba terminada con una incidencia. No se ha guardado ni movido ningún archivo."
+            : "Prueba terminada. No se ha guardado ni movido ningún archivo."}`,
+          result.ok === false ? "warn" : "ok"
+        );
       }
     } catch (error) {
       if (!ui.isCurrentTestRequest(section, requestId)) return;
-      ui.state.lastResult[section] = null;
-      ui.state.testContext[section] = null;
+      const resolverFailure = section === "resolver" ? {
+        ok: false,
+        status: "REQUEST_ERROR",
+        message: String(error?.message || "No se pudo completar la petición."),
+        decision: {
+          status: "REQUEST_ERROR",
+          accepted: false,
+          has_scoring: false,
+          bypass: false
+        }
+      } : null;
+      const failureContext = resolverFailure ? Object.freeze({
+        requestId,
+        name,
+        category,
+        parserTitle: "",
+        parserYear: ""
+      }) : null;
+      ui.state.lastResult[section] = resolverFailure;
+      ui.state.testContext[section] = failureContext;
       if (ui.isActiveView() && ui.state.section === section) {
         const currentBox = document.getElementById("identity-test-result");
-        if (currentBox) currentBox.innerHTML = `<div class="identity-test-error"><strong>Error de prueba</strong><span>${ui.esc(error.message)}</span></div>`;
-        ui.status(`Error probando: ${error.message}`, "bad");
+        if (currentBox) currentBox.innerHTML = resolverFailure
+          ? ui.renderResolverResult(resolverFailure, failureContext)
+          : `<div class="identity-test-error"><strong>Error de prueba</strong><span>${ui.esc(error.message)}</span></div>`;
+        ui.status(
+          resolverFailure
+            ? "PRUEBA NO COMPLETADA. No se ha guardado ni movido ningún archivo."
+            : `Error probando: ${error.message}`,
+          "bad"
+        );
       }
     } finally {
       const released = ui.finishTestRequest(request);
@@ -160,49 +202,6 @@
       <div class="identity-result-wide"><small>Nombre limpio</small><strong>${ui.esc(result.cleaned || "-")}</strong></div>
       <div class="identity-result-wide"><small>Candidatos</small><strong>${ui.esc((result.candidates || []).join(" · ") || "-")}</strong></div>
       ${steps ? `<div class="identity-table-wrap"><table class="table identity-trace"><thead><tr><th scope="col">Regla</th><th scope="col">Antes</th><th scope="col">Después</th></tr></thead><tbody>${steps}</tbody></table></div>` : ""}`;
-  };
-
-  ui.renderResolverResult = function (payload, context) {
-    const identity = payload.identity || {};
-    const details = payload.details || {};
-    const candidates = payload.candidates?.length ? payload.candidates : (details.candidates || []);
-    const score = Number(identity.score ?? details.top_score ?? candidates[0]?.score ?? 0);
-    const margin = Number(identity.margin ?? details.margin ?? 0);
-    const threshold = Number(ui.getPath(ui.state.draft, "resolver.acceptance.min_score") ?? 75);
-    const minMargin = Number(ui.getPath(ui.state.draft, "resolver.acceptance.min_margin") ?? 12);
-    const progress = threshold === 0 ? 100 : Math.round((score / threshold) * 1000) / 10;
-    const tone = String(payload.status || "").startsWith("ACCEPT") ? "ok" : payload.ok === false ? "bad" : "warn";
-    const parserTitle = String(context?.parserTitle || "").trim();
-    const parserYear = String(context?.parserYear || "").trim();
-    const category = ["movies", "tv"].includes(context?.category) ? context.category : "";
-    const requestId = Number(context?.requestId || 0);
-    const rows = candidates.map(candidate => {
-      const canAlias = Boolean(category && parserTitle && candidate.title);
-      const canForce = Boolean(category && parserTitle && candidate.tmdb_id && (category === "tv" || parserYear));
-      const forceHint = !category
-        ? "El parser no determinó si es película o serie."
-        : category === "movies" && !parserYear
-        ? "El parser no encontró año; una coincidencia forzada de película no sería válida."
-        : "Crear coincidencia forzada con el título y año extraídos por el parser.";
-      return `<tr>
-      <td>${ui.esc(candidate.tmdb_id ?? "-")}</td><td>${ui.esc(candidate.title || "-")}</td>
-      <td>${ui.esc(candidate.year ?? "-")}</td><td><strong>${ui.esc(candidate.score ?? "-")}</strong></td>
-      <td>${ui.esc((candidate.reasons || []).join(" · "))}</td>
-      <td class="identity-candidate-actions">
-        <button type="button" class="btn ghost small" data-candidate-action="alias" data-test-request-id="${requestId}" data-tmdb-id="${ui.esc(candidate.tmdb_id)}" data-candidate-title="${ui.esc(candidate.title)}" ${canAlias ? "" : "disabled"}>Crear alias</button>
-        <button type="button" class="btn ghost small" data-candidate-action="forced" data-test-request-id="${requestId}" data-tmdb-id="${ui.esc(candidate.tmdb_id)}" title="${ui.esc(forceHint)}" ${canForce ? "" : "disabled"}>Forzar TMDb</button>
-      </td>
-    </tr>`;
-    }).join("");
-    const queries = (payload.queries || []).map(item => `<li><code>${ui.esc(item.params?.query || item.endpoint || "-")}</code><span>${ui.esc(item.params?.language || "")} ${ui.esc(item.params?.year || "")}</span><b>${ui.esc(item.status_code || "")}</b></li>`).join("");
-    return `<div class="identity-decision ${tone}">
-        <span class="pill ${tone}">${ui.esc(payload.status || "-")}</span>
-        <strong>${score} puntos de ${threshold} · ${progress}% del umbral</strong>
-        <span>Margen ${margin} de ${minMargin}</span>
-      </div>
-      ${payload.message ? `<div class="identity-result-message">${ui.esc(payload.message)}</div>` : ""}
-      ${rows ? `<div class="identity-table-wrap"><table class="table"><thead><tr><th scope="col">TMDb</th><th scope="col">Título</th><th scope="col">Año</th><th scope="col">Puntos</th><th scope="col">Desglose</th><th scope="col">Acciones</th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="identity-test-empty">No hay candidatos para mostrar.</div>`}
-      ${queries ? `<details class="identity-queries"><summary>Consultas TMDb realizadas (${(payload.queries || []).length})</summary><ul>${queries}</ul></details>` : ""}`;
   };
 
   ui.addCandidateRule = function (dataset) {

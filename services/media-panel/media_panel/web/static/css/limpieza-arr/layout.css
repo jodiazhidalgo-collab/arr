@@ -306,9 +306,14 @@
     min-width: 0;
     text-align: left;
   }
-  .identity-toolbar { position: static; }
+  .identity-toolbar {
+    position: static;
+    flex-direction: column;
+  }
   .identity-toolbar,
   .identity-toolbar-actions { align-items: stretch; }
+  .identity-toolbar .identity-status { flex: 0 0 auto; }
+  .identity-toolbar-actions { width: 100%; }
   .identity-toolbar-actions > .btn { flex: 1 1 42%; }
   .identity-sidebar { grid-template-columns: 1fr; }
 }
