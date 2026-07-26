@@ -13,6 +13,7 @@ DEFAULT_POLICY: Dict[str, object] = {
     "region": "ES",
     "fallback_language": "en-US",
     "use_fallback_language": True,
+    "original_language_preference": {"enabled": True, "language": "en"},
     "query_aliases": [],
     "forced_matches": [],
     "evidence": {
@@ -117,6 +118,7 @@ def effective_policy(
             policy["forced_matches"] = copy.deepcopy(forced[category])
         for key in (
             "evidence",
+            "original_language_preference",
             "guess_selection",
             "query_variants",
             "search_limits",

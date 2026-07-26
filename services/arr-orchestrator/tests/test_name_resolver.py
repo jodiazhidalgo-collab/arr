@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from arr_orchestrator.db import Database
 from arr_orchestrator.filebot import FileBotRunner, TV_FORMATS
+from arr_orchestrator.identity import factory_identity_rules
 from arr_orchestrator.name_resolver import (
     NameResolver,
     ResolutionError,
@@ -40,22 +41,24 @@ class FakeSession:
         return payload if isinstance(payload, FakeResponse) else FakeResponse(payload)
 
 
-def movie_payload(tmdb_id, title, original_title, year):
+def movie_payload(tmdb_id, title, original_title, year, original_language=""):
     return {
         "id": tmdb_id,
         "title": title,
         "original_title": original_title,
+        "original_language": original_language,
         "release_date": f"{year}-01-01" if year else "",
         "alternative_titles": {"titles": []},
         "translations": {"translations": []},
     }
 
 
-def tv_payload(tmdb_id, title, original_title, year, seasons=10):
+def tv_payload(tmdb_id, title, original_title, year, seasons=10, original_language=""):
     return {
         "id": tmdb_id,
         "name": title,
         "original_name": original_title,
+        "original_language": original_language,
         "first_air_date": f"{year}-01-01",
         "number_of_seasons": seasons,
         "alternative_titles": {"results": []},
@@ -156,6 +159,152 @@ class NameResolverTests(unittest.TestCase):
         self.assertNotIn("reasons", payload["candidates"][0])
         filesystem_evidence.assert_not_called()
         self.assertNotIn(private_path, json.dumps(payload, ensure_ascii=False))
+
+    def test_original_english_language_breaks_canta_like_ambiguity(self):
+        hungarian = movie_payload(427416, "Canta", "Mindenki", 2016, "hu")
+        animated = movie_payload(335797, "¡Canta!", "Sing", 2016, "en")
+        hungarian_detail = movie_payload(427416, "Canta", "Mindenki", 2016)
+        animated_detail = movie_payload(335797, "¡Canta!", "Sing", 2016)
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [hungarian, animated]},
+                "/movie/427416": hungarian_detail,
+                "/movie/335797": animated_detail,
+            }
+        )
+
+        payload = resolver.preview("Canta 2016", "movies")
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 335797)
+        self.assertEqual(payload["identity"]["original_language"], "en")
+        self.assertEqual(payload["candidates"][0]["tmdb_id"], 335797)
+        self.assertFalse(payload["decision"]["margin_passed"])
+        self.assertEqual(
+            payload["decision"]["original_language_preference"],
+            {
+                "applied": True,
+                "enabled": True,
+                "language": "en",
+                "selected_original_language": "en",
+            },
+        )
+
+    def test_configured_french_preference_breaks_the_same_kind_of_ambiguity(self):
+        english = movie_payload(1, "La señal", "The Signal", 2024, "en")
+        french = movie_payload(2, "La señal", "Le Signal", 2024, "fr")
+        rules = factory_identity_rules()
+        rules["resolver"]["original_language_preference"]["language"] = "fr-FR"
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [english, french]},
+                "/movie/1": english,
+                "/movie/2": french,
+            }
+        )
+
+        payload = resolver.preview("La señal 2024", "movies", rules)
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 2)
+        self.assertEqual(
+            payload["decision"]["original_language_preference"]["language"],
+            "fr-FR",
+        )
+
+    def test_original_language_preference_also_resolves_tv_ambiguity(self):
+        spanish = tv_payload(1, "La serie", "La serie", 2020, original_language="es")
+        english = tv_payload(2, "La serie", "The Show", 2020, original_language="en")
+        resolver, _ = self.resolver(
+            {
+                "/search/tv": {"results": [spanish, english]},
+                "/tv/1": spanish,
+                "/tv/2": english,
+            }
+        )
+
+        payload = resolver.preview("La serie S01E01 2020", "tv")
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 2)
+        self.assertEqual(payload["identity"]["original_language"], "en")
+        self.assertTrue(
+            payload["decision"]["original_language_preference"]["applied"]
+        )
+
+    def test_clear_french_movie_is_not_filtered_by_language_preference(self):
+        french = movie_payload(11687, "Los visitantes", "Les Visiteurs", 1993, "fr")
+        resolver, _ = self.resolver(
+            {"/search/movie": {"results": [french]}, "/movie/11687": french}
+        )
+
+        payload = resolver.preview("Los visitantes 1993", "movies")
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 11687)
+        self.assertEqual(payload["identity"]["original_language"], "fr")
+        self.assertFalse(
+            payload["decision"]["original_language_preference"]["applied"]
+        )
+
+    def test_two_english_candidates_remain_ambiguous(self):
+        first = movie_payload(1, "El desconocido", "Unknown", 2000, "en")
+        second = movie_payload(2, "El desconocido", "Unknown", 2000, "en")
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [first, second]},
+                "/movie/1": first,
+                "/movie/2": second,
+            }
+        )
+
+        payload = resolver.preview("El desconocido 2000", "movies")
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertFalse(
+            payload["decision"]["original_language_preference"]["applied"]
+        )
+
+    def test_disabled_original_language_preference_keeps_ambiguity(self):
+        hungarian = movie_payload(427416, "Canta", "Mindenki", 2016, "hu")
+        animated = movie_payload(335797, "¡Canta!", "Sing", 2016, "en")
+        rules = factory_identity_rules()
+        rules["resolver"]["original_language_preference"]["enabled"] = False
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [hungarian, animated]},
+                "/movie/427416": hungarian,
+                "/movie/335797": animated,
+            }
+        )
+
+        payload = resolver.preview("Canta 2016", "movies", rules)
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(payload["candidates"][0]["tmdb_id"], 427416)
+        self.assertEqual(
+            payload["decision"]["original_language_preference"]["enabled"],
+            False,
+        )
+        self.assertFalse(
+            payload["decision"]["original_language_preference"]["applied"]
+        )
+
+    def test_single_english_candidate_is_not_rescued_as_an_ambiguity(self):
+        unrelated = movie_payload(99, "Completamente distinto", "Different", 1900, "en")
+        rules = factory_identity_rules()
+        rules["resolver"]["acceptance"]["min_score"] = -100
+        resolver, _ = self.resolver(
+            {"/search/movie": {"results": [unrelated]}, "/movie/99": unrelated}
+        )
+
+        payload = resolver.preview("Nada 2024", "movies", rules)
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertFalse(payload["decision"]["has_second_candidate"])
+        self.assertFalse(
+            payload["decision"]["original_language_preference"]["applied"]
+        )
 
     def test_preview_preserves_zero_min_score_when_classifying_rejection(self):
         resolver, _ = self.resolver({})

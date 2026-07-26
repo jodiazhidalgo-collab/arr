@@ -19,6 +19,16 @@
     return numeric > 0 ? `+${formatted}` : formatted;
   };
 
+  ui.resolverLanguageName = function (value) {
+    const code = String(value || "").trim().split("-", 1)[0].toLowerCase();
+    if (!code) return "configurado";
+    try {
+      return new Intl.DisplayNames(["es"], { type: "language" }).of(code) || code.toUpperCase();
+    } catch (_error) {
+      return code.toUpperCase();
+    }
+  };
+
   ui.resolverControlLabels = function () {
     const labels = new Map();
     const groups = ui.state.document?.schema?.resolver?.groups || [];
@@ -52,6 +62,9 @@
       : Boolean(decision.has_second_candidate);
     const tie = decision.has_scoring && margin === 0 && candidates.length > 1;
     const bothFailed = decision.has_scoring && !scorePassed && !marginPassed;
+    const languagePreference = decision?.original_language_preference || {};
+    const languagePreferenceApplied = languagePreference.applied === true;
+    const preferredLanguage = ui.resolverLanguageName(languagePreference.language);
     const sourceLabels = {
       tmdb_id: "un identificador TMDb directo",
       imdb_id: "un identificador IMDb directo",
@@ -63,7 +76,9 @@
       return {
         tone: "ok",
         title: "ACEPTADA",
-        text: decision.bypass && bypassSource
+        text: languagePreferenceApplied
+          ? `El candidato se ha seleccionado porque es el único con idioma original ${preferredLanguage} dentro del grupo ambiguo.`
+          : decision.bypass && bypassSource
           ? `Identidad aceptada mediante ${bypassSource}. Los umbrales no intervienen en esta decisión.`
           : hasSecondCandidate
             ? "El primer candidato cumple la puntuación y la ventaja mínimas configuradas."
@@ -145,6 +160,7 @@
     const marginLabel = ui.resolverControlLabel("resolver.acceptance.min_margin", "Margen mínimo");
     const hasScoring = Boolean(decision.has_scoring);
     const bypass = Boolean(decision.bypass);
+    const languagePreferenceApplied = decision?.original_language_preference?.applied === true;
     const hasSecondCandidate = decision.has_second_candidate === undefined
       ? candidates.length > 1
       : Boolean(decision.has_second_candidate);
@@ -159,7 +175,7 @@
           ? `<span>Ventaja sobre el segundo</span><strong>${ui.esc(ui.resolverNumber(decision.margin))}</strong>`
           : `<span>Segundo candidato</span><strong>No existe</strong><span>Ventaja calculada</span><strong>${ui.esc(ui.resolverNumber(decision.margin))}</strong>`}
         <span>${ui.esc(marginLabel)}</span><strong>${ui.esc(ui.resolverNumber(decision.min_margin))}</strong>
-        <b class="${bypass ? "neutral" : decision.margin_passed ? "pass" : "fail"}">${bypass ? "NO APLICA" : decision.margin_passed ? "CUMPLIDO" : "NO CUMPLIDO"}</b>
+        <b class="${bypass ? "neutral" : languagePreferenceApplied || decision.margin_passed ? "pass" : "fail"}">${bypass ? "NO APLICA" : languagePreferenceApplied ? "RESUELTO POR IDIOMA" : decision.margin_passed ? "CUMPLIDO" : "NO CUMPLIDO"}</b>
       </div>
     </div>`;
     return `<section class="resolver-outcome ${ui.esc(presentation.tone)}" aria-labelledby="resolver-outcome-title">

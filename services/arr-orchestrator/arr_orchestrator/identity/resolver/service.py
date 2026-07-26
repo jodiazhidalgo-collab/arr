@@ -229,10 +229,6 @@ class NameResolver:
 
         direct_identity = source in {"tmdb_id", "imdb_id", "forced_match"}
         ranked = self._rank_candidates(candidates, guessed, evidence, direct_identity)
-        self._trace["candidates"] = [candidate.to_dict() for candidate in ranked]
-        top = ranked[0]
-        second_score = ranked[1].score if len(ranked) > 1 else 0.0
-        margin = top.score - second_score
         acceptance = rules.get("acceptance") if isinstance(rules.get("acceptance"), dict) else {}
         min_score = float(acceptance.get("min_score", 75))
         min_margin = float(acceptance.get("min_margin", 12))
@@ -240,11 +236,39 @@ class NameResolver:
             source in {"tmdb_id", "imdb_id"}
             and bool(acceptance.get("direct_ids_bypass", True))
         ) or (source == "forced_match" and bool(acceptance.get("forced_bypass", True)))
+        normal_top = ranked[0]
+        normal_second_score = ranked[1].score if len(ranked) > 1 else 0.0
+        normal_margin = normal_top.score - normal_second_score
+        ranked, preference_applied = _prefer_original_language_candidate(
+            ranked,
+            source=source,
+            min_score=min_score,
+            min_margin=min_margin,
+            normal_score_passed=normal_top.score >= min_score,
+            normal_margin_passed=normal_margin >= min_margin,
+            preference=rules.get("original_language_preference"),
+        )
+        top = ranked[0]
+        second_score = ranked[1].score if len(ranked) > 1 else 0.0
+        margin = top.score - second_score
         score_passed = top.score >= min_score
         margin_passed = margin >= min_margin
+        self._trace["candidates"] = [candidate.to_dict() for candidate in ranked]
+        preference_rules = (
+            rules.get("original_language_preference")
+            if isinstance(rules.get("original_language_preference"), dict)
+            else {}
+        )
+        preference_language = str(preference_rules.get("language") or "en")
+        preference_decision = {
+            "applied": preference_applied,
+            "enabled": bool(preference_rules.get("enabled", True)),
+            "language": preference_language,
+            "selected_original_language": top.original_language or None,
+        }
         decision_status = (
             "ACCEPTED"
-            if bypass or (score_passed and margin_passed)
+            if bypass or (score_passed and margin_passed) or preference_applied
             else "REJECTED_SCORE"
             if not score_passed
             else "REJECTED_MARGIN"
@@ -263,8 +287,11 @@ class NameResolver:
             "margin": margin,
             "min_margin": min_margin,
             "margin_passed": margin_passed,
+            "original_language_preference": preference_decision,
         }
-        if not bypass and (top.score < min_score or margin < min_margin):
+        if not bypass and not preference_applied and (
+            top.score < min_score or margin < min_margin
+        ):
             raise ResolverAmbiguous(
                 "La identidad no supera el umbral de seguridad",
                 {
@@ -285,6 +312,7 @@ class NameResolver:
             title=top.title,
             original_title=top.original_title,
             year=top.year,
+            original_language=top.original_language,
             aliases=_unique([top.title, top.original_title, *top.aliases]),
             score=top.score,
             margin=margin,
@@ -560,3 +588,54 @@ def _preview_decision(status: str, trace: Dict[str, object]) -> Dict[str, object
         "has_scoring": False,
         "bypass": False,
     }
+
+
+def _prefer_original_language_candidate(
+    ranked: Sequence[ResolverCandidate],
+    *,
+    source: str,
+    min_score: float,
+    min_margin: float,
+    normal_score_passed: bool,
+    normal_margin_passed: bool,
+    preference: object,
+) -> Tuple[List[ResolverCandidate], bool]:
+    """Promueve un unico idioma preferido solo dentro de la zona ambigua."""
+
+    ordered = list(ranked)
+    settings = preference if isinstance(preference, dict) else {}
+    enabled = bool(settings.get("enabled", True))
+    language = _base_language(str(settings.get("language") or "en"))
+    if (
+        not ordered
+        or source != "search"
+        or not enabled
+        or not language
+        or not normal_score_passed
+        or normal_margin_passed
+    ):
+        return ordered, False
+
+    best_score = ordered[0].score
+    ambiguous = [
+        candidate
+        for candidate in ordered
+        if candidate.score >= min_score
+        and best_score - candidate.score < min_margin
+    ]
+    if len(ambiguous) < 2:
+        return ordered, False
+    preferred = [
+        candidate
+        for candidate in ambiguous
+        if _base_language(candidate.original_language) == language
+    ]
+    if len(preferred) != 1:
+        return ordered, False
+
+    selected = preferred[0]
+    return [selected, *(candidate for candidate in ordered if candidate is not selected)], True
+
+
+def _base_language(value: str) -> str:
+    return str(value or "").strip().split("-", 1)[0].casefold()

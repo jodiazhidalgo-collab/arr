@@ -166,6 +166,18 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
                     _control("resolver.locales.tv.language", "language", "Idioma series", "Locale principal para series."),
                     _control("resolver.locales.fallback_language", "language", "Idioma alternativo", "Segundo idioma de busqueda."),
                     _control("resolver.locales.use_fallback", "toggle", "Usar idioma alternativo", "Consulta el idioma alternativo cuando aporta candidatos."),
+                    _control(
+                        "resolver.original_language_preference.language",
+                        "language",
+                        "Idioma original preferido",
+                        "Idioma original usado para resolver resultados ambiguos, por ejemplo en.",
+                    ),
+                    _control(
+                        "resolver.original_language_preference.enabled",
+                        "toggle",
+                        "Resolver ambigüedades con este idioma",
+                        "Si existe un único candidato de este idioma entre los mejores, lo selecciona sin excluir películas claras de otros países.",
+                    ),
                     _control("resolver.aliases.movies", "mapping_rules", "Alias de peliculas", "Formato: origen | destino.", format="origen | destino"),
                     _control("resolver.aliases.tv", "mapping_rules", "Alias de series", "Formato: origen | destino.", format="origen | destino"),
                     _control("resolver.forced_matches.movies", "mapping_rules", "Coincidencias forzadas de peliculas", "Formato: titulo | año | tmdb_id.", format="titulo | año | tmdb_id"),

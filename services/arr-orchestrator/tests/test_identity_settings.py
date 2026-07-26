@@ -243,6 +243,26 @@ class IdentityRulesTests(unittest.TestCase):
         with self.assertRaises(IdentityRulesValidationError):
             normalize_identity_rules(invalid)
 
+    def test_legacy_v1_rules_gain_language_preference_without_losing_values(self):
+        legacy = changed_rules(language="fr-FR", score=83)
+        del legacy["resolver"]["original_language_preference"]
+
+        normalized = normalize_identity_rules(legacy)
+
+        self.assertEqual(
+            normalized["resolver"]["original_language_preference"],
+            {"enabled": True, "language": "en"},
+        )
+        self.assertEqual(
+            normalized["resolver"]["locales"]["movies"],
+            {"language": "fr-FR", "region": "US"},
+        )
+        self.assertEqual(normalized["resolver"]["acceptance"]["min_score"], 83)
+        self.assertEqual(
+            normalized["resolver"]["aliases"]["movies"],
+            ["The Visitors | Los visitantes"],
+        )
+
     def test_fingerprint_is_stable_after_normalization(self):
         first = changed_rules("EN-us")
         second = changed_rules("en-US")

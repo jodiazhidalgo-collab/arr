@@ -29,6 +29,8 @@ def merge_search_payload(
     for key in (title_key, original_key, date_key, "number_of_seasons"):
         if not merged.get(key) and incoming.get(key):
             merged[key] = incoming[key]
+    if not merged.get("original_language") and incoming.get("original_language"):
+        merged["original_language"] = incoming["original_language"]
     return merged
 
 
@@ -53,6 +55,7 @@ def candidate_from_payload(
         title=str(payload.get(title_key) or payload.get(original_key) or ""),
         original_title=str(payload.get(original_key) or payload.get(title_key) or ""),
         year=date_year(payload.get(date_key)),
+        original_language=str(payload.get("original_language") or "").strip().lower(),
         aliases=unique(value for value in aliases if value),
         season_count=as_int(payload.get("number_of_seasons")),
     )

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from arr_orchestrator.db import Database
 from arr_orchestrator.identity.controller import IdentityController
+from arr_orchestrator.identity.fingerprint import identity_fingerprint
 
 
 RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
@@ -200,6 +201,66 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(
             controller.payload()["rules"]["resolver"]["acceptance"]["min_score"],
             60,
+        )
+
+    def test_legacy_v1_job_snapshot_keeps_old_behavior_and_coherent_fingerprint(self) -> None:
+        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        legacy_rules = copy.deepcopy(controller.payload()["rules"])
+        del legacy_rules["resolver"]["original_language_preference"]
+        stale_fingerprint = "sha256:" + ("a" * 64)
+        old_job = {
+            "source_meta_json": json.dumps(
+                {
+                    "identity_rules": {
+                        "rules": legacy_rules,
+                        "revision": 4,
+                        "saved_at": "2026-01-01T00:00:00Z",
+                        "fingerprint": stale_fingerprint,
+                    }
+                }
+            )
+        }
+
+        restored = controller.rules_for_job(old_job)
+
+        self.assertEqual(restored["revision"], 4)
+        self.assertEqual(
+            restored["rules"]["resolver"]["original_language_preference"],
+            {"enabled": False, "language": "en"},
+        )
+        self.assertNotEqual(restored["fingerprint"], stale_fingerprint)
+        self.assertEqual(
+            restored["fingerprint"], identity_fingerprint(restored["rules"])
+        )
+
+    def test_legacy_filebot_job_snapshot_does_not_gain_language_preference(self) -> None:
+        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        old_job = {
+            "source_meta_json": json.dumps(
+                {
+                    "filebot_rules": {
+                        "rules": {
+                            "movies": {
+                                "language": "es-ES",
+                                "region": "ES",
+                                "query_aliases": [],
+                                "forced_matches": [],
+                            }
+                        },
+                        "revision": 2,
+                    }
+                }
+            )
+        }
+
+        restored = controller.rules_for_job(old_job)
+
+        self.assertEqual(restored["source"], "legacy_filebot_snapshot")
+        self.assertFalse(
+            restored["rules"]["resolver"]["original_language_preference"]["enabled"]
+        )
+        self.assertEqual(
+            restored["fingerprint"], identity_fingerprint(restored["rules"])
         )
 
 

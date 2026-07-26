@@ -29,6 +29,7 @@ class ResolverCandidate:
     score: float = 0.0
     breakdown: List[Dict[str, object]] = field(default_factory=list)
     season_count: Optional[int] = None
+    original_language: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -47,6 +48,7 @@ class ResolvedIdentity:
     query: str
     guess: Dict[str, object]
     source: str
+    original_language: str = ""
     season: Optional[int] = None
     episodes: List[int] = field(default_factory=list)
 
@@ -61,6 +63,7 @@ class ResolvedIdentity:
             title=str(payload["title"]),
             original_title=str(payload.get("original_title") or payload["title"]),
             year=_optional_int(payload.get("year")),
+            original_language=str(payload.get("original_language") or ""),
             aliases=[str(value) for value in payload.get("aliases") or []],
             score=float(payload.get("score") or 0),
             margin=float(payload.get("margin") or 0),

@@ -180,6 +180,8 @@ def search_candidates(
     for candidate in selected[:detail_limit]:
         try:
             detailed = details(media_type, candidate.tmdb_id, language)
+            if not detailed.original_language:
+                detailed.original_language = candidate.original_language
             detailed.aliases = unique(
                 [
                     detailed.title,

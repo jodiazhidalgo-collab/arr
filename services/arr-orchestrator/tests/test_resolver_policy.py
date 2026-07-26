@@ -207,6 +207,27 @@ class ResolverPolicyTests(unittest.TestCase):
             set(DEFAULT_SCORING),
         )
 
+    def test_original_language_preference_has_two_editable_schema_controls(self):
+        schema = identity_settings_schema()
+        controls = {
+            control["path"]: control
+            for group in schema["resolver"]["groups"]
+            for control in group["controls"]
+        }
+
+        self.assertEqual(
+            controls["resolver.original_language_preference.language"]["type"],
+            "language",
+        )
+        self.assertEqual(
+            controls["resolver.original_language_preference.enabled"]["type"],
+            "toggle",
+        )
+        self.assertEqual(
+            controls["resolver.original_language_preference.language"]["label"],
+            "Idioma original preferido",
+        )
+
     def test_zero_and_decimal_weights_keep_an_exact_additive_breakdown(self):
         candidate = ResolverCandidate(8, "movie", "Titulo parcial", "", 2024, ["Titulo parcial"])
         guessed = {"title": "Titulo", "year": 2024}

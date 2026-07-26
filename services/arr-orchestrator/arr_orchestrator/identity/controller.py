@@ -80,12 +80,12 @@ class IdentityController:
         stored = meta.get("identity_rules")
         if isinstance(stored, dict) and isinstance(stored.get("rules"), dict):
             try:
-                rules = normalize_identity_rules(stored["rules"])
+                rules = _normalize_job_identity_rules(stored["rules"])
                 return {
                     "rules": rules,
                     "revision": int(stored.get("revision") or 0),
                     "saved_at": stored.get("saved_at"),
-                    "fingerprint": str(stored.get("fingerprint") or identity_fingerprint(rules)),
+                    "fingerprint": identity_fingerprint(rules),
                     "source": "job_snapshot",
                 }
             except (IdentityRulesValidationError, TypeError, ValueError):
@@ -94,6 +94,7 @@ class IdentityController:
         legacy = meta.get("filebot_rules")
         if isinstance(legacy, dict) and isinstance(legacy.get("rules"), dict):
             defaults = copy.deepcopy(self.store.payload()["defaults"])
+            defaults["resolver"]["original_language_preference"]["enabled"] = False
             migrated = _merge_legacy_filebot(defaults, legacy["rules"])
             return {
                 "rules": migrated,
@@ -249,6 +250,19 @@ def _merge_legacy_filebot(
             aliases[category] = copy.deepcopy(legacy_category["query_aliases"])  # type: ignore[index]
         if isinstance(legacy_category.get("forced_matches"), list):
             forced[category] = copy.deepcopy(legacy_category["forced_matches"])  # type: ignore[index]
+    return normalize_identity_rules(rules)
+
+
+def _normalize_job_identity_rules(value: Dict[str, object]) -> Dict[str, object]:
+    """Normaliza snapshots antiguos sin cambiar la decision que capturaron."""
+
+    rules = copy.deepcopy(value)
+    resolver = rules.get("resolver")
+    if isinstance(resolver, dict) and "original_language_preference" not in resolver:
+        resolver["original_language_preference"] = {
+            "enabled": False,
+            "language": "en",
+        }
     return normalize_identity_rules(rules)
 
 

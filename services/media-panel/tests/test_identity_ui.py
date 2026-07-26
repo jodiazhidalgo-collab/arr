@@ -186,10 +186,30 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             });
             ["ACEPTADA", "único candidato", "CUMPLIDA", "Titulo exacto", "Configurado", "Aplicado", "+35", "Segundo candidato", "No existe", "2 consultas · 2 correctas", "Buscar película", "Idioma es-ES · Año 2024", "Correcta"].forEach(text => requireText(accepted, text));
             rejectText(accepted, "Ventaja sobre el segundo");
+            rejectText(accepted, "RESUELTO POR IDIOMA");
+            rejectText(accepted, "grupo ambiguo");
             rejectText(accepted, "% del umbral");
             rejectText(accepted, "HTTP 200");
             rejectText(accepted, "<seguro>");
             requireText(accepted, "Titulo &lt;seguro&gt;");
+
+            const acceptedByLanguage = render({
+              status: "ACCEPTED", ok: true,
+              decision: decision("ACCEPTED", {
+                score: 125, min_score: 75, score_passed: true,
+                second_score: 125, has_second_candidate: true,
+                margin: 0, min_margin: 12, margin_passed: false,
+                original_language_preference: {
+                  applied: true, enabled: true, language: "en", selected_original_language: "en"
+                }
+              }),
+              candidates: [
+                { ...candidate, title: "¡Canta!", original_title: "Sing", original_language: "en", score: 125 },
+                { ...candidate, tmdb_id: 11, title: "Canta", original_title: "Mindenki", original_language: "hu", score: 125 }
+              ]
+            });
+            ["ACEPTADA", "idioma original inglés", "grupo ambiguo", "RESUELTO POR IDIOMA"].forEach(text => requireText(acceptedByLanguage, text));
+            rejectText(acceptedByLanguage, "RECHAZADA POR EMPATE");
 
             const tie = render({
               status: "REJECTED_MARGIN", ok: true,

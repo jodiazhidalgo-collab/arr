@@ -38,11 +38,18 @@ def _integers(
 
 
 def normalize_resolver(value: object) -> Dict[str, object]:
-    resolver = expect_object(value, "rules.resolver")
+    resolver = dict(expect_object(value, "rules.resolver"))
+    # Los documentos v1 anteriores a esta opcion se completan durante la
+    # normalizacion. El resto del contrato continua siendo estricto.
+    resolver.setdefault(
+        "original_language_preference",
+        {"enabled": True, "language": "en"},
+    )
     exact_keys(
         resolver,
         {
             "locales",
+            "original_language_preference",
             "aliases",
             "forced_matches",
             "evidence",
@@ -95,6 +102,26 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         ),
         "use_fallback": boolean(
             locales.get("use_fallback"), "rules.resolver.locales.use_fallback"
+        ),
+    }
+
+    original_language_preference = expect_object(
+        resolver.get("original_language_preference"),
+        "rules.resolver.original_language_preference",
+    )
+    exact_keys(
+        original_language_preference,
+        {"enabled", "language"},
+        "rules.resolver.original_language_preference",
+    )
+    normalized_original_language_preference = {
+        "enabled": boolean(
+            original_language_preference.get("enabled"),
+            "rules.resolver.original_language_preference.enabled",
+        ),
+        "language": language(
+            original_language_preference.get("language"),
+            "rules.resolver.original_language_preference.language",
         ),
     }
 
@@ -473,6 +500,7 @@ def normalize_resolver(value: object) -> Dict[str, object]:
 
     return {
         "locales": normalized_locales,
+        "original_language_preference": normalized_original_language_preference,
         "aliases": normalized_aliases,
         "forced_matches": normalized_forced,
         "evidence": normalized_evidence,

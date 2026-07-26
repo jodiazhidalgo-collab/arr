@@ -32,6 +32,10 @@ _IDENTITY_RULES_TEMPLATE: Dict[str, object] = {
             "fallback_language": "en-US",
             "use_fallback": True,
         },
+        "original_language_preference": {
+            "enabled": True,
+            "language": "en",
+        },
         "aliases": {"movies": [], "tv": []},
         "forced_matches": {"movies": [], "tv": []},
         "evidence": {
