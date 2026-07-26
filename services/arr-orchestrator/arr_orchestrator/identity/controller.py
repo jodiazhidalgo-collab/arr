@@ -21,6 +21,13 @@ from .settings import (
 )
 
 
+_HISTORICAL_TV_PATTERNS = {
+    "series_sxe": r"(?i)\bS0?(\d{1,2})\s*E0?(\d{1,3})(?:\s*(?:-|_|E)\s*0?(\d{1,3}))?\b",
+    "explicit_season": r"(?i)\b(?:temporada|season)\s*0?(\d{1,2})\b",
+    "season_pack": r"(?i)(?:^|\s)T0?(\d{1,2})(?:\b|[- ]|$)",
+}
+
+
 class IdentityController:
     def __init__(
         self,
@@ -94,7 +101,7 @@ class IdentityController:
         legacy = meta.get("filebot_rules")
         if isinstance(legacy, dict) and isinstance(legacy.get("rules"), dict):
             defaults = copy.deepcopy(self.store.payload()["defaults"])
-            defaults["resolver"]["original_language_preference"]["enabled"] = False
+            _disable_new_identity_behaviors(defaults, only_when_missing=False)
             migrated = _merge_legacy_filebot(defaults, legacy["rules"])
             return {
                 "rules": migrated,
@@ -216,6 +223,7 @@ class IdentityController:
         if not isinstance(legacy, dict):
             return
         defaults = copy.deepcopy(self.store.payload()["defaults"])
+        _disable_new_identity_behaviors(defaults, only_when_missing=False)
         migrated = _merge_legacy_filebot(defaults, legacy)
         if migrated == defaults:
             return
@@ -257,13 +265,53 @@ def _normalize_job_identity_rules(value: Dict[str, object]) -> Dict[str, object]
     """Normaliza snapshots antiguos sin cambiar la decision que capturaron."""
 
     rules = copy.deepcopy(value)
+    _disable_new_identity_behaviors(rules, only_when_missing=True)
+    return normalize_identity_rules(rules)
+
+
+def _disable_new_identity_behaviors(
+    rules: Dict[str, object], *, only_when_missing: bool
+) -> None:
+    """Conserva la semantica de snapshots y configuraciones heredadas."""
+
+    parser = rules.get("parser")
+    if isinstance(parser, dict):
+        for key in (
+            "video_extensions",
+            "video_markers",
+            "non_video_markers",
+            "season_number_words",
+        ):
+            if not only_when_missing or key not in parser:
+                parser[key] = []
+        normalization = parser.get("normalization")
+        if isinstance(normalization, dict):
+            for key in (
+                "movie_without_year_from_video",
+                "allow_tv_year_range",
+            ):
+                if not only_when_missing or key not in normalization:
+                    normalization[key] = False
+        patterns = parser.get("patterns")
+        if isinstance(patterns, dict):
+            for key, historical_pattern in _HISTORICAL_TV_PATTERNS.items():
+                if not only_when_missing or key not in patterns:
+                    patterns[key] = historical_pattern
+
     resolver = rules.get("resolver")
-    if isinstance(resolver, dict) and "original_language_preference" not in resolver:
+    if not isinstance(resolver, dict):
+        return
+    if not only_when_missing or "original_language_preference" not in resolver:
         resolver["original_language_preference"] = {
             "enabled": False,
             "language": "en",
         }
-    return normalize_identity_rules(rules)
+    acceptance = resolver.get("acceptance")
+    if isinstance(acceptance, dict) and (
+        not only_when_missing
+        or "prefer_oldest_exact_title_without_year" not in acceptance
+    ):
+        acceptance["prefer_oldest_exact_title_without_year"] = False
 
 
 def _source_meta(value: object) -> Dict[str, object]:

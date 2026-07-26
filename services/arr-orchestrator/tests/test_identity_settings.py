@@ -180,6 +180,95 @@ class IdentityRulesTests(unittest.TestCase):
         self.assertEqual(rules["resolver"]["http"]["total_budget_ms"], 6600)
         self.assertEqual(rules["resolver"]["retry"]["base_seconds"], 45)
 
+    def test_factory_enables_the_new_active_classification_defaults(self):
+        rules = factory_identity_rules()
+
+        self.assertTrue(rules["parser"]["video_extensions"])
+        self.assertTrue(rules["parser"]["video_markers"])
+        self.assertTrue(rules["parser"]["non_video_markers"])
+        self.assertIn("one | 1", rules["parser"]["season_number_words"])
+        self.assertTrue(
+            rules["parser"]["normalization"]["movie_without_year_from_video"]
+        )
+        self.assertTrue(
+            rules["parser"]["normalization"]["allow_tv_year_range"]
+        )
+        self.assertTrue(
+            rules["resolver"]["acceptance"][
+                "prefer_oldest_exact_title_without_year"
+            ]
+        )
+
+    def test_active_v1_document_gains_new_defaults_without_losing_values(self):
+        legacy = changed_rules(language="fr-FR", score=83)
+        parser = legacy["parser"]
+        for key in (
+            "video_extensions",
+            "video_markers",
+            "non_video_markers",
+            "season_number_words",
+        ):
+            del parser[key]
+        del parser["normalization"]["movie_without_year_from_video"]
+        del parser["normalization"]["allow_tv_year_range"]
+        del legacy["resolver"]["acceptance"][
+            "prefer_oldest_exact_title_without_year"
+        ]
+
+        normalized = normalize_identity_rules(legacy)
+
+        self.assertEqual(normalized["resolver"]["acceptance"]["min_score"], 83)
+        self.assertTrue(normalized["parser"]["video_extensions"])
+        self.assertTrue(normalized["parser"]["season_number_words"])
+        self.assertTrue(
+            normalized["parser"]["normalization"]["movie_without_year_from_video"]
+        )
+        self.assertTrue(
+            normalized["parser"]["normalization"]["allow_tv_year_range"]
+        )
+        self.assertTrue(
+            normalized["resolver"]["acceptance"][
+                "prefer_oldest_exact_title_without_year"
+            ]
+        )
+
+    def test_season_number_words_are_canonical_and_contradictions_fail(self):
+        rules = factory_identity_rules()
+        rules["parser"]["season_number_words"] = ["Primera | 01", "One | 1"]
+
+        normalized = normalize_identity_rules(rules)
+
+        self.assertEqual(
+            normalized["parser"]["season_number_words"],
+            ["primera | 1", "one | 1"],
+        )
+
+        invalid = factory_identity_rules()
+        invalid["parser"]["season_number_words"] = ["one | 1", "ONE | 2"]
+        with self.assertRaisesRegex(
+            IdentityRulesValidationError, "contradice otra regla"
+        ):
+            normalize_identity_rules(invalid)
+
+    def test_parser_schema_uses_human_groups_without_duplicate_controls(self):
+        groups = IdentitySettingsStore(FakeSettingsDatabase()).payload()["schema"][
+            "parser"
+        ]["groups"]
+        paths = [control["path"] for group in groups for control in group["controls"]]
+
+        self.assertEqual(
+            [group["title"] for group in groups],
+            [
+                "Limpieza inicial",
+                "Series y episodios",
+                "Clasificación automática",
+                "Derivación manual",
+                "Patrones avanzados",
+                "Normalización",
+            ],
+        )
+        self.assertEqual(len(paths), len(set(paths)))
+
     def test_factory_rejects_runtime_http_below_contract_minimum(self):
         with self.assertRaisesRegex(ValueError, "resolver_http_timeout_ms"):
             factory_identity_rules(resolver_http_timeout_ms=99)

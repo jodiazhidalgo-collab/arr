@@ -19,10 +19,11 @@ def parse_tv(text: str, rules: Mapping[str, Any], trace: Optional[ParserTrace] =
     season = None
 
     explicit_season = _search(rules, "explicit_season", text)
-    explicit_season_value = _captured_int(explicit_season, 1)
-    if explicit_season and explicit_season_value is not None:
+    explicit_season_value = _first_captured_int(explicit_season)
+    if explicit_season:
         before = deepcopy(result)
-        season = explicit_season_value
+        if explicit_season_value is not None:
+            season = explicit_season_value
         result["strong"] = True
         _record(trace, "tv.explicit_season", before, result)
 
@@ -179,6 +180,16 @@ def _captured_int(match: Optional[re.Match[str]], index: int) -> Optional[int]:
     if value is None or not value.isdigit():
         return None
     return int(value)
+
+
+def _first_captured_int(match: Optional[re.Match[str]]) -> Optional[int]:
+    if match is None:
+        return None
+    for index in range(1, len(match.groups()) + 1):
+        value = _captured_int(match, index)
+        if value is not None:
+            return value
+    return None
 
 
 def _record(

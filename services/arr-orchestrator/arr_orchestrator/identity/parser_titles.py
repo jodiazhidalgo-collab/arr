@@ -42,9 +42,14 @@ def title_candidates(
     title = title_from_cleaned(cleaned, year, tv, rules, trace)
     candidates: List[str] = []
     if title:
-        outer, inner = split_parenthesized_title(title, rules)
-        for value in (outer, inner, title):
-            append_unique(candidates, value)
+        bilingual = [part.strip() for part in re.split(r"\s+/\s+", title) if part.strip()]
+        variants = bilingual if len(bilingual) > 1 else [title]
+        for variant in variants:
+            outer, inner = split_parenthesized_title(variant, rules)
+            for value in (outer, inner, variant):
+                append_unique(candidates, value)
+        # El nombre completo conserva contexto y sirve como candidato adicional.
+        append_unique(candidates, title)
     if trace is not None:
         trace.record("title.candidates", title, candidates)
     return candidates
@@ -92,7 +97,12 @@ def title_from_cleaned(
     _record(trace, "title.compact_web", before, text)
     text = strip_title_tail_noise(text, rules, trace)
 
-    tokens = regex_items(rules.get("technical_tokens") or [])
+    tokens = regex_items(
+        [
+            *(rules.get("technical_tokens") or []),
+            *(rules.get("video_markers") or []),
+        ]
+    )
     if tokens:
         marker = re.search(rf"(?i)\b(?:{tokens})\b", text)
         if marker:
@@ -156,11 +166,25 @@ def trim_unbalanced_parentheses(text: str) -> str:
     return current
 
 
-def manual_name(cleaned: str, title: str, rules: Mapping[str, Any]) -> bool:
+def manual_name(
+    cleaned: str,
+    title: str,
+    rules: Mapping[str, Any],
+    *,
+    tv_strong: bool = False,
+) -> bool:
     normalized = fold(f"{cleaned} {title}")
-    if multiple_years_require_manual(cleaned, rules):
+    normalization = rules.get("normalization") if isinstance(rules.get("normalization"), Mapping) else {}
+    allow_tv_year_range = bool(
+        tv_strong
+        and normalization.get("allow_tv_year_range", False)
+        and single_year_range_covers_all_years(cleaned, rules)
+    )
+    if not allow_tv_year_range and multiple_years_require_manual(cleaned, rules):
         return True
-    if collection_like_manual(cleaned, rules) or collection_like_manual(title, rules):
+    if collection_like_manual(
+        cleaned, rules, allow_year_range=allow_tv_year_range
+    ) or collection_like_manual(title, rules, allow_year_range=allow_tv_year_range):
         return True
     keywords = [re.escape(fold(str(item))) for item in rules.get("manual_keywords") or [] if fold(str(item))]
     if keywords and re.search(rf"\b(?:{'|'.join(keywords)})\b", normalized):
@@ -174,10 +198,15 @@ def multiple_years_require_manual(value: str, rules: Mapping[str, Any]) -> bool:
     year_rules = rules.get("year") if isinstance(rules.get("year"), Mapping) else {}
     if str(year_rules.get("multiple") or "first").strip().lower() != "manual":
         return False
+    return len(_matched_years(value, rules)) > 1
+
+
+def _matched_years(value: str, rules: Mapping[str, Any]) -> List[int]:
+    year_rules = rules.get("year") if isinstance(rules.get("year"), Mapping) else {}
     pattern = str(year_rules.get("pattern") or r"(?<!\d)((?:19|20)\d{2})(?!\d)")
     minimum = _integer(year_rules.get("min"), 1900)
     maximum = _integer(year_rules.get("max"), 2099)
-    years = []
+    years: List[int] = []
     for match in re.finditer(pattern, value):
         try:
             year = int(match.group(1) if match.lastindex else match.group(0))
@@ -185,10 +214,27 @@ def multiple_years_require_manual(value: str, rules: Mapping[str, Any]) -> bool:
             continue
         if minimum <= year <= maximum:
             years.append(year)
-    return len(years) > 1
+    return years
 
 
-def collection_like_manual(value: str, rules: Mapping[str, Any]) -> bool:
+def single_year_range_covers_all_years(value: str, rules: Mapping[str, Any]) -> bool:
+    range_pattern = parser_pattern(rules, "year_range")
+    if not range_pattern:
+        return False
+    ranges = list(re.finditer(range_pattern, value, flags=re.IGNORECASE))
+    if len(ranges) != 1:
+        return False
+    all_years = _matched_years(value, rules)
+    range_years = _matched_years(ranges[0].group(0), rules)
+    return len(all_years) == 2 and len(range_years) == 2 and all_years == range_years
+
+
+def collection_like_manual(
+    value: str,
+    rules: Mapping[str, Any],
+    *,
+    allow_year_range: bool = False,
+) -> bool:
     normalized = fold(value)
     keywords = [re.escape(fold(str(item))) for item in rules.get("collection_keywords") or [] if fold(str(item))]
     if keywords and re.search(rf"\b(?:{'|'.join(keywords)})\b", normalized):
@@ -199,6 +245,8 @@ def collection_like_manual(value: str, rules: Mapping[str, Any]) -> bool:
     part_pattern = parser_pattern(rules, "collection_part")
     if part_pattern and re.search(part_pattern, normalized, flags=re.IGNORECASE):
         return True
+    if allow_year_range:
+        return False
     range_pattern = parser_pattern(rules, "year_range")
     return bool(range_pattern and re.search(range_pattern, value, flags=re.IGNORECASE))
 

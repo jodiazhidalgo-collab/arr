@@ -54,6 +54,7 @@ DEFAULT_POLICY: Dict[str, object] = {
         "early_stop_require_exact_movie_year": True,
         "direct_ids_bypass": True,
         "forced_bypass": True,
+        "prefer_oldest_exact_title_without_year": False,
     },
     "forced_validation": {
         "min_title_similarity": 0.92,

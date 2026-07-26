@@ -66,20 +66,58 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
                 ],
             ),
             _group(
+                "parser_series",
+                "Series y episodios",
+                "Formas humanas de reconocer temporadas, episodios y rangos de emision.",
+                [
+                    _control("parser.season_pack_markers", "tags", "Pack de temporada", "Marcas que convierten una temporada sin episodios en pack."),
+                    _control(
+                        "parser.season_number_words",
+                        "mapping_rules",
+                        "Numeros de temporada escritos",
+                        "Convierte palabras solo cuando acompañan a Temporada o Season.",
+                        format="palabra | numero",
+                    ),
+                    _control("parser.normalization.allow_tv_year_range", "toggle", "Permitir rango de años en series", "Un rango de emision no fuerza revision manual cuando el nombre ya contiene una señal clara de serie."),
+                    _control("parser.normalization.max_episode_range", "number", "Maximo intervalo de episodios", "0 no limita; un valor positivo limita y recorta intervalos mayores.", min=0, max=1000, step=1),
+                    *[
+                        _control(f"parser.patterns.{key}", "regex", label, help_text)
+                        for key, label, help_text in (
+                            ("series_sxe", "Serie SxxExx", "Temporada y episodio en formato SxxExx."),
+                            ("series_x", "Serie 1x02", "Temporada y episodio en formato 1x02."),
+                            ("explicit_season", "Temporada escrita", "Reconoce Temporada, Season, Temp, Sezon, expresiones como 1 série y miniseries."),
+                            ("season_pack", "Pack de temporada", "Temporada compacta en formato Sxx o Txx."),
+                            ("chapter", "Capítulo", "Capítulo simple o intervalo."),
+                            ("episode_word", "Episodio", "Texto Episodio o Episode seguido de número."),
+                        )
+                    ],
+                ],
+            ),
+            _group(
+                "parser_classification",
+                "Clasificación automática",
+                "Señales de vídeo usadas para decidir película o revisión manual cuando falta el año.",
+                [
+                    _control("parser.video_extensions", "tags", "Extensiones de vídeo", "Extensiones que aportan una señal audiovisual aunque falte el año."),
+                    _control("parser.video_markers", "tags", "Marcas de vídeo", "Calidades, fuentes y codecs que permiten reconocer una película sin año."),
+                    _control("parser.non_video_markers", "tags", "Marcas no audiovisuales", "Bloquean la clasificación automática de paquetes que no son películas ni series."),
+                    _control("parser.normalization.movie_without_year_from_video", "toggle", "Película sin año por señal de vídeo", "Permite clasificar una película sin año cuando existe una señal de vídeo y no hay señales de serie, colección o contenido no audiovisual."),
+                ],
+            ),
+            _group(
                 "parser_manual",
-                "Derivacion manual",
+                "Derivación manual",
                 "Barreras que evitan consultar TMDb para nombres no audiovisuales o colecciones.",
                 [
                     _control("parser.manual_keywords", "tags", "Palabras manuales", "Una coincidencia fuerza revision manual."),
                     _control("parser.manual_exact_names", "tags", "Nombres manuales exactos", "Titulos completos que no deben auto-clasificarse sin una categoria de origen fiable."),
                     _control("parser.collection_keywords", "tags", "Indicadores de coleccion", "Saga, pack o filmografia no se tratan como una sola obra."),
-                    _control("parser.season_pack_markers", "tags", "Pack de temporada", "Marcas que convierten una temporada sin episodios en pack."),
                 ],
             ),
             _group(
-                "parser_patterns",
-                "Patrones",
-                "Expresiones regulares compiladas y validadas antes de guardar.",
+                "parser_advanced_patterns",
+                "Patrones avanzados",
+                "Años, colecciones y limpieza especial mediante expresiones regulares validadas.",
                 [
                     _control("parser.year.pattern", "regex", "Año", "Patron con el año en el primer grupo capturado."),
                     _control("parser.year.min", "number", "Año minimo", "Primer año aceptado.", min=1800, max=2200, step=1),
@@ -98,12 +136,6 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
                     *[
                         _control(f"parser.patterns.{key}", "regex", label, help_text)
                         for key, label, help_text in (
-                            ("series_sxe", "Serie SxxExx", "Temporada y episodio en formato SxxExx."),
-                            ("series_x", "Serie 1x02", "Temporada y episodio en formato 1x02."),
-                            ("explicit_season", "Temporada explicita", "Texto Temporada o Season seguido de numero."),
-                            ("season_pack", "Pack Txx", "Temporada compacta en formato Txx."),
-                            ("chapter", "Capitulo", "Capitulo simple o intervalo."),
-                            ("episode_word", "Episodio", "Texto Episodio o Episode seguido de numero."),
                             ("collection_count", "Cantidad de peliculas", "Colecciones expresadas como numero de peliculas."),
                             ("collection_part", "Parte de coleccion", "Expresiones tipo parte 1 de 3."),
                             ("year_range", "Intervalo de años", "Intervalos que indican coleccion o filmografia."),
@@ -116,7 +148,7 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
             ),
             _group(
                 "parser_normalization",
-                "Normalizacion",
+                "Normalización",
                 "Orden de limpieza estable antes de producir candidatos.",
                 [
                     *[
@@ -131,24 +163,7 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
                             ("collapse_whitespace", "Compactar espacios", "Reduce espacios repetidos."),
                         )
                     ],
-                    _control(
-                        "parser.normalization.tail_noise_passes",
-                        "number",
-                        "Pasadas de ruido final",
-                        "Número máximo de capas de ruido final eliminadas.",
-                        min=1,
-                        max=100,
-                        step=1,
-                    ),
-                    _control(
-                        "parser.normalization.max_episode_range",
-                        "number",
-                        "Maximo intervalo de episodios",
-                        "0 no limita; un valor positivo limita y recorta intervalos mayores.",
-                        min=0,
-                        max=1000,
-                        step=1,
-                    ),
+                    _control("parser.normalization.tail_noise_passes", "number", "Pasadas de ruido final", "Número máximo de capas de ruido final eliminadas.", min=1, max=100, step=1),
                 ],
             ),
         ],
@@ -289,6 +304,7 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
                             ("early_stop_require_exact_movie_year", "Exigir año exacto", "El corte temprano de peliculas exige año exacto."),
                             ("direct_ids_bypass", "ID directo evita umbrales", "TMDb/IMDb confirmado no compite por score."),
                             ("forced_bypass", "Forzado evita umbrales", "Una regla forzada validada no compite por score."),
+                            ("prefer_oldest_exact_title_without_year", "Preferir la película más antigua", "Si varias películas sin año tienen título y puntuación exactamente iguales, elige la de estreno más antiguo sin saltarse la puntuación mínima."),
                         )
                     ],
                     _control("resolver.forced_validation.min_title_similarity", "decimal", "Similitud forzada", "Minimo para validar el titulo de una regla forzada.", min=0, max=1, step=0.01),

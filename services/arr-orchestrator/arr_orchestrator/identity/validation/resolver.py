@@ -354,9 +354,10 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         ),
     }
 
-    acceptance = expect_object(
-        resolver.get("acceptance"), "rules.resolver.acceptance"
+    acceptance = dict(
+        expect_object(resolver.get("acceptance"), "rules.resolver.acceptance")
     )
+    acceptance.setdefault("prefer_oldest_exact_title_without_year", True)
     exact_keys(
         acceptance,
         {
@@ -367,6 +368,7 @@ def normalize_resolver(value: object) -> Dict[str, object]:
             "early_stop_require_exact_movie_year",
             "direct_ids_bypass",
             "forced_bypass",
+            "prefer_oldest_exact_title_without_year",
         },
         "rules.resolver.acceptance",
     )
@@ -406,6 +408,10 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         "forced_bypass": boolean(
             acceptance.get("forced_bypass"),
             "rules.resolver.acceptance.forced_bypass",
+        ),
+        "prefer_oldest_exact_title_without_year": boolean(
+            acceptance.get("prefer_oldest_exact_title_without_year"),
+            "rules.resolver.acceptance.prefer_oldest_exact_title_without_year",
         ),
     }
 

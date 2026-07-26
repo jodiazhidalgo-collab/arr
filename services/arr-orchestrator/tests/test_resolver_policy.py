@@ -26,6 +26,9 @@ class ResolverPolicyTests(unittest.TestCase):
         self.assertEqual(policy["search_limits"]["max_searches"], 8)
         self.assertEqual(policy["acceptance"]["min_score"], 75)
         self.assertEqual(policy["acceptance"]["min_margin"], 12)
+        self.assertFalse(
+            policy["acceptance"]["prefer_oldest_exact_title_without_year"]
+        )
         self.assertEqual(policy["cache"]["ttl_seconds"], 30 * 24 * 3600)
 
     def test_new_identity_document_controls_every_resolver_block(self):
@@ -41,7 +44,11 @@ class ResolverPolicyTests(unittest.TestCase):
                     "aliases": {"movies": ["origen | destino"], "tv": []},
                     "forced_matches": {"movies": ["titulo | 2024 | 10"], "tv": []},
                     "search_limits": {"max_searches": 4},
-                    "acceptance": {"min_score": 60, "min_margin": 7},
+                    "acceptance": {
+                        "min_score": 60,
+                        "min_margin": 7,
+                        "prefer_oldest_exact_title_without_year": True,
+                    },
                     "cache": {"enabled": False, "ttl_seconds": 90},
                 },
             },
@@ -58,6 +65,9 @@ class ResolverPolicyTests(unittest.TestCase):
         self.assertEqual(policy["search_limits"]["detail_candidates"], 3)
         self.assertEqual(policy["acceptance"]["min_score"], 60)
         self.assertEqual(policy["acceptance"]["min_margin"], 7)
+        self.assertTrue(
+            policy["acceptance"]["prefer_oldest_exact_title_without_year"]
+        )
         self.assertFalse(policy["cache"]["enabled"])
         self.assertEqual(policy["parser"]["site_words"], ["ejemplo"])
 
@@ -227,6 +237,20 @@ class ResolverPolicyTests(unittest.TestCase):
             controls["resolver.original_language_preference.language"]["label"],
             "Idioma original preferido",
         )
+
+    def test_oldest_exact_title_preference_has_one_acceptance_toggle(self):
+        schema = identity_settings_schema()
+        matches = [
+            (group["title"], control)
+            for group in schema["resolver"]["groups"]
+            for control in group["controls"]
+            if control["path"]
+            == "resolver.acceptance.prefer_oldest_exact_title_without_year"
+        ]
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0][0], "Aceptacion y validacion")
+        self.assertEqual(matches[0][1]["type"], "toggle")
 
     def test_zero_and_decimal_weights_keep_an_exact_additive_breakdown(self):
         candidate = ResolverCandidate(8, "movie", "Titulo parcial", "", 2024, ["Titulo parcial"])

@@ -23,8 +23,15 @@ from .common import (
 
 
 def normalize_parser(value: object) -> Dict[str, object]:
-    parser = expect_object(value, "rules.parser")
+    parser = dict(expect_object(value, "rules.parser"))
     defaults = factory_parser_rules()
+    for key in (
+        "video_extensions",
+        "video_markers",
+        "non_video_markers",
+        "season_number_words",
+    ):
+        parser.setdefault(key, defaults[key])
     exact_keys(parser, set(defaults), "rules.parser")
 
     year = expect_object(parser.get("year"), "rules.parser.year")
@@ -38,10 +45,12 @@ def normalize_parser(value: object) -> Dict[str, object]:
     pattern_keys = list(defaults["patterns"])
     exact_keys(patterns, set(pattern_keys), "rules.parser.patterns")
 
-    normalization = expect_object(
-        parser.get("normalization"), "rules.parser.normalization"
+    normalization = dict(
+        expect_object(parser.get("normalization"), "rules.parser.normalization")
     )
-    normalization_defaults = defaults["normalization"]
+    normalization_defaults = dict(defaults["normalization"])
+    for key in ("movie_without_year_from_video", "allow_tv_year_range"):
+        normalization.setdefault(key, normalization_defaults[key])
     exact_keys(
         normalization,
         set(normalization_defaults),
@@ -101,6 +110,26 @@ def normalize_parser(value: object) -> Dict[str, object]:
         "ocr_replacements": ocr_replacements(
             parser.get("ocr_replacements"), "rules.parser.ocr_replacements"
         ),
+        "video_extensions": string_list(
+            parser.get("video_extensions"),
+            "rules.parser.video_extensions",
+            lowercase=True,
+            validator=EXTENSION_RE,
+        ),
+        "video_markers": string_list(
+            parser.get("video_markers"),
+            "rules.parser.video_markers",
+            lowercase=True,
+        ),
+        "non_video_markers": string_list(
+            parser.get("non_video_markers"),
+            "rules.parser.non_video_markers",
+            lowercase=True,
+        ),
+        "season_number_words": _season_number_words(
+            parser.get("season_number_words"),
+            "rules.parser.season_number_words",
+        ),
         "manual_keywords": string_list(
             parser.get("manual_keywords"),
             "rules.parser.manual_keywords",
@@ -136,6 +165,43 @@ def normalize_parser(value: object) -> Dict[str, object]:
         },
         "normalization": normalized_normalization,
     }
+    return normalized
+
+
+def _season_number_words(value: object, label: str) -> list[str]:
+    items = string_list(value, label, lowercase=True)
+    normalized: list[str] = []
+    numbers_by_word: Dict[str, int] = {}
+    for index, item in enumerate(items):
+        parts = [part.strip() for part in item.split("|")]
+        item_label = f"{label}[{index}]"
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            raise IdentityRulesValidationError(
+                f"{item_label} debe usar el formato palabra | numero."
+            )
+        word, raw_number = parts
+        if not re.fullmatch(r"[^\W\d_]+(?:[ '-][^\W\d_]+)*", word, re.UNICODE):
+            raise IdentityRulesValidationError(
+                f"{item_label} debe comenzar por una palabra valida."
+            )
+        try:
+            number_value = int(raw_number)
+        except (TypeError, ValueError):
+            raise IdentityRulesValidationError(
+                f"{item_label} debe terminar en un numero entero."
+            ) from None
+        if not 0 <= number_value <= 99:
+            raise IdentityRulesValidationError(
+                f"{item_label} debe terminar en un numero entre 0 y 99."
+            )
+        previous = numbers_by_word.get(word)
+        if previous is not None and previous != number_value:
+            raise IdentityRulesValidationError(
+                f"{item_label} contradice otra regla para {word}."
+            )
+        if previous is None:
+            numbers_by_word[word] = number_value
+            normalized.append(f"{word} | {number_value}")
     return normalized
 
 

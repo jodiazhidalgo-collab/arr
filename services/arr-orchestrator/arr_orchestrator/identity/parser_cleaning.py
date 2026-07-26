@@ -10,7 +10,7 @@ from .parser_trace import ParserTrace
 def preclean(value: str, rules: Mapping[str, Any], trace: Optional[ParserTrace] = None) -> str:
     normalization = _normalization(rules)
     original = str(value or "")
-    text = Path(original).name.strip()
+    text = release_leaf_name(original, rules).strip()
     _record(trace, "clean.basename", original, text)
 
     suffix = Path(text).suffix.lower()
@@ -36,6 +36,7 @@ def preclean(value: str, rules: Mapping[str, Any], trace: Optional[ParserTrace] 
         text = _sub(trace, "clean.dashes", r"[–—]+", "-", text)
     if normalization.get("normalize_ocr", True):
         text = normalize_release_ocr_tokens(text, rules, trace, "clean.ocr.initial")
+    text = normalize_season_number_words(text, rules, trace)
 
     tlds = "|".join(re.escape(str(item)) for item in rules.get("domain_tlds") or [] if str(item))
     if tlds:
@@ -85,7 +86,7 @@ def preclean(value: str, rules: Mapping[str, Any], trace: Optional[ParserTrace] 
     text = _sub(
         trace,
         "clean.word_number_spacing",
-        r"(?i)\b(temporada|season|capitulo|capítulo|episode|episodio|cap)\s*([0-9])",
+        r"(?i)\b(temporada|season|temp|sezon|capitulo|capítulo|episode|episodio|cap)\s*([0-9])",
         r"\1 \2",
         text,
     )
@@ -106,6 +107,68 @@ def preclean(value: str, rules: Mapping[str, Any], trace: Optional[ParserTrace] 
     return text
 
 
+def release_leaf_name(value: str, rules: Mapping[str, Any]) -> str:
+    """Quita una ruta real sin confundir separadores internos del release.
+
+    Los nombres de torrent pueden contener ``Titulo / Original`` o cadenas de
+    idiomas como ``CZ/SK/EN``. Solo una ruta absoluta/explicita, o una relativa
+    terminada en una extension conocida, se reduce a su ultimo componente.
+    """
+
+    text = str(value or "").strip()
+    if not text or not re.search(r"[\\/]", text):
+        return text
+
+    absolute_or_explicit = bool(
+        re.match(r"^(?:[a-zA-Z]:[\\/]|[/\\]{2}|[/\\]|\.{1,2}[\\/])", text)
+    )
+    relative_known_extension = _has_known_final_extension(text, rules)
+    release_separator = re.search(r"\s/\s", text)
+    language_chain = re.search(
+        r"(?i)(?:^|[\s._/\-\[(])(?:[a-z]{2,3}/){1,}[a-z]{2,3}(?=$|[\s._\-\])])",
+        text,
+    )
+    protected_release_separator = bool(
+        release_separator and not _path_separator_before(text, release_separator.start())
+    )
+    protected_language_chain = bool(
+        language_chain and not _path_separator_before(text, language_chain.start())
+    )
+    if not absolute_or_explicit and (
+        not relative_known_extension
+        or protected_release_separator
+        or protected_language_chain
+    ):
+        return text
+
+    return re.split(r"[\\/]", text.rstrip("\\/"))[-1]
+
+
+def normalize_season_number_words(
+    text: str,
+    rules: Mapping[str, Any],
+    trace: Optional[ParserTrace] = None,
+) -> str:
+    current = text
+    entries = []
+    for item in rules.get("season_number_words") or []:
+        word, separator, raw_number = str(item or "").partition("|")
+        word = word.strip()
+        raw_number = raw_number.strip()
+        if not separator or not word or not raw_number.isdigit():
+            continue
+        entries.append((word, int(raw_number)))
+    for word, number in sorted(entries, key=lambda entry: len(entry[0]), reverse=True):
+        before = current
+        current = re.sub(
+            rf"(?i)(?<![a-z0-9])(temporada|season|temp|sezon)([\s._-]+){re.escape(word)}\b",
+            lambda match: f"{match.group(1)} {number}",
+            current,
+        )
+        _record(trace, f"clean.season_number_word:{word}", before, current)
+    return current
+
+
 def normalize_release_ocr_tokens(
     text: str,
     rules: Mapping[str, Any],
@@ -122,6 +185,17 @@ def normalize_release_ocr_tokens(
         target = str(replacement.get("replacement") or "")
         current = _sub(trace, f"{rule_prefix}.{index}", pattern, target, current, flags=re.IGNORECASE)
     return current
+
+
+def _has_known_final_extension(text: str, rules: Mapping[str, Any]) -> bool:
+    final_component = re.split(r"[\\/]", text.rstrip("\\/"))[-1]
+    suffix = Path(final_component).suffix.lower()
+    extensions = {str(item or "").strip().lower() for item in rules.get("extensions") or []}
+    return bool(suffix and suffix in extensions)
+
+
+def _path_separator_before(text: str, index: int) -> bool:
+    return bool(re.search(r"[\\/]", text[:index]))
 
 
 def smart_title(value: str, rules: Optional[Mapping[str, Any]] = None) -> str:

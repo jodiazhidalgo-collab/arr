@@ -97,6 +97,14 @@ class NameResolverTests(unittest.TestCase):
         (input_root / name).write_bytes(b"movie")
         return input_root
 
+    @staticmethod
+    def oldest_exact_title_rules(enabled=True):
+        rules = factory_identity_rules()
+        rules["resolver"]["acceptance"][
+            "prefer_oldest_exact_title_without_year"
+        ] = enabled
+        return rules
+
     def test_preview_turns_tmdb_401_into_safe_json_error(self):
         resolver, _ = self.resolver(
             {"/search/movie": FakeResponse({"token": "must-not-leak"}, status_code=401)}
@@ -305,6 +313,258 @@ class NameResolverTests(unittest.TestCase):
         self.assertFalse(
             payload["decision"]["original_language_preference"]["applied"]
         )
+
+    def test_oldest_exact_movie_without_year_is_selected_and_reserved_for_details(self):
+        recent = movie_payload(1, "El objetivo", "El objetivo", 2024, "es")
+        middle = movie_payload(2, "El objetivo", "El objetivo", 2010, "es")
+        discarded_top = movie_payload(3, "El objetivo", "El objetivo", 2000, "es")
+        oldest = movie_payload(4, "El objetivo", "El objetivo", 1980, "es")
+        resolver, session = self.resolver(
+            {
+                "/search/movie": {"results": [recent, middle, discarded_top, oldest]},
+                "/movie/1": recent,
+                "/movie/4": oldest,
+            }
+        )
+        rules = self.oldest_exact_title_rules()
+        rules["resolver"]["search_limits"]["initial_candidates"] = 2
+        rules["resolver"]["search_limits"]["detail_candidates"] = 2
+
+        payload = resolver.preview(
+            "El objetivo",
+            "movies",
+            rules,
+        )
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 4)
+        self.assertEqual([item["tmdb_id"] for item in payload["candidates"]], [4, 1])
+        self.assertFalse(payload["decision"]["margin_passed"])
+        self.assertEqual(
+            payload["decision"]["oldest_exact_title_preference"],
+            {
+                "applied": True,
+                "enabled": True,
+                "selected_year": 1980,
+                "reason_code": "oldest_exact_title_without_year",
+            },
+        )
+        detail_paths = [call[0].split("/3", 1)[1] for call in session.calls]
+        self.assertIn("/movie/4", detail_paths)
+        self.assertNotIn("/movie/2", detail_paths)
+        self.assertNotIn("/movie/3", detail_paths)
+
+    def test_oldest_preference_requires_a_real_score_tie(self):
+        recent = movie_payload(1, "El objetivo", "El objetivo", 2024, "es")
+        oldest = movie_payload(2, "El objetivo", "El objetivo", 1980, "es")
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [recent, oldest]},
+                "/movie/1": recent,
+                "/movie/2": oldest,
+            }
+        )
+        rules = self.oldest_exact_title_rules()
+        original_rank = resolver._rank_candidates
+
+        def rank_with_one_point_advantage(candidates, guessed, evidence, direct_identity):
+            ranked = original_rank(candidates, guessed, evidence, direct_identity)
+            for candidate in ranked:
+                candidate.score = 105 if candidate.tmdb_id == 1 else 104
+            return sorted(ranked, key=lambda candidate: candidate.score, reverse=True)
+
+        with patch.object(
+            NameResolver,
+            "_rank_candidates",
+            side_effect=rank_with_one_point_advantage,
+        ):
+            payload = resolver.preview("El objetivo", "movies", rules)
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(payload["decision"]["margin"], 1)
+        self.assertFalse(
+            payload["decision"]["oldest_exact_title_preference"]["applied"]
+        )
+
+    def test_oldest_preference_rejects_other_candidate_inside_margin_zone(self):
+        recent = movie_payload(1, "El objetivo", "El objetivo", 2024, "es")
+        oldest = movie_payload(2, "El objetivo", "El objetivo", 1980, "es")
+        nearby = movie_payload(3, "El objetivo final", "El objetivo final", 2000, "es")
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [recent, oldest, nearby]},
+                "/movie/1": recent,
+                "/movie/2": oldest,
+                "/movie/3": nearby,
+            }
+        )
+        rules = self.oldest_exact_title_rules()
+        original_rank = resolver._rank_candidates
+
+        def rank_with_nearby_ambiguity(candidates, guessed, evidence, direct_identity):
+            ranked = original_rank(candidates, guessed, evidence, direct_identity)
+            scores = {1: 100, 2: 100, 3: 95}
+            for candidate in ranked:
+                candidate.score = scores[candidate.tmdb_id]
+            return sorted(ranked, key=lambda candidate: candidate.score, reverse=True)
+
+        with patch.object(
+            NameResolver,
+            "_rank_candidates",
+            side_effect=rank_with_nearby_ambiguity,
+        ):
+            payload = resolver.preview("El objetivo", "movies", rules)
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(payload["decision"]["score"], 100)
+        self.assertEqual(payload["decision"]["second_score"], 100)
+        self.assertFalse(
+            payload["decision"]["oldest_exact_title_preference"]["applied"]
+        )
+
+    def test_original_language_preference_keeps_priority_over_oldest_movie(self):
+        oldest_french = movie_payload(1, "La señal", "Le Signal", 1950, "fr")
+        newer_english = movie_payload(2, "La señal", "The Signal", 2020, "en")
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [oldest_french, newer_english]},
+                "/movie/1": oldest_french,
+                "/movie/2": newer_english,
+            }
+        )
+
+        payload = resolver.preview(
+            "La señal",
+            "movies",
+            self.oldest_exact_title_rules(),
+        )
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 2)
+        self.assertTrue(
+            payload["decision"]["original_language_preference"]["applied"]
+        )
+        self.assertEqual(
+            payload["decision"]["oldest_exact_title_preference"],
+            {
+                "applied": False,
+                "enabled": True,
+                "selected_year": None,
+                "reason_code": None,
+            },
+        )
+
+    def test_oldest_preference_disabled_keeps_exact_movie_ambiguity(self):
+        recent = movie_payload(1, "El objetivo", "El objetivo", 2024, "es")
+        oldest = movie_payload(2, "El objetivo", "El objetivo", 1980, "es")
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [recent, oldest]},
+                "/movie/1": recent,
+                "/movie/2": oldest,
+            }
+        )
+
+        payload = resolver.preview(
+            "El objetivo",
+            "movies",
+            self.oldest_exact_title_rules(enabled=False),
+        )
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(
+            payload["decision"]["oldest_exact_title_preference"]["enabled"],
+            False,
+        )
+        self.assertFalse(
+            payload["decision"]["oldest_exact_title_preference"]["applied"]
+        )
+
+    def test_oldest_preference_does_not_apply_when_input_has_year(self):
+        recent = movie_payload(1, "El objetivo", "El objetivo", 2024, "es")
+        oldest = movie_payload(2, "El objetivo", "El objetivo", 1980, "es")
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [recent, oldest]},
+                "/movie/1": recent,
+                "/movie/2": oldest,
+            }
+        )
+        rules = self.oldest_exact_title_rules()
+        rules["resolver"]["acceptance"]["min_score"] = 0
+        rules["resolver"]["acceptance"]["min_margin"] = 100
+
+        payload = resolver.preview("El objetivo 2024", "movies", rules)
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertFalse(
+            payload["decision"]["oldest_exact_title_preference"]["applied"]
+        )
+
+    def test_equal_oldest_year_keeps_exact_movie_ambiguity(self):
+        first_oldest = movie_payload(1, "El objetivo", "El objetivo", 1980, "es")
+        second_oldest = movie_payload(2, "El objetivo", "El objetivo", 1980, "es")
+        recent = movie_payload(3, "El objetivo", "El objetivo", 2024, "es")
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [first_oldest, second_oldest, recent]},
+                "/movie/1": first_oldest,
+                "/movie/2": second_oldest,
+                "/movie/3": recent,
+            }
+        )
+
+        payload = resolver.preview(
+            "El objetivo",
+            "movies",
+            self.oldest_exact_title_rules(),
+        )
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertFalse(
+            payload["decision"]["oldest_exact_title_preference"]["applied"]
+        )
+
+    def test_oldest_reservation_never_evicts_a_non_exact_ambiguity(self):
+        exact_recent = movie_payload(1, "Objetivo", "Objetivo", 2024, "es")
+        non_exact = movie_payload(2, "Objetivo final", "Objetivo final", 2020, "es")
+        exact_middle = movie_payload(3, "Objetivo", "Objetivo", 2000, "es")
+        exact_oldest = movie_payload(4, "Objetivo", "Objetivo", 1980, "es")
+        resolver, session = self.resolver(
+            {
+                "/search/movie": {
+                    "results": [exact_recent, non_exact, exact_middle, exact_oldest]
+                },
+                "/movie/1": exact_recent,
+                "/movie/2": non_exact,
+                "/movie/3": exact_middle,
+            }
+        )
+        rules = self.oldest_exact_title_rules()
+        rules["resolver"]["acceptance"]["min_score"] = 0
+        rules["resolver"]["acceptance"]["min_margin"] = 100
+        for key in (
+            "title_exact",
+            "title_similarity_max",
+            "token_overlap_max",
+            "parser_exact",
+            "parser_near",
+            "origin_evidence",
+        ):
+            rules["resolver"]["scoring"][key] = 0
+
+        payload = resolver.preview("Objetivo", "movies", rules)
+
+        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(
+            [item["tmdb_id"] for item in payload["candidates"]],
+            [1, 2, 3],
+        )
+        self.assertFalse(
+            payload["decision"]["oldest_exact_title_preference"]["applied"]
+        )
+        detail_paths = [call[0].split("/3", 1)[1] for call in session.calls]
+        self.assertNotIn("/movie/4", detail_paths)
 
     def test_preview_preserves_zero_min_score_when_classifying_rejection(self):
         resolver, _ = self.resolver({})

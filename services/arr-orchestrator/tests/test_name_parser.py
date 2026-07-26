@@ -11,6 +11,36 @@ from arr_orchestrator.name_parser import (
 
 
 class NameParserTests(unittest.TestCase):
+    def test_real_paths_use_only_the_final_component(self):
+        samples = (
+            "/downloads/releases/Movie.Name.2024.mkv",
+            r"C:\Downloads\releases\Movie.Name.2024.mkv",
+            r"\\server\share\Movie.Name.2024.mkv",
+            "downloads/releases/Movie.Name.2024.mkv",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                parsed = parse_release_name(sample)
+                self.assertEqual(parsed.display_title, "Movie Name")
+
+    def test_internal_release_slashes_are_not_treated_as_paths(self):
+        bilingual = parse_release_name("Titulo / Original.Title.2024.1080p.mkv")
+        languages = parse_release_name("Titulo.CZ/SK/EN.2024.1080p.mkv")
+        prefixed_languages = parse_release_name("Titulo/CZ/SK/EN.Movie.2024.mkv")
+        mixed_path = parse_release_name(
+            "downloads/releases/Titulo / Original.Title.2024.mkv"
+        )
+
+        self.assertEqual(bilingual.display_title, "Titulo")
+        self.assertEqual(
+            bilingual.title_candidates,
+            ["Titulo", "Original Title", "Titulo / Original Title"],
+        )
+        self.assertEqual(languages.display_title, "Titulo CZ/SK/EN")
+        self.assertEqual(prefixed_languages.display_title, "Titulo/CZ/SK/EN Movie")
+        self.assertEqual(mixed_path.display_title, "Original Title")
+        self.assertEqual(mixed_path.title_candidates, ["Original Title"])
+
     def test_s03_e53_is_tv(self):
         parsed = parse_release_name("La reina del flow S03 E53 (2026) NETFLIX.mkv")
         self.assertEqual(parsed.media_hint, "tv")
@@ -47,11 +77,170 @@ class NameParserTests(unittest.TestCase):
         self.assertEqual(parsed.media_hint, "tv")
         self.assertEqual(parsed.season_pack, 6)
 
+    def test_supported_compact_tv_patterns(self):
+        samples = (
+            ("Serie.S01.1080p.mkv", 1, []),
+            ("Serie.S01E02.1080p.mkv", 1, [2]),
+            ("Serie.1x02.1080p.mkv", 1, [2]),
+            ("Serie.01E09.1080p.mkv", 1, [9]),
+            ("Serie.Temporada.2.1080p.mkv", 2, []),
+            ("Serie.Season.2.1080p.mkv", 2, []),
+            ("Serie.Temp.2.1080p.mkv", 2, []),
+            ("Serie.Sezon.2.1080p.mkv", 2, []),
+        )
+        for name, season, episodes in samples:
+            with self.subTest(name=name):
+                parsed = parse_release_name(name)
+                self.assertEqual(parsed.media_hint, "tv")
+                self.assertEqual(parsed.season, season)
+                self.assertEqual(parsed.episodes, episodes)
+
+    def test_configurable_written_season_numbers(self):
+        samples = (
+            ("Serie Temporada uno 1080p.mkv", 1),
+            ("Serie Season two 1080p.mkv", 2),
+            ("Serie Temp tercera 1080p.mkv", 3),
+            ("Serie Sezon fourth 1080p.mkv", 4),
+        )
+        for name, season in samples:
+            with self.subTest(name=name):
+                parsed = parse_release_name(name)
+                self.assertEqual(parsed.media_hint, "tv")
+                self.assertEqual(parsed.season, season)
+                self.assertNotRegex(parsed.display_title, r"(?i)temporada|season|temp|sezon")
+
+        custom = parse_release_name(
+            "Serie Temp once.mkv",
+            rules={"season_number_words": ["once | 11"]},
+        )
+        self.assertEqual(custom.season, 11)
+
+        underscored = parse_release_name("Serie_Temporada_Uno.mkv")
+        self.assertEqual(underscored.media_hint, "tv")
+        self.assertEqual(underscored.season, 1)
+        self.assertEqual(underscored.display_title, "Serie")
+
+    def test_numeric_serie_and_miniseries_with_year_range_are_tv(self):
+        numbered = parse_release_name("Spartacus House of Ashur 1 série 2025-2026.mkv")
+        miniseries = parse_release_name(
+            "Spartacus House of Ashur 2025-2026 Miniserial WEB-DL"
+        )
+
+        self.assertEqual(numbered.media_hint, "tv")
+        self.assertEqual(numbered.season, 1)
+        self.assertEqual(miniseries.media_hint, "tv")
+        self.assertIsNone(miniseries.season)
+
     def test_movie_with_year(self):
         parsed = parse_release_name("Erase Una Vez En... Hollywood (2019).mkv")
         self.assertEqual(parsed.media_hint, "movies")
         self.assertEqual(parsed.year, 2019)
         self.assertEqual(parsed.display_title, "Erase Una Vez En Hollywood")
+
+    def test_movie_without_year_accepts_video_extension_or_strong_marker(self):
+        by_extension = parse_release_name("Una pelicula sin fecha.mkv")
+        by_marker = parse_release_name("Una pelicula sin fecha WEB-DL x265")
+
+        self.assertEqual(by_extension.media_hint, "movies")
+        self.assertEqual(by_marker.media_hint, "movies")
+
+    def test_movie_without_year_rejects_weak_or_non_video_evidence(self):
+        weak_samples = (
+            "Titulo sin fecha 1080p",
+            "Titulo sin fecha 4K Spanish AAC",
+            "Titulo sin fecha Castellano AC3",
+        )
+        for name in weak_samples:
+            with self.subTest(name=name):
+                self.assertEqual(parse_release_name(name).media_hint, "manual")
+
+        blocked_samples = (
+            "Mi Videojuego WEB-DL x265.mkv",
+            "Grandes PC Games WEB-DL x265.mkv",
+            "Coleccion de clasicos WEB-DL x265.mkv",
+            "Saga completa WEB-DL x265.mkv",
+        )
+        for name in blocked_samples:
+            with self.subTest(name=name):
+                self.assertEqual(parse_release_name(name).media_hint, "manual")
+
+        self.assertEqual(
+            parse_release_name("4KUHDrip-Recuperado.jpg [4KUHDrip]").media_hint,
+            "manual",
+        )
+
+    def test_common_video_sources_without_year_are_strong_and_clean(self):
+        samples = (
+            "Pelicula UHDmicro Spanish",
+            "Pelicula 4KUHDremux Spanish",
+            "Pelicula FullUHD 2160p Spanish",
+            "Pelicula HDRip Ac3 Spanish",
+            "Pelicula DVD-Screener Spanish",
+            "Pelicula 3D SBS Spanish",
+            "Pelicula (1080p mkv) Spanish",
+        )
+        for name in samples:
+            with self.subTest(name=name):
+                parsed = parse_release_name(name)
+                self.assertEqual(parsed.media_hint, "movies")
+                self.assertEqual(parsed.display_title, "Pelicula")
+
+    def test_platform_markers_override_video_looking_game_releases(self):
+        samples = (
+            "Resident Evil 5 PCDVD DVD-Screener",
+            "Resident Evil 4 PS2 DVD-Screener",
+            "Resident Evil Xbox360 HDRip",
+            "Resident Evil Wii BluRayRip",
+        )
+        for name in samples:
+            with self.subTest(name=name):
+                self.assertEqual(parse_release_name(name).media_hint, "manual")
+
+    def test_game_words_inside_real_titles_are_not_global_vetoes(self):
+        parsed = parse_release_name("Juego.de.tronos.S01E01.mkv")
+        movie = parse_release_name("The.Game.1997.mkv")
+        nintendo_tv = parse_release_name("Nintendo.S01E01.mkv")
+        nintendo_movie = parse_release_name("Nintendo.2024.mkv")
+        nintendo_game = parse_release_name("Nintendo.WEB-DL.x265")
+
+        self.assertEqual(parsed.media_hint, "tv")
+        self.assertEqual(movie.media_hint, "movies")
+        self.assertEqual(nintendo_tv.media_hint, "tv")
+        self.assertEqual(nintendo_movie.media_hint, "movies")
+        self.assertEqual(nintendo_game.media_hint, "manual")
+
+    def test_video_heuristic_does_not_conflict_with_explicit_tv(self):
+        decision = decide_media("Serie sin patron WEB-DL x265.mkv", "tv")
+
+        self.assertEqual(decision.media_type, "tv")
+        self.assertIsNone(decision.block_reason)
+        self.assertTrue(decision.allow_external_lookup)
+
+    def test_tv_year_range_skips_only_year_barriers(self):
+        allowed = parse_release_name(
+            "Serie.S01.2010-2020.1080p.mkv",
+            rules={"year": {"multiple": "manual"}},
+        )
+        collection = parse_release_name("Serie.S01.Saga.2010-2020.1080p.mkv")
+        unrelated_years = parse_release_name(
+            "Serie.S01.1999.2024.mkv",
+            rules={"year": {"multiple": "manual"}},
+        )
+        extra_year = parse_release_name(
+            "Serie.S01.2010-2020.2024.mkv",
+            rules={"year": {"multiple": "manual"}},
+        )
+        second_range = parse_release_name(
+            "Serie.S01.2010-2020.2021-2022.mkv",
+            rules={"year": {"multiple": "manual"}},
+        )
+
+        self.assertEqual(allowed.media_hint, "tv")
+        self.assertEqual(allowed.season, 1)
+        self.assertEqual(collection.media_hint, "manual")
+        self.assertEqual(unrelated_years.media_hint, "manual")
+        self.assertEqual(extra_year.media_hint, "manual")
+        self.assertEqual(second_range.media_hint, "manual")
 
     def test_bilingual_title_candidates(self):
         parsed = parse_release_name("Red One (Código Traje Rojo) (2024) cast.mp4")

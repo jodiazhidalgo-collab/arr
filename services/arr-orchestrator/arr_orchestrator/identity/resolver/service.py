@@ -62,6 +62,7 @@ from .text import (
 
 
 MIN_HTTP_TIMEOUT_MS = 100
+SCORE_TIE_EPSILON = 1e-9
 
 
 class NameResolver:
@@ -248,6 +249,23 @@ class NameResolver:
             normal_margin_passed=normal_margin >= min_margin,
             preference=rules.get("original_language_preference"),
         )
+        oldest_preference_enabled = bool(
+            acceptance.get("prefer_oldest_exact_title_without_year", False)
+        )
+        oldest_preference_applied = False
+        if not preference_applied:
+            ranked, oldest_preference_applied = _prefer_oldest_exact_title_movie_candidate(
+                ranked,
+                media_type=media_type,
+                source=source,
+                guessed=guessed,
+                min_score=min_score,
+                min_margin=min_margin,
+                normal_score_passed=normal_top.score >= min_score,
+                normal_margin_passed=normal_margin >= min_margin,
+                enabled=oldest_preference_enabled,
+                search_selection=self._trace.get("oldest_exact_title_search"),
+            )
         top = ranked[0]
         second_score = ranked[1].score if len(ranked) > 1 else 0.0
         margin = top.score - second_score
@@ -266,9 +284,20 @@ class NameResolver:
             "language": preference_language,
             "selected_original_language": top.original_language or None,
         }
+        oldest_preference_decision = {
+            "applied": oldest_preference_applied,
+            "enabled": oldest_preference_enabled,
+            "selected_year": top.year if oldest_preference_applied else None,
+            "reason_code": (
+                "oldest_exact_title_without_year" if oldest_preference_applied else None
+            ),
+        }
         decision_status = (
             "ACCEPTED"
-            if bypass or (score_passed and margin_passed) or preference_applied
+            if bypass
+            or (score_passed and margin_passed)
+            or preference_applied
+            or oldest_preference_applied
             else "REJECTED_SCORE"
             if not score_passed
             else "REJECTED_MARGIN"
@@ -288,9 +317,13 @@ class NameResolver:
             "min_margin": min_margin,
             "margin_passed": margin_passed,
             "original_language_preference": preference_decision,
+            "oldest_exact_title_preference": oldest_preference_decision,
         }
-        if not bypass and not preference_applied and (
-            top.score < min_score or margin < min_margin
+        if (
+            not bypass
+            and not preference_applied
+            and not oldest_preference_applied
+            and (top.score < min_score or margin < min_margin)
         ):
             raise ResolverAmbiguous(
                 "La identidad no supera el umbral de seguridad",
@@ -515,6 +548,7 @@ class NameResolver:
             self._get,
             self._details,
             self._rank_candidates,
+            selection_trace=self._trace,
         )
 
     def _find_imdb(
@@ -639,3 +673,69 @@ def _prefer_original_language_candidate(
 
 def _base_language(value: str) -> str:
     return str(value or "").strip().split("-", 1)[0].casefold()
+
+
+def _prefer_oldest_exact_title_movie_candidate(
+    ranked: Sequence[ResolverCandidate],
+    *,
+    media_type: str,
+    source: str,
+    guessed: Dict[str, object],
+    min_score: float,
+    min_margin: float,
+    normal_score_passed: bool,
+    normal_margin_passed: bool,
+    enabled: bool,
+    search_selection: object,
+) -> Tuple[List[ResolverCandidate], bool]:
+    """Promueve el unico año minimo solo en una ambiguedad exacta y comprobada."""
+
+    ordered = list(ranked)
+    selection = search_selection if isinstance(search_selection, dict) else {}
+    expected_tmdb_id = _as_int(selection.get("tmdb_id"))
+    if (
+        len(ordered) < 2
+        or media_type != "movie"
+        or source != "search"
+        or not enabled
+        or _as_int(guessed.get("year")) is not None
+        or not normal_score_passed
+        or normal_margin_passed
+        or abs(ordered[0].score - ordered[1].score) > SCORE_TIE_EPSILON
+        or selection.get("eligible") is not True
+        or expected_tmdb_id is None
+    ):
+        return ordered, False
+
+    best_score = ordered[0].score
+    ambiguous = [
+        candidate
+        for candidate in ordered
+        if candidate.score >= min_score
+        and best_score - candidate.score < min_margin
+    ]
+    query_normalized = _normalize_title(str(guessed.get("title") or ""))
+    if (
+        len(ambiguous) < 2
+        or not query_normalized
+        or any(
+            abs(best_score - candidate.score) > SCORE_TIE_EPSILON
+            for candidate in ambiguous
+        )
+        or any(
+            _normalize_title(candidate.title) != query_normalized
+            for candidate in ambiguous
+        )
+        or any(candidate.year is None for candidate in ambiguous)
+    ):
+        return ordered, False
+
+    oldest_year = min(
+        int(candidate.year) for candidate in ambiguous if candidate.year is not None
+    )
+    oldest = [candidate for candidate in ambiguous if candidate.year == oldest_year]
+    if len(oldest) != 1 or oldest[0].tmdb_id != expected_tmdb_id:
+        return ordered, False
+
+    selected = oldest[0]
+    return [selected, *(candidate for candidate in ordered if candidate is not selected)], True

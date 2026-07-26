@@ -211,6 +211,45 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             ["ACEPTADA", "idioma original inglés", "grupo ambiguo", "RESUELTO POR IDIOMA"].forEach(text => requireText(acceptedByLanguage, text));
             rejectText(acceptedByLanguage, "RECHAZADA POR EMPATE");
 
+            const acceptedByOldest = render({
+              status: "ACCEPTED", ok: true,
+              decision: decision("ACCEPTED", {
+                score: 125, min_score: 75, score_passed: true,
+                second_score: 125, has_second_candidate: true,
+                margin: 0, min_margin: 12, margin_passed: false,
+                oldest_exact_title_preference: {
+                  applied: true, enabled: true, selected_year: 1979,
+                  reason_code: "oldest_exact_title_without_year"
+                }
+              }),
+              candidates: [
+                { ...candidate, year: 1979, score: 125 },
+                { ...candidate, tmdb_id: 11, year: 2024, score: 125 }
+              ]
+            });
+            ["ACEPTADA", "año 1979 es el más antiguo", "RESUELTO POR MÁS ANTIGUA"].forEach(text => requireText(acceptedByOldest, text));
+            rejectText(acceptedByOldest, "RECHAZADA POR EMPATE");
+
+            const acceptedByBoth = render({
+              status: "ACCEPTED", ok: true,
+              decision: decision("ACCEPTED", {
+                score: 125, min_score: 75, score_passed: true,
+                second_score: 125, has_second_candidate: true,
+                margin: 0, min_margin: 12, margin_passed: false,
+                original_language_preference: {
+                  applied: true, enabled: true, language: "en", selected_original_language: "en"
+                },
+                oldest_exact_title_preference: {
+                  applied: true, enabled: true, selected_year: 1979,
+                  reason_code: "oldest_exact_title_without_year"
+                }
+              }),
+              candidates: [candidate, { ...candidate, tmdb_id: 11 }]
+            });
+            ["idioma original inglés", "RESUELTO POR IDIOMA"].forEach(text => requireText(acceptedByBoth, text));
+            rejectText(acceptedByBoth, "RESUELTO POR MÁS ANTIGUA");
+            rejectText(acceptedByBoth, "año 1979 es el más antiguo");
+
             const tie = render({
               status: "REJECTED_MARGIN", ok: true,
               decision: decision("REJECTED_MARGIN", { score: 125, score_passed: true, second_score: 125, has_second_candidate: true, margin: 0, margin_passed: false }),

@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -44,6 +45,19 @@ class IdentityControllerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.database.close()
         self.temporary.cleanup()
+
+    def assert_legacy_tv_regex_semantics(self, rules) -> None:
+        patterns = rules["parser"]["patterns"]
+
+        self.assertIsNotNone(re.search(patterns["series_sxe"], "Serie S01E02"))
+        self.assertIsNotNone(
+            re.search(patterns["explicit_season"], "Serie Temporada 2")
+        )
+        self.assertIsNotNone(re.search(patterns["season_pack"], "Serie T02"))
+        self.assertIsNone(re.search(patterns["series_sxe"], "Serie 01E02"))
+        self.assertIsNone(re.search(patterns["explicit_season"], "Serie Temp 2"))
+        self.assertIsNone(re.search(patterns["explicit_season"], "Serie miniserie"))
+        self.assertIsNone(re.search(patterns["season_pack"], "Serie S02"))
 
     def test_parser_test_uses_unsaved_draft_and_returns_trace(self) -> None:
         controller = IdentityController(_config(), self.database, _FileBotSettings())
@@ -156,6 +170,24 @@ class IdentityControllerTests(unittest.TestCase):
             payload["rules"]["resolver"]["aliases"]["tv"],
             ["La oficina | The Office"],
         )
+        self.assertEqual(payload["rules"]["parser"]["video_extensions"], [])
+        self.assertEqual(payload["rules"]["parser"]["video_markers"], [])
+        self.assertEqual(payload["rules"]["parser"]["non_video_markers"], [])
+        self.assertEqual(payload["rules"]["parser"]["season_number_words"], [])
+        self.assertFalse(
+            payload["rules"]["parser"]["normalization"][
+                "movie_without_year_from_video"
+            ]
+        )
+        self.assertFalse(
+            payload["rules"]["parser"]["normalization"]["allow_tv_year_range"]
+        )
+        self.assertFalse(
+            payload["rules"]["resolver"]["acceptance"][
+                "prefer_oldest_exact_title_without_year"
+            ]
+        )
+        self.assert_legacy_tv_regex_semantics(payload["rules"])
 
         restarted = IdentityController(
             _config(), self.database, _FileBotSettings({})
@@ -207,6 +239,22 @@ class IdentityControllerTests(unittest.TestCase):
         controller = IdentityController(_config(), self.database, _FileBotSettings())
         legacy_rules = copy.deepcopy(controller.payload()["rules"])
         del legacy_rules["resolver"]["original_language_preference"]
+        for key in (
+            "video_extensions",
+            "video_markers",
+            "non_video_markers",
+            "season_number_words",
+        ):
+            del legacy_rules["parser"][key]
+        del legacy_rules["parser"]["normalization"][
+            "movie_without_year_from_video"
+        ]
+        del legacy_rules["parser"]["normalization"]["allow_tv_year_range"]
+        for key in ("series_sxe", "explicit_season", "season_pack"):
+            del legacy_rules["parser"]["patterns"][key]
+        del legacy_rules["resolver"]["acceptance"][
+            "prefer_oldest_exact_title_without_year"
+        ]
         stale_fingerprint = "sha256:" + ("a" * 64)
         old_job = {
             "source_meta_json": json.dumps(
@@ -228,6 +276,24 @@ class IdentityControllerTests(unittest.TestCase):
             restored["rules"]["resolver"]["original_language_preference"],
             {"enabled": False, "language": "en"},
         )
+        self.assertEqual(restored["rules"]["parser"]["video_extensions"], [])
+        self.assertEqual(restored["rules"]["parser"]["video_markers"], [])
+        self.assertEqual(restored["rules"]["parser"]["non_video_markers"], [])
+        self.assertEqual(restored["rules"]["parser"]["season_number_words"], [])
+        self.assertFalse(
+            restored["rules"]["parser"]["normalization"][
+                "movie_without_year_from_video"
+            ]
+        )
+        self.assertFalse(
+            restored["rules"]["parser"]["normalization"]["allow_tv_year_range"]
+        )
+        self.assertFalse(
+            restored["rules"]["resolver"]["acceptance"][
+                "prefer_oldest_exact_title_without_year"
+            ]
+        )
+        self.assert_legacy_tv_regex_semantics(restored["rules"])
         self.assertNotEqual(restored["fingerprint"], stale_fingerprint)
         self.assertEqual(
             restored["fingerprint"], identity_fingerprint(restored["rules"])
@@ -259,6 +325,16 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertFalse(
             restored["rules"]["resolver"]["original_language_preference"]["enabled"]
         )
+        self.assertEqual(restored["rules"]["parser"]["video_extensions"], [])
+        self.assertEqual(restored["rules"]["parser"]["video_markers"], [])
+        self.assertEqual(restored["rules"]["parser"]["non_video_markers"], [])
+        self.assertEqual(restored["rules"]["parser"]["season_number_words"], [])
+        self.assertFalse(
+            restored["rules"]["resolver"]["acceptance"][
+                "prefer_oldest_exact_title_without_year"
+            ]
+        )
+        self.assert_legacy_tv_regex_semantics(restored["rules"])
         self.assertEqual(
             restored["fingerprint"], identity_fingerprint(restored["rules"])
         )

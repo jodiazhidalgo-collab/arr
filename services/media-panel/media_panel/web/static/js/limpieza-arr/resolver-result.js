@@ -65,6 +65,9 @@
     const languagePreference = decision?.original_language_preference || {};
     const languagePreferenceApplied = languagePreference.applied === true;
     const preferredLanguage = ui.resolverLanguageName(languagePreference.language);
+    const oldestPreference = decision?.oldest_exact_title_preference || {};
+    const oldestPreferenceApplied = oldestPreference.applied === true;
+    const selectedOldestYear = Number(oldestPreference.selected_year);
     const sourceLabels = {
       tmdb_id: "un identificador TMDb directo",
       imdb_id: "un identificador IMDb directo",
@@ -78,6 +81,8 @@
         title: "ACEPTADA",
         text: languagePreferenceApplied
           ? `El candidato se ha seleccionado porque es el único con idioma original ${preferredLanguage} dentro del grupo ambiguo.`
+          : oldestPreferenceApplied
+            ? `La película se ha seleccionado porque ${Number.isFinite(selectedOldestYear) ? `su año ${selectedOldestYear} es` : "es"} el más antiguo entre los candidatos con título y puntuación exactamente iguales.`
           : decision.bypass && bypassSource
           ? `Identidad aceptada mediante ${bypassSource}. Los umbrales no intervienen en esta decisión.`
           : hasSecondCandidate
@@ -161,6 +166,7 @@
     const hasScoring = Boolean(decision.has_scoring);
     const bypass = Boolean(decision.bypass);
     const languagePreferenceApplied = decision?.original_language_preference?.applied === true;
+    const oldestPreferenceApplied = decision?.oldest_exact_title_preference?.applied === true;
     const hasSecondCandidate = decision.has_second_candidate === undefined
       ? candidates.length > 1
       : Boolean(decision.has_second_candidate);
@@ -175,7 +181,7 @@
           ? `<span>Ventaja sobre el segundo</span><strong>${ui.esc(ui.resolverNumber(decision.margin))}</strong>`
           : `<span>Segundo candidato</span><strong>No existe</strong><span>Ventaja calculada</span><strong>${ui.esc(ui.resolverNumber(decision.margin))}</strong>`}
         <span>${ui.esc(marginLabel)}</span><strong>${ui.esc(ui.resolverNumber(decision.min_margin))}</strong>
-        <b class="${bypass ? "neutral" : languagePreferenceApplied || decision.margin_passed ? "pass" : "fail"}">${bypass ? "NO APLICA" : languagePreferenceApplied ? "RESUELTO POR IDIOMA" : decision.margin_passed ? "CUMPLIDO" : "NO CUMPLIDO"}</b>
+        <b class="${bypass ? "neutral" : languagePreferenceApplied || oldestPreferenceApplied || decision.margin_passed ? "pass" : "fail"}">${bypass ? "NO APLICA" : languagePreferenceApplied ? "RESUELTO POR IDIOMA" : oldestPreferenceApplied ? "RESUELTO POR MÁS ANTIGUA" : decision.margin_passed ? "CUMPLIDO" : "NO CUMPLIDO"}</b>
       </div>
     </div>`;
     return `<section class="resolver-outcome ${ui.esc(presentation.tone)}" aria-labelledby="resolver-outcome-title">

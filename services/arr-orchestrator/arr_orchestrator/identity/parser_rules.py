@@ -139,6 +139,107 @@ _PARSER_RULES_TEMPLATE: Dict[str, Any] = {
     ],
     "manual_keywords": ["lynda", "course", "collection", "linux", "ubuntu", "shell", "cli"],
     "manual_exact_names": ["wasabi", "doraemon", "bluey", "la reina del flow"],
+    "video_extensions": [
+        ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts",
+    ],
+    # Solo fuente, formato o codec: resolucion/idioma/audio aislados son debiles.
+    "video_markers": [
+        "dvd",
+        "dvd5",
+        "dvd9",
+        "2dvd9",
+        "dvdr",
+        "dvdscr",
+        "dvdscreener",
+        "dvd-screener",
+        "ts-screener",
+        "bluray",
+        "blu-ray",
+        "blurayrip",
+        "fullbluray",
+        "bdrip",
+        "bdremux",
+        "remux",
+        "webdl",
+        "web-dl",
+        "web dl",
+        "webrip",
+        "hdtv",
+        "dvdrip",
+        "hdrip",
+        "microhd",
+        "uhdmicro",
+        "4kuhdmicro",
+        "4kuhdrip",
+        "4kuhdremux",
+        "4kultrahd",
+        "fulluhd",
+        "fulluhd4k",
+        "3d sbs",
+        "3d-sbs",
+        "mkv",
+        "mp4",
+        "avi",
+        "x264",
+        "x265",
+        "h264",
+        "h265",
+        "hevc",
+        "avc",
+    ],
+    "non_video_markers": [
+        "pcdvd",
+        "pc dvd",
+        "pccd",
+        "pc game",
+        "pc games",
+        "video game",
+        "video games",
+        "videojuego",
+        "videojuegos",
+        "juego para pc",
+        "juegos para pc",
+        "xbox",
+        "xbox360",
+        "psx",
+        "ps1",
+        "ps2",
+        "ps3",
+        "ps4",
+        "ps5",
+        "psp",
+        "wii",
+        "nintendo",
+        "gamecube",
+        "regionfree",
+        "audiolibro",
+        "audiolibros",
+        "ebook",
+        "ebooks",
+        "epub",
+        "cbr",
+        "cbz",
+        "jpg",
+        "jpeg",
+        "png",
+        "gif",
+        "webp",
+        "pdf",
+    ],
+    "season_number_words": [
+        "uno | 1", "una | 1", "primero | 1", "primera | 1", "one | 1", "first | 1",
+        "dos | 2", "segundo | 2", "segunda | 2", "two | 2", "second | 2",
+        "tres | 3", "tercero | 3", "tercera | 3", "three | 3", "third | 3",
+        "cuatro | 4", "cuarto | 4", "cuarta | 4", "four | 4", "fourth | 4",
+        "cinco | 5", "quinto | 5", "quinta | 5", "five | 5", "fifth | 5",
+        "seis | 6", "sexto | 6", "sexta | 6", "six | 6", "sixth | 6",
+        "siete | 7", "septimo | 7", "septima | 7", "séptimo | 7", "séptima | 7",
+        "seven | 7", "seventh | 7",
+        "ocho | 8", "octavo | 8", "octava | 8", "eight | 8", "eighth | 8",
+        "nueve | 9", "noveno | 9", "novena | 9", "nine | 9", "ninth | 9",
+        "diez | 10", "decimo | 10", "decima | 10", "décimo | 10", "décima | 10",
+        "ten | 10", "tenth | 10",
+    ],
     "collection_keywords": [
         "collection",
         "coleccion",
@@ -156,10 +257,16 @@ _PARSER_RULES_TEMPLATE: Dict[str, Any] = {
         "multiple": "first",
     },
     "patterns": {
-        "series_sxe": r"(?i)\bS0?(\d{1,2})\s*E0?(\d{1,3})(?:\s*(?:-|_|E)\s*0?(\d{1,3}))?\b",
+        "series_sxe": r"(?i)\bS?0?(\d{1,2})\s*E0?(\d{1,3})(?:\s*(?:-|_|E)\s*0?(\d{1,3}))?\b",
         "series_x": r"(?i)\b(\d{1,2})x0?(\d{1,3})(?:\s*(?:-|_)\s*0?(\d{1,3}))?\b",
-        "explicit_season": r"(?i)\b(?:temporada|season)\s*0?(\d{1,2})\b",
-        "season_pack": r"(?i)(?:^|\s)T0?(\d{1,2})(?:\b|[- ]|$)",
+        "explicit_season": (
+            r"(?i)\b(?:"
+            r"(?:temporada|season|temp|sezon)\s*0?(\d{1,2})"
+            r"|0?(\d{1,2})\s+s[ée]rie"
+            r"|miniserie|miniseries|miniserial|mini[- ]?series"
+            r")\b"
+        ),
+        "season_pack": r"(?i)(?:^|\s)[ST]0?(\d{1,2})(?:\b|[- ]|$)",
         "chapter": r"(?i)\bcap(?:[íi]tulo)?\.?\s*0?(\d{1,4})(?:\s*(?:-|_)\s*0?(\d{1,4}))?\b",
         "episode_word": r"(?i)\b(?:episode|episodio)\s*0?(\d{1,3})\b",
         "collection_count": r"\b\d+\s*(?:movies|peliculas|films)\b",
@@ -181,6 +288,8 @@ _PARSER_RULES_TEMPLATE: Dict[str, Any] = {
         "tail_noise_passes": 4,
         # 0 reproduce el comportamiento histórico: no limita el rango.
         "max_episode_range": 0,
+        "movie_without_year_from_video": True,
+        "allow_tv_year_range": True,
     },
 }
 
@@ -284,6 +393,12 @@ def _normalize_in_place(rules: Dict[str, Any]) -> None:
         if text:
             extensions.append(text if text.startswith(".") else f".{text}")
     rules["extensions"] = extensions
+    video_extensions = []
+    for value in rules.get("video_extensions") or []:
+        text = str(value or "").strip().lower()
+        if text:
+            video_extensions.append(text if text.startswith(".") else f".{text}")
+    rules["video_extensions"] = video_extensions
     for key in (
         "site_words",
         "domain_tlds",
@@ -294,6 +409,9 @@ def _normalize_in_place(rules: Dict[str, Any]) -> None:
         "manual_exact_names",
         "collection_keywords",
         "season_pack_markers",
+        "video_markers",
+        "non_video_markers",
+        "season_number_words",
     ):
         values = rules.get(key)
         if isinstance(values, str):

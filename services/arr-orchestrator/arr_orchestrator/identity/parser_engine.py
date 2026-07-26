@@ -1,5 +1,6 @@
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+from .parser_classification import classification_evidence
 from .parser_cleaning import preclean
 from .parser_models import MediaDecision, ParsedName
 from .parser_rules import resolve_parser_rules
@@ -160,8 +161,24 @@ def _parse_release_name(
     if trace is not None:
         trace.record("guessit.build", display_title, guessit)
 
-    is_manual = manual_name(cleaned, display_title, rules)
+    is_manual = manual_name(
+        cleaned,
+        display_title,
+        rules,
+        tv_strong=bool(tv["strong"]),
+    )
+    evidence = classification_evidence(raw, cleaned, rules, trace)
+    non_video = bool(evidence["non_video"])
+    normalization = rules.get("normalization") if isinstance(rules.get("normalization"), Mapping) else {}
     movie_strong = bool(year and not tv["strong"] and not is_manual)
+    movie_from_video = bool(
+        normalization.get("movie_without_year_from_video", False)
+        and not year
+        and not tv["strong"]
+        and not is_manual
+        and not non_video
+        and evidence["strong_video"]
+    )
     tv_strong = bool(tv["strong"] and not is_manual)
     media_hint = "manual"
     confidence = _confidence(rules, "low")
@@ -175,6 +192,9 @@ def _parse_release_name(
     elif explicit in trusted and not is_manual:
         media_hint = explicit
         confidence = _confidence(rules, "medium")
+    elif movie_from_video:
+        media_hint = "movies"
+        confidence = _confidence(rules, "high")
 
     category_conflict = None
     if explicit == "movies" and tv_strong:
@@ -184,8 +204,19 @@ def _parse_release_name(
     if trace is not None:
         trace.record(
             "category.classify",
-            {"explicit": explicit, "manual": is_manual, "movie_strong": movie_strong, "tv_strong": tv_strong},
-            {"category": media_hint, "confidence": confidence, "conflict": category_conflict},
+            {
+                "explicit": explicit,
+                "manual": is_manual,
+                "non_video": non_video,
+                "movie_strong": movie_strong,
+                "movie_from_video": movie_from_video,
+                "tv_strong": tv_strong,
+            },
+            {
+                "category": media_hint,
+                "confidence": confidence,
+                "conflict": category_conflict,
+            },
         )
 
     parsed = ParsedName(

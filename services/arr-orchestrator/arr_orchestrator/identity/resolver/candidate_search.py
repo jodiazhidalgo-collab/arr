@@ -6,6 +6,7 @@ from .candidate_data import candidate_from_payload, merge_search_payload
 from .models import ResolverCandidate, ResolverUnavailable
 from .text import (
     as_int,
+    normalize_title,
     search_query_variants,
     spanish_missing_c_variants,
     strip_query_tail_noise,
@@ -15,6 +16,7 @@ from .text import (
 
 MAX_TMDB_SEARCHES = 8
 MAX_DETAIL_CANDIDATES = 3
+SCORE_TIE_EPSILON = 1e-9
 
 GetPayload = Callable[[str, Dict[str, object]], Dict[str, object]]
 Details = Callable[[str, int, Optional[str]], ResolverCandidate]
@@ -34,6 +36,7 @@ def search_candidates(
     get_payload: GetPayload,
     details: Details,
     ranker: Ranker,
+    selection_trace: Optional[Dict[str, object]] = None,
 ) -> List[ResolverCandidate]:
     variant_rules = (
         policy.get("query_variants")
@@ -150,6 +153,15 @@ def search_candidates(
 
     initial = [candidate_from_payload(media_type, item) for item in raw.values()]
     initial = ranker(initial, guessed, [], False)
+    oldest_exact_selection = _oldest_exact_title_search_selection(
+        media_type,
+        initial,
+        guessed,
+        acceptance,
+        policy.get("original_language_preference"),
+    )
+    if selection_trace is not None:
+        selection_trace["oldest_exact_title_search"] = dict(oldest_exact_selection)
     selected = list(initial[: min(initial_limit, detail_limit)])
     if (
         media_type == "movie"
@@ -170,6 +182,45 @@ def search_candidates(
                 selected[-1] = exact_year
             else:
                 selected.append(exact_year)
+    oldest_exact_id = as_int(oldest_exact_selection.get("tmdb_id"))
+    oldest_not_selected = (
+        oldest_exact_selection.get("eligible") is True
+        and oldest_exact_id is not None
+        and all(candidate.tmdb_id != oldest_exact_id for candidate in selected)
+    )
+    if oldest_not_selected:
+        oldest_exact = next(
+            (candidate for candidate in initial if candidate.tmdb_id == oldest_exact_id),
+            None,
+        )
+        if oldest_exact is not None and len(selected) < detail_limit:
+            # Solo usa un hueco libre: nunca expulsa un candidato no exacto ni
+            # altera el conjunto que necesita la preferencia de idioma.
+            selected.append(oldest_exact)
+        elif oldest_exact is not None:
+            tied_ids = {
+                int(value)
+                for value in oldest_exact_selection.get("tied_tmdb_ids") or []
+            }
+            preferred_ids = {
+                int(value)
+                for value in oldest_exact_selection.get("preferred_tmdb_ids") or []
+            }
+            for index in range(len(selected) - 1, -1, -1):
+                current = selected[index]
+                if current.tmdb_id not in tied_ids:
+                    continue
+                proposed = [*selected[:index], oldest_exact, *selected[index + 1 :]]
+                preferred_after = sum(
+                    candidate.tmdb_id in preferred_ids for candidate in proposed
+                )
+                if preferred_after == 1:
+                    continue
+                # Sustituye empate exacto por empate exacto: conserva cualquier
+                # candidato no exacto y al menos otro testigo de la ambiguedad.
+                if sum(candidate.tmdb_id in tied_ids for candidate in proposed) >= 2:
+                    selected[index] = oldest_exact
+                    break
     for candidate in initial:
         if len(selected) >= detail_limit:
             break
@@ -198,6 +249,100 @@ def search_candidates(
                 enriched.append(candidate)
             break
     return enriched or initial
+
+
+def _oldest_exact_title_search_selection(
+    media_type: str,
+    ranked: Sequence[ResolverCandidate],
+    guessed: Dict[str, object],
+    acceptance: Dict[str, object],
+    original_language_preference: object,
+) -> Dict[str, object]:
+    """Identifica un unico minimo seguro usando todo el resultado de busqueda."""
+
+    result: Dict[str, object] = {
+        "eligible": False,
+        "tmdb_id": None,
+        "tied_tmdb_ids": [],
+        "preferred_tmdb_ids": [],
+    }
+    if (
+        media_type != "movie"
+        or not bool(acceptance.get("prefer_oldest_exact_title_without_year", False))
+        or as_int(guessed.get("year")) is not None
+        or len(ranked) < 2
+    ):
+        return result
+
+    min_score = float(acceptance.get("min_score", 75))
+    min_margin = float(acceptance.get("min_margin", 12))
+    best_score = ranked[0].score
+    normal_margin = best_score - ranked[1].score
+    if (
+        best_score < min_score
+        or normal_margin >= min_margin
+        or abs(normal_margin) > SCORE_TIE_EPSILON
+    ):
+        return result
+
+    ambiguous = [
+        candidate
+        for candidate in ranked
+        if candidate.score >= min_score
+        and best_score - candidate.score < min_margin
+    ]
+    query_normalized = normalize_title(str(guessed.get("title") or ""))
+    if (
+        len(ambiguous) < 2
+        or not query_normalized
+        or any(
+            abs(best_score - candidate.score) > SCORE_TIE_EPSILON
+            for candidate in ambiguous
+        )
+        or any(
+            normalize_title(candidate.title) != query_normalized
+            for candidate in ambiguous
+        )
+        or any(candidate.year is None for candidate in ambiguous)
+    ):
+        return result
+
+    oldest_year = min(
+        int(candidate.year) for candidate in ambiguous if candidate.year is not None
+    )
+    oldest = [candidate for candidate in ambiguous if candidate.year == oldest_year]
+    if len(oldest) != 1:
+        return result
+
+    preference = (
+        original_language_preference
+        if isinstance(original_language_preference, dict)
+        else {}
+    )
+    preferred_language = _base_language(str(preference.get("language") or "en"))
+    preferred = (
+        [
+            candidate
+            for candidate in ambiguous
+            if _base_language(candidate.original_language) == preferred_language
+        ]
+        if bool(preference.get("enabled", True)) and preferred_language
+        else []
+    )
+    if len(preferred) == 1:
+        # La preferencia de idioma tiene prioridad; si su unico candidato no
+        # cabe en detalle, no se permite que la regla de año la adelante.
+        return result
+    return {
+        "eligible": True,
+        "tmdb_id": oldest[0].tmdb_id,
+        "tied_tmdb_ids": [candidate.tmdb_id for candidate in ambiguous],
+        "preferred_tmdb_ids": [candidate.tmdb_id for candidate in preferred],
+    }
+
+
+def _base_language(value: str) -> str:
+    return str(value or "").strip().split("-", 1)[0].casefold()
 
 
 def find_imdb(
