@@ -92,7 +92,7 @@ const RULE_SECTIONS = {
       },
       {
         title: "Salida",
-        note: "Etiquetas finales de la pista de video.",
+        note: "Etiqueta final del idioma del vídeo si es aceptado.",
         controls: [
           { type: "text", path: "video.idioma_final", label: "Idioma final" },
           { type: "boolean", path: "video.marcar_default", label: "Marcar default" },
