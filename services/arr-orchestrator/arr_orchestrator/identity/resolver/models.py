@@ -30,6 +30,7 @@ class ResolverCandidate:
     breakdown: List[Dict[str, object]] = field(default_factory=list)
     season_count: Optional[int] = None
     original_language: str = ""
+    matching_rules: List[Dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)

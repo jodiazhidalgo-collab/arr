@@ -15,6 +15,11 @@ from arr_orchestrator.identity import (
     normalize_identity_rules,
 )
 from arr_orchestrator.identity.parser_rules import DEFAULT_PARSER_RULES
+from arr_orchestrator.identity.resolver.policy import effective_policy
+from arr_orchestrator.identity.resolver_defaults import (
+    DEFAULT_SERIES_CANDIDATES,
+    DEFAULT_TITLE_MATCHING,
+)
 
 
 RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
@@ -86,6 +91,18 @@ def changed_rules(language="EN-us", score=76):
         "The Visitors | 1993 | 11687"
     ]
     rules["resolver"]["acceptance"]["min_score"] = score  # type: ignore[index]
+    rules["resolver"]["series_candidates"].update(  # type: ignore[index]
+        {"title_before_episode_marker": False, "min_title_words": 4}
+    )
+    rules["resolver"]["title_matching"].update(  # type: ignore[index]
+        {
+            "score_parser_candidates": False,
+            "roman_arabic_equivalence": False,
+            "allow_omitted_part_number": False,
+            "omitted_part_min_words": 5,
+            "supplemental_min_chars": 6,
+        }
+    )
     return rules
 
 
@@ -133,6 +150,18 @@ def _large_valid_rules():
     ]
 
     resolver = rules["resolver"]
+    resolver["series_candidates"].update(
+        {"title_before_episode_marker": False, "min_title_words": 20}
+    )
+    resolver["title_matching"].update(
+        {
+            "score_parser_candidates": False,
+            "roman_arabic_equivalence": False,
+            "allow_omitted_part_number": False,
+            "omitted_part_min_words": 20,
+            "supplemental_min_chars": 100,
+        }
+    )
     for category in ("movies", "tv"):
         resolver["aliases"][category] = []
         resolver["forced_matches"][category] = []
@@ -198,6 +227,18 @@ class IdentityRulesTests(unittest.TestCase):
                 "prefer_oldest_exact_title_without_year"
             ]
         )
+        self.assertEqual(
+            rules["resolver"]["series_candidates"],
+            DEFAULT_SERIES_CANDIDATES,
+        )
+        self.assertIsNot(
+            rules["resolver"]["series_candidates"], DEFAULT_SERIES_CANDIDATES
+        )
+        self.assertEqual(
+            rules["resolver"]["title_matching"],
+            DEFAULT_TITLE_MATCHING,
+        )
+        self.assertIsNot(rules["resolver"]["title_matching"], DEFAULT_TITLE_MATCHING)
 
     def test_active_v1_document_gains_new_defaults_without_losing_values(self):
         legacy = changed_rules(language="fr-FR", score=83)
@@ -214,6 +255,8 @@ class IdentityRulesTests(unittest.TestCase):
         del legacy["resolver"]["acceptance"][
             "prefer_oldest_exact_title_without_year"
         ]
+        del legacy["resolver"]["series_candidates"]
+        del legacy["resolver"]["title_matching"]
 
         normalized = normalize_identity_rules(legacy)
 
@@ -230,6 +273,14 @@ class IdentityRulesTests(unittest.TestCase):
             normalized["resolver"]["acceptance"][
                 "prefer_oldest_exact_title_without_year"
             ]
+        )
+        self.assertEqual(
+            normalized["resolver"]["series_candidates"],
+            DEFAULT_SERIES_CANDIDATES,
+        )
+        self.assertEqual(
+            normalized["resolver"]["title_matching"],
+            DEFAULT_TITLE_MATCHING,
         )
 
     def test_season_number_words_are_canonical_and_contradictions_fail(self):
@@ -269,6 +320,36 @@ class IdentityRulesTests(unittest.TestCase):
         )
         self.assertEqual(len(paths), len(set(paths)))
 
+    def test_resolver_schema_exposes_series_and_title_matching_groups(self):
+        groups = IdentitySettingsStore(FakeSettingsDatabase()).payload()["schema"][
+            "resolver"
+        ]["groups"]
+        by_title = {group["title"]: group for group in groups}
+
+        self.assertEqual(
+            [
+                control["path"]
+                for control in by_title["Candidatos de series"]["controls"]
+            ],
+            [
+                "resolver.series_candidates.title_before_episode_marker",
+                "resolver.series_candidates.min_title_words",
+            ],
+        )
+        self.assertEqual(
+            [
+                control["path"]
+                for control in by_title["Comparación de títulos"]["controls"]
+            ],
+            [
+                "resolver.title_matching.score_parser_candidates",
+                "resolver.title_matching.roman_arabic_equivalence",
+                "resolver.title_matching.allow_omitted_part_number",
+                "resolver.title_matching.omitted_part_min_words",
+                "resolver.title_matching.supplemental_min_chars",
+            ],
+        )
+
     def test_factory_rejects_runtime_http_below_contract_minimum(self):
         with self.assertRaisesRegex(ValueError, "resolver_http_timeout_ms"):
             factory_identity_rules(resolver_http_timeout_ms=99)
@@ -306,6 +387,20 @@ class IdentityRulesTests(unittest.TestCase):
             normalized["resolver"]["forced_matches"]["movies"],
             ["The Visitors | 1993 | 11687"],
         )
+        self.assertEqual(
+            normalized["resolver"]["series_candidates"],
+            {"title_before_episode_marker": False, "min_title_words": 4},
+        )
+        self.assertEqual(
+            normalized["resolver"]["title_matching"],
+            {
+                "score_parser_candidates": False,
+                "roman_arabic_equivalence": False,
+                "allow_omitted_part_number": False,
+                "omitted_part_min_words": 5,
+                "supplemental_min_chars": 6,
+            },
+        )
 
         invalid = changed_rules()
         invalid["resolver"]["cache"]["exec"] = "rm"  # type: ignore[index]
@@ -331,6 +426,75 @@ class IdentityRulesTests(unittest.TestCase):
         del invalid["resolver"]["scoring"]["title_exact"]  # type: ignore[index]
         with self.assertRaises(IdentityRulesValidationError):
             normalize_identity_rules(invalid)
+
+    def test_series_and_title_matching_types_and_ranges_are_strict(self):
+        boolean_paths = (
+            ("series_candidates", "title_before_episode_marker"),
+            ("title_matching", "score_parser_candidates"),
+            ("title_matching", "roman_arabic_equivalence"),
+            ("title_matching", "allow_omitted_part_number"),
+        )
+        for block, key in boolean_paths:
+            with self.subTest(block=block, key=key):
+                rules = factory_identity_rules()
+                rules["resolver"][block][key] = "true"
+                with self.assertRaises(IdentityRulesValidationError):
+                    normalize_identity_rules(rules)
+
+        numeric_ranges = (
+            ("series_candidates", "min_title_words", 1, 20),
+            ("title_matching", "omitted_part_min_words", 1, 20),
+            ("title_matching", "supplemental_min_chars", 1, 100),
+        )
+        for block, key, minimum, maximum in numeric_ranges:
+            for value in (minimum, maximum):
+                with self.subTest(block=block, key=key, valid=value):
+                    rules = factory_identity_rules()
+                    rules["resolver"][block][key] = value
+                    self.assertEqual(
+                        normalize_identity_rules(rules)["resolver"][block][key],
+                        value,
+                    )
+            for value in (minimum - 1, maximum + 1, True):
+                with self.subTest(block=block, key=key, invalid=value):
+                    rules = factory_identity_rules()
+                    rules["resolver"][block][key] = value
+                    with self.assertRaises(IdentityRulesValidationError):
+                        normalize_identity_rules(rules)
+
+    def test_effective_policy_and_fingerprints_include_new_blocks(self):
+        normalized = normalize_identity_rules(changed_rules())
+        policy = effective_policy(normalized, "tv")
+
+        self.assertEqual(
+            policy["series_candidates"],
+            normalized["resolver"]["series_candidates"],
+        )
+        self.assertEqual(
+            policy["title_matching"],
+            normalized["resolver"]["title_matching"],
+        )
+
+        changed_series = copy.deepcopy(normalized)
+        changed_series["resolver"]["series_candidates"][
+            "title_before_episode_marker"
+        ] = True
+        changed_matching = copy.deepcopy(normalized)
+        changed_matching["resolver"]["title_matching"][
+            "roman_arabic_equivalence"
+        ] = True
+        self.assertNotEqual(
+            policy["fingerprint"],
+            effective_policy(changed_series, "tv")["fingerprint"],
+        )
+        self.assertNotEqual(
+            policy["fingerprint"],
+            effective_policy(changed_matching, "tv")["fingerprint"],
+        )
+        self.assertNotEqual(
+            identity_fingerprint(normalized),
+            identity_fingerprint(changed_matching),
+        )
 
     def test_legacy_v1_rules_gain_language_preference_without_losing_values(self):
         legacy = changed_rules(language="fr-FR", score=83)
@@ -450,7 +614,51 @@ class IdentityStoreTests(unittest.TestCase):
             reset["rules"]["resolver"]["locales"]["movies"],
             {"language": "en-GB", "region": "GB"},
         )
+        self.assertEqual(
+            reset["rules"]["resolver"]["series_candidates"],
+            DEFAULT_SERIES_CANDIDATES,
+        )
+        self.assertEqual(
+            reset["rules"]["resolver"]["title_matching"],
+            DEFAULT_TITLE_MATCHING,
+        )
         self.assertEqual([item["revision"] for item in reset["history"]], [3, 4])
+
+    def test_persisted_v1_snapshot_backfills_new_resolver_blocks(self):
+        legacy = changed_rules(language="fr-FR", score=83)
+        del legacy["resolver"]["series_candidates"]
+        del legacy["resolver"]["title_matching"]
+        database = FakeSettingsDatabase()
+        database.values[IDENTITY_SETTING_KEY] = json.dumps(
+            {
+                "rules": legacy,
+                "revision": 7,
+                "saved_at": "2026-07-26T10:11:12.000Z",
+                "history": [],
+            }
+        )
+
+        payload = IdentitySettingsStore(database).payload()
+        policy = effective_policy(payload["rules"], "movies")
+
+        self.assertEqual(payload["revision"], 7)
+        self.assertEqual(payload["saved_at"], "2026-07-26T10:11:12.000Z")
+        self.assertEqual(
+            payload["rules"]["resolver"]["locales"]["movies"],
+            {"language": "fr-FR", "region": "US"},
+        )
+        self.assertEqual(payload["rules"]["resolver"]["acceptance"]["min_score"], 83)
+        self.assertEqual(
+            payload["rules"]["resolver"]["series_candidates"],
+            DEFAULT_SERIES_CANDIDATES,
+        )
+        self.assertEqual(
+            payload["rules"]["resolver"]["title_matching"],
+            DEFAULT_TITLE_MATCHING,
+        )
+        self.assertEqual(policy["series_candidates"], DEFAULT_SERIES_CANDIDATES)
+        self.assertEqual(policy["title_matching"], DEFAULT_TITLE_MATCHING)
+        self.assertEqual(payload["fingerprint"], identity_fingerprint(payload["rules"]))
 
     def test_invalid_conflict_persistence_failure_and_noop_contracts(self):
         database = FakeSettingsDatabase()

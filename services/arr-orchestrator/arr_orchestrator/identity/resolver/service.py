@@ -576,6 +576,7 @@ class NameResolver:
             evidence,
             direct_identity,
             self._active_policy.get("scoring"),
+            self._active_policy.get("title_matching"),
         )
 
     def _score_candidate(
@@ -591,6 +592,7 @@ class NameResolver:
             evidence,
             direct_identity,
             self._active_policy.get("scoring"),
+            self._active_policy.get("title_matching"),
         )
 
     def _get(self, endpoint: str, params: Dict[str, object]) -> Dict[str, object]:

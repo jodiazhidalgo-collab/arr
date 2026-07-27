@@ -67,10 +67,17 @@ def rank_candidates(
     evidence: Sequence[str],
     direct_identity: bool,
     scoring: object,
+    title_matching: object = None,
 ) -> list[ResolverCandidate]:
     settings = scoring if isinstance(scoring, dict) else None
+    matching_settings = title_matching if isinstance(title_matching, dict) else None
     for candidate in candidates:
         candidate.score, candidate.breakdown = score_candidate(
-            candidate, guessed, evidence, direct_identity, settings
+            candidate,
+            guessed,
+            evidence,
+            direct_identity,
+            settings,
+            matching_settings,
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)

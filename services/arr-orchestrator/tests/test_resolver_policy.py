@@ -30,6 +30,16 @@ class ResolverPolicyTests(unittest.TestCase):
             policy["acceptance"]["prefer_oldest_exact_title_without_year"]
         )
         self.assertEqual(policy["cache"]["ttl_seconds"], 30 * 24 * 3600)
+        self.assertEqual(
+            policy["title_matching"],
+            {
+                "score_parser_candidates": True,
+                "roman_arabic_equivalence": True,
+                "allow_omitted_part_number": True,
+                "omitted_part_min_words": 3,
+                "supplemental_min_chars": 3,
+            },
+        )
 
     def test_new_identity_document_controls_every_resolver_block(self):
         policy = effective_policy(
@@ -254,6 +264,395 @@ class ResolverPolicyTests(unittest.TestCase):
         self.assertEqual(score, 110.0)
         self.assertIn("title_exact", self._breakdown_keys(breakdown))
         self.assertIn("parser_exact", self._breakdown_keys(breakdown))
+
+    def test_parser_candidates_can_be_removed_from_scoring_without_affecting_primary(self):
+        candidate = ResolverCandidate(
+            14,
+            "movie",
+            "Clean Global Title",
+            "Clean Global Title",
+            2024,
+            ["Clean Global Title"],
+        )
+        guessed = {
+            "title": "Etiqueta Titulo Sucio",
+            "year": 2024,
+            "_title_candidates": ["Clean Global Title"],
+        }
+
+        enabled_score, enabled_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+        )
+        disabled_score, disabled_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            title_matching={"score_parser_candidates": False},
+        )
+
+        self.assertGreater(enabled_score, disabled_score)
+        self.assertIn("title_exact", self._breakdown_keys(enabled_breakdown))
+        self.assertIn("parser_exact", self._breakdown_keys(enabled_breakdown))
+        self.assertNotIn("title_exact", self._breakdown_keys(disabled_breakdown))
+        self.assertNotIn("parser_exact", self._breakdown_keys(disabled_breakdown))
+        self.assertEqual(candidate.matching_rules, [])
+
+        primary = ResolverCandidate(
+            15,
+            "movie",
+            "Titulo primario",
+            "Titulo primario",
+            2024,
+            ["Titulo primario"],
+        )
+        _, primary_breakdown = score_candidate(
+            primary,
+            {"title": "Titulo primario", "year": 2024},
+            [],
+            False,
+            title_matching={"score_parser_candidates": False},
+        )
+        self.assertIn("title_exact", self._breakdown_keys(primary_breakdown))
+
+    def test_roman_equivalence_toggle_and_trace_are_independent(self):
+        candidate = ResolverCandidate(
+            16,
+            "movie",
+            "Saga III Capitulo final",
+            "Saga III Capitulo final",
+            2024,
+            ["Saga III Capitulo final"],
+        )
+        guessed = {"title": "Saga 3 Capitulo final", "year": 2024}
+
+        _, enabled_breakdown = score_candidate(candidate, guessed, [], False)
+        enabled_rules = list(candidate.matching_rules)
+        _, disabled_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            title_matching={"roman_arabic_equivalence": False},
+        )
+
+        self.assertIn("title_exact", self._breakdown_keys(enabled_breakdown))
+        self.assertNotIn("title_exact", self._breakdown_keys(disabled_breakdown))
+        self.assertEqual(
+            enabled_rules,
+            [
+                {
+                    "path": "resolver.title_matching.roman_arabic_equivalence",
+                    "detail": "III = 3",
+                }
+            ],
+        )
+        self.assertEqual(candidate.matching_rules, [])
+
+    def test_omitted_part_toggle_and_minimum_words_control_the_match(self):
+        candidate = ResolverCandidate(
+            17,
+            "movie",
+            "Saga IV Capitulo final",
+            "Saga IV Capitulo final",
+            2024,
+            ["Saga IV Capitulo final"],
+        )
+        guessed = {"title": "Saga Capitulo final", "year": 2024}
+
+        _, enabled_breakdown = score_candidate(candidate, guessed, [], False)
+        enabled_rules = list(candidate.matching_rules)
+        _, disabled_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            title_matching={"allow_omitted_part_number": False},
+        )
+        _, strict_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            title_matching={"omitted_part_min_words": 4},
+        )
+
+        self.assertIn("title_exact", self._breakdown_keys(enabled_breakdown))
+        self.assertNotIn("title_exact", self._breakdown_keys(disabled_breakdown))
+        self.assertNotIn("title_exact", self._breakdown_keys(strict_breakdown))
+        self.assertEqual(
+            enabled_rules,
+            [
+                {
+                    "path": "resolver.title_matching.allow_omitted_part_number",
+                    "detail": "Número de saga omitido",
+                }
+            ],
+        )
+
+    def test_supplemental_minimum_chars_controls_short_parser_candidate(self):
+        candidate = ResolverCandidate(18, "movie", "EP", "EP", None, ["EP"])
+        guessed = {
+            "title": "The Long Musical Release",
+            "year": 2007,
+            "_title_candidates": ["EP"],
+        }
+
+        _, default_breakdown = score_candidate(candidate, guessed, [], False)
+        _, relaxed_breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            title_matching={"supplemental_min_chars": 2},
+        )
+
+        self.assertNotIn("title_exact", self._breakdown_keys(default_breakdown))
+        self.assertNotIn("parser_exact", self._breakdown_keys(default_breakdown))
+        self.assertIn("title_exact", self._breakdown_keys(relaxed_breakdown))
+        self.assertIn("parser_exact", self._breakdown_keys(relaxed_breakdown))
+        self.assertEqual(
+            candidate.matching_rules,
+            [
+                {
+                    "path": "resolver.title_matching.score_parser_candidates",
+                    "detail": "Título auxiliar del parser: EP",
+                }
+            ],
+        )
+
+    def test_internal_normalization_does_not_create_visible_matching_rules(self):
+        candidate = ResolverCandidate(
+            19,
+            "movie",
+            "Ángel's Journey",
+            "Ángel's Journey",
+            2024,
+            ["Ángel's Journey"],
+        )
+
+        _, breakdown = score_candidate(
+            candidate,
+            {"title": "Angels Journey", "year": 2024},
+            [],
+            False,
+        )
+
+        self.assertIn("title_exact", self._breakdown_keys(breakdown))
+        self.assertEqual(candidate.matching_rules, [])
+
+    def test_matching_rules_are_serialized_with_each_candidate(self):
+        candidate = ResolverCandidate(
+            20,
+            "movie",
+            "Saga III Capitulo final",
+            "Saga III Capitulo final",
+            2024,
+            ["Saga III Capitulo final"],
+        )
+        score_candidate(
+            candidate,
+            {"title": "Saga 3 Capitulo final", "year": 2024},
+            [],
+            False,
+        )
+
+        self.assertEqual(candidate.to_dict()["matching_rules"], candidate.matching_rules)
+
+    def test_primary_parser_title_is_not_presented_as_an_auxiliary_rule(self):
+        candidate = ResolverCandidate(
+            21,
+            "movie",
+            "Titulo principal",
+            "Titulo principal",
+            2024,
+            ["Titulo principal"],
+        )
+
+        score_candidate(
+            candidate,
+            {
+                "title": "Titulo principal",
+                "year": 2024,
+                "_title_candidates": ["Titulo principal"],
+            },
+            [],
+            False,
+        )
+
+        self.assertEqual(candidate.matching_rules, [])
+
+    def test_parser_auxiliary_is_traced_when_it_only_improves_base_metrics(self):
+        candidate = ResolverCandidate(
+            22,
+            "movie",
+            "Target title",
+            "Target title",
+            2024,
+            ["Target title"],
+        )
+        score_candidate(
+            candidate,
+            {
+                "title": "Noise release title",
+                "year": 2024,
+                "_title_candidates": ["Target partial"],
+            },
+            [],
+            False,
+            settings={"parser_exact": 0, "parser_near": 0},
+        )
+
+        self.assertEqual(
+            candidate.matching_rules,
+            [
+                {
+                    "path": "resolver.title_matching.score_parser_candidates",
+                    "detail": "Título auxiliar del parser: Target partial",
+                }
+            ],
+        )
+
+    def test_exact_parser_auxiliary_is_traced_when_parser_bonus_is_zero(self):
+        candidate = ResolverCandidate(
+            23,
+            "movie",
+            "Target title",
+            "Target title",
+            2024,
+            ["Target title"],
+        )
+        score, breakdown = score_candidate(
+            candidate,
+            {
+                "title": "Noise release title",
+                "year": 2024,
+                "_title_candidates": ["Target title"],
+            },
+            [],
+            False,
+            settings={"parser_exact": 0, "parser_near": 0},
+        )
+
+        self.assertGreaterEqual(score, 75)
+        self.assertIn("title_exact", self._breakdown_keys(breakdown))
+        self.assertNotIn("parser_exact", self._breakdown_keys(breakdown))
+        self.assertEqual(
+            candidate.matching_rules[0]["detail"],
+            "Título auxiliar del parser: Target title",
+        )
+
+    def test_roman_trace_survives_shifted_and_possessive_tokens(self):
+        cases = (
+            ("Saga III Final", "The Saga 3 Final"),
+            ("King s Saga III Journey", "Kings Saga 3 Journey"),
+        )
+        for query, title in cases:
+            with self.subTest(query=query, title=title):
+                candidate = ResolverCandidate(
+                    24,
+                    "movie",
+                    title,
+                    title,
+                    2024,
+                    [title],
+                )
+                score_candidate(
+                    candidate,
+                    {"title": query, "year": 2024},
+                    [],
+                    False,
+                )
+
+                self.assertIn(
+                    {
+                        "path": "resolver.title_matching.roman_arabic_equivalence",
+                        "detail": "III = 3",
+                    },
+                    candidate.matching_rules,
+                )
+
+    def test_parser_auxiliary_trace_is_compact_and_sanitized(self):
+        auxiliary = "Long auxiliary\n" + ("x" * 120)
+        candidate = ResolverCandidate(
+            25,
+            "movie",
+            auxiliary,
+            auxiliary,
+            2024,
+            [auxiliary],
+        )
+        score_candidate(
+            candidate,
+            {
+                "title": "Noise release title",
+                "year": 2024,
+                "_title_candidates": [auxiliary],
+            },
+            [],
+            False,
+        )
+
+        detail = candidate.matching_rules[0]["detail"]
+        self.assertNotIn("\n", detail)
+        self.assertTrue(detail.endswith("…"))
+        self.assertLessEqual(len(detail), len("Título auxiliar del parser: ") + 80)
+
+    def test_english_pronoun_i_is_never_an_omitted_part_number(self):
+        cases = (
+            ("I Know What You Did Last Summer", "Know What You Did Last Summer"),
+            ("The Day I Met Your Mother", "The Day Met Your Mother"),
+            ("Me Myself And I", "Me Myself And"),
+        )
+        for query, title in cases:
+            with self.subTest(query=query):
+                candidate = ResolverCandidate(
+                    26,
+                    "movie",
+                    title,
+                    title,
+                    1997,
+                    [title],
+                )
+                score, breakdown = score_candidate(
+                    candidate,
+                    {"title": query, "year": 1997, "_title_candidates": [query]},
+                    [],
+                    False,
+                )
+
+                self.assertLess(score, 75)
+                self.assertNotIn("title_exact", self._breakdown_keys(breakdown))
+                self.assertNotIn("parser_exact", self._breakdown_keys(breakdown))
+                self.assertEqual(candidate.matching_rules, [])
+
+    def test_single_roman_i_still_works_with_an_explicit_part_marker(self):
+        candidate = ResolverCandidate(
+            27,
+            "movie",
+            "Long Saga Chapter 1 Final",
+            "Long Saga Chapter 1 Final",
+            2024,
+            ["Long Saga Chapter 1 Final"],
+        )
+        _, breakdown = score_candidate(
+            candidate,
+            {"title": "Long Saga Chapter I Final", "year": 2024},
+            [],
+            False,
+        )
+
+        self.assertIn("title_exact", self._breakdown_keys(breakdown))
+        self.assertIn(
+            {
+                "path": "resolver.title_matching.roman_arabic_equivalence",
+                "detail": "I = 1",
+            },
+            candidate.matching_rules,
+        )
 
     def test_scoring_breakdown_covers_every_kind_of_points_and_penalty(self):
         movie = ResolverCandidate(

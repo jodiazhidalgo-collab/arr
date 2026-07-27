@@ -161,6 +161,11 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             const context = { requestId: 7, category: "movies", parserTitle: "Titulo", parserYear: "2024" };
             const candidate = {
               tmdb_id: 10, title: "Titulo <seguro>", original_title: "Original", year: 2024, score: 55,
+              matching_rules: [
+                { path: "resolver.title_matching.roman_arabic_equivalence", detail: "III = 3" },
+                { path: "resolver.title_matching.allow_omitted_part_number", detail: "Numero de saga omitido" },
+                { path: "resolver.title_matching.score_parser_candidates", detail: "Titulo auxiliar del parser: Titulo <auxiliar>" }
+              ],
               breakdown: [
                 { key: "title_exact", path: "resolver.scoring.title_exact", configured: 35, applied: 35 },
                 { key: "title_similarity_max", path: "resolver.scoring.title_similarity_max", configured: 20, applied: 20 }
@@ -184,14 +189,20 @@ class IdentityUiStaticContractTests(unittest.TestCase):
                 { endpoint: "/movie/10", params: { language: "es-ES" }, status_code: 200 }
               ]
             });
-            ["ACEPTADA", "único candidato", "CUMPLIDA", "Titulo exacto", "Configurado", "Aplicado", "+35", "Segundo candidato", "No existe", "2 consultas · 2 correctas", "Buscar película", "Idioma es-ES · Año 2024", "Correcta"].forEach(text => requireText(accepted, text));
+            ["ACEPTADA", "único candidato", "CUMPLIDA", "Titulo exacto", "Configurado", "Aplicado", "+35", "Segundo candidato", "No existe", "Reglas aplicadas", "Equivalencia romana aplicada: III = 3", "Número de saga omitido aceptado", "Título auxiliar utilizado: Titulo &lt;auxiliar&gt;", "2 consultas · 2 correctas", "Buscar película", "Idioma es-ES · Año 2024", "Correcta"].forEach(text => requireText(accepted, text));
             rejectText(accepted, "Ventaja sobre el segundo");
             rejectText(accepted, "RESUELTO POR IDIOMA");
             rejectText(accepted, "grupo ambiguo");
             rejectText(accepted, "% del umbral");
             rejectText(accepted, "HTTP 200");
             rejectText(accepted, "<seguro>");
+            rejectText(accepted, "Titulo <auxiliar>");
             requireText(accepted, "Titulo &lt;seguro&gt;");
+
+            const withoutRules = ui.renderResolverCandidate(
+              { ...candidate, matching_rules: [] }, 0, context
+            );
+            rejectText(withoutRules, "Reglas aplicadas");
 
             const acceptedByLanguage = render({
               status: "ACCEPTED", ok: true,

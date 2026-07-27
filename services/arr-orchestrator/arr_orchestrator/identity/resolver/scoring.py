@@ -1,11 +1,21 @@
-"""Puntuacion pura y desglose estructurado de candidatos TMDb."""
+"""Acumulacion de puntos y desglose estructurado de candidatos TMDb."""
 
-from difflib import SequenceMatcher
 from typing import Dict, List, Sequence, Tuple
 
 from guessit import guessit
 
 from .models import ResolverCandidate
+from .title_matching import (
+    best_title_match,
+    matching_rules_for_pairs,
+    merge_matching_rules,
+    parser_candidate_rules,
+    parser_candidate_rules_for_pairs,
+    resolve_title_matching,
+    scoring_title_values,
+    supplemental_title_candidates,
+    unique_title_values,
+)
 from .text import as_int, clean_release_name, normalize_title, spanish_missing_c_variants
 
 
@@ -30,82 +40,136 @@ DEFAULT_SCORING: Dict[str, float] = {
     "season_invalid": -100.0,
 }
 
-_ORDINAL_TOKENS = {
-    "i": 1,
-    "ii": 2,
-    "iii": 3,
-    "iv": 4,
-    "v": 5,
-    "vi": 6,
-    "vii": 7,
-    "viii": 8,
-    "ix": 9,
-    "x": 10,
-    **{str(value): value for value in range(1, 11)},
-}
-
-
 def score_candidate(
     candidate: ResolverCandidate,
     guessed: Dict[str, object],
     evidence: Sequence[str],
     direct_identity: bool,
     settings: Dict[str, object] | None = None,
+    title_matching: Dict[str, object] | None = None,
 ) -> Tuple[float, List[Dict[str, object]]]:
     weights = dict(DEFAULT_SCORING)
     for key, value in dict(settings or {}).items():
         if key in weights and isinstance(value, (int, float)) and not isinstance(value, bool):
             weights[key] = float(value)
 
+    matching_settings = resolve_title_matching(title_matching)
     contributions: List[Tuple[str, float, float]] = []
+    applied_matching_rules: List[List[Dict[str, str]]] = []
+    candidate.matching_rules = []
 
-    def add(key: str, applied: float) -> None:
+    def add(key: str, applied: float) -> bool:
         value = float(applied)
         if abs(value) < 1e-12:
-            return
+            return False
         contributions.append((key, float(weights[key]), value))
+        return True
 
     if direct_identity:
         add("direct_identity", weights["direct_identity"])
         return _finalize_breakdown(contributions)
 
     query = str(guessed.get("title") or "")
-    title_candidates = [
-        str(value)
-        for value in guessed.get("_title_candidates") or []
-        if _is_distinctive_supplemental_title(value)
-    ]
-    query_values = _unique_values([query, *title_candidates])
-    alias_values = _unique_values(candidate.aliases)
-    exact, ratio, token_overlap = _best_title_match(query_values, alias_values)
-    if exact:
-        add("title_exact", weights["title_exact"])
-    add("title_similarity_max", ratio * weights["title_similarity_max"])
-    add("token_overlap_max", token_overlap * weights["token_overlap_max"])
-    spanish_variants = [
-        variant
-        for value in query_values
-        for variant in spanish_missing_c_variants(value)
-    ]
-    if not exact and _best_title_match(spanish_variants, alias_values)[0]:
-        add("spanish_correction", weights["spanish_correction"])
-
-    parser_exact, best_candidate_ratio, _ = _best_title_match(
-        title_candidates,
-        alias_values,
+    title_candidates = supplemental_title_candidates(
+        guessed.get("_title_candidates") or [], matching_settings
     )
-    if parser_exact:
-        add("parser_exact", weights["parser_exact"])
-    elif best_candidate_ratio >= weights["parser_near_min"]:
-        add("parser_near", weights["parser_near"])
+    query_values = scoring_title_values(query, title_candidates, matching_settings)
+    alias_values = unique_title_values(candidate.aliases)
+    title_match = best_title_match(query_values, alias_values, matching_settings)
+    title_pairs = []
+    if title_match.exact:
+        if add("title_exact", weights["title_exact"]):
+            title_pairs.append(title_match.exact_pair)
+    if add(
+        "title_similarity_max",
+        title_match.ratio * weights["title_similarity_max"],
+    ):
+        title_pairs.append(title_match.ratio_pair)
+    if add(
+        "token_overlap_max",
+        title_match.token_overlap * weights["token_overlap_max"],
+    ):
+        title_pairs.append(title_match.token_overlap_pair)
+    if title_pairs:
+        applied_matching_rules.append(matching_rules_for_pairs(title_pairs))
+        applied_matching_rules.append(
+            parser_candidate_rules_for_pairs(
+                title_pairs,
+                title_candidates,
+                query,
+            )
+        )
+
+    spanish_variant_sources: Dict[str, List[str]] = {}
+    spanish_variants = []
+    for value in query_values:
+        for variant in spanish_missing_c_variants(value):
+            spanish_variants.append(variant)
+            spanish_variant_sources.setdefault(normalize_title(variant), []).append(value)
+    spanish_match = best_title_match(
+        spanish_variants, alias_values, matching_settings
+    )
+    if (
+        not title_match.exact
+        and spanish_match.exact
+        and add("spanish_correction", weights["spanish_correction"])
+    ):
+        spanish_pairs = [spanish_match.exact_pair]
+        applied_matching_rules.append(matching_rules_for_pairs(spanish_pairs))
+        spanish_sources = (
+            spanish_variant_sources.get(
+                normalize_title(spanish_match.exact_pair.left_value),
+                [],
+            )
+            if spanish_match.exact_pair is not None
+            else []
+        )
+        if any(
+            normalize_title(value) == normalize_title(query)
+            for value in spanish_sources
+        ):
+            spanish_sources = [query]
+        applied_matching_rules.append(
+            parser_candidate_rules(spanish_sources, title_candidates, query)
+        )
+
+    if bool(matching_settings["score_parser_candidates"]):
+        parser_match = best_title_match(
+            title_candidates,
+            alias_values,
+            matching_settings,
+        )
+        parser_pairs = []
+        if parser_match.exact:
+            if add("parser_exact", weights["parser_exact"]):
+                parser_pairs.append(parser_match.exact_pair)
+        elif parser_match.ratio >= weights["parser_near_min"]:
+            if add("parser_near", weights["parser_near"]):
+                parser_pairs.append(parser_match.ratio_pair)
+        if parser_pairs:
+            applied_matching_rules.append(matching_rules_for_pairs(parser_pairs))
+            applied_matching_rules.append(
+                parser_candidate_rules_for_pairs(
+                    parser_pairs,
+                    title_candidates,
+                    query,
+                )
+            )
 
     configured_aliases = [
         str(value)
         for value in guessed.get("_rule_query_aliases") or []
         if str(value or "").strip()
     ]
-    if _best_title_match(configured_aliases, alias_values)[0]:
-        add("configured_alias", weights["configured_alias"])
+    configured_alias_match = best_title_match(
+        configured_aliases, alias_values, matching_settings
+    )
+    if configured_alias_match.exact and add(
+        "configured_alias", weights["configured_alias"]
+    ):
+        applied_matching_rules.append(
+            matching_rules_for_pairs([configured_alias_match.exact_pair])
+        )
 
     guessed_year = as_int(guessed.get("year"))
     if guessed_year and candidate.year:
@@ -135,89 +199,8 @@ def score_candidate(
                 add("season_valid", weights["season_valid"])
             else:
                 add("season_invalid", weights["season_invalid"])
+    candidate.matching_rules = merge_matching_rules(*applied_matching_rules)
     return _finalize_breakdown(contributions)
-
-
-TitleForm = Tuple[str, bool, bool]
-
-
-def _best_title_match(
-    left_values: Sequence[str],
-    right_values: Sequence[str],
-) -> Tuple[bool, float, float]:
-    left_forms = [form for value in left_values for form in _title_forms(value)]
-    right_forms = [form for value in right_values for form in _title_forms(value)]
-    exact = False
-    best_ratio = 0.0
-    best_overlap = 0.0
-    for left in left_forms:
-        for right in right_forms:
-            if not _compatible_forms(left, right):
-                continue
-            exact = exact or left[0] == right[0]
-            best_ratio = max(best_ratio, SequenceMatcher(None, left[0], right[0]).ratio())
-            left_tokens = set(left[0].split())
-            right_tokens = set(right[0].split())
-            best_overlap = max(
-                best_overlap,
-                len(left_tokens & right_tokens)
-                / max(1, len(left_tokens | right_tokens)),
-            )
-    return exact, best_ratio, best_overlap
-
-
-def _title_forms(value: str) -> List[TitleForm]:
-    normalized = normalize_title(value)
-    if not normalized:
-        return []
-    tokens = normalized.split()
-    ordinal_values = [
-        _ORDINAL_TOKENS[token] for token in tokens if token in _ORDINAL_TOKENS
-    ]
-    canonical = [
-        str(_ORDINAL_TOKENS[token]) if token in _ORDINAL_TOKENS else token
-        for token in tokens
-    ]
-    forms: List[TitleForm] = [(" ".join(canonical), bool(ordinal_values), False)]
-    without_ordinals = [
-        token for token in canonical if token not in {str(value) for value in ordinal_values}
-    ]
-    if len(ordinal_values) == 1 and len(without_ordinals) >= 3:
-        forms.append((" ".join(without_ordinals), True, True))
-    expanded: List[TitleForm] = []
-    for text, has_ordinal, omitted_ordinal in forms:
-        expanded.append((text, has_ordinal, omitted_ordinal))
-        tokens = text.split()
-        for index, token in enumerate(tokens):
-            if token != "s" or index == 0:
-                continue
-            joined = [*tokens]
-            joined[index - 1 : index + 1] = [f"{tokens[index - 1]}s"]
-            expanded.append((" ".join(joined), has_ordinal, omitted_ordinal))
-    return list(dict.fromkeys(expanded))
-
-
-def _compatible_forms(left: TitleForm, right: TitleForm) -> bool:
-    if left[2] or right[2]:
-        return left[2] != right[2] and left[1] != right[1]
-    return True
-
-
-def _unique_values(values: Sequence[str]) -> List[str]:
-    result: List[str] = []
-    seen = set()
-    for value in values:
-        text = str(value or "").strip()
-        key = text.casefold()
-        if text and key not in seen:
-            seen.add(key)
-            result.append(text)
-    return result
-
-
-def _is_distinctive_supplemental_title(value: object) -> bool:
-    normalized = normalize_title(str(value or ""))
-    return len(normalized.replace(" ", "")) >= 3
 
 
 def _finalize_breakdown(

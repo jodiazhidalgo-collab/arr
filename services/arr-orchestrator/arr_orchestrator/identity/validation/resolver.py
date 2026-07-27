@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Dict, Tuple
 
+from ..resolver_defaults import DEFAULT_SERIES_CANDIDATES, DEFAULT_TITLE_MATCHING
 from .common import (
     IdentityRulesValidationError,
     aliases,
@@ -39,11 +41,19 @@ def _integers(
 
 def normalize_resolver(value: object) -> Dict[str, object]:
     resolver = dict(expect_object(value, "rules.resolver"))
-    # Los documentos v1 anteriores a esta opcion se completan durante la
+    # Los documentos v1 anteriores a estas opciones se completan durante la
     # normalizacion. El resto del contrato continua siendo estricto.
     resolver.setdefault(
         "original_language_preference",
         {"enabled": True, "language": "en"},
+    )
+    resolver.setdefault(
+        "series_candidates",
+        copy.deepcopy(DEFAULT_SERIES_CANDIDATES),
+    )
+    resolver.setdefault(
+        "title_matching",
+        copy.deepcopy(DEFAULT_TITLE_MATCHING),
     )
     exact_keys(
         resolver,
@@ -54,7 +64,9 @@ def normalize_resolver(value: object) -> Dict[str, object]:
             "forced_matches",
             "evidence",
             "guess_selection",
+            "series_candidates",
             "query_variants",
+            "title_matching",
             "search_limits",
             "scoring",
             "acceptance",
@@ -206,6 +218,28 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         },
     )
 
+    series_candidates = expect_object(
+        resolver.get("series_candidates"),
+        "rules.resolver.series_candidates",
+    )
+    exact_keys(
+        series_candidates,
+        {"title_before_episode_marker", "min_title_words"},
+        "rules.resolver.series_candidates",
+    )
+    normalized_series_candidates = {
+        "title_before_episode_marker": boolean(
+            series_candidates.get("title_before_episode_marker"),
+            "rules.resolver.series_candidates.title_before_episode_marker",
+        ),
+        "min_title_words": integer(
+            series_candidates.get("min_title_words"),
+            "rules.resolver.series_candidates.min_title_words",
+            1,
+            20,
+        ),
+    }
+
     query_keys = (
         "with_year",
         "without_year",
@@ -223,6 +257,48 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         raise IdentityRulesValidationError(
             "rules.resolver.query_variants requiere buscar con año o sin año."
         )
+
+    title_matching = expect_object(
+        resolver.get("title_matching"),
+        "rules.resolver.title_matching",
+    )
+    exact_keys(
+        title_matching,
+        {
+            "score_parser_candidates",
+            "roman_arabic_equivalence",
+            "allow_omitted_part_number",
+            "omitted_part_min_words",
+            "supplemental_min_chars",
+        },
+        "rules.resolver.title_matching",
+    )
+    normalized_title_matching = {
+        "score_parser_candidates": boolean(
+            title_matching.get("score_parser_candidates"),
+            "rules.resolver.title_matching.score_parser_candidates",
+        ),
+        "roman_arabic_equivalence": boolean(
+            title_matching.get("roman_arabic_equivalence"),
+            "rules.resolver.title_matching.roman_arabic_equivalence",
+        ),
+        "allow_omitted_part_number": boolean(
+            title_matching.get("allow_omitted_part_number"),
+            "rules.resolver.title_matching.allow_omitted_part_number",
+        ),
+        "omitted_part_min_words": integer(
+            title_matching.get("omitted_part_min_words"),
+            "rules.resolver.title_matching.omitted_part_min_words",
+            1,
+            20,
+        ),
+        "supplemental_min_chars": integer(
+            title_matching.get("supplemental_min_chars"),
+            "rules.resolver.title_matching.supplemental_min_chars",
+            1,
+            100,
+        ),
+    }
 
     limits = expect_object(
         resolver.get("search_limits"), "rules.resolver.search_limits"
@@ -511,7 +587,9 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         "forced_matches": normalized_forced,
         "evidence": normalized_evidence,
         "guess_selection": normalized_guess,
+        "series_candidates": normalized_series_candidates,
         "query_variants": normalized_queries,
+        "title_matching": normalized_title_matching,
         "search_limits": normalized_limits,
         "scoring": normalized_scoring,
         "acceptance": normalized_acceptance,

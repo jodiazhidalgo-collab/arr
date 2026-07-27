@@ -158,6 +158,40 @@
   border-top: 1px solid rgba(148, 163, 184, .16);
 }
 
+.resolver-matching-rules {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid rgba(56, 189, 248, .2);
+  border-radius: 6px;
+  background: rgba(56, 189, 248, .07);
+}
+
+.resolver-matching-rules > strong {
+  color: #bae6fd;
+  font-size: 11px;
+  letter-spacing: .03em;
+}
+
+.resolver-matching-rules ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.resolver-matching-rules li {
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, .7);
+  color: #e2e8f0;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
 .resolver-breakdown-wrap {
   min-width: 0;
   padding-top: 10px;

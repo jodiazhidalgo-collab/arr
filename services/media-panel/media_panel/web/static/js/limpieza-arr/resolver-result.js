@@ -214,6 +214,38 @@
     </table></div>`;
   };
 
+  ui.resolverMatchingRuleText = function (item) {
+    if (typeof item === "string") return item.trim();
+    if (!item || typeof item !== "object") return "";
+    const path = String(item.path || "");
+    const detail = String(item.detail || "").trim();
+    if (path.endsWith(".roman_arabic_equivalence")) {
+      return detail ? `Equivalencia romana aplicada: ${detail}` : "Equivalencia romana aplicada";
+    }
+    if (path.endsWith(".allow_omitted_part_number")) {
+      return "Número de saga omitido aceptado";
+    }
+    if (path.endsWith(".score_parser_candidates")) {
+      const title = detail.replace(/^T[ií]tulo auxiliar del parser:\s*/i, "").trim();
+      return title ? `Título auxiliar utilizado: ${title}` : "Título auxiliar utilizado";
+    }
+    return detail;
+  };
+
+  ui.renderResolverMatchingRules = function (candidate) {
+    const rules = Array.isArray(candidate?.matching_rules)
+      ? candidate.matching_rules.map(ui.resolverMatchingRuleText).filter(Boolean)
+      : [];
+    if (!rules.length) return "";
+    const items = [...new Set(rules)]
+      .map(rule => `<li>${ui.esc(rule)}</li>`)
+      .join("");
+    return `<section class="resolver-matching-rules" aria-label="Reglas aplicadas">
+      <strong>Reglas aplicadas</strong>
+      <ul>${items}</ul>
+    </section>`;
+  };
+
   ui.renderResolverCandidate = function (candidate, index, context) {
     const category = ["movies", "tv"].includes(context?.category) ? context.category : "";
     const parserTitle = String(context?.parserTitle || "").trim();
@@ -240,6 +272,7 @@
         <span class="resolver-open-label">Ver puntuación</span>
       </summary>
       <div class="resolver-candidate-body">
+        ${ui.renderResolverMatchingRules(candidate)}
         ${ui.renderResolverBreakdown(candidate)}
         <div class="resolver-candidate-actions">
           <button type="button" class="btn ghost small" data-candidate-action="alias" data-test-request-id="${requestId}" data-tmdb-id="${ui.esc(tmdbId)}" data-candidate-title="${ui.esc(candidateTitle)}" ${canAlias ? "" : "disabled"}>Crear alias</button>

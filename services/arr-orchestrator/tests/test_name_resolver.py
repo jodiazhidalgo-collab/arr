@@ -7,6 +7,10 @@ from unittest.mock import patch
 from arr_orchestrator.db import Database
 from arr_orchestrator.filebot import FileBotRunner, TV_FORMATS
 from arr_orchestrator.identity import factory_identity_rules
+from arr_orchestrator.identity.resolver.title_candidates import (
+    ordered_title_candidates,
+    series_title_candidates,
+)
 from arr_orchestrator.name_resolver import (
     NameResolver,
     ResolutionError,
@@ -1307,6 +1311,59 @@ class NameResolverTests(unittest.TestCase):
                 self.assertIn("Universal Story", queries)
                 self.assertEqual(identity.season, 1)
                 self.assertEqual(identity.episodes, [3])
+
+    def test_series_title_candidate_rule_can_be_disabled(self):
+        candidates = series_title_candidates(
+            ["Universal.Story.S01E03.The.Return.1080p"],
+            {
+                "series_candidates": {
+                    "title_before_episode_marker": False,
+                    "min_title_words": 2,
+                }
+            },
+        )
+
+        self.assertEqual(candidates, [])
+
+    def test_series_title_candidates_respect_minimum_words(self):
+        evidence = [
+            "Universal.Story.S01E03.The.Return.1080p",
+            "The.Universal.Story.S01E03.The.Return.1080p",
+        ]
+
+        candidates = series_title_candidates(
+            evidence,
+            {
+                "series_candidates": {
+                    "title_before_episode_marker": True,
+                    "min_title_words": 3,
+                }
+            },
+        )
+
+        self.assertNotIn("Universal Story", candidates)
+        self.assertIn("The Universal Story", candidates)
+
+    def test_parser_titles_stay_before_deduplicated_derived_candidates(self):
+        candidates = ordered_title_candidates(
+            [
+                "Historia Lokalna",
+                "Universal Story",
+                "Historia Lokalna / Universal Story",
+            ],
+            "Historia Lokalna",
+            ["Historia Lokalna / Universal Story", "Historia Lokalna 2024"],
+        )
+
+        self.assertEqual(
+            candidates,
+            [
+                "Historia Lokalna",
+                "Universal Story",
+                "Historia Lokalna / Universal Story",
+                "Historia Lokalna 2024",
+            ],
+        )
 
     def test_tv_search_keeps_bilingual_parser_titles_before_derived_prefixes(self):
         correct = tv_payload(
