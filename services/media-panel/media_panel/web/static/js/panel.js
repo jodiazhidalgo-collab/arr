@@ -78,7 +78,7 @@ const RULE_SECTIONS = {
         controls: [
           { type: "number", path: "video.pistas_exactas", label: "Pistas permitidas", min: 1, max: 3, step: 1 },
           { type: "list", path: "video.idiomas_aceptados", label: "Idiomas aceptados" },
-          { type: "list", path: "video.idiomas_indeterminados_como_es", label: "Indeterminados como ES" }
+          { type: "list", path: "video.idiomas_indeterminados_como_es", label: "Idiomas renombrados a ES" }
         ]
       },
       {
