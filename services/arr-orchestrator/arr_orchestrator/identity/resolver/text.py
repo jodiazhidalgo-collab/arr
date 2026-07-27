@@ -10,7 +10,12 @@ from ...filesystem import MEDIA_EXTENSIONS
 
 
 def normalize_title(value: str) -> str:
-    ascii_value = unicodedata.normalize("NFKD", str(value or ""))
+    text = re.sub(
+        r"(?<=\w)['’‘`´ʼʻ](?=\w)",
+        "",
+        str(value or ""),
+    )
+    ascii_value = unicodedata.normalize("NFKD", text)
     ascii_value = "".join(char for char in ascii_value if not unicodedata.combining(char))
     return " ".join(re.findall(r"[a-z0-9]+", ascii_value.casefold()))
 

@@ -114,6 +114,147 @@ class ResolverPolicyTests(unittest.TestCase):
         self.assertEqual(custom_title["configured"], 3)
         self.assertEqual(custom_title["applied"], 3)
 
+    def test_scoring_normalizes_apostrophes_without_title_specific_rules(self):
+        candidate = ResolverCandidate(
+            10,
+            "movie",
+            "King's Journey",
+            "King's Journey",
+            2024,
+            ["King's Journey"],
+        )
+
+        for query in ("Kings Journey", "King s Journey", "King,s Journey"):
+            with self.subTest(query=query):
+                score, breakdown = score_candidate(
+                    candidate,
+                    {
+                        "title": query,
+                        "year": 2024,
+                        "_title_candidates": [query],
+                    },
+                    [],
+                    False,
+                )
+
+                self.assertEqual(score, 110.0)
+                self.assertIn("title_exact", self._breakdown_keys(breakdown))
+                self.assertIn("parser_exact", self._breakdown_keys(breakdown))
+
+    def test_scoring_matches_roman_arabic_and_safe_omitted_ordinals(self):
+        cases = (
+            ("Saga 3 Capitulo final", "Saga III Capitulo final"),
+            ("Saga Capitulo final", "Saga IV Capitulo final"),
+        )
+        for query, title in cases:
+            with self.subTest(query=query, title=title):
+                candidate = ResolverCandidate(
+                    11,
+                    "movie",
+                    title,
+                    title,
+                    2024,
+                    [title],
+                )
+                score, breakdown = score_candidate(
+                    candidate,
+                    {
+                        "title": query,
+                        "year": 2024,
+                        "_title_candidates": [query],
+                    },
+                    [],
+                    False,
+                )
+
+                self.assertEqual(score, 110.0)
+                self.assertIn("title_exact", self._breakdown_keys(breakdown))
+
+    def test_ordinal_tolerance_does_not_collapse_short_or_conflicting_sagas(self):
+        cases = (
+            ("Rocky", "Rocky II"),
+            ("Saga III Capitulo final", "Saga IV Capitulo final"),
+        )
+        for query, title in cases:
+            with self.subTest(query=query, title=title):
+                candidate = ResolverCandidate(
+                    12,
+                    "movie",
+                    title,
+                    title,
+                    2024,
+                    [title],
+                )
+                score, breakdown = score_candidate(
+                    candidate,
+                    {
+                        "title": query,
+                        "year": 2024,
+                        "_title_candidates": [query],
+                    },
+                    [],
+                    False,
+                )
+                keys = self._breakdown_keys(breakdown)
+
+                self.assertLess(score, 75)
+                self.assertNotIn("title_exact", keys)
+                self.assertNotIn("parser_exact", keys)
+
+    def test_tiny_supplemental_candidate_cannot_decide_an_unrelated_identity(self):
+        candidate = ResolverCandidate(
+            13,
+            "movie",
+            "EP",
+            "EP",
+            None,
+            ["EP"],
+        )
+
+        score, breakdown = score_candidate(
+            candidate,
+            {
+                "title": "The Long Musical Release",
+                "year": 2007,
+                "_title_candidates": ["The Long Musical Release", "EP"],
+            },
+            ["The Long Musical Release EP 2007 FLAC lossless"],
+            False,
+        )
+        keys = self._breakdown_keys(breakdown)
+
+        self.assertLess(score, 75)
+        self.assertNotIn("title_exact", keys)
+        self.assertNotIn("parser_exact", keys)
+
+    def test_scoring_uses_the_best_parser_title_candidate(self):
+        candidate = ResolverCandidate(
+            13,
+            "movie",
+            "Clean Global Title",
+            "Clean Global Title",
+            2024,
+            ["Clean Global Title"],
+        )
+
+        score, breakdown = score_candidate(
+            candidate,
+            {
+                "title": "Etiqueta Titulo Sucio",
+                "year": 2024,
+                "_title_candidates": [
+                    "Etiqueta Titulo Sucio",
+                    "Clean Global Title",
+                ],
+            },
+            [],
+            False,
+        )
+
+        self.assertEqual(score, 110.0)
+        self.assertIn("title_exact", self._breakdown_keys(breakdown))
+        self.assertIn("parser_exact", self._breakdown_keys(breakdown))
+
     def test_scoring_breakdown_covers_every_kind_of_points_and_penalty(self):
         movie = ResolverCandidate(
             1,

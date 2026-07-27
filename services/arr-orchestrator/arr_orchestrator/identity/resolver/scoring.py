@@ -30,6 +30,20 @@ DEFAULT_SCORING: Dict[str, float] = {
     "season_invalid": -100.0,
 }
 
+_ORDINAL_TOKENS = {
+    "i": 1,
+    "ii": 2,
+    "iii": 3,
+    "iv": 4,
+    "v": 5,
+    "vi": 6,
+    "vii": 7,
+    "viii": 8,
+    "ix": 9,
+    "x": 10,
+    **{str(value): value for value in range(1, 11)},
+}
+
 
 def score_candidate(
     candidate: ResolverCandidate,
@@ -56,50 +70,41 @@ def score_candidate(
         return _finalize_breakdown(contributions)
 
     query = str(guessed.get("title") or "")
-    query_norm = normalize_title(query)
-    aliases = [normalize_title(value) for value in candidate.aliases if value]
-    ratios = [SequenceMatcher(None, query_norm, alias).ratio() for alias in aliases]
-    ratio = max(ratios or [0.0])
-    exact = query_norm in aliases
-    tokens = set(query_norm.split())
-    token_overlap = max(
-        (
-            len(tokens & set(alias.split())) / max(1, len(tokens | set(alias.split())))
-            for alias in aliases
-        ),
-        default=0.0,
-    )
+    title_candidates = [
+        str(value)
+        for value in guessed.get("_title_candidates") or []
+        if _is_distinctive_supplemental_title(value)
+    ]
+    query_values = _unique_values([query, *title_candidates])
+    alias_values = _unique_values(candidate.aliases)
+    exact, ratio, token_overlap = _best_title_match(query_values, alias_values)
     if exact:
         add("title_exact", weights["title_exact"])
     add("title_similarity_max", ratio * weights["title_similarity_max"])
     add("token_overlap_max", token_overlap * weights["token_overlap_max"])
-    if not exact and any(
-        normalize_title(value) in aliases for value in spanish_missing_c_variants(query)
-    ):
+    spanish_variants = [
+        variant
+        for value in query_values
+        for variant in spanish_missing_c_variants(value)
+    ]
+    if not exact and _best_title_match(spanish_variants, alias_values)[0]:
         add("spanish_correction", weights["spanish_correction"])
 
-    title_candidates = [
-        normalize_title(str(value))
-        for value in guessed.get("_title_candidates") or []
-        if str(value or "").strip()
-    ]
-    candidate_ratios = [
-        SequenceMatcher(None, candidate_title, alias).ratio()
-        for candidate_title in title_candidates
-        for alias in aliases
-    ]
-    best_candidate_ratio = max(candidate_ratios or [0.0])
-    if any(candidate_title in aliases for candidate_title in title_candidates):
+    parser_exact, best_candidate_ratio, _ = _best_title_match(
+        title_candidates,
+        alias_values,
+    )
+    if parser_exact:
         add("parser_exact", weights["parser_exact"])
     elif best_candidate_ratio >= weights["parser_near_min"]:
         add("parser_near", weights["parser_near"])
 
-    configured_aliases = {
-        normalize_title(str(value))
+    configured_aliases = [
+        str(value)
         for value in guessed.get("_rule_query_aliases") or []
         if str(value or "").strip()
-    }
-    if configured_aliases.intersection(aliases):
+    ]
+    if _best_title_match(configured_aliases, alias_values)[0]:
         add("configured_alias", weights["configured_alias"])
 
     guessed_year = as_int(guessed.get("year"))
@@ -116,6 +121,7 @@ def score_candidate(
 
     add("category", weights["category"])
 
+    aliases = {normalize_title(value) for value in alias_values if value}
     if evidence and any(
         normalize_title(str(dict(guessit(clean_release_name(value))).get("title") or "")) in aliases
         for value in evidence
@@ -130,6 +136,88 @@ def score_candidate(
             else:
                 add("season_invalid", weights["season_invalid"])
     return _finalize_breakdown(contributions)
+
+
+TitleForm = Tuple[str, bool, bool]
+
+
+def _best_title_match(
+    left_values: Sequence[str],
+    right_values: Sequence[str],
+) -> Tuple[bool, float, float]:
+    left_forms = [form for value in left_values for form in _title_forms(value)]
+    right_forms = [form for value in right_values for form in _title_forms(value)]
+    exact = False
+    best_ratio = 0.0
+    best_overlap = 0.0
+    for left in left_forms:
+        for right in right_forms:
+            if not _compatible_forms(left, right):
+                continue
+            exact = exact or left[0] == right[0]
+            best_ratio = max(best_ratio, SequenceMatcher(None, left[0], right[0]).ratio())
+            left_tokens = set(left[0].split())
+            right_tokens = set(right[0].split())
+            best_overlap = max(
+                best_overlap,
+                len(left_tokens & right_tokens)
+                / max(1, len(left_tokens | right_tokens)),
+            )
+    return exact, best_ratio, best_overlap
+
+
+def _title_forms(value: str) -> List[TitleForm]:
+    normalized = normalize_title(value)
+    if not normalized:
+        return []
+    tokens = normalized.split()
+    ordinal_values = [
+        _ORDINAL_TOKENS[token] for token in tokens if token in _ORDINAL_TOKENS
+    ]
+    canonical = [
+        str(_ORDINAL_TOKENS[token]) if token in _ORDINAL_TOKENS else token
+        for token in tokens
+    ]
+    forms: List[TitleForm] = [(" ".join(canonical), bool(ordinal_values), False)]
+    without_ordinals = [
+        token for token in canonical if token not in {str(value) for value in ordinal_values}
+    ]
+    if len(ordinal_values) == 1 and len(without_ordinals) >= 3:
+        forms.append((" ".join(without_ordinals), True, True))
+    expanded: List[TitleForm] = []
+    for text, has_ordinal, omitted_ordinal in forms:
+        expanded.append((text, has_ordinal, omitted_ordinal))
+        tokens = text.split()
+        for index, token in enumerate(tokens):
+            if token != "s" or index == 0:
+                continue
+            joined = [*tokens]
+            joined[index - 1 : index + 1] = [f"{tokens[index - 1]}s"]
+            expanded.append((" ".join(joined), has_ordinal, omitted_ordinal))
+    return list(dict.fromkeys(expanded))
+
+
+def _compatible_forms(left: TitleForm, right: TitleForm) -> bool:
+    if left[2] or right[2]:
+        return left[2] != right[2] and left[1] != right[1]
+    return True
+
+
+def _unique_values(values: Sequence[str]) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        key = text.casefold()
+        if text and key not in seen:
+            seen.add(key)
+            result.append(text)
+    return result
+
+
+def _is_distinctive_supplemental_title(value: object) -> bool:
+    normalized = normalize_title(str(value or ""))
+    return len(normalized.replace(" ", "")) >= 3
 
 
 def _finalize_breakdown(

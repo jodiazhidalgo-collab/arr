@@ -1266,6 +1266,81 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(identity.season, 3)
         self.assertEqual(identity.episodes, [53])
 
+    def test_tv_search_adds_generic_series_title_before_episode_marker(self):
+        correct = tv_payload(
+            501,
+            "Universal Story",
+            "Universal Story",
+            2024,
+            seasons=2,
+        )
+
+        def search(params):
+            if params.get("query") == "Universal Story":
+                return {"results": [correct]}
+            return {"results": []}
+
+        routes = {
+            "/search/tv": search,
+            "/tv/501": correct,
+        }
+        samples = (
+            "Universal.Story.S01E03.The.Return.1080p",
+            "Universal.Story.[WEB-DL.1080p].[Dual].1x03.The.Return",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                resolver, session = self.resolver(routes)
+                input_root = self.input_file(f"{sample}.mkv")
+
+                identity = resolver.resolve(
+                    {"category": "tv", "name": sample},
+                    input_root,
+                )
+
+                queries = [
+                    call[1].get("query")
+                    for call in session.calls
+                    if "/search/tv" in call[0]
+                ]
+                self.assertEqual(identity.tmdb_id, 501)
+                self.assertIn("Universal Story", queries)
+                self.assertEqual(identity.season, 1)
+                self.assertEqual(identity.episodes, [3])
+
+    def test_tv_search_keeps_bilingual_parser_titles_before_derived_prefixes(self):
+        correct = tv_payload(
+            502,
+            "Universal Story",
+            "Universal Story",
+            2024,
+            seasons=2,
+        )
+
+        def search(params):
+            if params.get("query") == "Universal Story":
+                return {"results": [correct]}
+            return {"results": []}
+
+        routes = {"/search/tv": search, "/tv/502": correct}
+        resolver, session = self.resolver(routes)
+        sample = "Historia Lokalna / Universal Story (2024) S01E03 WEB-DL"
+        input_root = self.input_file("bilingual-series-sample.mkv")
+
+        identity = resolver.resolve(
+            {"category": "tv", "name": sample},
+            input_root,
+        )
+
+        queries = [
+            call[1].get("query")
+            for call in session.calls
+            if "/search/tv" in call[0]
+        ]
+        self.assertEqual(identity.tmdb_id, 502)
+        self.assertIn("Universal Story", queries)
+        self.assertLessEqual(queries.index("Universal Story"), 4)
+
     def test_tv_search_with_year_control_sends_first_air_date_year(self):
         correct = tv_payload(11, "Serie ejemplo", "Example show", 2024, seasons=2)
         routes = {"/search/tv": {"results": [correct]}, "/tv/11": correct}

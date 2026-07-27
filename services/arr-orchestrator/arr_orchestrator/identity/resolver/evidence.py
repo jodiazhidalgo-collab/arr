@@ -1,5 +1,6 @@
 """Recogida de evidencias locales y selección del mejor GuessIt."""
 
+import re
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -7,10 +8,19 @@ from guessit import guessit
 
 from ...filesystem import media_files
 from ...name_parser import parse_release_name
-from .text import clean_release_name, prefer_parser_title, unique
+from ..parser_rules import parser_pattern, resolve_parser_rules
+from .text import clean_release_name, normalize_title, prefer_parser_title, unique
 
 
 TECHNICAL_NAMES = {"original", "filebot_input", "filebot_output", "extracted"}
+TV_IDENTITY_PATTERNS = (
+    "series_sxe",
+    "series_x",
+    "explicit_season",
+    "season_pack",
+    "chapter",
+    "episode_word",
+)
 
 
 def collect_name_evidence(
@@ -77,6 +87,9 @@ def best_guess(
         if isinstance(policy.get("guess_selection"), dict)
         else {}
     )
+    series_titles = (
+        _series_title_candidates(evidence, policy) if media_type == "tv" else []
+    )
     for index, value in enumerate(evidence):
         parsed_name = parse_release_name(
             value,
@@ -103,7 +116,10 @@ def best_guess(
                 parsed["episode"] = parsed_name.episodes
             if parsed_name.absolute_episode is not None:
                 parsed["absolute_episode"] = parsed_name.absolute_episode
-        parsed["_title_candidates"] = parsed_name.title_candidates or [title]
+        parsed_titles = parsed_name.title_candidates or [title]
+        parsed["_title_candidates"] = unique(
+            [*parsed_titles, *series_titles]
+        )
         parsed["_display_title"] = parsed_name.display_title
         parsed["_guessit_input"] = cleaned
         quality = int(settings.get("base", 100)) - index * int(settings.get("index_penalty", 1))
@@ -115,3 +131,35 @@ def best_guess(
             quality += int(settings.get("parser_high_bonus", 10))
         guesses.append((quality, parsed))
     return max(guesses, key=lambda item: item[0])[1] if guesses else {}
+
+
+def _series_title_candidates(
+    evidence: Sequence[str], policy: Dict[str, object]
+) -> List[str]:
+    """Añade el nombre anterior al marcador TV como consulta alternativa.
+
+    El título de un episodio puede aparecer después de ``S01E02`` o ``1x02``.
+    La alternativa conserva el título completo y solo amplía la búsqueda TMDb.
+    """
+
+    rules = resolve_parser_rules(rules=policy.get("parser"))
+    result: List[str] = []
+    for value in evidence:
+        text = str(value or "").strip()
+        matches = []
+        for name in TV_IDENTITY_PATTERNS:
+            pattern = parser_pattern(rules, name)
+            if pattern and (match := re.search(pattern, text, flags=re.IGNORECASE)):
+                matches.append(match)
+        if not matches:
+            continue
+        first = min(matches, key=lambda match: match.start())
+        prefix = text[: first.start()].strip(" ._-")
+        if not prefix:
+            continue
+        parsed = parse_release_name(prefix, "tv", rules=rules)
+        for candidate in (parsed.display_title, clean_release_name(prefix)):
+            candidate = candidate.strip()
+            if len(normalize_title(candidate).split()) >= 2:
+                result.append(candidate)
+    return unique(result)
