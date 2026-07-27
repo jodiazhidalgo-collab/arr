@@ -27,14 +27,6 @@ def _config(**overrides):
     return SimpleNamespace(**values)
 
 
-class _FileBotSettings:
-    def __init__(self, rules=None) -> None:
-        self._rules = rules or {}
-
-    def snapshot(self):
-        return copy.deepcopy(self._rules)
-
-
 class IdentityControllerTests(unittest.TestCase):
     def setUp(self) -> None:
         RUNTIME_TEST_ROOT.mkdir(parents=True, exist_ok=True)
@@ -60,7 +52,7 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertIsNone(re.search(patterns["season_pack"], "Serie S02"))
 
     def test_parser_test_uses_unsaved_draft_and_returns_trace(self) -> None:
-        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        controller = IdentityController(_config(), self.database)
         document = controller.payload()
         draft = copy.deepcopy(document["rules"])
         draft["parser"]["site_words"].append("MarcaPrueba")
@@ -80,7 +72,7 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(controller.payload()["revision"], 0)
 
     def test_resolver_tester_reports_missing_tmdb_without_side_effects(self) -> None:
-        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        controller = IdentityController(_config(), self.database)
 
         result = controller.test_resolver(
             {"name": "Blade.Runner.1982.1080p.mkv", "category": "movies"}
@@ -93,7 +85,7 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
 
     def test_resolver_tester_returns_human_contract_for_invalid_draft(self) -> None:
-        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        controller = IdentityController(_config(), self.database)
         draft = controller.payload()["rules"]
         draft["resolver"]["acceptance"]["min_margin"] = "no-es-un-numero"
 
@@ -126,7 +118,6 @@ class IdentityControllerTests(unittest.TestCase):
                 resolver_retry_seconds=41,
             ),
             self.database,
-            _FileBotSettings(),
         )
 
         payload = controller.payload()
@@ -141,7 +132,7 @@ class IdentityControllerTests(unittest.TestCase):
             41,
         )
 
-    def test_legacy_identity_fields_migrate_once_from_filebot_settings(self) -> None:
+    def test_constructor_ignores_live_legacy_filebot_setting(self) -> None:
         legacy = {
             "movies": {
                 "language": "en-GB",
@@ -155,66 +146,27 @@ class IdentityControllerTests(unittest.TestCase):
                 "forced_matches": ["The Office | 2316"],
             },
         }
-
-        controller = IdentityController(
-            _config(), self.database, _FileBotSettings(legacy)
+        self.database.set_setting(
+            "filebot.rules",
+            json.dumps({"rules": legacy, "revision": 7}),
         )
+
+        controller = IdentityController(_config(), self.database)
         payload = controller.payload()
 
-        self.assertEqual(payload["revision"], 1)
+        self.assertEqual(payload["revision"], 0)
         self.assertEqual(
             payload["rules"]["resolver"]["locales"]["movies"],
-            {"language": "en-GB", "region": "GB"},
+            {"language": "es-ES", "region": "ES"},
         )
+        self.assertEqual(payload["rules"]["resolver"]["aliases"]["tv"], [])
+        self.assertIsNone(self.database.get_setting("identity.pipeline"))
         self.assertEqual(
-            payload["rules"]["resolver"]["aliases"]["tv"],
-            ["La oficina | The Office"],
+            json.loads(self.database.get_setting("filebot.rules"))["revision"], 7
         )
-        self.assertEqual(payload["rules"]["parser"]["video_extensions"], [])
-        self.assertEqual(payload["rules"]["parser"]["video_markers"], [])
-        self.assertEqual(payload["rules"]["parser"]["non_video_markers"], [])
-        self.assertEqual(payload["rules"]["parser"]["season_number_words"], [])
-        self.assertFalse(
-            payload["rules"]["parser"]["normalization"][
-                "movie_without_year_from_video"
-            ]
-        )
-        self.assertFalse(
-            payload["rules"]["parser"]["normalization"]["allow_tv_year_range"]
-        )
-        self.assertFalse(
-            payload["rules"]["resolver"]["acceptance"][
-                "prefer_oldest_exact_title_without_year"
-            ]
-        )
-        self.assert_legacy_tv_regex_semantics(payload["rules"])
-
-        restarted = IdentityController(
-            _config(), self.database, _FileBotSettings({})
-        )
-        self.assertEqual(restarted.payload()["revision"], 1)
-
-    def test_legacy_migration_never_overwrites_an_existing_invalid_value(self) -> None:
-        legacy = {
-            "movies": {
-                "language": "en-GB",
-                "query_aliases": ["Origen | Destination"],
-            }
-        }
-
-        for raw in ("{invalid", json.dumps({"schema_version": 99})):
-            with self.subTest(raw=raw):
-                self.database.set_setting("identity.pipeline", raw)
-                controller = IdentityController(
-                    _config(), self.database, _FileBotSettings(legacy)
-                )
-
-                self.assertEqual(self.database.get_setting("identity.pipeline"), raw)
-                self.assertEqual(controller.payload()["revision"], 0)
-                self.assertTrue(controller.payload()["repair_required"])
 
     def test_job_snapshot_is_stable_after_later_save(self) -> None:
-        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        controller = IdentityController(_config(), self.database)
         before = controller.job_snapshot()
         changed = controller.payload()["rules"]
         changed["resolver"]["acceptance"]["min_score"] = 60
@@ -236,7 +188,7 @@ class IdentityControllerTests(unittest.TestCase):
         )
 
     def test_legacy_v1_job_snapshot_keeps_old_behavior_and_coherent_fingerprint(self) -> None:
-        controller = IdentityController(_config(), self.database, _FileBotSettings())
+        controller = IdentityController(_config(), self.database)
         legacy_rules = copy.deepcopy(controller.payload()["rules"])
         del legacy_rules["resolver"]["original_language_preference"]
         for key in (
@@ -299,8 +251,8 @@ class IdentityControllerTests(unittest.TestCase):
             restored["fingerprint"], identity_fingerprint(restored["rules"])
         )
 
-    def test_legacy_filebot_job_snapshot_does_not_gain_language_preference(self) -> None:
-        controller = IdentityController(_config(), self.database, _FileBotSettings())
+    def test_legacy_filebot_job_snapshot_remains_read_only_compatible(self) -> None:
+        controller = IdentityController(_config(), self.database)
         old_job = {
             "source_meta_json": json.dumps(
                 {
@@ -322,6 +274,11 @@ class IdentityControllerTests(unittest.TestCase):
         restored = controller.rules_for_job(old_job)
 
         self.assertEqual(restored["source"], "legacy_filebot_snapshot")
+        self.assertEqual(restored["revision"], 2)
+        self.assertEqual(
+            restored["rules"]["resolver"]["locales"]["movies"],
+            {"language": "es-ES", "region": "ES"},
+        )
         self.assertFalse(
             restored["rules"]["resolver"]["original_language_preference"]["enabled"]
         )

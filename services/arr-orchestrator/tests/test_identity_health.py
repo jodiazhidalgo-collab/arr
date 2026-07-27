@@ -26,6 +26,27 @@ def _post_raw(url: str, data: bytes):
 
 
 class IdentityHealthTests(unittest.TestCase):
+    def test_removed_filebot_settings_endpoint_returns_404(self) -> None:
+        server = start_health_server(
+            0,
+            lambda: {"status": "ok"},
+            lambda: [],
+        )
+        try:
+            port = server.server_address[1]
+            url = f"http://127.0.0.1:{port}/settings/filebot"
+            with self.assertRaises(urllib.error.HTTPError) as raised:
+                urllib.request.urlopen(url, timeout=5)
+            self.assertEqual(raised.exception.code, 404)
+            self.assertEqual(
+                json.loads(raised.exception.read().decode("utf-8")),
+                {"error": "not_found"},
+            )
+            self.assertEqual(_post(url, {})[0], 404)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_identity_endpoints_preserve_contract_and_statuses(self) -> None:
         calls = []
 

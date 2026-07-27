@@ -283,14 +283,6 @@ def _save_watcher_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _upstream_post_json(f"{ORCH_URL}/settings/watcher", payload)
 
 
-def _filebot_rules_payload() -> Tuple[int, Dict[str, Any]]:
-    return _proxy_upstream_json(f"{ORCH_URL}/settings/filebot", timeout=8)
-
-
-def _save_filebot_rules(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-    return _proxy_upstream_json(f"{ORCH_URL}/settings/filebot", payload, timeout=20)
-
-
 def _status_payload() -> Dict[str, Any]:
     orch = _upstream_json(f"{ORCH_URL}/health")
     worker = _upstream_json(f"{WORKER_URL}/health")
@@ -505,10 +497,6 @@ class Handler(BaseHTTPRequestHandler):
             result = _watcher_rules_payload()
             self._json(200 if result.get("ok") else 502, result)
             return
-        if path == "/api/filebot-rules":
-            status, result = _filebot_rules_payload()
-            self._json(status, result)
-            return
         if path == "/api/identity-rules":
             status, result = IDENTITY_PROXY.get_rules()
             self._json(status, result)
@@ -581,13 +569,6 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = _save_watcher_rules(self._read_payload())
                 self._json(200 if result.get("ok") else 400, result)
-            except Exception as error:
-                self._json(500, {"ok": False, "error": str(error)})
-            return
-        if parsed.path == "/api/filebot-rules":
-            try:
-                status, result = _save_filebot_rules(self._read_payload())
-                self._json(status, result)
             except Exception as error:
                 self._json(500, {"ok": False, "error": str(error)})
             return

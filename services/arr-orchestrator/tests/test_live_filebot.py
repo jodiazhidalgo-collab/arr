@@ -54,9 +54,17 @@ class LiveFileBotTests(unittest.TestCase):
             )
 
             self.assertEqual(result["exit_code"], 0, result["stdout_tail"])
-            destinations = [item["destination"] for item in result["moves"]]
-            self.assertTrue(any(value.endswith(".mkv") for value in destinations))
-            self.assertTrue(any(value.endswith(".srt") for value in destinations))
+            destinations = {
+                Path(item["destination"]).relative_to(output_root).as_posix()
+                for item in result["moves"]
+            }
+            self.assertEqual(
+                destinations,
+                {
+                    "Un padre en apuros (1996)/Un padre en apuros (1996).mkv",
+                    "Un padre en apuros (1996)/Un padre en apuros (1996).srt",
+                },
+            )
 
     def test_guided_tv_moves_episode_and_subtitle(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -82,9 +90,18 @@ class LiveFileBotTests(unittest.TestCase):
             )
 
             self.assertEqual(result["exit_code"], 0, result["stdout_tail"])
-            destinations = [item["destination"] for item in result["moves"]]
-            self.assertEqual(sum(value.endswith(".mkv") for value in destinations), 2)
-            self.assertTrue(any(value.endswith(".srt") for value in destinations))
+            destinations = {
+                Path(item["destination"]).relative_to(output_root).as_posix()
+                for item in result["moves"]
+            }
+            self.assertEqual(
+                destinations,
+                {
+                    "Juego de tronos/Season 01/Juego de tronos - S01E01.mkv",
+                    "Juego de tronos/Season 01/Juego de tronos - S01E01.srt",
+                    "Juego de tronos/Season 01/Juego de tronos - S01E02.mkv",
+                },
+            )
 
 
 if __name__ == "__main__":

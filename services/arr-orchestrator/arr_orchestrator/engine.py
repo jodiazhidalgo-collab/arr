@@ -14,7 +14,6 @@ from .config import Config
 from .codex_diagnostics import create_codex_diagnostic
 from .db import Database
 from .filebot import FileBotRunner
-from .filebot_settings import FileBotSettingsStore
 from .identity.controller import IdentityController
 from .filesystem import (
     ExtractionError,
@@ -107,16 +106,9 @@ class Engine:
             config.rdt_url, config.rdt_user, config.rdt_password, "RDT-Client"
         )
         self.filebot = FileBotRunner(config.filebot_bin, config.log_dir)
-        self.filebot_settings = FileBotSettingsStore(
-            database,
-            default_language=config.resolver_language,
-            default_region=config.resolver_region,
-            logger=self.log,
-        )
         self.identity = IdentityController(
             config,
             database,
-            self.filebot_settings,
             logger=self.log,
         )
         self.name_resolver = self.identity.resolver
@@ -252,12 +244,6 @@ class Engine:
         result["saved"] = True
         return result
 
-    def filebot_rules(self) -> Dict[str, object]:
-        return self.filebot_settings.payload()
-
-    def update_filebot_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return self.filebot_settings.update(payload)
-
     def identity_rules(self) -> Dict[str, object]:
         return self.identity.payload()
 
@@ -276,22 +262,13 @@ class Engine:
     def test_identity_resolver(self, payload: Dict[str, object]) -> Dict[str, object]:
         return self.identity.test_resolver(payload)
 
-    def _active_filebot_rules_context(self) -> Dict[str, object]:
-        return self.filebot_settings.job_snapshot()
-
     def _new_job_source_meta_json(
         self,
         *,
         identity_context: Optional[Dict[str, object]] = None,
-        filebot_context: Optional[Dict[str, object]] = None,
     ) -> str:
         return json.dumps(
             {
-                "filebot_rules": (
-                    filebot_context
-                    if isinstance(filebot_context, dict)
-                    else self._active_filebot_rules_context()
-                ),
                 "identity_rules": (
                     identity_context
                     if isinstance(identity_context, dict)
@@ -301,19 +278,6 @@ class Engine:
             ensure_ascii=False,
             sort_keys=True,
         )
-
-    def _filebot_rules_for_job(self, job: Dict[str, object]) -> Dict[str, object]:
-        raw_meta = job.get("source_meta_json")
-        try:
-            meta = json.loads(str(raw_meta)) if raw_meta else {}
-        except (TypeError, ValueError, json.JSONDecodeError):
-            meta = {}
-        stored = meta.get("filebot_rules") if isinstance(meta, dict) else None
-        if isinstance(stored, dict) and isinstance(stored.get("rules"), dict):
-            return json.loads(json.dumps(stored, ensure_ascii=False, default=str))
-        context = self._active_filebot_rules_context()
-        context["source"] = "current_fallback"
-        return context
 
     def _ignored_movies_item(
         self,
@@ -374,17 +338,12 @@ class Engine:
         self.observer.join(timeout=10)
 
     def status(self) -> Dict[str, object]:
-        filebot_rules = self.filebot_settings.payload()
         identity_rules = self.identity.payload()
         return {
             "status": "ok",
             "mode": self.config.mode,
             "heartbeat": self._last_heartbeat,
             "dependencies": self.dependencies,
-            "filebot_rules": {
-                "revision": filebot_rules.get("revision"),
-                "resolver_fingerprint": filebot_rules.get("resolver_fingerprint"),
-            },
             "identity_rules": {
                 "revision": identity_rules.get("revision"),
                 "fingerprint": identity_rules.get("fingerprint"),
@@ -994,17 +953,12 @@ class Engine:
             )
 
     def _diagnostic_status(self) -> Dict[str, object]:
-        filebot_rules = self.filebot_settings.payload()
         identity_rules = self.identity.payload()
         return {
             "orchestrator": {
                 "status": "ok",
                 "mode": self.config.mode,
                 "dependencies": dict(self.dependencies),
-                "filebot_rules": {
-                    "revision": filebot_rules.get("revision"),
-                    "resolver_fingerprint": filebot_rules.get("resolver_fingerprint"),
-                },
                 "identity_rules": {
                     "revision": identity_rules.get("revision"),
                     "fingerprint": identity_rules.get("fingerprint"),
@@ -1298,13 +1252,8 @@ class Engine:
             job_root,
             str(job.get("name") or ""),
         )
-        rules_context = self._filebot_rules_for_job(job)
-        rules_snapshot = dict(rules_context.get("rules") or {})
         identity_context = self.identity.configure_for_job(job)
         identity_rules = dict(identity_context.get("rules") or {})
-        filebot_configure = getattr(self.filebot, "configure_rules", None)
-        if callable(filebot_configure):
-            filebot_configure(rules_snapshot)
         filebot_identity_configure = getattr(
             self.filebot, "configure_identity_rules", None
         )
@@ -1316,17 +1265,12 @@ class Engine:
             "decision",
             (
                 "Configuracion de identidad revision "
-                f"{int(identity_context.get('revision') or 0)} y FileBot revision "
-                f"{int(rules_context.get('revision') or 0)}"
+                f"{int(identity_context.get('revision') or 0)}"
             ),
             {
                 "identity_revision": int(identity_context.get("revision") or 0),
                 "identity_fingerprint": str(identity_context.get("fingerprint") or ""),
                 "identity_source": str(identity_context.get("source") or "job_snapshot"),
-                "filebot_revision": int(rules_context.get("revision") or 0),
-                "filebot_source": str(rules_context.get("source") or "job_snapshot"),
-                # Claves historicas conservadas para lectores de diagnosticos
-                # anteriores. Ahora apuntan a la configuracion que resuelve.
                 "revision": int(identity_context.get("revision") or 0),
                 "resolver_fingerprint": str(identity_context.get("fingerprint") or ""),
                 "category": str(job.get("category") or ""),
@@ -1453,7 +1397,6 @@ class Engine:
             output_root,
             identity,
         )
-        command_preview["filebot_rules_revision"] = int(rules_context.get("revision") or 0)
         command_preview["identity_rules_revision"] = int(identity_context.get("revision") or 0)
         command_preview["identity_fingerprint"] = str(identity_context.get("fingerprint") or "")
         command_preview["rules_revision"] = int(identity_context.get("revision") or 0)

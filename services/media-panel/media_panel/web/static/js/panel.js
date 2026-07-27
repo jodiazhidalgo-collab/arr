@@ -4,8 +4,7 @@ const tabs = [...document.querySelectorAll(".tabs button")];
 
 const rulesStates = {
   media: null,
-  watcher: null,
-  filebot: null
+  watcher: null
 };
 const RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
 let currentRuleSection = readStoredRuleSection();
@@ -43,14 +42,6 @@ const RULE_SOURCES = {
     endpoint: "/api/watcher-rules",
     label: "Vigilante ARR",
     fallbackRules: { ignored_suffixes: [] }
-  },
-  filebot: {
-    endpoint: "/api/filebot-rules",
-    label: "FileBot",
-    fallbackRules: {
-      movies: { language: "es-ES", region: "ES", query_aliases: [], forced_matches: [], filename_style: "title_year" },
-      tv: { language: "es-ES", query_aliases: [], forced_matches: [], filename_style: "series_sxxexx", episode_order: "Airdate" }
-    }
   }
 };
 
@@ -243,49 +234,13 @@ const RULE_SECTIONS = {
         ]
       }
     ]
-  },
-  filebot_peliculas: {
-    title: "FileBot Películas",
-    help: "Nombre final que FileBot aplica después de la identificación. La limpieza y TMDb se configuran en Limpieza ARR.",
-    source: "filebot",
-    groups: [
-      {
-        title: "Nombre final",
-        note: "Aquí solo se decide cómo queda escrito el archivo ya identificado.",
-        controls: [
-          { type: "select", path: "movies.filename_style", label: "Estilo de nombre", options: [
-            { value: "title_year", label: "Titulo y año" },
-            { value: "title_year_quality", label: "Titulo, año y calidad" }
-          ] }
-        ]
-      }
-    ]
-  },
-  filebot_series: {
-    title: "FileBot Series",
-    help: "Nombre y orden de episodios que FileBot aplica después de la identificación. La limpieza y TMDb se configuran en Limpieza ARR.",
-    source: "filebot",
-    groups: [
-      {
-        title: "Nombre final",
-        note: "Aquí solo se decide cómo queda escrito el episodio ya identificado.",
-        controls: [
-          { type: "select", path: "tv.filename_style", label: "Estilo de nombre", options: [
-            { value: "series_sxxexx", label: "Serie y SxxExx" },
-            { value: "series_sxxexx_title", label: "Serie, SxxExx y titulo" }
-          ] },
-          { type: "select", path: "tv.episode_order", label: "Orden de episodios", options: [
-            { value: "Airdate", label: "Emision" },
-            { value: "DVD", label: "DVD" },
-            { value: "Absolute", label: "Absoluto" }
-          ] }
-        ]
-      }
-    ]
   }
 };
 
-if (!RULE_SECTIONS[currentRuleSection]) currentRuleSection = "entrada";
+if (!RULE_SECTIONS[currentRuleSection]) {
+  currentRuleSection = "entrada";
+  storeRuleSection(currentRuleSection);
+}
 
 function readStoredRuleSection() {
   try {
@@ -576,23 +531,9 @@ function currentRulesDocument() {
   return rulesStates[currentRulesSource()];
 }
 
-function formatSavedAt(value) {
-  if (!value) return "";
-  if (typeof value === "number") return formatTime(value);
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("es-ES");
-}
-
 function rulesStatusText(documentState, source) {
   if (documentState?.ok === false) {
     return `Error cargando: ${documentState.error || "orquestador no disponible"}`;
-  }
-  if (source === "filebot") {
-    const revision = documentState?.revision ?? "-";
-    const savedAt = formatSavedAt(documentState?.saved_at);
-    const fingerprint = documentState?.resolver_fingerprint || "";
-    const rulesPath = documentState?.rules_path || "";
-    return `Reglas FileBot activas · Revisión ${revision}${savedAt ? ` · Guardadas ${savedAt}` : ""}${fingerprint ? ` · Huella ${fingerprint}` : ""}${rulesPath ? ` · Origen ${rulesPath}` : ""}`;
   }
   if (source === "media") {
     const fingerprint = String(documentState?.fingerprint || "").slice(0, 12);
@@ -607,9 +548,6 @@ function rulesStatusText(documentState, source) {
 function savedRulesMessage(source, savedState) {
   if (source === "watcher") {
     return "Reglas guardadas y activas para nuevas detecciones. Los trabajos ya creados mantienen sus reglas.";
-  }
-  if (source === "filebot") {
-    return `Reglas guardadas y activas para trabajos nuevos. · Revisión ${savedState.revision ?? "-"}.`;
   }
   const fingerprint = String(savedState?.fingerprint || "").slice(0, 12);
   return `Reglas guardadas y activas para trabajos nuevos.${fingerprint ? ` · Huella ${fingerprint}.` : ""}`;
@@ -646,7 +584,6 @@ function renderRules(statusMessage = "") {
         </div>
         <div id="rules-status" class="status">${esc(statusText)}</div>
         <div id="rules-editor">${section.groups.map(renderGroup).join("")}</div>
-        ${source === "filebot" ? renderFileBotExtras(documentState, currentRuleSection) : ""}
       </div>
     </section>`;
 
@@ -657,68 +594,6 @@ function renderRules(statusMessage = "") {
   }));
   document.getElementById("reload-rules").addEventListener("click", () => showReglas());
   document.getElementById("save-rules").addEventListener("click", saveRules);
-  if (source === "filebot") {
-    document.querySelectorAll("[data-path]").forEach(input => {
-      input.addEventListener("input", updateFileBotPreview);
-      input.addEventListener("change", updateFileBotPreview);
-    });
-  }
-}
-
-function safetyLabel(key) {
-  const labels = {
-    read_only: "Solo lectura",
-    databases: "Bases de datos",
-    action: "Acción",
-    conflict: "Conflictos",
-    strictness: "Modo de resolución",
-    canonical_root_folders: "Carpetas raíz canónicas",
-    paths_editable: "Edición de rutas",
-    custom_code_editable: "Código personalizado",
-    exec_editable: "Ejecución de comandos"
-  };
-  return labels[key] || String(key || "").replace(/_/g, " ").replace(/^./, ch => ch.toUpperCase());
-}
-
-function safetyValue(value) {
-  if (value === true) return "Sí";
-  if (value === false) return "No";
-  if (Array.isArray(value)) return value.join(", ");
-  if (value && typeof value === "object") return Object.entries(value).map(([key, item]) => `${key === "movies" ? "películas" : key === "tv" ? "series" : key}: ${safetyValue(item)}`).join(" · ");
-  return String(value ?? "-");
-}
-
-function fileBotPreview(rules, sectionKey) {
-  if (sectionKey === "filebot_peliculas") {
-    const quality = getPath(rules, "movies.filename_style") === "title_year_quality" ? " [1080p]" : "";
-    return `Los visitantes (1993)/Los visitantes (1993)${quality}.mkv`;
-  }
-  const withTitle = getPath(rules, "tv.filename_style") === "series_sxxexx_title" ? " - El comienzo" : "";
-  const episodeOrder = getPath(rules, "tv.episode_order") || "Airdate";
-  return `Los visitantes/Season 01/Los visitantes - S01E01${withTitle}.mkv\nOrden: ${episodeOrder}`;
-}
-
-function renderFileBotExtras(documentState, sectionKey) {
-  const entries = Object.entries(documentState?.safety || {});
-  const protections = entries.length
-    ? entries.map(([key, value]) => `<div class="field"><label>${esc(safetyLabel(key))}</label><div class="readonly-value">${esc(safetyValue(value))}</div></div>`).join("")
-    : `<div class="muted">Las protecciones del motor no estan disponibles.</div>`;
-  return `
-    <div class="rule-group">
-      <h3>Vista previa</h3>
-      <p>Ejemplo visual. No ejecuta FileBot ni mueve archivos.</p>
-      <pre id="filebot-format-preview" class="pre">${esc(fileBotPreview(documentState?.rules || {}, sectionKey))}</pre>
-    </div>
-    <div class="rule-group">
-      <h3>Protecciones activas</h3>
-      <p>Informacion de solo lectura fijada por el motor.</p>
-      ${protections}
-    </div>`;
-}
-
-function updateFileBotPreview() {
-  const preview = document.getElementById("filebot-format-preview");
-  if (preview) preview.textContent = fileBotPreview(collectRules(), currentRuleSection);
 }
 
 function renderGroup(group) {
@@ -799,9 +674,6 @@ async function saveRules() {
     const payload = { rules };
     if (savingSource === "media") {
       payload.expected_fingerprint = rulesStates[savingSource]?.fingerprint;
-    }
-    if (savingSource === "filebot") {
-      payload.expected_revision = rulesStates[savingSource]?.revision;
     }
     const savedState = await api(savingEndpoint, {
       method: "POST",

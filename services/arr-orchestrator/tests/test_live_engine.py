@@ -86,8 +86,8 @@ class LiveEngineTests(unittest.TestCase):
         self.assertIn('"tmdb_id": 9279', updated["identity_json"])
         output = Path(updated["source_path"])
         self.assertEqual(output.name, "Un padre en apuros (1996)")
-        self.assertEqual(len(list(output.glob("*.mkv"))), 1)
-        self.assertEqual(len(list(output.glob("*.srt"))), 1)
+        self.assertTrue((output / "Un padre en apuros (1996).mkv").is_file())
+        self.assertTrue((output / "Un padre en apuros (1996).srt").is_file())
 
     def test_complete_guided_tv_stage(self):
         job = self.create_job("tv", "Juego.de.tronos.S01E01.mkv")
@@ -97,10 +97,9 @@ class LiveEngineTests(unittest.TestCase):
         updated = self.database.get_job(job["job_id"])
         self.assertEqual(updated["state"], "ready_cleanup")
         self.assertIn('"tmdb_id": 1399', updated["identity_json"])
-        episodes = list(self.config.tv_output.rglob("*.mkv"))
-        subtitles = list(self.config.tv_output.rglob("*.srt"))
-        self.assertEqual(len(episodes), 1)
-        self.assertEqual(len(subtitles), 1)
+        output = self.config.tv_output / "Juego de tronos" / "Season 01"
+        self.assertTrue((output / "Juego de tronos - S01E01.mkv").is_file())
+        self.assertTrue((output / "Juego de tronos - S01E01.srt").is_file())
 
 
 if __name__ == "__main__":

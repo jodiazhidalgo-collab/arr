@@ -46,10 +46,11 @@ Si una sandbox externa dice que no puede ejecutar pytest por falta de dependenci
 - `services/arr-orchestrator/tests/test_live_engine.py`
 - `services/arr-orchestrator/tests/test_live_filebot.py`
 - `services/arr-orchestrator/tests/test_live_resolver.py`
+- `services/arr-orchestrator/tests/test_filebot_commands.py`
 - `services/arr-orchestrator/tests/test_name_parser.py`
 - `services/arr-orchestrator/tests/test_name_resolver.py`
 - `services/media-worker/tests/test_idempotency.py`
-- `services/media-panel/tests/test_filebot_rules.py`
+- `services/media-panel/tests/test_rules_panel.py`
 - `services/media-panel/tests/test_watcher_rules.py`
 - `services/buscador-puente-arr/tests/test_app_tracing.py`
 - `services/buscador-puente-arr/tests/test_arr_trace.py`
@@ -104,7 +105,7 @@ Name: requests
 Version: 2.32.5
 ```
 
-## Resultado de validacion local
+## Resultado historico de validacion local (2026-07-24)
 
 Ejecucion realizada en un venv temporal bajo `_codex_runtime/tmp/`:
 
@@ -128,6 +129,21 @@ OK
 $env:PYTHONPATH = "services\buscador-puente-arr"
 python -m unittest discover -s services\buscador-puente-arr\tests -v
 OK
+```
+
+## Validacion actual (2026-07-28)
+
+Tras retirar la configuracion editable de FileBot y fijar sus formatos en el motor:
+
+```text
+python -m compileall -q conftest.py services tests
+OK
+
+node --check services/media-panel/media_panel/web/static/js/panel.js
+OK
+
+python -m pytest -q --junitxml _codex_runtime/artifacts/pytest-junit-filebot-removal-final.xml --durations=20
+466 passed, 7 skipped in 41.06s
 ```
 
 ## Interpretacion correcta para revisiones externas

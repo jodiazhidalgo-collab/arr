@@ -55,8 +55,6 @@ def main() -> int:
         diagnostic_creator=diagnostic,
         watcher_rules_provider=engine.watcher_rules,
         watcher_rules_updater=engine.update_watcher_rules,
-        filebot_rules_provider=engine.filebot_rules,
-        filebot_rules_updater=engine.update_filebot_rules,
         identity_rules_provider=engine.identity_rules,
         identity_rules_updater=engine.update_identity_rules,
         identity_rules_resetter=engine.reset_identity_rules,

@@ -8,7 +8,6 @@ import copy
 import json
 import logging
 import re
-from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 from ..name_parser import MediaDecision, decide_media, test_parser_title
@@ -33,7 +32,6 @@ class IdentityController:
         self,
         config: object,
         database: object,
-        filebot_settings: object,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.log = logger or logging.getLogger("arr-orchestrator.identity")
@@ -61,7 +59,6 @@ class IdentityController:
             database,
             self.log,
         )
-        self._migrate_legacy_filebot(filebot_settings)
 
     @property
     def enabled(self) -> bool:
@@ -214,23 +211,6 @@ class IdentityController:
         supplied = payload.get("rules")
         rules = normalize_identity_rules(supplied) if supplied is not None else self.store.snapshot()
         return name, explicit_category, rules
-
-    def _migrate_legacy_filebot(self, filebot_settings: object) -> None:
-        snapshot_reader = getattr(filebot_settings, "snapshot", None)
-        if not callable(snapshot_reader):
-            return
-        legacy = snapshot_reader()
-        if not isinstance(legacy, dict):
-            return
-        defaults = copy.deepcopy(self.store.payload()["defaults"])
-        _disable_new_identity_behaviors(defaults, only_when_missing=False)
-        migrated = _merge_legacy_filebot(defaults, legacy)
-        if migrated == defaults:
-            return
-        result = self.store.migrate_legacy_if_absent(migrated)
-        if not result.get("ok"):
-            self.log.warning("No se pudo migrar filebot.rules a identity.pipeline: %s", result.get("message"))
-
 
 def _merge_legacy_filebot(
     identity_rules: Dict[str, object], legacy_rules: Dict[str, object]

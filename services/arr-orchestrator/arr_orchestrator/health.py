@@ -18,8 +18,6 @@ def start_health_server(
     diagnostic_creator: Optional[Callable[[str, bool], Dict[str, object]]] = None,
     watcher_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
     watcher_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
-    filebot_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
-    filebot_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
     identity_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
     identity_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
     identity_rules_resetter: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
@@ -34,8 +32,6 @@ def start_health_server(
                 self._json(200, status_provider())
             elif path == "/settings/watcher" and watcher_rules_provider:
                 self._json(200, watcher_rules_provider())
-            elif path == "/settings/filebot" and filebot_rules_provider:
-                self._json(200, filebot_rules_provider())
             elif path == "/settings/identity" and identity_rules_provider:
                 self._json(200, identity_rules_provider())
             elif path == "/jobs":
@@ -80,18 +76,6 @@ def start_health_server(
             if path == "/settings/watcher" and watcher_rules_updater:
                 result = watcher_rules_updater(self._read_json())
                 self._json(200 if result.get("ok") else 400, result)
-                return
-            if path == "/settings/filebot" and filebot_rules_updater:
-                result = filebot_rules_updater(self._read_json())
-                if result.get("ok"):
-                    status = 200
-                elif result.get("error") == "revision_conflict":
-                    status = 409
-                elif result.get("error") == "persistence_failed":
-                    status = 500
-                else:
-                    status = 400
-                self._json(status, result)
                 return
             identity_handlers = {
                 "/settings/identity": identity_rules_updater,

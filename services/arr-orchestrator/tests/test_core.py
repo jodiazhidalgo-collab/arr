@@ -578,9 +578,6 @@ class CoreTests(unittest.TestCase):
             )
 
             class DuplicateFileBot:
-                def configure_rules(self, _rules):
-                    pass
-
                 def configure_identity_rules(self, _rules):
                     pass
 
@@ -2518,7 +2515,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(len(recovery_events), 1)
             database.close()
 
-    def test_filebot_rules_are_snapshotted_per_job(self) -> None:
+    def test_new_job_source_meta_only_snapshots_identity_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = test_config(root)
@@ -2527,26 +2524,31 @@ class CoreTests(unittest.TestCase):
             database.initialize()
             engine = Engine(config, database)
 
-            before = json.loads(engine._new_job_source_meta_json())["filebot_rules"]
-            changed = engine.filebot_rules()["rules"]
-            changed["movies"]["filename_style"] = "title_year_quality"
-            saved = engine.update_filebot_rules(
+            source_meta = json.loads(engine._new_job_source_meta_json())
+            before = source_meta["identity_rules"]
+            changed = engine.identity_rules()["rules"]
+            changed["resolver"]["acceptance"]["min_score"] = 60
+            saved = engine.update_identity_rules(
                 {"rules": changed, "expected_revision": 0}
             )
-            after = engine._active_filebot_rules_context()
-            old_job_context = engine._filebot_rules_for_job(
-                {"source_meta_json": json.dumps({"filebot_rules": before})}
+            after = engine.identity.job_snapshot()
+            old_job_context = engine.identity.rules_for_job(
+                {"source_meta_json": json.dumps(source_meta)}
             )
 
+            self.assertNotIn("filebot_rules", source_meta)
+            self.assertIn("identity_rules", source_meta)
             self.assertTrue(saved["ok"])
             self.assertEqual(before["revision"], 0)
             self.assertEqual(old_job_context["revision"], 0)
             self.assertEqual(
-                old_job_context["rules"]["movies"]["filename_style"], "title_year"
+                old_job_context["rules"]["resolver"]["acceptance"]["min_score"],
+                75,
             )
             self.assertEqual(after["revision"], 1)
             self.assertEqual(
-                after["rules"]["movies"]["filename_style"], "title_year_quality"
+                after["rules"]["resolver"]["acceptance"]["min_score"],
+                60,
             )
             database.close()
 
@@ -2574,9 +2576,6 @@ class CoreTests(unittest.TestCase):
             )
 
             class TimeoutFileBot:
-                def configure_rules(self, rules):
-                    self.rules = rules
-
                 def run(self, _job_id, _category, _input_path, output_root):
                     partial = output_root / "Timeout Movie (2026)" / "Timeout Movie (2026).mkv"
                     partial.parent.mkdir(parents=True, exist_ok=True)
@@ -2654,9 +2653,6 @@ class CoreTests(unittest.TestCase):
             )
 
             class TimeoutFileBot:
-                def configure_rules(self, _rules):
-                    return None
-
                 def run(self, _job_id, _category, input_path, _output_root):
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(b"moved")

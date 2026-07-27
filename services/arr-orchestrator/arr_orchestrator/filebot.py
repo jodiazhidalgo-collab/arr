@@ -16,15 +16,8 @@ MOVE_PATTERN = re.compile(
 MAX_RAW_LOG_BYTES = 250_000
 FILEBOT_TIMEOUT_SECONDS = 14400
 
-MOVIE_FORMATS = {
-    "title_year": "{n} ({y})/{n} ({y})",
-    "title_year_quality": "{n} ({y})/{n} ({y}) [{vf}]",
-}
-TV_FORMATS = {
-    "series_sxxexx": "{n}/Season {s.pad(2)}/{n} - {s00e00}",
-    "series_sxxexx_title": "{n}/Season {s.pad(2)}/{n} - {s00e00} - {t}",
-}
-TV_ORDERS = {"Airdate", "DVD", "Absolute"}
+MOVIE_FORMAT = "{n} ({y})/{n} ({y})"
+TV_FORMAT = "{n}/Season {s.pad(2)}/{n} - {s00e00}"
 
 
 def is_duplicate_output(output: str, moves: List[Dict[str, str]]) -> bool:
@@ -56,20 +49,7 @@ class FileBotRunner:
     def __init__(self, binary: str, log_dir: Path):
         self.binary = binary
         self.log_dir = log_dir
-        self._rules_snapshot: Dict[str, object] = {}
         self._identity_rules_snapshot: Dict[str, object] = {}
-
-    def configure_rules(self, rules: Optional[Mapping[str, object]]) -> None:
-        """Capture one normalized snapshot before previewing/running a job.
-
-        Engine processes jobs serially. Keeping the snapshot here preserves the
-        historical ``run`` signature used by existing integrations and tests,
-        while ensuring a concurrent settings save cannot alter a running job.
-        """
-
-        self._rules_snapshot = json.loads(
-            json.dumps(dict(rules or {}), ensure_ascii=False, default=str)
-        )
 
     def configure_identity_rules(self, rules: Optional[Mapping[str, object]]) -> None:
         """Captura el locale del resolver del mismo snapshot que gobierna el job."""
@@ -184,8 +164,6 @@ class FileBotRunner:
     def _legacy_amc_command(
         self, category: str, input_path: Path, output_root: Path, log_file: Path
     ) -> List[str]:
-        rules = self._category_rules(category)
-        language = _filebot_language(str(rules.get("language") or "es-ES"))
         command: List[str] = [
             self.binary,
             "-no-xattr",
@@ -202,7 +180,7 @@ class FileBotRunner:
             "skip",
             "-non-strict",
             "--lang",
-            language,
+            "es",
             "--def",
             "clean=y",
             "music=n",
@@ -210,26 +188,18 @@ class FileBotRunner:
             "excludeList=/dev/null",
         ]
         if category == "movies":
-            output_format = MOVIE_FORMATS.get(
-                str(rules.get("filename_style") or "title_year"),
-                MOVIE_FORMATS["title_year"],
-            )
             command.extend(
                 [
                     "ut_label=movie",
-                    f"movieFormat={output_format}",
+                    f"movieFormat={MOVIE_FORMAT}",
                 ]
             )
         elif category == "tv":
-            output_format = TV_FORMATS.get(
-                str(rules.get("filename_style") or "series_sxxexx"),
-                TV_FORMATS["series_sxxexx"],
-            )
             command.extend(
                 [
                     "ut_label=TV",
                     "minLengthMS=300000",
-                    f"seriesFormat={output_format}",
+                    f"seriesFormat={TV_FORMAT}",
                 ]
             )
         return command
@@ -242,19 +212,8 @@ class FileBotRunner:
         log_file: Path,
         identity: ResolvedIdentity,
     ) -> List[str]:
-        rules = self._category_rules(category)
         database = "TheMovieDB" if category == "movies" else "TheMovieDB::TV"
-        output_format = (
-            MOVIE_FORMATS.get(
-                str(rules.get("filename_style") or "title_year"),
-                MOVIE_FORMATS["title_year"],
-            )
-            if category == "movies"
-            else TV_FORMATS.get(
-                str(rules.get("filename_style") or "series_sxxexx"),
-                TV_FORMATS["series_sxxexx"],
-            )
-        )
+        output_format = MOVIE_FORMAT if category == "movies" else TV_FORMAT
         command = [
             self.binary,
             "-no-xattr",
@@ -268,7 +227,7 @@ class FileBotRunner:
             "--q",
             str(identity.tmdb_id),
             "--lang",
-            self._guided_language(category, rules),
+            self._guided_language(category),
             "--output",
             str(output_root),
             "--action",
@@ -279,16 +238,9 @@ class FileBotRunner:
             "--format",
             output_format,
         ]
-        order = str(rules.get("episode_order") or "Airdate")
-        if category == "tv" and order in TV_ORDERS and order != "Airdate":
-            command.extend(["--order", order])
         return command
 
-    def _category_rules(self, category: str) -> Dict[str, object]:
-        value = self._rules_snapshot.get(category)
-        return dict(value) if isinstance(value, dict) else {}
-
-    def _guided_locale(self, category: str, filebot_rules: Mapping[str, object]) -> str:
+    def _guided_locale(self, category: str) -> str:
         resolver = self._identity_rules_snapshot.get("resolver")
         locales = resolver.get("locales") if isinstance(resolver, dict) else None
         category_locale = locales.get(category) if isinstance(locales, dict) else None
@@ -297,34 +249,18 @@ class FileBotRunner:
             if isinstance(category_locale, dict)
             else None
         )
-        return str(language or filebot_rules.get("language") or "es-ES")
+        return str(language or "es-ES")
 
-    def _guided_language(self, category: str, filebot_rules: Mapping[str, object]) -> str:
-        return _filebot_language(self._guided_locale(category, filebot_rules))
+    def _guided_language(self, category: str) -> str:
+        return _filebot_language(self._guided_locale(category))
 
     def _command_rules_summary(
         self, category: str, *, guided: bool = False
     ) -> Dict[str, object]:
-        rules = self._category_rules(category)
-        language = (
-            self._guided_locale(category, rules)
-            if guided
-            else str(rules.get("language") or "es-ES")
-        )
+        language = self._guided_locale(category) if guided else "es"
         return {
             "language": language,
-            "region": (
-                str(rules.get("region") or "ES") if category == "movies" else None
-            ),
-            "filename_style": str(
-                rules.get("filename_style")
-                or ("title_year" if category == "movies" else "series_sxxexx")
-            ),
-            "episode_order": (
-                str(rules.get("episode_order") or "Airdate")
-                if category == "tv"
-                else None
-            ),
+            "format": MOVIE_FORMAT if category == "movies" else TV_FORMAT,
             "safety": {
                 "action": "move",
                 "conflict": "skip",

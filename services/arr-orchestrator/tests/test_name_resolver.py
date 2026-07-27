@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from arr_orchestrator.db import Database
-from arr_orchestrator.filebot import FileBotRunner, TV_FORMATS
+from arr_orchestrator.filebot import FileBotRunner, TV_FORMAT
 from arr_orchestrator.identity import factory_identity_rules
 from arr_orchestrator.identity.resolver.title_candidates import (
     ordered_title_candidates,
@@ -1144,7 +1144,7 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(preview["argv"][preview["argv"].index("--q") + 1], "9279")
         self.assertTrue(str(preview["log_file"]).endswith("filebot-job-1.log"))
 
-    def test_guided_filebot_uses_identity_locale_and_legacy_formatting_rules(self):
+    def test_guided_filebot_uses_identity_locale_and_fixed_format(self):
         identity = ResolvedIdentity(
             media_type="tv",
             tmdb_id=77,
@@ -1161,15 +1161,6 @@ class NameResolverTests(unittest.TestCase):
             episodes=[1],
         )
         runner = FileBotRunner("filebot", self.root)
-        runner.configure_rules(
-            {
-                "tv": {
-                    "language": "en-US",
-                    "filename_style": "series_sxxexx_title",
-                    "episode_order": "DVD",
-                }
-            }
-        )
         runner.configure_identity_rules(
             {"resolver": {"locales": {"tv": {"language": "fr-FR"}}}}
         )
@@ -1192,12 +1183,15 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(guided_argv[guided_argv.index("--lang") + 1], "fr")
         self.assertEqual(
             guided_argv[guided_argv.index("--format") + 1],
-            TV_FORMATS["series_sxxexx_title"],
+            TV_FORMAT,
         )
-        self.assertEqual(guided_argv[guided_argv.index("--order") + 1], "DVD")
+        self.assertNotIn("{t}", TV_FORMAT)
+        self.assertNotIn("--order", guided_argv)
         self.assertEqual(guided["rules"]["language"], "fr-FR")
-        self.assertEqual(legacy["argv"][legacy["argv"].index("--lang") + 1], "en")
-        self.assertEqual(legacy["rules"]["language"], "en-US")
+        self.assertEqual(guided["rules"]["format"], TV_FORMAT)
+        self.assertEqual(legacy["argv"][legacy["argv"].index("--lang") + 1], "es")
+        self.assertEqual(legacy["rules"]["language"], "es")
+        self.assertEqual(legacy["rules"]["format"], TV_FORMAT)
 
     def test_output_validation_accepts_alias_and_rejects_wrong_title(self):
         identity = ResolvedIdentity(

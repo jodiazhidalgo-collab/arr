@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from arr_orchestrator.filebot import FileBotRunner
+from arr_orchestrator.filebot import FileBotRunner, MOVIE_FORMAT, TV_FORMAT
 from arr_orchestrator.name_resolver import ResolvedIdentity
 
 
@@ -26,8 +26,8 @@ def identity(media_type: str = "movie") -> ResolvedIdentity:
     )
 
 
-class FileBotRuleCommandTests(unittest.TestCase):
-    def test_default_guided_movie_command_is_unchanged(self) -> None:
+class FileBotCommandTests(unittest.TestCase):
+    def test_guided_movie_command_is_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             input_root = root / "input"
@@ -62,11 +62,11 @@ class FileBotRuleCommandTests(unittest.TestCase):
                     "skip",
                     "-non-strict",
                     "--format",
-                    "{n} ({y})/{n} ({y})",
+                    MOVIE_FORMAT,
                 ],
             )
 
-    def test_default_guided_tv_command_is_unchanged(self) -> None:
+    def test_guided_tv_command_is_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             input_root = root / "input"
@@ -101,11 +101,11 @@ class FileBotRuleCommandTests(unittest.TestCase):
                     "skip",
                     "-non-strict",
                     "--format",
-                    "{n}/Season {s.pad(2)}/{n} - {s00e00}",
+                    TV_FORMAT,
                 ],
             )
 
-    def test_default_legacy_movie_and_tv_commands_are_unchanged(self) -> None:
+    def test_legacy_movie_and_tv_commands_are_fixed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             input_root = root / "input"
@@ -148,7 +148,7 @@ class FileBotRuleCommandTests(unittest.TestCase):
                 common
                 + [str(root / "filebot-legacy-movie.log")]
                 + common_tail
-                + ["ut_label=movie", "movieFormat={n} ({y})/{n} ({y})"],
+                + ["ut_label=movie", f"movieFormat={MOVIE_FORMAT}"],
             )
             self.assertEqual(
                 tv,
@@ -158,46 +158,50 @@ class FileBotRuleCommandTests(unittest.TestCase):
                 + [
                     "ut_label=TV",
                     "minLengthMS=300000",
-                    "seriesFormat={n}/Season {s.pad(2)}/{n} - {s00e00}",
+                    f"seriesFormat={TV_FORMAT}",
                 ],
             )
 
-    def test_safe_styles_keep_canonical_roots(self) -> None:
+    def test_guided_locale_does_not_change_fixed_formats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runner = FileBotRunner("filebot", root)
-            runner.configure_rules(
+            runner.configure_identity_rules(
                 {
-                    "movies": {
-                        "language": "fr-FR",
-                        "filename_style": "title_year_quality",
-                    },
-                    "tv": {
-                        "language": "en-US",
-                        "filename_style": "series_sxxexx_title",
-                        "episode_order": "DVD",
-                    },
+                    "resolver": {
+                        "locales": {
+                            "movies": {"language": "fr-FR"},
+                            "tv": {"language": "en-US"},
+                        }
+                    }
                 }
             )
 
             movie = runner.preview_command(
                 "movie", "movies", root / "in-m", root / "out-m", identity()
-            )["argv"]
+            )
             tv = runner.preview_command(
                 "tv", "tv", root / "in-t", root / "out-t", identity("tv")
-            )["argv"]
+            )
+            legacy = runner.preview_command(
+                "legacy", "tv", root / "in-l", root / "out-l"
+            )
 
-            self.assertEqual(movie[movie.index("--lang") + 1], "fr")
-            self.assertEqual(
-                movie[movie.index("--format") + 1],
-                "{n} ({y})/{n} ({y}) [{vf}]",
-            )
-            self.assertEqual(tv[tv.index("--lang") + 1], "en")
-            self.assertEqual(
-                tv[tv.index("--format") + 1],
-                "{n}/Season {s.pad(2)}/{n} - {s00e00} - {t}",
-            )
-            self.assertEqual(tv[tv.index("--order") + 1], "DVD")
+            movie_argv = movie["argv"]
+            tv_argv = tv["argv"]
+            self.assertEqual(movie_argv[movie_argv.index("--lang") + 1], "fr")
+            self.assertEqual(movie_argv[movie_argv.index("--format") + 1], MOVIE_FORMAT)
+            self.assertNotIn("[vf]", MOVIE_FORMAT)
+            self.assertEqual(tv_argv[tv_argv.index("--lang") + 1], "en")
+            self.assertEqual(tv_argv[tv_argv.index("--format") + 1], TV_FORMAT)
+            self.assertNotIn("{t}", TV_FORMAT)
+            self.assertNotIn("--order", tv_argv)
+            self.assertEqual(movie["rules"]["language"], "fr-FR")
+            self.assertEqual(movie["rules"]["format"], MOVIE_FORMAT)
+            self.assertEqual(tv["rules"]["language"], "en-US")
+            self.assertEqual(tv["rules"]["format"], TV_FORMAT)
+            self.assertEqual(legacy["rules"]["language"], "es")
+            self.assertEqual(legacy["rules"]["format"], TV_FORMAT)
 
     def test_timeout_is_returned_as_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
