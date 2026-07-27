@@ -6,14 +6,14 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from .reglas import cargar_reglas
+from .reglas import REGLAS_ACTUALES
 
 TALLER = Path(os.environ.get("MEDIA_AUTO_TALLER", "/taller"))
 WORK = TALLER / "work"
 TERMINADO = WORK / "terminado"
 REPORTES = Path(os.environ.get("MEDIA_AUTO_REPORTES", "/reportes"))
 PROCESO_JSON = REPORTES / "ultimo_proceso.json"
-REGLAS = cargar_reglas()
+REGLAS = REGLAS_ACTUALES
 CHAPTER_TITLE_PREFIX = "Cap\u00edtulo"
 
 def run(cmd):

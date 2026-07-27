@@ -363,7 +363,7 @@ services:
       MEDIA_WORKER_URL: "http://media-worker:8790"
       CODEX_DIAG_ROOT: "/diagnosticos_codex"
     volumes:
-      - ${ARR_ROOT}/config:/config
+      - ${ARR_ROOT}/config:/config:ro
       - ${ARR_DATA_ROOT}:/data:ro
       - ${ARR_ROOT}/diagnosticos_codex:/diagnosticos_codex
       - ${ARR_ROOT}/services/media-worker/media_worker/legacy/reglas_motor_default.json:/defaults/reglas_motor_default.json:ro

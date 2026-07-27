@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .core import normalize_bluray, process_movie, process_trailer
+from .legacy import reglas as media_rules
 
 
 REPORT_ROOT_ENV = "MEDIA_WORKER_REPORT_ROOT"
@@ -309,6 +310,7 @@ class MediaJobRegistry:
 
 
 JOB_REGISTRY = MediaJobRegistry()
+MEDIA_RULES_STORE = media_rules.RULES_STORE
 
 
 def _processor(kind: str):
@@ -354,6 +356,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         if parsed.path == "/health":
             self._json(200, {"status": "ok"})
+            return
+        if parsed.path == "/settings/rules":
+            self._json(200, MEDIA_RULES_STORE.payload())
             return
         match = re.fullmatch(r"/jobs/([^/]+)/status", parsed.path)
         if not match:
@@ -465,8 +470,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         response_status = 200
+        rules_snapshot = MEDIA_RULES_STORE.snapshot() if kind in {"movie", "trailer"} else None
         try:
-            raw_result = _processor(kind)(payload)
+            if rules_snapshot is None:
+                raw_result = _processor(kind)(payload)
+            else:
+                with media_rules.usar_reglas(rules_snapshot):
+                    raw_result = _processor(kind)(payload)
             raw_status_value = raw_result.get("status") if isinstance(raw_result, dict) else None
             raw_status = raw_status_value.strip() if isinstance(raw_status_value, str) else ""
             valid_result = bool(raw_status) and (
@@ -477,6 +487,8 @@ class Handler(BaseHTTPRequestHandler):
             result = dict(raw_result)
             result["job_id"] = job_id
             result["kind"] = kind
+            if rules_snapshot is not None:
+                result["rules_fingerprint"] = rules_snapshot.fingerprint
             _write_terminal_atomic(kind, job_id, result)
             if raw_status == "error":
                 response_status = 500
@@ -489,6 +501,8 @@ class Handler(BaseHTTPRequestHandler):
                 job_id=job_id,
                 retryable=False,
             )
+            if rules_snapshot is not None:
+                result["rules_fingerprint"] = rules_snapshot.fingerprint
             try:
                 _write_terminal_atomic(kind, job_id, result)
             except Exception as persist_error:
@@ -521,6 +535,38 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/normalize-bluray":
             self._run_idempotent("bluray", payload)
+            return
+        if parsed.path == "/settings/rules":
+            try:
+                self._json(200, MEDIA_RULES_STORE.save(payload))
+            except media_rules.RulesConflictError as error:
+                current = dict(error.current)
+                current.update(
+                    {
+                        "ok": False,
+                        "error": "fingerprint_conflict",
+                        "message": str(error),
+                    }
+                )
+                self._json(409, current)
+            except media_rules.RulesValidationError as error:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_rules",
+                        "message": str(error),
+                    },
+                )
+            except OSError as error:
+                self._json(
+                    500,
+                    {
+                        "ok": False,
+                        "error": "rules_persist_failed",
+                        "message": _safe_error_text(error),
+                    },
+                )
             return
         self._json(404, {"error": "not_found"})
 

@@ -11,9 +11,6 @@ from .legacy import detector, planificador, procesador, rescate_subtitulos, trai
 from .legacy.reglas import valor
 
 
-VIDEO_EXTENSIONS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".mts", ".webm"}
-
-
 def _safe_folder_name(value: str) -> str:
     text = re.sub(r"[\\/]+", " ", value or "").strip()
     text = re.sub(r"[\x00-\x1f]+", " ", text)
@@ -37,12 +34,13 @@ def _write_json(path: Path, payload: Dict[str, object]) -> None:
 
 
 def _video_files(folder: Path) -> List[Path]:
-    if folder.is_file() and folder.suffix.lower() in VIDEO_EXTENSIONS:
+    video_extensions = set(valor("entrada.extensiones_video", []) or [])
+    if folder.is_file() and folder.suffix.lower() in video_extensions:
         return [folder]
     return sorted(
         p for p in folder.rglob("*")
         if p.is_file()
-        and p.suffix.lower() in VIDEO_EXTENSIONS
+        and p.suffix.lower() in video_extensions
         and not p.name.endswith(".procesando.tmp.mkv")
         and ".limpio" not in p.stem
     )

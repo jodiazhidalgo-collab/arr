@@ -8,7 +8,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from .reglas import cargar_reglas
+from .reglas import REGLAS_ACTUALES
 
 TALLER = Path(os.environ.get("MEDIA_AUTO_TALLER", "/taller"))
 WORK = TALLER / "work"
@@ -16,7 +16,7 @@ REPORTES = Path(os.environ.get("MEDIA_AUTO_REPORTES", "/reportes"))
 LOGS = Path(os.environ.get("MEDIA_AUTO_LOGS", "/logs"))
 TEMP = Path(os.environ.get("MEDIA_AUTO_TEMP", "/temp/core"))
 PLAN_JSON = REPORTES / "ultimo_plan.json"
-REGLAS = cargar_reglas()
+REGLAS = REGLAS_ACTUALES
 CHAPTER_TITLE_PREFIX = "Cap\u00edtulo"
 
 def run(cmd):

@@ -9,7 +9,7 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 
-from .reglas import cargar_reglas
+from .reglas import REGLAS_ACTUALES
 
 TALLER = Path(os.environ.get("MEDIA_AUTO_TALLER", "/taller"))
 WORK = TALLER / "work"
@@ -17,35 +17,7 @@ ENTRADA = WORK / "entrada"
 REPORTES = Path(os.environ.get("MEDIA_AUTO_REPORTES", "/reportes"))
 LOGS = Path(os.environ.get("MEDIA_AUTO_LOGS", "/logs"))
 
-REGLAS = cargar_reglas()
-TEXT_SUBS = set(REGLAS.get("subtitulos", {}).get("formatos_texto_aceptados", []))
-IMAGE_SUBS = set(REGLAS.get("subtitulos", {}).get("formatos_imagen_no_aceptados", []))
-VIDEO_EXTS = set(REGLAS.get("entrada", {}).get("extensiones_video", []))
-VIDEO_LANG_ES = set(REGLAS.get("video", {}).get("idiomas_aceptados", []))
-VIDEO_LANG_INDETERMINADO = set(REGLAS.get("video", {}).get("idiomas_indeterminados_como_es", []))
-VIDEO_POR_AUDIO_ES_ACTIVO = bool(REGLAS.get("video", {}).get("aceptar_por_audio_es", False))
-VIDEO_LANG_POR_AUDIO_ES = set(
-    str(x or "").strip().lower()
-    for x in REGLAS.get("video", {}).get("idiomas_corregibles_por_audio_es", [])
-)
-VIDEO_LANG_FINAL_POR_AUDIO_ES = str(REGLAS.get("video", {}).get("idioma_final_por_audio_es", "es") or "es").strip() or "es"
-AUDIO_LANG_OK = set(REGLAS.get("audio", {}).get("idiomas_aceptados", []))
-AUDIO_INDETERMINADO_SI_VIDEO_ES = bool(REGLAS.get("audio", {}).get("aceptar_indeterminado_si_video_es", False))
-AUDIO_LANG_COND_VIDEO_ES = set(
-    str(x or "").strip().lower()
-    for x in REGLAS.get("audio", {}).get("idiomas_condicionales_si_video_es", [])
-)
-AUDIO_LANG_FINAL_COND_VIDEO_ES = str(REGLAS.get("audio", {}).get("idioma_final_condicional", "es") or "es").strip() or "es"
-SUB_LANG_OK = set(REGLAS.get("subtitulos", {}).get("idiomas_aceptados", []))
-SUB_SPAM_MAX_FRASES = int(REGLAS.get("subtitulos", {}).get("frases_descartar_hasta", 1))
-SUB_DELAY_AUDIO = REGLAS.get("subtitulos", {}).get("delay_audio", {})
-SUB_DELAY_AUDIO_ACTIVO = bool(SUB_DELAY_AUDIO.get("activo", True))
-SUB_DELAY_AUDIO_TEXTO = str(SUB_DELAY_AUDIO.get("texto_titulo", "ESPAÑOL delay audio") or "").strip()
-SUB_DELAY_AUDIO_MAX_FRASES = int(SUB_DELAY_AUDIO.get("frases_maximo", 150) or 150)
-SUB_SIN_SUBTITULOS_MODO = str(REGLAS.get("subtitulos", {}).get("sin_subtitulos_modo", "cuarentena")).strip().lower()
-SUB_UNICO_MAX_FRASES = int(REGLAS.get("subtitulos", {}).get("frases_maximo_unico_forzado", 150))
-SUB_UNICO_ES_MODO = str(REGLAS.get("subtitulos", {}).get("unico_es_modo", "aplicar_limite")).strip().lower()
-AUDIO_CODEC_RANK = REGLAS.get("audio", {}).get("codec_prioridad", {})
+REGLAS = REGLAS_ACTUALES
 AUDIO_ACCION_CONVERTIR_AC3_5_1 = "convertir_ac3_5_1"
 AUDIO_ACCION_COPIAR_AC3_5_1 = "copiar_ac3_5_1"
 AUDIO_ACCION_COPIAR_ORIGINAL = "copiar_original"
@@ -130,12 +102,21 @@ def hay_audio_es_valido(streams):
 def decision_idioma_video(stream, audio_es_valido=False):
     tags = stream.get("tags") or {}
     lang = normalizar_txt(tags.get("language"))
-    if lang in VIDEO_LANG_ES:
-        return True, REGLAS.get("video", {}).get("idioma_final", "es"), "OK: idioma de video espanol"
-    if lang in VIDEO_LANG_INDETERMINADO:
-        return True, REGLAS.get("video", {}).get("idioma_final", "es"), "CORREGIR A ES: idioma de video indeterminado"
-    if VIDEO_POR_AUDIO_ES_ACTIVO and audio_es_valido and (lang == "" or lang in VIDEO_LANG_POR_AUDIO_ES):
-        return True, VIDEO_LANG_FINAL_POR_AUDIO_ES, f"CORREGIR A ES: idioma de video permitido por audio espanol ({lang or '-'})"
+    video_rules = REGLAS.get("video", {})
+    idiomas_es = set(video_rules.get("idiomas_aceptados", []))
+    idiomas_indeterminados = set(video_rules.get("idiomas_indeterminados_como_es", []))
+    idiomas_por_audio = {
+        str(value or "").strip().lower()
+        for value in video_rules.get("idiomas_corregibles_por_audio_es", [])
+    }
+    idioma_final = video_rules.get("idioma_final", "es")
+    if lang in idiomas_es:
+        return True, idioma_final, "OK: idioma de video espanol"
+    if lang in idiomas_indeterminados:
+        return True, idioma_final, "CORREGIR A ES: idioma de video indeterminado"
+    if video_rules.get("aceptar_por_audio_es", False) and audio_es_valido and (lang == "" or lang in idiomas_por_audio):
+        final_por_audio = str(video_rules.get("idioma_final_por_audio_es", "es") or "es").strip() or "es"
+        return True, final_por_audio, f"CORREGIR A ES: idioma de video permitido por audio espanol ({lang or '-'})"
     return False, lang or "-", f"CUARENTENA: idioma de video no permitido ({lang or '-'})"
 
 def video_queda_en_es(streams, audio_es_valido=False):
@@ -151,39 +132,51 @@ def video_queda_en_es(streams, audio_es_valido=False):
     return False
 
 def archivos_video_entrada():
+    video_exts = set(REGLAS.get("entrada", {}).get("extensiones_video", []))
     return sorted(
         p for p in ENTRADA.rglob("*")
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTS
+        if p.is_file() and p.suffix.lower() in video_exts
     )
 
 def idioma_audio_permitido(stream):
     tags = stream.get("tags") or {}
     lang = normalizar_txt(tags.get("language"))
-    return lang in AUDIO_LANG_OK
+    return lang in set(REGLAS.get("audio", {}).get("idiomas_aceptados", []))
 
 def idioma_audio_condicional_por_video(stream, video_queda_es):
-    if not AUDIO_INDETERMINADO_SI_VIDEO_ES or not video_queda_es:
+    audio_rules = REGLAS.get("audio", {})
+    if not audio_rules.get("aceptar_indeterminado_si_video_es", False) or not video_queda_es:
         return False
     tags = stream.get("tags") or {}
     lang = normalizar_txt(tags.get("language"))
-    return lang == "" or lang in AUDIO_LANG_COND_VIDEO_ES
+    condicionales = {
+        str(value or "").strip().lower()
+        for value in audio_rules.get("idiomas_condicionales_si_video_es", [])
+    }
+    return lang == "" or lang in condicionales
 
 def idioma_sub_permitido(stream):
     tags = stream.get("tags") or {}
     lang = normalizar_txt(tags.get("language"))
-    return lang in SUB_LANG_OK
+    return lang in set(REGLAS.get("subtitulos", {}).get("idiomas_aceptados", []))
 
 def subtitulo_delay_audio_aceptado(stream, esp, codec, frases):
-    if not SUB_DELAY_AUDIO_ACTIVO or not SUB_DELAY_AUDIO_TEXTO:
+    subtitle_rules = REGLAS.get("subtitulos", {})
+    delay_rules = subtitle_rules.get("delay_audio", {})
+    delay_text = str(delay_rules.get("texto_titulo", "ESPAÑOL delay audio") or "").strip()
+    text_subs = set(subtitle_rules.get("formatos_texto_aceptados", []))
+    spam_max = int(subtitle_rules.get("frases_descartar_hasta", 1))
+    delay_max = int(delay_rules.get("frases_maximo", 150) or 150)
+    if not delay_rules.get("activo", True) or not delay_text:
         return False
-    if not esp or codec not in TEXT_SUBS or frases is None:
+    if not esp or codec not in text_subs or frases is None:
         return False
     frases_num = int(frases or 0)
-    if frases_num <= SUB_SPAM_MAX_FRASES:
+    if frases_num <= spam_max:
         return False
-    if frases_num > SUB_DELAY_AUDIO_MAX_FRASES:
+    if frases_num > delay_max:
         return False
-    return normalizar_busqueda(SUB_DELAY_AUDIO_TEXTO) in normalizar_busqueda(titulo(stream))
+    return normalizar_busqueda(delay_text) in normalizar_busqueda(titulo(stream))
 
 def int_seguro(v, default=0):
     try:
@@ -200,7 +193,7 @@ def es_ac3_5_1(codec, channels):
 def prioridad_audio(codec, channels, bit_rate):
     channels = int_seguro(channels)
     codec_normalizado = str(codec or "").lower()
-    codec_rank = AUDIO_CODEC_RANK.get(str(codec or "").lower(), 100)
+    codec_rank = REGLAS.get("audio", {}).get("codec_prioridad", {}).get(str(codec or "").lower(), 100)
     if channels >= 6:
         if es_ac3_5_1(codec_normalizado, channels):
             return 200000 + (channels * 1000) + codec_rank + min(bit_rate // 10000, 999)
@@ -318,6 +311,15 @@ def analizar_archivo(ruta):
 
     data = json.loads(out or "{}")
     streams = data.get("streams", [])
+    audio_rules = REGLAS.get("audio", {})
+    subtitle_rules = REGLAS.get("subtitulos", {})
+    text_subs = set(subtitle_rules.get("formatos_texto_aceptados", []))
+    image_subs = set(subtitle_rules.get("formatos_imagen_no_aceptados", []))
+    spam_max = int(subtitle_rules.get("frases_descartar_hasta", 1))
+    sub_mode = str(subtitle_rules.get("sin_subtitulos_modo", "cuarentena")).strip().lower()
+    unique_max = int(subtitle_rules.get("frases_maximo_unico_forzado", 150))
+    unique_mode = str(subtitle_rules.get("unico_es_modo", "aplicar_limite")).strip().lower()
+    final_conditional_audio = str(audio_rules.get("idioma_final_condicional", "es") or "es").strip() or "es"
 
     videos = []
     audios = []
@@ -355,7 +357,7 @@ def analizar_archivo(ruta):
             audio_ok_directo = idioma_audio_permitido(s)
             audio_ok_condicional = idioma_audio_condicional_por_video(s, video_queda_es)
             audio_ok = audio_ok_directo or audio_ok_condicional
-            idioma_final_audio = "es" if audio_ok_directo else (AUDIO_LANG_FINAL_COND_VIDEO_ES if audio_ok_condicional else "-")
+            idioma_final_audio = "es" if audio_ok_directo else (final_conditional_audio if audio_ok_condicional else "-")
 
             if not audio_ok:
                 decision = "DESCARTAR: idioma de audio no permitido"
@@ -410,9 +412,9 @@ def analizar_archivo(ruta):
             eventos = None
             error_extra = None
 
-            if codec in TEXT_SUBS:
+            if codec in text_subs:
                 cues, error_extra = contar_frases_subtitulo(ruta, idx, s)
-            elif codec in IMAGE_SUBS or codec not in TEXT_SUBS:
+            elif codec in image_subs or codec not in text_subs:
                 eventos = contar_frases_metadata(s)
                 if eventos is None:
                     if eventos_subtitulos is None:
@@ -424,22 +426,22 @@ def analizar_archivo(ruta):
             if not esp:
                 decision = "DESCARTAR: no es español"
                 prioridad = 0
-            elif codec in IMAGE_SUBS:
+            elif codec in image_subs:
                 decision = "CUARENTENA: subtítulo de imagen/OCR"
                 prioridad = 0
-            elif codec not in TEXT_SUBS:
+            elif codec not in text_subs:
                 decision = "CUARENTENA: formato de subtítulo no controlado"
                 prioridad = 0
             elif cues is None:
                 decision = "DESCARTAR: subtitulo largo sin conteo"
                 prioridad = 0
-            elif cues <= SUB_SPAM_MAX_FRASES:
+            elif cues <= spam_max:
                 decision = "DESCARTAR: posible promo/trampa"
                 prioridad = 0
             elif delay_audio_ok:
                 decision = "CANDIDATO FORZADO REAL"
                 prioridad = max(1, 200000 - int(cues or 0))
-            elif cues > SUB_SPAM_MAX_FRASES:
+            elif cues > spam_max:
                 decision = "CANDIDATO FORZADO REAL"
                 prioridad = max(1, 100000 - int(cues or 0))
             elif False:
@@ -470,27 +472,27 @@ def analizar_archivo(ruta):
     video_ok = len(videos) == pistas_video_esperadas and all(int(v.get("prioridad", 0)) >= 100 for v in videos)
     audio_ok = any(int(a.get("prioridad", 0)) > 0 for a in audios)
     sub_candidatos = [s for s in subtitulos if s["decision"] == "CANDIDATO FORZADO REAL"]
-    sub_cero_ok = len(subtitulos) == 0 and SUB_SIN_SUBTITULOS_MODO == "procesar_sin_subtitulos"
-    aceptar_unico_es_siempre = SUB_UNICO_ES_MODO == "aceptar_siempre"
+    sub_cero_ok = len(subtitulos) == 0 and sub_mode == "procesar_sin_subtitulos"
+    aceptar_unico_es_siempre = unique_mode == "aceptar_siempre"
     sub_unico_ok = (
         len(sub_candidatos) == 1
-        and int(sub_candidatos[0].get("frases") or 999999) <= SUB_UNICO_MAX_FRASES
+        and int(sub_candidatos[0].get("frases") or 999999) <= unique_max
     )
     sub_unico_largo_sin_subtitulos_ok = (
-        SUB_SIN_SUBTITULOS_MODO == "procesar_sin_subtitulos"
+        sub_mode == "procesar_sin_subtitulos"
         and aceptar_unico_es_siempre
         and len(sub_candidatos) == 1
-        and int(sub_candidatos[0].get("frases") or 999999) > SUB_UNICO_MAX_FRASES
+        and int(sub_candidatos[0].get("frases") or 999999) > unique_max
     )
     subtitulos_es = [s for s in subtitulos if s.get("language_final") == "es"]
     sub_unico_promo_trampa_ok = (
-        SUB_SIN_SUBTITULOS_MODO == "procesar_sin_subtitulos"
+        sub_mode == "procesar_sin_subtitulos"
         and len(subtitulos_es) == 1
-        and subtitulos_es[0].get("codec") in TEXT_SUBS
+        and subtitulos_es[0].get("codec") in text_subs
         and subtitulos_es[0].get("decision") == "DESCARTAR: posible promo/trampa"
     )
     sub_solo_no_es_ok = (
-        SUB_SIN_SUBTITULOS_MODO == "procesar_sin_subtitulos"
+        sub_mode == "procesar_sin_subtitulos"
         and len(subtitulos) > 0
         and not subtitulos_es
     )
@@ -520,7 +522,7 @@ def analizar_archivo(ruta):
         elif sub_ok:
             estado = "APTO PARA PROCESO AUTOMATICO"
         elif len(sub_candidatos) == 1:
-            estado = f"CUARENTENA: unico subtitulo es/spa valido supera {SUB_UNICO_MAX_FRASES} frases"
+            estado = f"CUARENTENA: unico subtitulo es/spa valido supera {unique_max} frases"
         else:
             estado = "CUARENTENA: no hay subtitulo es/spa valido"
 

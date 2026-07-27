@@ -328,7 +328,7 @@
         ? "La revisión enviada se guardó; los cambios hechos durante el guardado siguen en el borrador."
         : payload.saved === false
           ? "No había cambios nuevos que guardar."
-          : "Configuración guardada y versionada.", changedWhileSaving ? "warn" : "ok");
+          : "Configuración guardada, versionada y activa para trabajos nuevos.", changedWhileSaving ? "warn" : "ok");
     } catch (error) {
       if (ui.isActiveView()) ui.render();
       const conflict = error.status === 409 || error.payload?.error === "revision_conflict";

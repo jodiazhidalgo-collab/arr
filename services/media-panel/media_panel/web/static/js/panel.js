@@ -594,7 +594,25 @@ function rulesStatusText(documentState, source) {
     const rulesPath = documentState?.rules_path || "";
     return `Reglas FileBot activas · Revisión ${revision}${savedAt ? ` · Guardadas ${savedAt}` : ""}${fingerprint ? ` · Huella ${fingerprint}` : ""}${rulesPath ? ` · Origen ${rulesPath}` : ""}`;
   }
+  if (source === "media") {
+    const fingerprint = String(documentState?.fingerprint || "").slice(0, 12);
+    return `Reglas multimedia activas para trabajos nuevos${fingerprint ? ` · Huella ${fingerprint}` : ""}`;
+  }
+  if (source === "watcher") {
+    return "Reglas del Vigilante ARR activas para nuevas detecciones.";
+  }
   return `Archivo: ${documentState?.rules_path || "-"}`;
+}
+
+function savedRulesMessage(source, savedState) {
+  if (source === "watcher") {
+    return "Reglas guardadas y activas para nuevas detecciones. Los trabajos ya creados mantienen sus reglas.";
+  }
+  if (source === "filebot") {
+    return `Reglas guardadas y activas para trabajos nuevos. · Revisión ${savedState.revision ?? "-"}.`;
+  }
+  const fingerprint = String(savedState?.fingerprint || "").slice(0, 12);
+  return `Reglas guardadas y activas para trabajos nuevos.${fingerprint ? ` · Huella ${fingerprint}.` : ""}`;
 }
 
 function renderRules(statusMessage = "") {
@@ -739,7 +757,9 @@ function collectRules() {
     } else if (type === "number") {
       value = Number(input.value);
     } else if (type === "list") {
-      value = input.value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+      value = input.value.split(/\r?\n/).map(x => x.trim()).filter((item, index) =>
+        Boolean(item) || (path === "video.idiomas_indeterminados_como_es" && index === 0)
+      );
     } else if (type === "kv-number" || type === "kv-text") {
       value = {};
       input.value.split(/\r?\n/).forEach(line => {
@@ -770,6 +790,9 @@ async function saveRules() {
     const savingEndpoint = RULE_SOURCES[savingSource].endpoint;
     const rules = collectRules();
     const payload = { rules };
+    if (savingSource === "media") {
+      payload.expected_fingerprint = rulesStates[savingSource]?.fingerprint;
+    }
     if (savingSource === "filebot") {
       payload.expected_revision = rulesStates[savingSource]?.revision;
     }
@@ -777,10 +800,12 @@ async function saveRules() {
       method: "POST",
       body: JSON.stringify(payload)
     });
+    if (savingSource === "media" && savedState.applied !== true) {
+      throw new Error("El motor no confirmó la activación de las reglas.");
+    }
     rulesStates[savingSource] = savedState;
     if (isCurrentViewContext(context) && currentRuleSection === savingSection) {
-      const revision = savingSource === "filebot" ? ` · Revisión ${savedState.revision ?? "-"}` : "";
-      renderRules(`Reglas guardadas y activas${revision}.`);
+      renderRules(savedRulesMessage(savingSource, savedState));
     }
   } catch (error) {
     status.textContent = error.status === 409

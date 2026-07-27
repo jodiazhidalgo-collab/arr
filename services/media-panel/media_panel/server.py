@@ -1,12 +1,9 @@
 import json
 import os
-import shutil
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -86,71 +83,6 @@ CONTENT_TYPES = {
     ".zip": "application/zip",
 }
 
-RULES_SCHEMA: Dict[str, Any] = {
-    "version": True,
-    "entrada": {
-        "extensiones_video": True,
-    },
-    "video": {
-        "pistas_exactas": True,
-        "idiomas_aceptados": True,
-        "idiomas_indeterminados_como_es": True,
-        "aceptar_por_audio_es": True,
-        "idiomas_corregibles_por_audio_es": True,
-        "idioma_final_por_audio_es": True,
-        "idioma_final": True,
-        "marcar_default": True,
-        "marcar_forzado": True,
-    },
-    "audio": {
-        "idiomas_aceptados": True,
-        "aceptar_indeterminado_si_video_es": True,
-        "idiomas_condicionales_si_video_es": True,
-        "idioma_final_condicional": True,
-        "canales_convertir_ac3_desde": True,
-        "bitrate_ac3": True,
-        "titulo_ac3_convertido": True,
-        "marcar_default": True,
-        "marcar_forzado": True,
-        "codec_prioridad": True,
-        "titulos_codec": True,
-    },
-    "subtitulos": {
-        "idiomas_aceptados": True,
-        "formatos_texto_aceptados": True,
-        "formatos_imagen_no_aceptados": True,
-        "frases_descartar_hasta": True,
-        "delay_audio": {
-            "activo": True,
-            "texto_titulo": True,
-            "frases_maximo": True,
-        },
-        "sin_subtitulos_modo": True,
-        "frases_maximo_unico_forzado": True,
-        "unico_es_modo": True,
-        "titulo_final": True,
-        "sufijo_srt_externo": True,
-        "interno_default": True,
-        "interno_forzado": True,
-    },
-    "limpieza": {
-        "crear_capitulos": True,
-        "capitulo_cada_segundos": True,
-        "borrar_metadata_original": True,
-        "limpiar_tags_mkv": True,
-        "exportar_srt_externo": True,
-    },
-    "trailers": {
-        "extensiones_video": True,
-        "score_minimo_con_ano": True,
-        "score_minimo_sin_ano": True,
-        "nombre_final": True,
-        "si_existe": True,
-        "palabras_ruido_titulo": True,
-    },
-}
-
-
 def _read_json(path: Path) -> Dict[str, Any]:
     try:
         if path.is_file():
@@ -158,34 +90,6 @@ def _read_json(path: Path) -> Dict[str, Any]:
     except Exception:
         return {}
     return {}
-
-
-def _merge(base: Any, override: Any) -> Any:
-    if isinstance(base, dict) and isinstance(override, dict):
-        result = deepcopy(base)
-        for key, value in override.items():
-            result[key] = _merge(result.get(key), value)
-        return result
-    if override is None:
-        return deepcopy(base)
-    return deepcopy(override)
-
-
-def _sanitize_rules(source: Any, schema: Dict[str, Any] = RULES_SCHEMA) -> Dict[str, Any]:
-    if not isinstance(source, dict):
-        return {}
-    result: Dict[str, Any] = {}
-    for key, rule in schema.items():
-        if key not in source:
-            continue
-        value = source[key]
-        if rule is True:
-            result[key] = deepcopy(value)
-        elif isinstance(rule, dict) and isinstance(value, dict):
-            child = _sanitize_rules(value, rule)
-            if child:
-                result[key] = child
-    return result
 
 
 def _safe_child(root: Path, value: str) -> Optional[Path]:
@@ -359,39 +263,16 @@ def _create_codex_diagnostic(job_id: str) -> Dict[str, Any]:
     return result
 
 
-def _rules_payload() -> Dict[str, Any]:
-    defaults = _read_json(DEFAULT_RULES_PATH)
-    active = _read_json(RULES_PATH)
-    rules = _sanitize_rules(_merge(defaults, active))
-    return {
-        "ok": True,
-        "rules": rules,
-        "active": active,
-        "defaults": defaults,
-        "rules_path": str(RULES_PATH),
-        "defaults_path": str(DEFAULT_RULES_PATH),
-    }
+def _media_rules_payload() -> Tuple[int, Dict[str, Any]]:
+    return _proxy_upstream_json(f"{WORKER_URL}/settings/rules", timeout=8)
 
 
-def _save_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
-    rules = payload.get("rules") if isinstance(payload, dict) else None
-    if not isinstance(rules, dict):
-        return {"ok": False, "error": "Payload de reglas no valido."}
-    rules = _sanitize_rules(rules)
-
-    RULES_PATH.parent.mkdir(parents=True, exist_ok=True)
-    backup_dir = RULES_PATH.parent / "backups"
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    if RULES_PATH.exists():
-        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        shutil.copy2(RULES_PATH, backup_dir / f"reglas_motor_{stamp}.json")
-
-    tmp = RULES_PATH.with_suffix(RULES_PATH.suffix + ".tmp")
-    tmp.write_text(json.dumps(rules, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(RULES_PATH)
-    result = _rules_payload()
-    result["saved"] = True
-    return result
+def _save_media_rules(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    return _proxy_upstream_json(
+        f"{WORKER_URL}/settings/rules",
+        payload,
+        timeout=20,
+    )
 
 
 def _watcher_rules_payload() -> Dict[str, Any]:
@@ -617,7 +498,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200 if detail.get("ok") else 404, detail)
             return
         if path == "/api/rules":
-            self._json(200, _rules_payload())
+            status, result = _media_rules_payload()
+            self._json(status, result)
             return
         if path == "/api/watcher-rules":
             result = _watcher_rules_payload()
@@ -690,7 +572,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/rules":
             try:
-                self._json(200, _save_rules(self._read_payload()))
+                status, result = _save_media_rules(self._read_payload())
+                self._json(status, result)
             except Exception as error:
                 self._json(500, {"ok": False, "error": str(error)})
             return

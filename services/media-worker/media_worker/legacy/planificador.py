@@ -6,14 +6,14 @@ import shlex
 from datetime import datetime
 from pathlib import Path
 
-from .reglas import cargar_reglas
+from .reglas import REGLAS_ACTUALES
 
 TALLER = Path(os.environ.get("MEDIA_AUTO_TALLER", "/taller"))
 WORK = TALLER / "work"
 REPORTES = Path(os.environ.get("MEDIA_AUTO_REPORTES", "/reportes"))
 
 REPORTE_JSON = REPORTES / "ultimo_reporte.json"
-REGLAS = cargar_reglas()
+REGLAS = REGLAS_ACTUALES
 
 def q(v):
     return shlex.quote(str(v))
