@@ -30,6 +30,9 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         cls.panel = (cls.web / "static" / "js" / "panel.js").read_text(
             encoding="utf-8"
         )
+        cls.panel_styles = (cls.web / "static" / "css" / "panel.css").read_text(
+            encoding="utf-8"
+        )
         js_root = cls.web / "static" / "js" / "limpieza-arr"
         css_root = cls.web / "static" / "css" / "limpieza-arr"
         cls.utils = (js_root / "utils.js").read_text(encoding="utf-8")
@@ -102,6 +105,23 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("validCachePayload(payload)", self.view)
         self.assertIn("if (!ui.isActiveView()) return;", self.view)
         self.assertIn('body: "{}"', self.view)
+
+    def test_save_cursor_waits_only_during_a_real_save(self) -> None:
+        self.assertIn(
+            '!ui.state.dirty && !saving ? \'data-idle-disabled="true"\'',
+            self.view,
+        )
+        self.assertIn(
+            'save.toggleAttribute("data-idle-disabled", !ui.state.dirty);',
+            self.view,
+        )
+        self.assertIn(
+            '#identity-save:disabled[data-idle-disabled="true"]',
+            self.panel_styles,
+        )
+        self.assertIn("cursor: default;", self.panel_styles)
+        self.assertIn(".btn:disabled", self.panel_styles)
+        self.assertIn("cursor: wait;", self.panel_styles)
 
     def test_schema_controls_are_dynamic_and_fully_editable(self) -> None:
         for marker in (

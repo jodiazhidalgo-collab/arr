@@ -137,7 +137,7 @@
       <div class="toolbar-actions identity-toolbar-actions">
         <button type="button" class="btn ghost" id="identity-reload">Recargar</button>
         <button type="button" class="btn ghost" id="identity-reset">Restablecer</button>
-        <button type="button" class="btn primary" id="identity-save" ${!ui.state.dirty || saving ? "disabled" : ""}>${saving ? "Guardando…" : "Guardar"}</button>
+        <button type="button" class="btn primary" id="identity-save" ${!ui.state.dirty || saving ? "disabled" : ""} ${!ui.state.dirty && !saving ? 'data-idle-disabled="true"' : ""}>${saving ? "Guardando…" : "Guardar"}</button>
         <button type="button" class="btn ghost" id="identity-export">Exportar</button>
         <button type="button" class="btn ghost" id="identity-import">Importar</button>
         ${ui.state.section === "resolver" ? `<button type="button" class="btn ghost danger" id="identity-clear-cache" ${ui.state.cacheClearing ? "disabled" : ""}>${ui.state.cacheClearing ? "Limpiando…" : "Limpiar caché"}</button>` : ""}
@@ -340,6 +340,7 @@
       const save = ui.isActiveView() ? document.getElementById("identity-save") : null;
       if (save) {
         save.disabled = !ui.state.dirty;
+        save.toggleAttribute("data-idle-disabled", !ui.state.dirty);
         save.textContent = "Guardar";
       }
     }

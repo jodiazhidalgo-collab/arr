@@ -116,6 +116,10 @@ h3 {
   cursor: wait;
 }
 
+#identity-save:disabled[data-idle-disabled="true"] {
+  cursor: default;
+}
+
 .wrap {
   width: min(1500px, 100%);
   margin: 0 auto;
