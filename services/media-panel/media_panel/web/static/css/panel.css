@@ -120,6 +120,41 @@ h3 {
   cursor: default;
 }
 
+.btn[data-tooltip] {
+  position: relative;
+}
+
+.btn[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 7px);
+  right: 0;
+  z-index: 1000;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #0a1220;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition: opacity .12s ease, transform .12s ease, visibility 0s linear .12s;
+}
+
+.btn[data-tooltip]:hover::after,
+.btn[data-tooltip]:focus-visible::after {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  transition-delay: .45s;
+}
+
 .wrap {
   width: min(1500px, 100%);
   margin: 0 auto;

@@ -123,6 +123,13 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn(".btn:disabled", self.panel_styles)
         self.assertIn("cursor: wait;", self.panel_styles)
 
+    def test_save_tooltip_remains_visible_when_button_is_disabled(self) -> None:
+        self.assertIn(".btn[data-tooltip]:hover::after", self.panel_styles)
+        self.assertIn("content: attr(data-tooltip);", self.panel_styles)
+        self.assertIn(
+            'data-tooltip="Orquestador /api/identity-rules"', self.view
+        )
+
     def test_schema_controls_are_dynamic_and_fully_editable(self) -> None:
         for marker in (
             "ui.renderGroups = function",

@@ -137,7 +137,7 @@
       <div class="toolbar-actions identity-toolbar-actions">
         <button type="button" class="btn ghost" id="identity-reload">Recargar</button>
         <button type="button" class="btn ghost" id="identity-reset">Restablecer</button>
-        <button type="button" class="btn primary" id="identity-save" ${!ui.state.dirty || saving ? "disabled" : ""} ${!ui.state.dirty && !saving ? 'data-idle-disabled="true"' : ""}>${saving ? "Guardando…" : "Guardar"}</button>
+        <button type="button" class="btn primary" id="identity-save" data-tooltip="Orquestador /api/identity-rules" ${!ui.state.dirty || saving ? "disabled" : ""} ${!ui.state.dirty && !saving ? 'data-idle-disabled="true"' : ""}>${saving ? "Guardando…" : "Guardar"}</button>
         <button type="button" class="btn ghost" id="identity-export">Exportar</button>
         <button type="button" class="btn ghost" id="identity-import">Importar</button>
         ${ui.state.section === "resolver" ? `<button type="button" class="btn ghost danger" id="identity-clear-cache" ${ui.state.cacheClearing ? "disabled" : ""}>${ui.state.cacheClearing ? "Limpiando…" : "Limpiar caché"}</button>` : ""}

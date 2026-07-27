@@ -615,11 +615,18 @@ function savedRulesMessage(source, savedState) {
   return `Reglas guardadas y activas para trabajos nuevos.${fingerprint ? ` · Huella ${fingerprint}.` : ""}`;
 }
 
+function saveRulesTooltip(source) {
+  if (source === "watcher") return "Orquestador /api/watcher-rules";
+  if (source === "media") return "Media Worker /api/rules";
+  return "";
+}
+
 function renderRules(statusMessage = "") {
   const section = RULE_SECTIONS[currentRuleSection];
   const source = currentRulesSource();
   const documentState = currentRulesDocument();
   const statusText = statusMessage || rulesStatusText(documentState, source);
+  const saveTooltip = saveRulesTooltip(source);
   const sectionButtons = Object.entries(RULE_SECTIONS).map(([key, value]) =>
     `<button class="${key === currentRuleSection ? "active" : ""}" data-rule-section="${key}">${esc(value.title)}</button>`
   ).join("");
@@ -634,7 +641,7 @@ function renderRules(statusMessage = "") {
           </div>
           <div class="toolbar-actions">
             <button class="btn ghost" id="reload-rules">Recargar</button>
-            <button class="btn primary" id="save-rules" ${documentState?.ok === false ? "disabled" : ""}>Guardar reglas</button>
+            <button class="btn primary" id="save-rules" ${saveTooltip ? `data-tooltip="${esc(saveTooltip)}"` : ""} ${documentState?.ok === false ? "disabled" : ""}>Guardar reglas</button>
           </div>
         </div>
         <div id="rules-status" class="status">${esc(statusText)}</div>

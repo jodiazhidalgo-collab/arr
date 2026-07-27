@@ -88,6 +88,14 @@ class MediaRulesPanelContractTests(unittest.TestCase):
             self.identity_js,
         )
 
+    def test_save_tooltips_identify_owner_and_panel_endpoint(self) -> None:
+        self.assertIn('return "Media Worker /api/rules";', self.panel_js)
+        self.assertIn('return "Orquestador /api/watcher-rules";', self.panel_js)
+        self.assertIn("saveRulesTooltip(source)", self.panel_js)
+        self.assertIn(
+            'data-tooltip="Orquestador /api/identity-rules"', self.identity_js
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
