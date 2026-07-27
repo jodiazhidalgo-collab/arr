@@ -82,8 +82,8 @@ const RULE_SECTIONS = {
         ]
       },
       {
-        title: "Correccion por audio",
-        note: "Permite corregir el idioma de video si el audio espanol es valido.",
+        title: "Correccion idioma video segun idioma audio",
+        note: "Permite corregir la etiqueta del idioma del video si hay audio espanol valido y el idioma del video esta dentro de Idiomas corregibles.",
         controls: [
           { type: "boolean", path: "video.aceptar_por_audio_es", label: "Aceptar por audio ES" },
           { type: "list", path: "video.idiomas_corregibles_por_audio_es", label: "Idiomas corregibles" },
