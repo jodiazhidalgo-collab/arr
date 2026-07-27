@@ -116,6 +116,9 @@ def release_leaf_name(value: str, rules: Mapping[str, Any]) -> str:
     """
 
     text = str(value or "").strip()
+    # Algunos nombres escapados llegan como ``Bean\'s``. Esa barra inversa
+    # pertenece al apostrofo y no representa un separador de ruta Windows.
+    text = text.replace("\\'", "'")
     if not text or not re.search(r"[\\/]", text):
         return text
 

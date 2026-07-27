@@ -41,6 +41,18 @@ class NameParserTests(unittest.TestCase):
         self.assertEqual(mixed_path.display_title, "Original Title")
         self.assertEqual(mixed_path.title_candidates, ["Original Title"])
 
+    def test_escaped_apostrophe_is_not_treated_as_a_path_separator(self):
+        samples = (
+            r"Mr. Bean\'s Holiday (2007) BDRip 1080p multisub [mkvonly]",
+            r"Mr. Bean\'s Holiday  (2007) DVDRip (dutch subs NL).avi",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                parsed = parse_release_name(sample)
+                self.assertEqual(parsed.display_title, "Mr Bean's Holiday")
+                self.assertEqual(parsed.year, 2007)
+                self.assertEqual(parsed.media_hint, "movies")
+
     def test_s03_e53_is_tv(self):
         parsed = parse_release_name("La reina del flow S03 E53 (2026) NETFLIX.mkv")
         self.assertEqual(parsed.media_hint, "tv")
