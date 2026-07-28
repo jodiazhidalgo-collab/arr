@@ -1540,8 +1540,38 @@ class SourceContextEngineRaceTests(unittest.TestCase):
     def test_rdt_path_translation_does_not_adopt_internal_automation_roots(self) -> None:
         temporary, config, database, engine = self._engine()
         try:
-            raw_path = "C:\\Downloads\\movies_automatizacion\\internal.mkv"
-            self.assertEqual(engine._translate_rdt_path(raw_path), Path(raw_path))
+            for category in ("movies_automatizacion", "trailers_automatizacion"):
+                with self.subTest(category=category):
+                    internal = config.complete_root / category / "internal.mkv"
+                    internal.parent.mkdir(parents=True, exist_ok=True)
+                    internal.write_bytes(b"internal")
+                    self.assertIsNone(engine._translate_rdt_path(str(internal)))
+
+            item = config.complete_root / "movies_automatizacion" / "internal.mkv"
+            job = database.create_job(
+                "fs-rdt-internal-root",
+                "fs",
+                "movies_automatizacion",
+                item.name,
+                state="waiting_stable",
+                source_path=str(item),
+                source_meta_json=engine._new_job_source_meta_json(),
+            )
+            engine.source_context_correlation.remember_rdt(
+                [
+                    {
+                        "hash": "5" * 40,
+                        "id": "rdt-internal-root",
+                        "content_path": str(item),
+                        "progress": 100,
+                    }
+                ]
+            )
+            adopted = engine.source_context_correlation.adopt_rdt_for_materialized_job(
+                job, "movies_automatizacion", item
+            )
+            self.assertIsNone(adopted.get("infohash"))
+            self.assertIsNone(adopted.get("rdt_id"))
         finally:
             database.close()
             temporary.cleanup()

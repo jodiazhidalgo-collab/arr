@@ -3179,6 +3179,12 @@ class Engine:
             return None
         path = Path(raw_path)
         if path.exists():
+            category_root = self._complete_category_path(path)
+            if (
+                category_root is not None
+                and category_root.name.lower() not in RDT_SOURCE_CATEGORIES
+            ):
+                return None
             return path
 
         normalized = str(raw_path).strip().replace("\\", "/").rstrip("/")
