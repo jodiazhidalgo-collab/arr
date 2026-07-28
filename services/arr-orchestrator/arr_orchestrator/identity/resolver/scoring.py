@@ -74,8 +74,61 @@ def score_candidate(
         contributions.append((key, float(configured), value))
         return True
 
+    def score_source_title() -> None:
+        source_title = str(guessed.get("_source_context_title") or "").strip()
+        source_settings = (
+            dict(source_title_fallback)
+            if isinstance(source_title_fallback, dict)
+            else {}
+        )
+        if not source_title or not bool(source_settings.get("enabled", True)):
+            return
+        source_aliases = unique_title_values(candidate.aliases)
+        source_match = best_title_match(
+            [source_title], source_aliases, matching_settings
+        )
+        minimum = float(source_settings.get("min_similarity", 0.80))
+        qualifies = source_match.exact or source_match.ratio >= minimum
+        if (
+            qualifies
+            and not source_match.exact
+            and bool(
+                source_settings.get(
+                    "require_compatible_year_for_fuzzy", True
+                )
+            )
+        ):
+            source_year = as_int(guessed.get("year"))
+            tolerance = max(0, int(weights["year_tolerance"]))
+            qualifies = bool(
+                source_year
+                and candidate.year
+                and abs(source_year - candidate.year) <= tolerance
+            )
+        candidate.source_title_qualified = qualifies
+        bonus = float(source_settings.get("score_bonus", 30))
+        if qualifies and add_custom("source_title_match", bonus, bonus):
+            source_pair = (
+                source_match.exact_pair
+                if source_match.exact
+                else source_match.ratio_pair
+            )
+            applied_matching_rules.append(
+                matching_rules_for_pairs([source_pair])
+            )
+            applied_matching_rules.append(
+                [
+                    {
+                        "path": "resolver.source_title_fallback.score_bonus",
+                        "detail": f"Título validado del buscador: {source_title}",
+                    }
+                ]
+            )
+
     if direct_identity:
         add("direct_identity", weights["direct_identity"])
+        score_source_title()
+        candidate.matching_rules = merge_matching_rules(*applied_matching_rules)
         return _finalize_breakdown(contributions)
 
     query = str(guessed.get("title") or "")
@@ -180,53 +233,7 @@ def score_candidate(
             matching_rules_for_pairs([configured_alias_match.exact_pair])
         )
 
-    source_title = str(guessed.get("_source_context_title") or "").strip()
-    source_settings = (
-        dict(source_title_fallback)
-        if isinstance(source_title_fallback, dict)
-        else {}
-    )
-    if source_title and bool(source_settings.get("enabled", True)):
-        source_match = best_title_match(
-            [source_title], alias_values, matching_settings
-        )
-        minimum = float(source_settings.get("min_similarity", 0.80))
-        qualifies = source_match.exact or source_match.ratio >= minimum
-        if (
-            qualifies
-            and not source_match.exact
-            and bool(
-                source_settings.get(
-                    "require_compatible_year_for_fuzzy", True
-                )
-            )
-        ):
-            source_year = as_int(guessed.get("year"))
-            tolerance = max(0, int(weights["year_tolerance"]))
-            qualifies = bool(
-                source_year
-                and candidate.year
-                and abs(source_year - candidate.year) <= tolerance
-            )
-        candidate.source_title_qualified = qualifies
-        bonus = float(source_settings.get("score_bonus", 30))
-        if qualifies and add_custom("source_title_match", bonus, bonus):
-            source_pair = (
-                source_match.exact_pair
-                if source_match.exact
-                else source_match.ratio_pair
-            )
-            applied_matching_rules.append(
-                matching_rules_for_pairs([source_pair])
-            )
-            applied_matching_rules.append(
-                [
-                    {
-                        "path": "resolver.source_title_fallback.score_bonus",
-                        "detail": f"Título validado del buscador: {source_title}",
-                    }
-                ]
-            )
+    score_source_title()
 
     guessed_year = as_int(guessed.get("year"))
     if guessed_year and candidate.year:

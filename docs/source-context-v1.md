@@ -40,7 +40,7 @@ Respuestas normales: `201` al crear, `200` al actualizar o deduplicar, `400` si 
 
 ## Persistencia y correlación
 
-No existe una tabla paralela en ARR. El receptor usa `jobs`, guarda un máximo de tres títulos normalizados en `source_meta_json.source_contexts` y registra las decisiones en `job_events`. La correlación se realiza exclusivamente mediante `infohash`.
+No existe una tabla paralela en ARR. El receptor usa `jobs`, guarda un máximo de tres títulos normalizados en `source_meta_json.source_contexts` y registra las decisiones en `job_events`. La correlación se realiza exclusivamente mediante `infohash`; una coincidencia de ruta solo sirve para recuperar ese hash canónico y nunca sustituye la unión por hash.
 
 Un primer `intent` crea un trabajo `source_submitted` con nombre neutro. Al materializarse qB/RDT, el trabajo adopta el nombre físico real. Si la descarga llega primero, el contexto posterior se adjunta al trabajo activo del mismo hash. Los contextos pendientes caducan a las 24 horas; una ficha tardía queda trazada y nunca reabre un estado terminal.
 

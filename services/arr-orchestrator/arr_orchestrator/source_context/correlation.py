@@ -9,10 +9,11 @@ from typing import Callable, Dict, MutableMapping, Optional
 
 from ..db import Database
 from ..filesystem import top_level_item
+from ..job_states import TERMINAL_JOB_STATES
 from .store import SourceContextStore
 
 
-TERMINAL_STATES = {"done", "manual_review", "duplicate", "error_terminal", "discarded"}
+TERMINAL_STATES = set(TERMINAL_JOB_STATES)
 
 
 class SourceContextCorrelator:
@@ -293,6 +294,39 @@ class SourceContextCorrelator:
         if str(job.get("state") or "") in TERMINAL_STATES:
             return job
         job_id = str(job["job_id"])
+        observed_hash = _infohash(infohash)
+        current_infohash = _infohash(job.get("infohash"))
+        current_qbt_hash = _infohash(job.get("qbt_hash"))
+        if not observed_hash:
+            self.db.add_event(
+                job_id,
+                "source_context",
+                "warning",
+                "Materializacion qB rechazada por infohash no valido",
+                {
+                    "action": "qbt_materialization_invalid_infohash",
+                    "current_infohash": current_infohash,
+                },
+            )
+            return job
+        if observed_hash and any(
+            current_hash and current_hash != observed_hash
+            for current_hash in (current_infohash, current_qbt_hash)
+        ):
+            self.db.add_event(
+                job_id,
+                "source_context",
+                "warning",
+                "Materializacion qB rechazada por conflicto de infohash",
+                {
+                    "action": "qbt_materialization_hash_conflict",
+                    "current_infohash": current_infohash,
+                    "current_qbt_hash": current_qbt_hash,
+                    "observed_infohash": observed_hash,
+                },
+            )
+            return job
+        infohash = observed_hash
         current_state = str(job.get("state") or "")
         materializing_states = {
             "received",
@@ -432,6 +466,7 @@ class SourceContextCorrelator:
     ) -> Dict[str, object]:
         """Adopta por ruta una fila RDT retenida y fija su infohash canonico."""
 
+        matches = []
         for torrent in self.rdt_inventory():
             infohash = _infohash(torrent.get("hash"))
             if not infohash:
@@ -447,57 +482,75 @@ class SourceContextCorrelator:
             )
             if not source_path or not self._same_path(source_path, item):
                 continue
+            matches.append((torrent, infohash))
 
-            current_hash = _infohash(job.get("infohash"))
-            if current_hash and current_hash != infohash:
-                self.db.add_event(
-                    str(job["job_id"]),
-                    "source_context",
-                    "warning",
-                    "No se adopto RDT por conflicto de infohash",
-                    {
-                        "action": "rdt_materialized_job_hash_conflict",
-                        "current_infohash": current_hash,
-                        "observed_infohash": infohash,
-                    },
-                )
+        if not matches:
+            return job
+        observed_hashes = sorted({infohash for _torrent, infohash in matches})
+        if len(observed_hashes) != 1:
+            self.db.add_event(
+                str(job["job_id"]),
+                "source_context",
+                "warning",
+                "No se adopto RDT porque la ruta corresponde a varios infohash",
+                {
+                    "action": "rdt_materialized_path_ambiguous",
+                    "observed_infohashes": observed_hashes,
+                },
+            )
+            return job
+
+        torrent, infohash = matches[0]
+
+        current_hash = _infohash(job.get("infohash"))
+        if current_hash and current_hash != infohash:
+            self.db.add_event(
+                str(job["job_id"]),
+                "source_context",
+                "warning",
+                "No se adopto RDT por conflicto de infohash",
+                {
+                    "action": "rdt_materialized_job_hash_conflict",
+                    "current_infohash": current_hash,
+                    "observed_infohash": infohash,
+                },
+            )
+            return job
+
+        context_job = self.db.get_active_job_by_infohash(infohash)
+        target = job
+        if context_job and str(context_job.get("job_id")) != str(job.get("job_id")):
+            merged = self.store.merge_into_materialized_job(
+                context_job, job, infohash
+            )
+            if not merged:
                 return job
-
+            target = merged
+        try:
+            return self.attach_rdt(
+                target,
+                torrent,
+                item,
+                "Materializacion RDT adoptada por trabajo detectado en carpeta",
+            )
+        except sqlite3.IntegrityError:
+            self.db.connect().rollback()
             context_job = self.db.get_active_job_by_infohash(infohash)
-            target = job
-            if context_job and str(context_job.get("job_id")) != str(job.get("job_id")):
-                merged = self.store.merge_into_materialized_job(
-                    context_job, job, infohash
-                )
-                if not merged:
-                    return job
-                target = merged
-            try:
-                return self.attach_rdt(
-                    target,
-                    torrent,
-                    item,
-                    "Materializacion RDT adoptada por trabajo detectado en carpeta",
-                )
-            except sqlite3.IntegrityError:
-                self.db.connect().rollback()
-                context_job = self.db.get_active_job_by_infohash(infohash)
-                if not context_job or str(context_job.get("job_id")) == str(
-                    target.get("job_id")
-                ):
-                    raise
-                merged = self.store.merge_into_materialized_job(
-                    context_job, target, infohash
-                )
-                if not merged:
-                    return target
-                return self.attach_rdt(
-                    merged,
-                    torrent,
-                    item,
-                    "Materializacion RDT adoptada tras carrera de contexto",
-                )
-        return job
+            if not context_job or str(context_job.get("job_id")) == str(
+                target.get("job_id")
+            ):
+                raise
+            merged = self.store.merge_into_materialized_job(
+                context_job, target, infohash
+            )
+            if not merged:
+                return target
+            return self.attach_rdt(
+                merged,
+                torrent,
+                item,
+                "Materializacion RDT adoptada tras carrera de contexto",
+            )
 
     def _update_with_safe_event(
         self,

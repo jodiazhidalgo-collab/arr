@@ -8,6 +8,7 @@ import time
 import unicodedata
 from typing import Dict, List
 
+from ..job_states import JOB_STATE_PROGRESS, TERMINAL_JOB_STATES
 from .contract import SourceContextContractError, SourceContextEvent
 from .policy import (
     CONTEXT_TTL_SECONDS,
@@ -17,32 +18,7 @@ from .policy import (
 )
 
 
-TERMINAL_STATES = (
-    "done",
-    "manual_review",
-    "duplicate",
-    "error_terminal",
-    "discarded",
-)
-_STATE_PROGRESS = {
-    "source_submitted": 5,
-    "received": 10,
-    "waiting_materialization": 15,
-    "waiting_stable": 20,
-    "retry_wait": 25,
-    "identity_retry": 25,
-    "staging": 30,
-    "extracting": 40,
-    "ready_extract": 45,
-    "filebot_running": 50,
-    "ready_filebot": 55,
-    "media_postprocess_running": 60,
-    "media_postprocess_ready": 65,
-    "trailer_running": 70,
-    "trailer_ready": 75,
-    "verifying_output": 80,
-    "ready_cleanup": 90,
-}
+TERMINAL_STATES = TERMINAL_JOB_STATES
 
 
 def migrate_active_infohash_duplicates(connection: sqlite3.Connection) -> None:
@@ -275,7 +251,7 @@ def _context_rank(context: Dict[str, object]) -> tuple:
 def _job_rank(job: Dict[str, object]) -> tuple:
     return (
         bool(job.get("source_path")),
-        _STATE_PROGRESS.get(str(job.get("state") or ""), 0),
+        JOB_STATE_PROGRESS.get(str(job.get("state") or ""), 0),
         bool(job.get("identity_json")),
         bool(job.get("qbt_hash") or job.get("rdt_id")),
         float(job.get("updated_at") or 0),

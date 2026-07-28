@@ -23,6 +23,7 @@ from .identity.source_privacy import (
     sanitize_persistent_payload,
     source_titles_from_meta,
 )
+from .job_states import PROCESSABLE_JOB_STATES, TERMINAL_JOB_STATES
 from .filesystem import (
     ExtractionError,
     MEDIA_EXTENSIONS,
@@ -62,24 +63,8 @@ from .torrent import torrent_info
 from .watchers import EventHandler
 
 
-TERMINAL_STATES = {"done", "manual_review", "duplicate", "error_terminal", "discarded"}
-PROCESSABLE_STATES = {
-    "waiting_stable",
-    "ready_stage",
-    "staging",
-    "ready_extract",
-    "extracting",
-    "ready_filebot",
-    "identity_retry",
-    "filebot_running",
-    "bluray_running",
-    "media_postprocess_ready",
-    "media_postprocess_running",
-    "trailer_ready",
-    "trailer_running",
-    "verifying_output",
-    "ready_cleanup",
-}
+TERMINAL_STATES = set(TERMINAL_JOB_STATES)
+PROCESSABLE_STATES = set(PROCESSABLE_JOB_STATES)
 
 
 def _sanitize_extraction_details(job_root: Path, details: Dict[str, object]) -> Dict[str, object]:

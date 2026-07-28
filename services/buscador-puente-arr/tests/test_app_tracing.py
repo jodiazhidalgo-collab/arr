@@ -34,6 +34,148 @@ class DeliveryTracingTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         return json.loads(matches[0].read_text(encoding="utf-8"))
 
+    def test_finished_rdt_row_is_retained_for_the_full_source_context_window(self) -> None:
+        self.assertEqual(app_module.RDT_FINISHED_CLEANUP_DELAY_SEC, 24 * 60 * 60)
+        key = "rdt-retained"
+        item = {
+            "rdt_id": key,
+            "title": "Pelicula retenida",
+            "category": "movies",
+            "kind": "magnet",
+            "magnet": "magnet:?xt=urn:btih:" + "a" * 40,
+            "hash": "a" * 40,
+        }
+        state = {key: item}
+        row = {"status": "finished", "progress": 100}
+        session = object()
+
+        with (
+            patch.object(app_module, "rdt_cleanup_finished") as cleanup,
+            patch.object(app_module, "cleanup_monitor_artifact") as artifact_cleanup,
+        ):
+            self.assertFalse(
+                app_module.monitor_cleanup_finished(session, key, item, row, 100, state)
+            )
+            self.assertNotIn("magnet", item)
+            self.assertEqual(item["hash"], "a" * 40)
+            self.assertFalse(
+                app_module.monitor_cleanup_finished(
+                    session, key, item, row, 100 + 24 * 60 * 60 - 1, state
+                )
+            )
+            cleanup.assert_not_called()
+            self.assertTrue(
+                app_module.monitor_cleanup_finished(
+                    session, key, item, row, 100 + 24 * 60 * 60, state
+                )
+            )
+
+        cleanup.assert_called_once_with(session, key)
+        artifact_cleanup.assert_called_once_with(item, "finished")
+        self.assertNotIn(key, state)
+
+    def test_monitor_cleans_retained_finished_row_even_when_fallback_is_disabled(self) -> None:
+        now = 1_000_000
+        key = "rdt-fallback-off"
+        item = {
+            "rdt_id": key,
+            "title": "Pelicula terminada",
+            "category": "movies",
+            "kind": "magnet",
+            "hash": "b" * 40,
+            "finished_seen_ts": now - 24 * 60 * 60,
+        }
+        state = {key: item}
+        session = object()
+        saved = []
+
+        with (
+            patch.object(app_module, "load_settings", return_value=settings(False)),
+            patch.object(app_module, "load_monitor_state", return_value=state),
+            patch.object(app_module, "save_monitor_state", side_effect=lambda value: saved.append(dict(value))),
+            patch.object(app_module, "rdt_login", return_value=session),
+            patch.object(
+                app_module,
+                "rdt_json",
+                return_value={"status": "finished", "progress": 100, "completed": True},
+            ),
+            patch.object(app_module, "rdt_cleanup_finished") as cleanup,
+            patch.object(app_module, "cleanup_monitor_artifact"),
+            patch.object(app_module.time, "time", return_value=now),
+        ):
+            app_module.monitor_once()
+
+        cleanup.assert_called_once_with(session, key)
+        self.assertEqual(state, {})
+        self.assertEqual(saved, [{}])
+
+    def test_missing_finished_row_never_triggers_qbit(self) -> None:
+        for fallback_enabled in (False, True):
+            with self.subTest(fallback_enabled=fallback_enabled):
+                key = f"rdt-finished-missing-{fallback_enabled}"
+                item = {
+                    "rdt_id": key,
+                    "title": "Pelicula ya terminada",
+                    "category": "movies",
+                    "finished_seen_ts": 100,
+                    "submission_key": f"submission-{fallback_enabled}",
+                }
+                state = {key: item}
+                saved = []
+                app_module.submissions.begin(
+                    item["submission_key"],
+                    item["title"],
+                    "movies",
+                    "movies",
+                    "result-1",
+                    "magnet:?xt=urn:btih:" + "a" * 40,
+                    3600,
+                )
+                app_module.submissions.update(
+                    item["submission_key"],
+                    state="rdt_monitoring",
+                    engine="RDT-Client",
+                    rdt_id=key,
+                )
+
+                with (
+                    patch.object(
+                        app_module,
+                        "load_settings",
+                        return_value=settings(fallback_enabled),
+                    ),
+                    patch.object(app_module, "load_monitor_state", return_value=state),
+                    patch.object(
+                        app_module,
+                        "save_monitor_state",
+                        side_effect=lambda value: saved.append(dict(value)),
+                    ),
+                    patch.object(app_module, "rdt_login", return_value=object()),
+                    patch.object(
+                        app_module,
+                        "rdt_json",
+                        side_effect=RuntimeError("HTTP 404"),
+                    ),
+                    patch.object(app_module, "rdt_find_row", return_value=None),
+                    patch.object(
+                        app_module,
+                        "cleanup_monitor_artifact",
+                    ) as artifact_cleanup,
+                    patch.object(
+                        app_module,
+                        "monitor_fallback",
+                        side_effect=AssertionError("qB no debe intervenir"),
+                    ),
+                ):
+                    app_module.monitor_once()
+
+                artifact_cleanup.assert_called_once_with(item, "finished-missing")
+                self.assertEqual(state, {})
+                self.assertEqual(saved, [{}])
+                submission = app_module.submissions.get(item["submission_key"])
+                self.assertEqual(submission["state"], "transport_done")
+                self.assertEqual(submission["rdt_id"], key)
+
     def test_delivery_trace_normal_rdt_submission(self) -> None:
         with (
             patch.object(app_module, "load_settings", return_value=settings()),

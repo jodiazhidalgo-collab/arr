@@ -412,6 +412,7 @@ services:
       ARR_HOST_ROOT: "${ARR_ROOT}"
       ARR_HOST_DATA_ROOT: "${ARR_DATA_ROOT}"
       ARR_ROOT_UNC: "${ARR_ROOT_UNC:-}"
+      RDT_FINISHED_CLEANUP_DELAY_SEC: "86400"
     volumes:
       - ${ARR_ROOT}/config/buscador-puente-arr/data:/app/data
       - ${ARR_ROOT}/config/buscador-puente-arr/logs:/app/logs

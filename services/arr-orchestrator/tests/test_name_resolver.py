@@ -1735,6 +1735,44 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(source_rows[0]["configured"], 30)
         self.assertEqual(source_rows[0]["applied"], 30)
 
+    def test_source_title_fallback_accepts_a_valid_forced_match(self):
+        correct = movie_payload(
+            1734,
+            "El regreso de la momia",
+            "The Mummy Returns",
+            2001,
+            "en",
+        )
+        rules = factory_identity_rules()
+        rules["resolver"]["forced_matches"]["movies"] = [
+            "El regreso de la momia | 2001 | 1734"
+        ]
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": []},
+                "/movie/1734": correct,
+            }
+        )
+
+        payload = resolver.preview(
+            "release irreconocible xyz 2001 remux",
+            "movies",
+            rules,
+            source_title="El regreso de la momia 2001",
+            source="buscador-pro",
+        )
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 1734)
+        self.assertEqual(payload["identity"]["source"], "source_title_fallback")
+        self.assertEqual(payload["decision"]["source"], "forced_match")
+        self.assertTrue(payload["decision"]["source_title_policy_passed"])
+        paths = {
+            row["path"] for row in payload["candidates"][0]["breakdown"]
+        }
+        self.assertIn("resolver.scoring.direct_identity", paths)
+        self.assertIn("resolver.source_title_fallback.score_bonus", paths)
+
     def test_preview_reports_unsafe_source_title_after_primary_has_no_candidates(self):
         unrelated = movie_payload(348, "Alien", "Alien", 2001, "en")
 

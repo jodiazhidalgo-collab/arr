@@ -12,6 +12,7 @@ from unittest.mock import patch
 from arr_orchestrator.config import Config
 from arr_orchestrator.db import Database, SCHEMA
 from arr_orchestrator.engine import Engine
+from arr_orchestrator.job_states import JOB_STATE_PROGRESS, PROCESSABLE_JOB_STATES
 from arr_orchestrator.name_resolver import ResolverAmbiguous
 from arr_orchestrator.source_context.contract import (
     MAX_SOURCE_TITLE_CHARS,
@@ -281,6 +282,126 @@ class SourceContextDatabaseMigrationTests(unittest.TestCase):
                 )
                 self.assertEqual((status, response["action"]), (200, "appended"))
                 self.assertEqual(response["job_id"], "legacy-materialized")
+            finally:
+                database.close()
+
+    def test_every_processable_state_outranks_a_pending_legacy_duplicate(self) -> None:
+        self.assertFalse(set(PROCESSABLE_JOB_STATES) - set(JOB_STATE_PROGRESS))
+        with _temporary_directory() as temporary:
+            path = Path(temporary) / "orchestrator.db"
+            connection = sqlite3.connect(path)
+            connection.executescript(SCHEMA)
+            expected = {}
+            for index, state in enumerate(
+                sorted(PROCESSABLE_JOB_STATES, key=JOB_STATE_PROGRESS.get), start=1
+            ):
+                infohash = f"{index:040x}"
+                pending_id = f"pending-{state}"
+                advanced_id = f"advanced-{state}"
+                expected[infohash] = advanced_id
+                for job_id, job_state, updated_at in (
+                    (pending_id, "source_submitted", 2.0),
+                    (advanced_id, state, 1.0),
+                ):
+                    connection.execute(
+                        """
+                        INSERT INTO jobs(
+                            job_id, source_uid, infohash, origin, category, name,
+                            state, source_path, created_at, updated_at
+                        ) VALUES(?, ?, ?, 'bridge', 'movies', 'Legacy', ?, ?, ?, ?)
+                        """,
+                        (
+                            job_id,
+                            f"legacy:{job_id}",
+                            infohash,
+                            job_state,
+                            f"/data/{job_id}",
+                            updated_at,
+                            updated_at,
+                        ),
+                    )
+            connection.commit()
+            connection.close()
+
+            database = Database(path)
+            database.initialize()
+            try:
+                for infohash, advanced_id in expected.items():
+                    with self.subTest(state=advanced_id.removeprefix("advanced-")):
+                        active = database.get_active_job_by_infohash(infohash)
+                        self.assertIsNotNone(active)
+                        self.assertEqual(active["job_id"], advanced_id)
+            finally:
+                database.close()
+
+    def test_migration_prefers_materialized_job_over_route_less_advanced_state(self) -> None:
+        with _temporary_directory() as temporary:
+            path = Path(temporary) / "orchestrator.db"
+            connection = sqlite3.connect(path)
+            connection.executescript(SCHEMA)
+            infohash = "c" * 40
+            for job_id, state, source_path in (
+                ("materialized", "waiting_stable", "/data/movie"),
+                ("route-less", "bluray_running", None),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO jobs(
+                        job_id, source_uid, infohash, origin, category, name,
+                        state, source_path, created_at, updated_at
+                    ) VALUES(?, ?, ?, 'bridge', 'movies', 'Legacy', ?, ?, 1, 1)
+                    """,
+                    (job_id, f"legacy:{job_id}", infohash, state, source_path),
+                )
+            connection.commit()
+            connection.close()
+
+            database = Database(path)
+            database.initialize()
+            try:
+                active = database.get_active_job_by_infohash(infohash)
+                self.assertEqual(active["job_id"], "materialized")
+                self.assertEqual(active["source_path"], "/data/movie")
+                self.assertEqual(database.get_job("route-less")["state"], "duplicate")
+            finally:
+                database.close()
+
+    def test_migration_prefers_ready_cleanup_over_dry_run_ready(self) -> None:
+        with _temporary_directory() as temporary:
+            path = Path(temporary) / "orchestrator.db"
+            connection = sqlite3.connect(path)
+            connection.executescript(SCHEMA)
+            infohash = "d" * 40
+            for job_id, state, updated_at in (
+                ("cleanup", "ready_cleanup", 1.0),
+                ("dry-run", "dry_run_ready", 2.0),
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO jobs(
+                        job_id, source_uid, infohash, origin, category, name,
+                        state, source_path, created_at, updated_at
+                    ) VALUES(?, ?, ?, 'bridge', 'movies', 'Legacy', ?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        f"legacy:{job_id}",
+                        infohash,
+                        state,
+                        f"/data/{job_id}",
+                        updated_at,
+                        updated_at,
+                    ),
+                )
+            connection.commit()
+            connection.close()
+
+            database = Database(path)
+            database.initialize()
+            try:
+                active = database.get_active_job_by_infohash(infohash)
+                self.assertEqual(active["job_id"], "cleanup")
+                self.assertEqual(database.get_job("dry-run")["state"], "duplicate")
             finally:
                 database.close()
 
@@ -1419,6 +1540,105 @@ class SourceContextEngineRaceTests(unittest.TestCase):
             database.close()
             temporary.cleanup()
 
+    def test_restart_recovers_retained_rdt_hash_before_late_context(self) -> None:
+        temporary, config, database, _engine = self._engine()
+        restarted_database = None
+        try:
+            infohash = "4" * 40
+            item = config.complete_root / "movies" / "Descarga retenida tras reinicio"
+            item.mkdir(parents=True)
+            (item / "video.mkv").write_bytes(b"movie")
+            torrent = {
+                "hash": infohash,
+                "id": "rdt-reinicio",
+                "content_path": str(item),
+                "progress": 100,
+            }
+
+            database.close()
+            restarted_database = Database(Path(temporary.name) / "orchestrator.db")
+            restarted_database.initialize()
+            restarted_engine = Engine(config, restarted_database)
+
+            class EmptyQbt:
+                def torrents(self, _filter):
+                    return []
+
+            class RetainedRdt:
+                def torrents(self, _filter):
+                    return [torrent]
+
+            restarted_engine.qbt = EmptyQbt()
+            restarted_engine.rdt = RetainedRdt()
+            restarted_engine._register_materialized("movies", item)
+            materialized = restarted_database.latest_jobs()
+            self.assertEqual(len(materialized), 1)
+            self.assertEqual(materialized[0]["infohash"], infohash)
+            self.assertEqual(materialized[0]["rdt_id"], "rdt-reinicio")
+
+            status, response = restarted_engine.source_context.handle(
+                _payload(infohash=infohash, state="accepted")
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(response["job_id"], materialized[0]["job_id"])
+            self.assertEqual(len(restarted_database.latest_jobs()), 1)
+        finally:
+            if restarted_database is not None:
+                restarted_database.close()
+            database.close()
+            temporary.cleanup()
+
+    def test_rdt_path_with_different_hashes_is_not_adopted(self) -> None:
+        temporary, config, database, engine = self._engine()
+        try:
+            item = config.complete_root / "movies" / "Ruta RDT ambigua"
+            item.mkdir(parents=True)
+            (item / "video.mkv").write_bytes(b"movie")
+
+            class EmptyQbt:
+                def torrents(self, _filter):
+                    return []
+
+            class AmbiguousRdt:
+                def torrents(self, _filter):
+                    return [
+                        {
+                            "hash": "1" * 40,
+                            "id": "rdt-uno",
+                            "content_path": str(item),
+                            "progress": 100,
+                        },
+                        {
+                            "hash": "2" * 40,
+                            "id": "rdt-dos",
+                            "content_path": str(item),
+                            "progress": 100,
+                        },
+                    ]
+
+            engine.qbt = EmptyQbt()
+            engine.rdt = AmbiguousRdt()
+            engine._register_materialized("movies", item)
+
+            jobs = database.latest_jobs()
+            self.assertEqual(len(jobs), 1)
+            self.assertFalse(jobs[0]["infohash"])
+            self.assertFalse(jobs[0]["rdt_id"])
+            event = next(
+                row
+                for row in reversed(database.job_detail(jobs[0]["job_id"])["timeline"])
+                if row["structured"].get("action")
+                == "rdt_materialized_path_ambiguous"
+            )
+            self.assertEqual(event["event_type"], "warning")
+            self.assertEqual(
+                event["structured"]["observed_infohashes"],
+                ["1" * 40, "2" * 40],
+            )
+        finally:
+            database.close()
+            temporary.cleanup()
+
     def test_rdt_windows_file_path_maps_to_materialized_folder(self) -> None:
         temporary, config, database, engine = self._engine()
         try:
@@ -1924,6 +2144,70 @@ class SourceContextEngineRaceTests(unittest.TestCase):
             self.assertNotIn(str(item), serialized)
             self.assertNotIn(str(content), serialized)
             self.assertTrue(event["structured"]["materialized"])
+        finally:
+            database.close()
+            temporary.cleanup()
+
+    def test_qbt_materialization_cannot_replace_a_different_existing_hash(self) -> None:
+        temporary, config, database, engine = self._engine()
+        try:
+            original_hash = "a" * 40
+            observed_hash = "b" * 40
+            _status, response = engine.source_context.handle(
+                _payload(infohash=original_hash, state="accepted")
+            )
+            database.update_job(response["job_id"], rdt_id="rdt-original")
+            job = database.get_job(response["job_id"])
+            item = config.complete_root / "movies" / "Ruta compartida"
+            content = item / "video.mkv"
+            content.parent.mkdir(parents=True)
+            content.write_bytes(b"movie")
+
+            engine.source_context_correlation.attach_qbt(
+                job,
+                observed_hash,
+                "movies",
+                item,
+                content,
+                123,
+                "Materializacion qB conflictiva",
+            )
+
+            updated = database.get_job(response["job_id"])
+            self.assertEqual(updated["infohash"], original_hash)
+            self.assertIsNone(updated["qbt_hash"])
+            self.assertEqual(updated["rdt_id"], "rdt-original")
+            timeline = database.job_detail(response["job_id"])["timeline"]
+            conflict = next(
+                row
+                for row in reversed(timeline)
+                if row["structured"].get("action")
+                == "qbt_materialization_hash_conflict"
+            )
+            self.assertEqual(conflict["event_type"], "warning")
+            self.assertEqual(conflict["structured"]["current_infohash"], original_hash)
+            self.assertEqual(conflict["structured"]["observed_infohash"], observed_hash)
+
+            engine.source_context_correlation.attach_qbt(
+                updated,
+                "hash-no-valido",
+                "movies",
+                item,
+                content,
+                124,
+                "Materializacion qB sin hash valido",
+            )
+            after_invalid = database.get_job(response["job_id"])
+            self.assertEqual(after_invalid["infohash"], original_hash)
+            self.assertIsNone(after_invalid["qbt_hash"])
+            self.assertEqual(after_invalid["rdt_id"], "rdt-original")
+            invalid = next(
+                row
+                for row in reversed(database.job_detail(response["job_id"])["timeline"])
+                if row["structured"].get("action")
+                == "qbt_materialization_invalid_infohash"
+            )
+            self.assertEqual(invalid["event_type"], "warning")
         finally:
             database.close()
             temporary.cleanup()

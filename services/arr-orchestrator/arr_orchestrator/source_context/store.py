@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..db import Database
+from ..job_states import TERMINAL_JOB_STATES
 from .contract import SourceContextContractError, SourceContextEvent
 from .policy import (
     CONTEXT_TTL_SECONDS,
@@ -22,7 +23,7 @@ from .policy import (
 
 
 NEUTRAL_JOB_NAME = "Descarga pendiente"
-TERMINAL_STATES = {"done", "manual_review", "duplicate", "error_terminal", "discarded"}
+TERMINAL_STATES = set(TERMINAL_JOB_STATES)
 PENDING_STATES = {"source_submitted", "waiting_materialization"}
 _CONTEXT_KEYS = {
     "event_id",

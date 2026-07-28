@@ -55,7 +55,9 @@ MONITOR_STARTED = False
 RETRYABLE_HTTP = {408, 409, 423, 425, 429, 500, 502, 503, 504}
 RESULT_CACHE_TTL_SEC = 6 * 60 * 60
 RESULT_CACHE_LIMIT = 3000
-RDT_FINISHED_CLEANUP_DELAY_SEC = int(os.getenv("RDT_FINISHED_CLEANUP_DELAY_SEC", "30"))
+RDT_FINISHED_CLEANUP_DELAY_SEC = int(
+    os.getenv("RDT_FINISHED_CLEANUP_DELAY_SEC", str(24 * 60 * 60))
+)
 SUBMISSION_REUSE_SEC = int(os.getenv("SUBMISSION_REUSE_SEC", str(6 * 60 * 60)))
 MONITOR_ORPHAN_CLEANUP_SEC = int(os.getenv("MONITOR_ORPHAN_CLEANUP_SEC", str(6 * 60 * 60)))
 
@@ -2031,6 +2033,11 @@ def rdt_local_download_complete(row: dict) -> bool:
 
 
 def monitor_is_finished(row: dict) -> bool:
+    try:
+        if int(row.get("finished_seen_ts") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
     return rdt_local_download_complete(row)
 
 
@@ -2110,6 +2117,8 @@ def monitor_cleanup_finished(session: requests.Session, key: str, item: dict, ro
     item["last_progress"] = max(old_progress, progress, 100.0)
     item["last_progress_ts"] = now
     item["last_status"] = text or str(item.get("last_status") or "")
+    item["completed"] = True
+    item.pop("magnet", None)
 
     finished_seen_ts = int(item.get("finished_seen_ts") or 0)
     if not finished_seen_ts:
@@ -2145,6 +2154,20 @@ def monitor_cleanup_finished(session: requests.Session, key: str, item: dict, ro
     return True
 
 
+def monitor_finalize_missing_finished(key: str, item: dict, state: dict) -> None:
+    submission_key_value = str(item.get("submission_key") or "")
+    if submission_key_value:
+        submissions.update(
+            submission_key_value,
+            state="transport_done",
+            engine="RDT-Client",
+            rdt_id=str(item.get("rdt_id") or key),
+        )
+    cleanup_monitor_artifact(item, "finished-missing")
+    state.pop(key, None)
+    logger.info("monitor removed finished missing rdt item id=%s", key)
+
+
 def monitor_missing_item(session: requests.Session, key: str, item: dict, settings: dict, now: int, state: dict) -> bool:
     row = rdt_find_row(session, str(item.get("rdt_id") or key), str(item.get("hash") or ""), set())
     if row:
@@ -2158,12 +2181,7 @@ def monitor_missing_item(session: requests.Session, key: str, item: dict, settin
         return True
 
     if monitor_is_finished(item):
-        submission_key_value = str(item.get("submission_key") or "")
-        if submission_key_value:
-            submissions.update(submission_key_value, state="transport_done", engine="RDT-Client", rdt_id=str(item.get("rdt_id") or key))
-        cleanup_monitor_artifact(item, "finished-missing")
-        state.pop(key, None)
-        logger.info("monitor removed finished missing rdt item id=%s", key)
+        monitor_finalize_missing_finished(key, item, state)
         return True
 
     monitor_fallback(session, item, "rdt item missing before progress", settings)
@@ -2174,8 +2192,10 @@ def monitor_missing_item(session: requests.Session, key: str, item: dict, settin
 
 def monitor_once() -> None:
     settings = load_settings()
-    if not settings.get("rdt", {}).get("fallback_enabled", True) or not settings.get("qbit", {}).get("fallback_enabled", True):
-        return
+    fallback_enabled = bool(
+        settings.get("rdt", {}).get("fallback_enabled", True)
+        and settings.get("qbit", {}).get("fallback_enabled", True)
+    )
     state = load_monitor_state()
     if not state:
         return
@@ -2189,6 +2209,8 @@ def monitor_once() -> None:
                 monitor_cleanup_finished(session, key, item, row, now, state)
                 changed = True
                 continue
+            if not fallback_enabled:
+                continue
             fallback, reason = monitor_should_fallback(row, item, settings, now)
             if fallback:
                 monitor_fallback(session, item, reason, settings)
@@ -2197,8 +2219,12 @@ def monitor_once() -> None:
         except Exception as exc:
             error = str(exc)
             if "HTTP 404" in error or "Not Found" in error:
-                monitor_missing_item(session, key, item, settings, now, state)
-                changed = True
+                if fallback_enabled:
+                    monitor_missing_item(session, key, item, settings, now, state)
+                    changed = True
+                elif monitor_is_finished(item):
+                    monitor_finalize_missing_finished(key, item, state)
+                    changed = True
                 continue
             item["last_error"] = error[:180]
             changed = True

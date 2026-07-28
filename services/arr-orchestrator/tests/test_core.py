@@ -273,12 +273,13 @@ class CoreTests(unittest.TestCase):
                 state="waiting_stable",
                 source_path=str(item),
             )
+            infohash = "a" * 40
 
             class FakeQbt:
                 def torrents(self, _torrent_filter):
                     return [
                         {
-                            "hash": "abc123",
+                            "hash": infohash,
                             "category": "movies",
                             "name": "Wasabi",
                             "content_path": str(content),
@@ -290,8 +291,8 @@ class CoreTests(unittest.TestCase):
             engine._reconcile_qbt()
 
             updated = database.get_job(job["job_id"])
-            self.assertEqual(updated["qbt_hash"], "abc123")
-            self.assertEqual(updated["infohash"], "abc123")
+            self.assertEqual(updated["qbt_hash"], infohash)
+            self.assertEqual(updated["infohash"], infohash)
             self.assertEqual(updated["source_path"], str(item))
             self.assertEqual(len(database.latest_jobs()), 1)
             self.assertTrue(
@@ -349,12 +350,13 @@ class CoreTests(unittest.TestCase):
             content = item / "Wasabi.avi"
             content.parent.mkdir(parents=True)
             content.write_bytes(b"movie")
+            infohash = "b" * 40
 
             class FakeQbt:
                 def torrents(self, _torrent_filter):
                     return [
                         {
-                            "hash": "abc123",
+                            "hash": infohash,
                             "category": "movies",
                             "name": "Wasabi",
                             "content_path": str(content),
@@ -368,7 +370,7 @@ class CoreTests(unittest.TestCase):
             jobs = database.latest_jobs()
             self.assertEqual(len(jobs), 1)
             self.assertEqual(jobs[0]["origin"], "fs")
-            self.assertEqual(jobs[0]["qbt_hash"], "abc123")
+            self.assertEqual(jobs[0]["qbt_hash"], infohash)
             self.assertEqual(jobs[0]["source_path"], str(item))
             database.close()
 
