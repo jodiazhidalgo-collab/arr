@@ -3,8 +3,6 @@
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
-from ..source_privacy import sanitize_persistent_payload
-
 
 class ResolutionError(RuntimeError):
     def __init__(self, message: str, details: Optional[Dict[str, object]] = None):
@@ -54,24 +52,9 @@ class ResolvedIdentity:
     original_language: str = ""
     season: Optional[int] = None
     episodes: List[int] = field(default_factory=list)
-    source_context: Optional[Dict[str, object]] = None
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
-
-    def to_persistent_dict(
-        self,
-        source_titles: Optional[List[str]] = None,
-    ) -> Dict[str, object]:
-        """Serializa sin duplicar el titulo validado fuera de source_meta."""
-
-        supplied = list(source_titles or [])
-        if isinstance(self.source_context, dict):
-            supplied.append(str(self.source_context.get("source_title") or ""))
-        if self.source == "source_title_fallback":
-            supplied.append(self.query)
-        payload = sanitize_persistent_payload(asdict(self), supplied)
-        return dict(payload) if isinstance(payload, dict) else {}
 
     @classmethod
     def from_dict(cls, payload: Dict[str, object]) -> "ResolvedIdentity":
@@ -90,11 +73,6 @@ class ResolvedIdentity:
             source=str(payload.get("source") or "cache"),
             season=_optional_int(payload.get("season")),
             episodes=[int(value) for value in payload.get("episodes") or []],
-            source_context=(
-                dict(payload["source_context"])
-                if isinstance(payload.get("source_context"), dict)
-                else None
-            ),
         )
 
 

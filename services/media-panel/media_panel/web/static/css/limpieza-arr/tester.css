@@ -31,8 +31,6 @@
   min-width: 0;
 }
 
-.identity-test-source-title { grid-column: 1 / -1; }
-
 .identity-sr-only {
   position: absolute;
   width: 1px;
@@ -119,7 +117,6 @@
 
 @media (max-width: 680px) {
   .identity-test-form { grid-template-columns: 1fr; }
-  .identity-test-source-title { grid-column: auto; }
   .identity-tester-heading { align-items: flex-start; }
 }
 

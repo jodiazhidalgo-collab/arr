@@ -15,12 +15,3 @@ DEFAULT_TITLE_MATCHING: Dict[str, object] = {
     "omitted_part_min_words": 3,
     "supplemental_min_chars": 3,
 }
-
-DEFAULT_SOURCE_TITLE_FALLBACK: Dict[str, object] = {
-    "enabled": True,
-    "movies": True,
-    "tv": True,
-    "score_bonus": 30,
-    "min_similarity": 0.80,
-    "require_compatible_year_for_fuzzy": True,
-}

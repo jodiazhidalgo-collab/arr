@@ -61,8 +61,6 @@ def main() -> int:
         identity_cache_clearer=engine.clear_identity_cache,
         identity_parser_tester=engine.test_identity_parser,
         identity_resolver_tester=engine.test_identity_resolver,
-        source_context_event_handler=engine.source_context.handle,
-        source_context_token=config.source_context_token,
     )
 
     def stop(_signum: int, _frame: object) -> None:

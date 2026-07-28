@@ -12,11 +12,6 @@ from typing import Dict, Iterable, Optional
 
 from ..name_parser import MediaDecision, decide_media, test_parser_title
 from ..name_resolver import NameResolver
-from ..source_context.contract import (
-    SourceContextContractError,
-    validate_source_title,
-)
-from .resolver_defaults import DEFAULT_SOURCE_TITLE_FALLBACK
 from .settings import (
     IdentityRulesValidationError,
     IdentitySettingsStore,
@@ -186,26 +181,7 @@ class IdentityController:
                 "message": "Las reglas del parser no pudieron aplicarse.",
                 "decision": _test_decision("PARSER_ERROR"),
             }
-        raw_source_title = payload.get("source_title")
-        source_title = ""
-        if raw_source_title not in (None, ""):
-            try:
-                source_title = validate_source_title(raw_source_title)
-            except SourceContextContractError:
-                return {
-                    "ok": False,
-                    "status": "INVALID_RULES",
-                    "error": "invalid_source_title",
-                    "message": "source_title no es válido.",
-                    "decision": _test_decision("INVALID_RULES"),
-                }
-        result = self.resolver.preview(
-            name,
-            category,
-            rules,
-            source_title=source_title,
-            source="preview",
-        )
+        result = self.resolver.preview(name, category, rules)
         result["parser_test"] = parser
         return result
 
@@ -310,10 +286,6 @@ def _disable_new_identity_behaviors(
             "enabled": False,
             "language": "en",
         }
-    if not only_when_missing or "source_title_fallback" not in resolver:
-        source_fallback = copy.deepcopy(DEFAULT_SOURCE_TITLE_FALLBACK)
-        source_fallback["enabled"] = False
-        resolver["source_title_fallback"] = source_fallback
     acceptance = resolver.get("acceptance")
     if isinstance(acceptance, dict) and (
         not only_when_missing

@@ -127,7 +127,7 @@ class FileBotRunner:
             "stdout_tail": combined[-6000:],
             "log_file": str(log_file),
             "raw_log_truncated": raw_log_truncated,
-            "identity": identity.to_persistent_dict() if identity else None,
+            "identity": identity.to_dict() if identity else None,
             "mode": "guided" if identity else "legacy_amc",
             "command_preview": preview,
         }

@@ -51,8 +51,6 @@ class Config:
     resolver_http_timeout_ms: int
     resolver_total_budget_ms: int
     resolver_retry_seconds: int
-    source_context_token: str = ""
-    source_context_correlation_grace_seconds: int = 90
 
     @property
     def db_path(self) -> Path:
@@ -126,17 +124,6 @@ class Config:
             ),
             resolver_retry_seconds=int(
                 os.environ.get("ARR_RESOLVER_RETRY_SECONDS", "60")
-            ),
-            source_context_token=_read_secret(
-                "ARR_SOURCE_CONTEXT_TOKEN", "ARR_SOURCE_CONTEXT_TOKEN_FILE"
-            ).strip(),
-            source_context_correlation_grace_seconds=max(
-                0,
-                int(
-                    os.environ.get(
-                        "ARR_SOURCE_CONTEXT_CORRELATION_GRACE_SECONDS", "90"
-                    )
-                ),
             ),
         )
 

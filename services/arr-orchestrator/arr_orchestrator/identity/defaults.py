@@ -12,11 +12,7 @@ import re
 from typing import Dict
 
 from .parser_rules import factory_parser_rules
-from .resolver_defaults import (
-    DEFAULT_SERIES_CANDIDATES,
-    DEFAULT_SOURCE_TITLE_FALLBACK,
-    DEFAULT_TITLE_MATCHING,
-)
+from .resolver_defaults import DEFAULT_SERIES_CANDIDATES, DEFAULT_TITLE_MATCHING
 
 
 IDENTITY_SETTING_KEY = "identity.pipeline"
@@ -67,7 +63,6 @@ _IDENTITY_RULES_TEMPLATE: Dict[str, object] = {
             "use_spanish_correction": True,
         },
         "title_matching": copy.deepcopy(DEFAULT_TITLE_MATCHING),
-        "source_title_fallback": copy.deepcopy(DEFAULT_SOURCE_TITLE_FALLBACK),
         "search_limits": {
             "max_searches": 8,
             "results_per_search": 10,

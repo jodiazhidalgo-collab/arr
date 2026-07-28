@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from arr_orchestrator.db import Database
 from arr_orchestrator.identity.controller import IdentityController
@@ -84,67 +83,6 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(result["decision"]["status"], "TMDB_UNAVAILABLE")
         self.assertFalse(result["decision"]["has_scoring"])
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
-
-    def test_resolver_tester_forwards_the_optional_source_title(self) -> None:
-        controller = IdentityController(_config(), self.database)
-        expected = {
-            "ok": True,
-            "status": "ACCEPTED",
-            "decision": {"status": "ACCEPTED"},
-        }
-
-        with patch.object(
-            controller.resolver, "preview", return_value=expected
-        ) as preview:
-            result = controller.test_resolver(
-                {
-                    "name": "1080p.mkv",
-                    "category": "movies",
-                    "source_title": "El regreso de la momia 2001",
-                }
-            )
-
-        self.assertEqual(result["status"], "ACCEPTED")
-        self.assertEqual(
-            preview.call_args.kwargs,
-            {
-                "source_title": "El regreso de la momia 2001",
-                "source": "preview",
-            },
-        )
-
-    def test_resolver_tester_matches_the_real_source_title_contract(self) -> None:
-        controller = IdentityController(_config(), self.database)
-        for source_title in (
-            "Título\x00oculto",
-            "x" * 513,
-            "magnet:?xt=urn:btih:" + "a" * 40,
-        ):
-            with self.subTest(source_title=source_title[:30]):
-                result = controller.test_resolver(
-                    {
-                        "name": "1080p.mkv",
-                        "category": "movies",
-                        "source_title": source_title,
-                    }
-                )
-                self.assertFalse(result["ok"])
-                self.assertEqual(result["status"], "INVALID_RULES")
-                self.assertEqual(result["error"], "invalid_source_title")
-
-        with patch.object(
-            controller.resolver,
-            "preview",
-            return_value={"ok": True, "status": "ACCEPTED"},
-        ) as preview:
-            controller.test_resolver(
-                {
-                    "name": "1080p.mkv",
-                    "category": "movies",
-                    "source_title": "x" * 512,
-                }
-            )
-        self.assertEqual(len(preview.call_args.kwargs["source_title"]), 512)
 
     def test_resolver_tester_returns_human_contract_for_invalid_draft(self) -> None:
         controller = IdentityController(_config(), self.database)
@@ -253,7 +191,6 @@ class IdentityControllerTests(unittest.TestCase):
         controller = IdentityController(_config(), self.database)
         legacy_rules = copy.deepcopy(controller.payload()["rules"])
         del legacy_rules["resolver"]["original_language_preference"]
-        del legacy_rules["resolver"]["source_title_fallback"]
         for key in (
             "video_extensions",
             "video_markers",
@@ -290,9 +227,6 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(
             restored["rules"]["resolver"]["original_language_preference"],
             {"enabled": False, "language": "en"},
-        )
-        self.assertFalse(
-            restored["rules"]["resolver"]["source_title_fallback"]["enabled"]
         )
         self.assertEqual(restored["rules"]["parser"]["video_extensions"], [])
         self.assertEqual(restored["rules"]["parser"]["video_markers"], [])

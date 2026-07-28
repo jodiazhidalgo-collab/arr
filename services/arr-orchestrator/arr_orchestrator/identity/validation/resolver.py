@@ -5,11 +5,7 @@ from __future__ import annotations
 import copy
 from typing import Dict, Tuple
 
-from ..resolver_defaults import (
-    DEFAULT_SERIES_CANDIDATES,
-    DEFAULT_SOURCE_TITLE_FALLBACK,
-    DEFAULT_TITLE_MATCHING,
-)
+from ..resolver_defaults import DEFAULT_SERIES_CANDIDATES, DEFAULT_TITLE_MATCHING
 from .common import (
     IdentityRulesValidationError,
     aliases,
@@ -59,10 +55,6 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         "title_matching",
         copy.deepcopy(DEFAULT_TITLE_MATCHING),
     )
-    resolver.setdefault(
-        "source_title_fallback",
-        copy.deepcopy(DEFAULT_SOURCE_TITLE_FALLBACK),
-    )
     exact_keys(
         resolver,
         {
@@ -75,7 +67,6 @@ def normalize_resolver(value: object) -> Dict[str, object]:
             "series_candidates",
             "query_variants",
             "title_matching",
-            "source_title_fallback",
             "search_limits",
             "scoring",
             "acceptance",
@@ -306,53 +297,6 @@ def normalize_resolver(value: object) -> Dict[str, object]:
             "rules.resolver.title_matching.supplemental_min_chars",
             1,
             100,
-        ),
-    }
-
-    source_title_fallback = expect_object(
-        resolver.get("source_title_fallback"),
-        "rules.resolver.source_title_fallback",
-    )
-    exact_keys(
-        source_title_fallback,
-        {
-            "enabled",
-            "movies",
-            "tv",
-            "score_bonus",
-            "min_similarity",
-            "require_compatible_year_for_fuzzy",
-        },
-        "rules.resolver.source_title_fallback",
-    )
-    normalized_source_title_fallback = {
-        "enabled": boolean(
-            source_title_fallback.get("enabled"),
-            "rules.resolver.source_title_fallback.enabled",
-        ),
-        "movies": boolean(
-            source_title_fallback.get("movies"),
-            "rules.resolver.source_title_fallback.movies",
-        ),
-        "tv": boolean(
-            source_title_fallback.get("tv"),
-            "rules.resolver.source_title_fallback.tv",
-        ),
-        "score_bonus": integer(
-            source_title_fallback.get("score_bonus"),
-            "rules.resolver.source_title_fallback.score_bonus",
-            0,
-            100,
-        ),
-        "min_similarity": number(
-            source_title_fallback.get("min_similarity"),
-            "rules.resolver.source_title_fallback.min_similarity",
-            0.5,
-            1,
-        ),
-        "require_compatible_year_for_fuzzy": boolean(
-            source_title_fallback.get("require_compatible_year_for_fuzzy"),
-            "rules.resolver.source_title_fallback.require_compatible_year_for_fuzzy",
         ),
     }
 
@@ -646,7 +590,6 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         "series_candidates": normalized_series_candidates,
         "query_variants": normalized_queries,
         "title_matching": normalized_title_matching,
-        "source_title_fallback": normalized_source_title_fallback,
         "search_limits": normalized_limits,
         "scoring": normalized_scoring,
         "acceptance": normalized_acceptance,

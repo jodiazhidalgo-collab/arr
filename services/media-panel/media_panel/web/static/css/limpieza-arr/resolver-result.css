@@ -29,21 +29,6 @@
   line-height: 1.45;
 }
 
-.resolver-origin {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 12px;
-  align-items: center;
-  width: fit-content;
-  padding: 5px 9px;
-  border-radius: 999px;
-  background: rgba(56, 189, 248, .12);
-  color: #bae6fd;
-  font-size: 12px;
-}
-
-.resolver-origin span { color: var(--muted); }
-
 .resolver-outcome .resolver-concrete-cause {
   padding: 8px 10px;
   border-radius: 6px;

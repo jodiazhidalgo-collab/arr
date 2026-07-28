@@ -67,8 +67,6 @@
     const preferredLanguage = ui.resolverLanguageName(languagePreference.language);
     const oldestPreference = decision?.oldest_exact_title_preference || {};
     const oldestPreferenceApplied = oldestPreference.applied === true;
-    const sourceFallback = decision?.source_fallback || payload?.source_fallback || {};
-    const sourceFallbackApplied = sourceFallback.applied === true;
     const selectedOldestYear = Number(oldestPreference.selected_year);
     const sourceLabels = {
       tmdb_id: "un identificador TMDb directo",
@@ -81,9 +79,7 @@
       return {
         tone: "ok",
         title: "ACEPTADA",
-        text: sourceFallbackApplied
-          ? "El nombre físico no fue suficiente y la identidad se ha confirmado con el título validado del buscador."
-          : languagePreferenceApplied
+        text: languagePreferenceApplied
           ? `El candidato se ha seleccionado porque es el único con idioma original ${preferredLanguage} dentro del grupo ambiguo.`
           : oldestPreferenceApplied
             ? `La película se ha seleccionado porque ${Number.isFinite(selectedOldestYear) ? `su año ${selectedOldestYear} es` : "es"} el más antiguo entre los candidatos con título y puntuación exactamente iguales.`
@@ -114,11 +110,6 @@
             : "No existe un segundo candidato y la ventaja calculada contra cero no alcanza el margen mínimo."
       };
     }
-    if (status === "REJECTED_SOURCE_TITLE") return {
-      tone: "warn",
-      title: "RESPALDO NO SEGURO",
-      text: "El título del buscador no alcanza la similitud mínima o contradice el año de TMDb."
-    };
     if (status === "NO_CANDIDATES") return { tone: "warn", title: "SIN CANDIDATOS", text: "TMDb no devolvió candidatos utilizables para las búsquedas realizadas." };
     if (status === "INVALID_RULES") return { tone: "bad", title: "CONFIGURACIÓN NO VÁLIDA", text: "El borrador contiene un valor que el motor no puede utilizar. Revisa el aviso de configuración." };
     if (status === "PARSER_ERROR") return { tone: "bad", title: "ERROR DEL PARSER", text: "Las reglas actuales no permiten analizar este nombre." };
@@ -137,7 +128,6 @@
       if (reason === "forced_year_mismatch") return { tone: "warn", title: "AÑO FORZADO INCORRECTO", text: "El año de la regla no coincide con el año real de TMDb." };
       if (reason.startsWith("forced_")) return { tone: "warn", title: "COINCIDENCIA FORZADA NO VÁLIDA", text: "La coincidencia forzada no concuerda con los datos reales de TMDb." };
       if (reason === "category_not_resolvable") return { tone: "warn", title: "CATEGORÍA NO RESOLUBLE", text: "La categoría seleccionada no permite consultar TMDb." };
-      if (reason === "source_context_conflict") return { tone: "warn", title: "RESPALDOS CONTRADICTORIOS", text: "Los títulos de origen conducen a identidades TMDb diferentes y el motor no puede elegir con seguridad." };
       return { tone: "warn", title: "IDENTIDAD NO SEGURA", text: "El motor no dispone de evidencia suficiente para aceptar una identidad." };
     }
     return { tone: "bad", title: "PRUEBA NO COMPLETADA", text: "No se pudo obtener un resultado utilizable del motor ARR." };
@@ -167,7 +157,7 @@
     return message;
   };
 
-  ui.renderResolverDecision = function (payload, candidates, context) {
+  ui.renderResolverDecision = function (payload, candidates) {
     const decision = payload?.decision || {};
     const presentation = ui.resolverPresentation(payload, candidates);
     const concreteCause = ui.resolverConcreteCause(payload);
@@ -180,21 +170,6 @@
     const hasSecondCandidate = decision.has_second_candidate === undefined
       ? candidates.length > 1
       : Boolean(decision.has_second_candidate);
-    const sourceFallback = decision?.source_fallback || payload?.source_fallback || {};
-    const sourceFallbackApplied = sourceFallback.applied === true;
-    const sourceNames = {
-      "buscador-jackett": "Buscador Jackett",
-      "buscador-pro": "Buscador Pro",
-      preview: "título mostrado en el buscador"
-    };
-    const sourceName = sourceNames[String(sourceFallback.source || "").toLowerCase()]
-      || String(sourceFallback.source || "buscador");
-    const origin = sourceFallbackApplied
-      ? `Respaldo: ${sourceName}`
-      : "Nombre físico";
-    const originRow = ui.resolverStatus(payload) === "ACCEPTED"
-      ? `<div class="resolver-origin"><span>Origen usado</span><strong>${ui.esc(origin)}</strong></div>`
-      : "";
     const metrics = !hasScoring ? "" : `<div class="resolver-criteria" aria-label="Criterios de aceptación">
       <div class="resolver-criterion">
         <span>Puntuación obtenida</span><strong>${ui.esc(ui.resolverNumber(decision.score))}</strong>
@@ -213,7 +188,6 @@
       <small>RESULTADO</small>
       <h4 id="resolver-outcome-title">${ui.esc(presentation.title)}</h4>
       <p>${ui.esc(presentation.text)}</p>
-      ${originRow}
       ${concreteCause ? `<p class="resolver-concrete-cause"><strong>Motivo concreto:</strong> ${ui.esc(concreteCause)}</p>` : ""}
       ${metrics}
     </section>`;
@@ -254,10 +228,6 @@
     if (path.endsWith(".score_parser_candidates")) {
       const title = detail.replace(/^T[ií]tulo auxiliar del parser:\s*/i, "").trim();
       return title ? `Título auxiliar utilizado: ${title}` : "Título auxiliar utilizado";
-    }
-    if (path.endsWith(".source_title_fallback.score_bonus")) {
-      const title = detail.replace(/^T[ií]tulo validado del buscador:\s*/i, "").trim();
-      return title ? `Título validado del buscador utilizado: ${title}` : "Título validado del buscador utilizado";
     }
     return detail;
   };
@@ -394,6 +364,6 @@
     const candidateCards = candidates.length
       ? `<section class="resolver-candidates" aria-label="Candidatos TMDb">${candidates.map((candidate, index) => ui.renderResolverCandidate(candidate, index, context)).join("")}</section>`
       : "";
-    return `${ui.renderResolverDecision(payload, candidates, context)}${candidateCards}${ui.renderResolverDiagnostics(payload)}`;
+    return `${ui.renderResolverDecision(payload, candidates)}${candidateCards}${ui.renderResolverDiagnostics(payload)}`;
   };
 })();
