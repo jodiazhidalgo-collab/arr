@@ -1557,19 +1557,25 @@ class SourceContextEngineRaceTests(unittest.TestCase):
                 source_path=str(item),
                 source_meta_json=engine._new_job_source_meta_json(),
             )
-            engine.source_context_correlation.remember_rdt(
-                [
-                    {
-                        "hash": "5" * 40,
-                        "id": "rdt-internal-root",
-                        "content_path": str(item),
-                        "progress": 100,
-                    }
-                ]
-            )
-            adopted = engine.source_context_correlation.adopt_rdt_for_materialized_job(
-                job, "movies_automatizacion", item
-            )
+            engine.source_context_correlation.begin_cycle()
+            try:
+                engine.source_context_correlation.remember_rdt(
+                    [
+                        {
+                            "hash": "5" * 40,
+                            "id": "rdt-internal-root",
+                            "content_path": str(item),
+                            "progress": 100,
+                        }
+                    ]
+                )
+                adopted = (
+                    engine.source_context_correlation.adopt_rdt_for_materialized_job(
+                        job, "movies_automatizacion", item
+                    )
+                )
+            finally:
+                engine.source_context_correlation.end_cycle()
             self.assertIsNone(adopted.get("infohash"))
             self.assertIsNone(adopted.get("rdt_id"))
         finally:
