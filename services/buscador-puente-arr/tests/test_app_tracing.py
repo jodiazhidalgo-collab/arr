@@ -137,6 +137,65 @@ class DeliveryTracingTests(unittest.TestCase):
                 self.assertEqual(submission["state"], "transport_done")
                 self.assertEqual(submission["rdt_id"], key)
 
+    def test_finished_item_ignores_regressed_rdt_row_without_qbit(self) -> None:
+        now = 1_000_000
+        for route in ("direct", "rediscovered"):
+            for elapsed, should_cleanup in ((29, False), (30, True)):
+                with self.subTest(route=route, elapsed=elapsed):
+                    key = f"rdt-regressed-{route}-{elapsed}"
+                    row = {"status": "error", "progress": 0, "completed": False}
+                    direct_get = (
+                        patch.object(app_module, "rdt_json", return_value=row)
+                        if route == "direct"
+                        else patch.object(
+                            app_module,
+                            "rdt_json",
+                            side_effect=RuntimeError("HTTP 404"),
+                        )
+                    )
+                    item = {
+                        "rdt_id": key,
+                        "title": "Pelicula ya terminada",
+                        "category": "movies",
+                        "finished_seen_ts": now - elapsed,
+                    }
+                    state = {key: item}
+                    saved = []
+                    session = object()
+
+                    with (
+                        patch.object(app_module, "load_settings", return_value=settings(True)),
+                        patch.object(app_module, "load_monitor_state", return_value=state),
+                        patch.object(
+                            app_module,
+                            "save_monitor_state",
+                            side_effect=lambda value: saved.append(dict(value)),
+                        ),
+                        patch.object(app_module, "rdt_login", return_value=session),
+                        direct_get,
+                        patch.object(app_module, "rdt_find_row", return_value=row) as find_row,
+                        patch.object(app_module, "rdt_cleanup_finished") as cleanup,
+                        patch.object(app_module, "cleanup_monitor_artifact"),
+                        patch.object(app_module, "monitor_fallback") as fallback,
+                        patch.object(app_module.time, "time", return_value=now),
+                    ):
+                        app_module.monitor_once()
+
+                    fallback.assert_not_called()
+                    if route == "direct":
+                        find_row.assert_not_called()
+                    else:
+                        find_row.assert_called_once()
+
+                    if should_cleanup:
+                        cleanup.assert_called_once_with(session, key)
+                        self.assertEqual(state, {})
+                        self.assertEqual(saved, [{}])
+                    else:
+                        cleanup.assert_not_called()
+                        self.assertIn(key, state)
+                        self.assertEqual(saved, [state])
+
     def test_delivery_trace_normal_rdt_submission(self) -> None:
         with (
             patch.object(app_module, "load_settings", return_value=settings()),

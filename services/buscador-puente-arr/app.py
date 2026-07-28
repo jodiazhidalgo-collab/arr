@@ -2169,7 +2169,7 @@ def monitor_finalize_missing_finished(key: str, item: dict, state: dict) -> None
 def monitor_missing_item(session: requests.Session, key: str, item: dict, settings: dict, now: int, state: dict) -> bool:
     row = rdt_find_row(session, str(item.get("rdt_id") or key), str(item.get("hash") or ""), set())
     if row:
-        if monitor_is_finished(row):
+        if monitor_is_finished(row) or monitor_is_finished(item):
             monitor_cleanup_finished(session, key, item, row, now, state)
             return True
         fallback, reason = monitor_should_fallback(row, item, settings, now)
@@ -2203,7 +2203,7 @@ def monitor_once() -> None:
     for key, item in list(state.items()):
         try:
             row = rdt_json(session, f"/Api/Torrents/Get/{quote(str(item.get('rdt_id') or key), safe='')}") or {}
-            if monitor_is_finished(row):
+            if monitor_is_finished(row) or monitor_is_finished(item):
                 monitor_cleanup_finished(session, key, item, row, now, state)
                 changed = True
                 continue
