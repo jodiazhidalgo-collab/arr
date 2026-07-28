@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .identity_proxy import IdentityProxy
+from .source_context_proxy import (
+    MAX_REQUEST_BODY_BYTES as SOURCE_CONTEXT_MAX_BODY_BYTES,
+    SourceContextProxy,
+    read_source_context_token,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,6 +31,7 @@ ORCH_URL = os.environ.get("ARR_ORCHESTRATOR_URL", "http://arr-orchestrator:8787"
 WORKER_URL = os.environ.get("MEDIA_WORKER_URL", "http://media-worker:8790").rstrip("/")
 CODEX_DIAG_ROOT = Path(os.environ.get("CODEX_DIAG_ROOT", "/diagnosticos_codex"))
 IDENTITY_PROXY = IdentityProxy(ORCH_URL)
+SOURCE_CONTEXT_PROXY = SourceContextProxy(ORCH_URL, read_source_context_token())
 MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
 
 
@@ -557,6 +563,71 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "El JSON supera el limite de 4 MB.",
                 },
             )
+            return
+        if parsed.path == "/api/source-context/events":
+            if not SOURCE_CONTEXT_PROXY.enabled:
+                self._json(
+                    503,
+                    {
+                        "ok": False,
+                        "error": "source_context_disabled",
+                        "message": "La recepcion de contexto de origen no esta configurada.",
+                    },
+                )
+                return
+            if not SOURCE_CONTEXT_PROXY.authorized(self.headers.get("Authorization")):
+                self._json(
+                    401,
+                    {
+                        "ok": False,
+                        "error": "unauthorized",
+                        "message": "Bearer no valido.",
+                    },
+                )
+                return
+            if not _is_application_json(self.headers):
+                self._json(
+                    415,
+                    {
+                        "ok": False,
+                        "error": "unsupported_media_type",
+                        "message": "Content-Type debe ser application/json.",
+                    },
+                )
+                return
+            if length > SOURCE_CONTEXT_MAX_BODY_BYTES:
+                self._json(
+                    413,
+                    {
+                        "ok": False,
+                        "error": "payload_too_large",
+                        "message": "El JSON supera el limite de 16 KB.",
+                    },
+                )
+                return
+            try:
+                status, result = SOURCE_CONTEXT_PROXY.post_event(
+                    self._read_payload(strict=True)
+                )
+                self._json(status, result)
+            except InvalidJsonPayloadError:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": "El cuerpo debe ser un objeto JSON valido.",
+                    },
+                )
+            except Exception:
+                self._json(
+                    500,
+                    {
+                        "ok": False,
+                        "error": "source_context_proxy_failed",
+                        "message": "No se pudo registrar el contexto de origen.",
+                    },
+                )
             return
         if parsed.path == "/api/rules":
             try:

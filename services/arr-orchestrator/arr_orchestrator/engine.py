@@ -15,8 +15,17 @@ from .codex_diagnostics import create_codex_diagnostic
 from .db import Database
 from .filebot import FileBotRunner
 from .identity.controller import IdentityController
+from .identity.source_fallback import (
+    source_fallback_block_reason,
+    source_title_contexts,
+)
+from .identity.source_privacy import (
+    sanitize_persistent_payload,
+    source_titles_from_meta,
+)
 from .filesystem import (
     ExtractionError,
+    MEDIA_EXTENSIONS,
     clean_junk,
     extract_archives,
     full_bluray_folders,
@@ -48,6 +57,7 @@ from .name_resolver import (
     ResolverUnavailable,
 )
 from .name_parser import MediaDecision, decide_media
+from .source_context import SourceContextCorrelator, SourceContextService
 from .torrent import torrent_info
 from .watchers import EventHandler
 
@@ -87,6 +97,7 @@ def _sanitize_extraction_details(job_root: Path, details: Dict[str, object]) -> 
 
     return sanitize(details)  # type: ignore[return-value]
 COMPLETE_CATEGORIES = ("movies", "tv", "manual", "movies_automatizacion", "trailers_automatizacion")
+RDT_SOURCE_CATEGORIES = ("movies", "tv", "manual")
 WATCHER_RULES_SETTING_KEY = "watcher.movies.ignored_suffixes"
 DEFAULT_IGNORED_MOVIES_SUFFIXES = (".delay-audio-part",)
 WORKER_STATUS_POLL_SECONDS = 5.0
@@ -112,6 +123,10 @@ class Engine:
             logger=self.log,
         )
         self.name_resolver = self.identity.resolver
+        self.source_context = SourceContextService(
+            database,
+            identity_snapshot_provider=self.identity.job_snapshot,
+        )
         self.media_worker = MediaWorkerClient(config.media_worker_url, config.callback_url)
         self.events: "queue.Queue[Tuple[str, Path]]" = queue.Queue()
         self.observer = Observer()
@@ -124,6 +139,17 @@ class Engine:
         self._last_heartbeat = 0.0
         self.running = True
         self.dependencies: Dict[str, str] = {}
+        self.source_context_correlation = SourceContextCorrelator(
+            database,
+            self.source_context.store,
+            qbt_client=lambda: self.qbt,
+            rdt_client=lambda: self.rdt,
+            dependencies=self.dependencies,
+            qbt_materialized_source=self._qbt_materialized_source,
+            translate_rdt_path=self._translate_rdt_path,
+            complete_category_path=self._complete_category_path,
+            same_path=self._same_path,
+        )
         self._watcher_rules_snapshot = self._load_ignored_movies_suffixes()
 
     @staticmethod
@@ -445,12 +471,20 @@ class Engine:
                 self.log.exception("Error manejando evento %s: %s", event_type, path)
 
     def reconcile(self) -> None:
-        self._reconcile_watch_inbox()
-        self._reconcile_qbt_events()
-        self._reconcile_qbt()
-        self._reconcile_rdt()
-        self._reconcile_complete()
-        self._reconcile_late_worker_results()
+        self.source_context_correlation.begin_cycle()
+        try:
+            try:
+                self.source_context.store.expire_stale_pending()
+            except Exception as error:
+                self.log.warning("No se pudieron caducar contextos de origen: %s", error)
+            self._reconcile_watch_inbox()
+            self._reconcile_qbt_events()
+            self._reconcile_qbt()
+            self._reconcile_rdt()
+            self._reconcile_complete()
+            self._reconcile_late_worker_results()
+        finally:
+            self.source_context_correlation.end_cycle()
 
     def _reconcile_watch_inbox(self) -> None:
         for path in self.config.watch_inbox.rglob("*.torrent"):
@@ -473,8 +507,10 @@ class Engine:
             torrents = self.qbt.torrents("completed")
         except Exception as error:
             self.dependencies["qbittorrent"] = f"error: {error}"
+            self.source_context_correlation.remember_qbt([])
             return
         self.dependencies["qbittorrent"] = "ok"
+        self.source_context_correlation.remember_qbt(torrents)
         for torrent in torrents:
             infohash = str(torrent.get("hash") or "").lower()
             content_path = Path(str(torrent.get("content_path") or ""))
@@ -495,6 +531,8 @@ class Engine:
                 str(torrent.get("name") or ""),
                 identity_rules,
             )
+            if self.source_context.store.has_context(job):
+                category = str(job.get("category") or category)
             if not job and self._ignored_movies_item(source_path):
                 continue
             if not job:
@@ -513,7 +551,7 @@ class Engine:
                     ),
                 )
             elif job["state"] not in TERMINAL_STATES:
-                self._attach_qbt_identity(
+                self.source_context_correlation.attach_qbt(
                     job,
                     infohash,
                     category,
@@ -528,8 +566,10 @@ class Engine:
             torrents = self.rdt.torrents("all")
         except Exception as error:
             self.dependencies["rdtclient"] = f"error: {error}"
+            self.source_context_correlation.remember_rdt([])
             return
         self.dependencies["rdtclient"] = "ok"
+        self.source_context_correlation.remember_rdt(torrents)
         for torrent in torrents:
             infohash = str(torrent.get("hash") or "").lower()
             if not infohash:
@@ -537,15 +577,18 @@ class Engine:
             job = self.db.get_active_job_by_infohash(infohash)
             if not job:
                 continue
-            updates = {
-                "rdt_id": str(torrent.get("id") or torrent.get("hash") or ""),
-                "rdt_progress": float(torrent.get("progress") or 0),
-            }
             content_path = self._translate_rdt_path(str(torrent.get("content_path") or ""))
-            if content_path and content_path.exists():
-                updates["source_path"] = str(content_path)
-                updates["state"] = "waiting_stable"
-            self.db.update_job(job["job_id"], **updates)
+            source_path = None
+            if content_path:
+                category_root = self._complete_category_path(content_path)
+                if category_root:
+                    source_path = top_level_item(category_root, content_path)
+            self.source_context_correlation.attach_rdt(
+                job,
+                torrent,
+                source_path,
+                "Descarga RDT correlacionada con trabajo existente",
+            )
         self._apply_rdt_fallback()
 
     def _apply_rdt_fallback(self) -> None:
@@ -600,6 +643,7 @@ class Engine:
             )
         else:
             category = str(job.get("category") or "manual")
+        job = self.source_context_correlation.adopt_watch_torrent(job, name, path)
         if self.config.active and job["state"] == "received":
             self._submit_rdt(job, path)
         elif not self.config.active and job["state"] == "received":
@@ -711,6 +755,8 @@ class Engine:
             str(torrent.get("name") or ""),
             identity_rules,
         )
+        if self.source_context.store.has_context(job):
+            category = str(job.get("category") or category)
         if not job and self._ignored_movies_item(source_path):
             path.unlink(missing_ok=True)
             return
@@ -730,7 +776,7 @@ class Engine:
                 ),
             )
         else:
-            self._attach_qbt_identity(
+            self.source_context_correlation.attach_qbt(
                 job,
                 infohash,
                 category,
@@ -757,12 +803,23 @@ class Engine:
             if not ready_source:
                 return
             item = ready_source
-        job = self.db.get_job_by_source_path(str(item))
+        job = self.source_context_correlation.job_for_source_path(item)
+        correlated = self.source_context_correlation.correlate_materialized(
+            category, item, materialized_job=job
+        )
+        if correlated:
+            job = correlated
         if not job:
             job = self._job_for_materialized(category, item)
         if not job and self._ignored_movies_item(item):
             return
         if not job:
+            if self.source_context_correlation.should_defer(
+                category,
+                item,
+                self.config.source_context_correlation_grace_seconds,
+            ):
+                return
             source_uid = self._new_source_uid(f"fs:{category}", item.name)
             job = self.db.create_job(
                 source_uid,
@@ -774,14 +831,23 @@ class Engine:
                 source_meta_json=self._new_job_source_meta_json(),
             )
         elif job["state"] not in TERMINAL_STATES:
+            physical_name = self.source_context_correlation.physical_name_updates(
+                job, item.name
+            )
             self.db.update_job(
                 job["job_id"],
                 category=category,
                 source_path=str(item),
                 state="waiting_stable",
+                **physical_name,
             )
         if job["state"] not in TERMINAL_STATES and not job.get("qbt_hash"):
-            self._adopt_qbt_for_materialized_job(job, category, item)
+            job = self._adopt_qbt_for_materialized_job(job, category, item)
+        if job["state"] not in TERMINAL_STATES and not job.get("rdt_id"):
+            job = self.source_context_correlation.adopt_rdt_for_materialized_job(
+                job, category, item
+            )
+        self.source_context_correlation.resolved(category, item)
 
     def _job_for_materialized(self, category: str, item: Path) -> Optional[Dict[str, object]]:
         for job in self.db.jobs_in_states(
@@ -805,73 +871,9 @@ class Engine:
         source_path: Path,
         content_path: Path,
     ) -> Optional[Dict[str, object]]:
-        job = self.db.get_active_job_by_infohash(infohash)
-        if job:
-            return job
-        seen: set[str] = set()
-        for candidate in (source_path, content_path):
-            key = str(candidate)
-            if key in seen:
-                continue
-            seen.add(key)
-            job = self.db.get_job_by_source_path(key)
-            if job:
-                return job
-        return None
-
-    def _attach_qbt_identity(
-        self,
-        job: Dict[str, object],
-        infohash: str,
-        category: str,
-        source_path: Path,
-        content_path: Path,
-        submitted_at: float,
-        message: str,
-    ) -> Dict[str, object]:
-        job_id = str(job["job_id"])
-        current_state = str(job.get("state") or "")
-        materializing_states = {
-            "received",
-            "source_submitted",
-            "waiting_materialization",
-            "waiting_stable",
-        }
-        target_state = "waiting_stable" if current_state in materializing_states else current_state
-        updates: Dict[str, object] = {}
-        if str(job.get("infohash") or "").lower() != infohash:
-            updates["infohash"] = infohash
-        if str(job.get("qbt_hash") or "").lower() != infohash:
-            updates["qbt_hash"] = infohash
-        if str(job.get("category") or "") != category:
-            updates["category"] = category
-        if str(job.get("source_path") or "") != str(source_path):
-            updates["source_path"] = str(source_path)
-        if not job.get("submitted_at") and submitted_at:
-            updates["submitted_at"] = submitted_at
-
-        structured = {
-            "state": target_state,
-            "infohash": infohash,
-            "qbt_hash": infohash,
-            "category": category,
-            "source_path": str(source_path),
-            "content_path": str(content_path),
-            "previous_source_path": str(job.get("source_path") or ""),
-        }
-        if target_state != current_state:
-            return self.db.transition(
-                job_id,
-                target_state,
-                "qbt",
-                message,
-                **updates,
-            )
-        if updates:
-            updated = self.db.update_job(job_id, **updates)
-            self.db.add_event(job_id, "qbt", "decision", message, structured)
-            return updated
-        return job
+        return self.source_context_correlation.job_for_qbt_content(
+            infohash, source_path, content_path
+        )
 
     def _adopt_qbt_for_materialized_job(
         self,
@@ -881,12 +883,7 @@ class Engine:
     ) -> Dict[str, object]:
         identity_context = self.identity.rules_for_job(job)
         identity_rules = dict(identity_context.get("rules") or {})
-        try:
-            torrents = self.qbt.torrents("completed")
-        except Exception as error:
-            self.dependencies["qbittorrent"] = f"error: {error}"
-            return job
-        self.dependencies["qbittorrent"] = "ok"
+        torrents = self.source_context_correlation.qbt_inventory()
         for torrent in torrents:
             infohash = str(torrent.get("hash") or "").lower()
             content_path = Path(str(torrent.get("content_path") or ""))
@@ -895,13 +892,17 @@ class Engine:
             source_path = self._qbt_materialized_source(content_path)
             if not source_path or not self._same_path(source_path, item):
                 continue
-            return self._attach_qbt_identity(
+            return self.source_context_correlation.attach_qbt(
                 job,
                 infohash,
-                self._category(
-                    str(torrent.get("category") or category),
-                    str(torrent.get("name") or item.name),
-                    identity_rules,
+                (
+                    str(job.get("category") or category)
+                    if self.source_context.store.has_context(job)
+                    else self._category(
+                        str(torrent.get("category") or category),
+                        str(torrent.get("name") or item.name),
+                        identity_rules,
+                    )
                 ),
                 source_path,
                 content_path,
@@ -1278,12 +1279,15 @@ class Engine:
         )
         identity: Optional[ResolvedIdentity] = None
         media_decision = self._media_decision_for_job(job, input_root, identity_rules)
+        persistent_media_decision = _persistent_job_payload(
+            job, media_decision.to_dict()
+        )
         self.db.add_event(
             str(job["job_id"]),
             "identity",
             "decision",
             f"Decision local: {media_decision.media_type} ({media_decision.confidence})",
-            {"media_decision": media_decision.to_dict()},
+            {"media_decision": persistent_media_decision},
         )
         if media_decision.block_reason == "category_conflict":
             review = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
@@ -1292,7 +1296,7 @@ class Engine:
                 "phase": "identity",
                 "reason": "category_conflict",
                 "category": job["category"],
-                "media_decision": media_decision.to_dict(),
+                "media_decision": persistent_media_decision,
                 "timestamp": time.time(),
             }
             parsed = media_decision.parsed
@@ -1323,6 +1327,13 @@ class Engine:
         if media_decision.block_reason == "no_usable_title":
             self._send_media_decision_review(job, job_root, media_decision)
             return
+        if (
+            not self.name_resolver.enabled
+            and "source_title_fallback" in media_decision.reason_codes
+        ):
+            media_decision.block_reason = "source_title_requires_tmdb"
+            self._send_media_decision_review(job, job_root, media_decision)
+            return
         if self.name_resolver.enabled:
             try:
                 identity = self.name_resolver.resolve(job, input_root)
@@ -1337,9 +1348,11 @@ class Engine:
                         "warning",
                         "TMDb no confirma, pero se continua por senal TV local",
                         {
-                            "media_decision": media_decision.to_dict(),
+                            "media_decision": persistent_media_decision,
                             "resolver_error": str(error),
-                            "resolver_details": error.details,
+                            "resolver_details": _persistent_job_payload(
+                                job, error.details
+                            ),
                         },
                     )
                     self.db.update_job(
@@ -1354,9 +1367,12 @@ class Engine:
                 self._defer_identity(job, input_root, error)
                 return
             if identity:
+                persistent_identity = identity.to_persistent_dict(
+                    source_titles_from_meta(job.get("source_meta_json"))
+                )
                 self.db.update_job(
                     str(job["job_id"]),
-                    identity_json=json.dumps(identity.to_dict(), ensure_ascii=False),
+                    identity_json=json.dumps(persistent_identity, ensure_ascii=False),
                     identity_retry_at=None,
                     last_error_code=None,
                     last_error_message=None,
@@ -1366,8 +1382,25 @@ class Engine:
                     "identity",
                     "resolved",
                     f"Identidad confirmada: TMDb {identity.tmdb_id} - {identity.title}",
-                    identity.to_dict(),
+                    persistent_identity,
                 )
+                if identity.source == "source_title_fallback":
+                    context = (
+                        identity.source_context
+                        if isinstance(identity.source_context, dict)
+                        else {}
+                    )
+                    self.db.add_event(
+                        str(job["job_id"]),
+                        "source_context",
+                        "used",
+                        "Título validado del buscador utilizado como respaldo",
+                        {
+                            "source": str(context.get("source") or ""),
+                            "event_id": str(context.get("event_id") or ""),
+                            "tmdb_id": identity.tmdb_id,
+                        },
+                    )
         else:
             self.db.add_event(
                 str(job["job_id"]),
@@ -1987,7 +2020,28 @@ class Engine:
         files = media_files(input_root)
         files.sort(key=lambda path: path.stat().st_size if path.exists() else 0, reverse=True)
         sources.extend(path.stem for path in files[:3])
-        return self.identity.decide_sources(sources, category, identity_rules)
+        primary = self.identity.decide_sources(sources, category, identity_rules)
+        if primary.block_reason != "no_usable_title":
+            return primary
+        fallback_block_reason = source_fallback_block_reason(job, identity_rules)
+        if fallback_block_reason:
+            primary.reason_codes.append(
+                f"source_fallback_blocked_{fallback_block_reason}"
+            )
+            return primary
+        for context in source_title_contexts(job, identity_rules):
+            fallback = self.identity.decide_sources(
+                [context.source_title], category, identity_rules
+            )
+            if (
+                not fallback.block_reason
+                and fallback.media_type == category
+                and fallback.confidence in {"high", "medium"}
+            ):
+                if "source_title_fallback" not in fallback.reason_codes:
+                    fallback.reason_codes.append("source_title_fallback")
+                return fallback
+        return primary
 
     @staticmethod
     def _can_continue_tv_without_identity(
@@ -1999,6 +2053,7 @@ class Engine:
             and media_decision.media_type == "tv"
             and media_decision.confidence in {"high", "medium"}
             and not media_decision.block_reason
+            and "source_title_fallback" not in media_decision.reason_codes
         )
 
     def _send_media_decision_review(
@@ -2008,13 +2063,13 @@ class Engine:
         media_decision: MediaDecision,
     ) -> None:
         review = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
-        reason = {
+        reason = _persistent_job_payload(job, {
             "job_id": job["job_id"],
             "phase": "identity",
             "reason": media_decision.block_reason or "media_decision_blocked",
             "media_decision": media_decision.to_dict(),
             "timestamp": time.time(),
-        }
+        })
         write_reason(
             review,
             reason,
@@ -2064,14 +2119,14 @@ class Engine:
         error: ResolverAmbiguous,
     ) -> None:
         review = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
-        reason = {
+        reason = _persistent_job_payload(job, {
             "job_id": job["job_id"],
             "phase": "identity",
             "reason": "identity_suspicious",
             "message": str(error),
             "details": error.details,
             "timestamp": time.time(),
-        }
+        })
         write_reason(
             review,
             reason,
@@ -2178,7 +2233,9 @@ class Engine:
             "job_id": job["job_id"],
             "phase": "identity",
             "reason": "filebot_identity_mismatch",
-            "resolved_identity": identity.to_dict(),
+            "resolved_identity": identity.to_persistent_dict(
+                source_titles_from_meta(job.get("source_meta_json"))
+            ),
             "filebot_output_names": output_names,
             "timestamp": time.time(),
         }
@@ -3123,14 +3180,44 @@ class Engine:
         path = Path(raw_path)
         if path.exists():
             return path
-        prefix = Path("/data/downloads")
-        try:
-            relative = path.relative_to(prefix)
-        except ValueError:
+
+        normalized = str(raw_path).strip().replace("\\", "/").rstrip("/")
+        relative_text: Optional[str] = None
+        docker_prefix = "/data/downloads/"
+        if normalized.lower().startswith(docker_prefix):
+            relative_text = normalized[len(docker_prefix) :]
+        else:
+            windows_match = re.match(
+                r"^[a-z]:/downloads/(.+)$", normalized, flags=re.IGNORECASE
+            )
+            if windows_match:
+                relative_text = windows_match.group(1)
+
+        if relative_text is None:
             return path
-        if not relative.parts or relative.parts[0] not in ("movies", "tv", "manual"):
+        parts = [part for part in relative_text.split("/") if part]
+        if (
+            not parts
+            or parts[0].lower() not in RDT_SOURCE_CATEGORIES
+            or any(part in {".", ".."} for part in parts)
+        ):
             return path
-        return self.config.complete_root / relative
+        parts[0] = parts[0].lower()
+        translated = self.config.complete_root.joinpath(*parts)
+        if translated.exists():
+            return translated
+
+        # La API compatible de RDT puede anunciar un archivo como content_path
+        # aunque lo materialice dentro de una carpeta con el mismo nombre sin
+        # extension. Solo aceptamos esa forma cuando ambos nombres coinciden.
+        if translated.suffix.lower() in MEDIA_EXTENSIONS:
+            materialized_folder = translated.with_suffix("")
+            if (
+                materialized_folder.is_dir()
+                and (materialized_folder / translated.name).is_file()
+            ):
+                return materialized_folder
+        return translated
 
     def _new_source_uid(self, prefix: str, infohash: str) -> str:
         base = f"{prefix}:{infohash}"
@@ -3155,6 +3242,16 @@ class Engine:
             or left_normalized in right_normalized
             or right_normalized in left_normalized
         )
+
+
+def _persistent_job_payload(
+    job: Dict[str, object], payload: object
+) -> Dict[str, object]:
+    sanitized = sanitize_persistent_payload(
+        payload,
+        source_titles_from_meta(job.get("source_meta_json")),
+    )
+    return dict(sanitized) if isinstance(sanitized, dict) else {}
 
 
 def _single_child(root: Path) -> Path:

@@ -6,6 +6,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
+from .identity.source_privacy import (
+    sanitize_persistent_json,
+    sanitize_persistent_payload,
+    source_titles_from_meta,
+)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -69,6 +75,14 @@ CREATE TABLE IF NOT EXISTS resolver_cache (
 
 CREATE INDEX IF NOT EXISTS idx_resolver_cache_expires_at
 ON resolver_cache(expires_at);
+"""
+
+ACTIVE_INFOHASH_UNIQUE_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_infohash_unique
+ON jobs(lower(trim(infohash)))
+WHERE infohash IS NOT NULL
+  AND length(trim(infohash))=40
+  AND state NOT IN ('done', 'manual_review', 'duplicate', 'error_terminal', 'discarded')
 """
 
 
@@ -155,6 +169,16 @@ class Database:
         self._ensure_column("jobs", "identity_json", "TEXT")
         self._ensure_column("jobs", "identity_retry_at", "REAL")
         connection.commit()
+        self._migrate_active_infohash_duplicates()
+        connection.execute(ACTIVE_INFOHASH_UNIQUE_INDEX_SQL)
+        connection.commit()
+
+    def _migrate_active_infohash_duplicates(self) -> None:
+        """Delega la migracion del contrato sin mezclarla con la base general."""
+
+        from .source_context.migration import migrate_active_infohash_duplicates
+
+        migrate_active_infohash_duplicates(self.connect())
 
     def _ensure_column(self, table: str, column: str, sql_type: str) -> None:
         columns = {
@@ -282,24 +306,44 @@ class Database:
         values.update(fields)
         columns = ", ".join(values.keys())
         placeholders = ", ".join("?" for _ in values)
-        self.connect().execute(
-            f"INSERT INTO jobs ({columns}) VALUES ({placeholders})",
-            tuple(values.values()),
-        )
-        self.connect().commit()
+        connection = self.connect()
+        try:
+            connection.execute(
+                f"INSERT INTO jobs ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+            connection.commit()
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            infohash = str(values.get("infohash") or "").strip()
+            concurrent = self.get_active_job_by_infohash(infohash) if infohash else None
+            if concurrent:
+                return concurrent
+            raise
         self.add_event(job_id, "received", "started", f"Trabajo creado: {name}", values)
         return self.get_job(job_id)
 
     def update_job(self, job_id: str, **fields: Any) -> Dict[str, Any]:
         if not fields:
             return self.get_job(job_id)
+        connection = self.connect()
+        source_meta = fields.get("source_meta_json")
+        if source_meta is None:
+            row = connection.execute(
+                "SELECT source_meta_json FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            source_meta = row["source_meta_json"] if row else None
+        source_titles = source_titles_from_meta(source_meta)
+        for key in ("identity_json", "result_json"):
+            if key in fields:
+                fields[key] = sanitize_persistent_json(fields[key], source_titles)
         fields["updated_at"] = time.time()
         assignments = ", ".join(f"{key}=?" for key in fields)
-        self.connect().execute(
+        connection.execute(
             f"UPDATE jobs SET {assignments} WHERE job_id=?",
             tuple(fields.values()) + (job_id,),
         )
-        self.connect().commit()
+        connection.commit()
         return self.get_job(job_id)
 
     def transition(
@@ -323,10 +367,34 @@ class Database:
         message: str,
         structured: Optional[Dict[str, Any]] = None,
     ) -> None:
+        event = self.append_event(
+            self.connect(), job_id, phase, event_type, message, structured
+        )
+        self.connect().commit()
+        self.publish_event(event)
+
+    def append_event(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        phase: str,
+        event_type: str,
+        message: str,
+        structured: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Inserta un evento usando la transaccion del llamador, sin confirmar."""
+
         phase = _clean_phase(phase)
         event_type = _clean_event_type(event_type, structured)
+        source_titles = _source_titles_for_job(connection, job_id)
+        message = str(sanitize_persistent_payload(message, source_titles))
+        sanitized_structured = sanitize_persistent_payload(
+            structured, source_titles
+        )
+        if not isinstance(sanitized_structured, dict):
+            sanitized_structured = None
         ts = time.time()
-        cursor = self.connect().execute(
+        cursor = connection.execute(
             """
             INSERT INTO job_events(job_id, ts, phase, event_type, message, structured_json)
             VALUES(?, ?, ?, ?, ?, ?)
@@ -337,21 +405,31 @@ class Database:
                 phase,
                 event_type,
                 message,
-                json.dumps(structured, ensure_ascii=False, default=str) if structured else None,
+                (
+                    json.dumps(
+                        sanitized_structured,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    if sanitized_structured
+                    else None
+                ),
             ),
         )
-        self.connect().commit()
-        self._record_event_best_effort(
-            {
-                "event_id": cursor.lastrowid,
-                "job_id": job_id,
-                "ts": ts,
-                "phase": phase,
-                "event_type": event_type,
-                "message": message,
-                "structured": structured,
-            }
-        )
+        return {
+            "event_id": cursor.lastrowid,
+            "job_id": job_id,
+            "ts": ts,
+            "phase": phase,
+            "event_type": event_type,
+            "message": message,
+            "structured": sanitized_structured,
+        }
+
+    def publish_event(self, event: Dict[str, Any]) -> None:
+        """Publica el espejo vivo solo despues de confirmar el evento canonico."""
+
+        self._record_event_best_effort(event)
 
     def _record_event_best_effort(self, event: Dict[str, Any]) -> None:
         if not self.event_recorder:
@@ -373,7 +451,7 @@ class Database:
 
     def get_job_by_infohash(self, infohash: str) -> Optional[Dict[str, Any]]:
         row = self.connect().execute(
-            "SELECT * FROM jobs WHERE lower(infohash)=lower(?) ORDER BY created_at DESC LIMIT 1",
+            "SELECT * FROM jobs WHERE lower(trim(infohash))=lower(trim(?)) ORDER BY created_at DESC LIMIT 1",
             (infohash,),
         ).fetchone()
         return dict(row) if row else None
@@ -382,7 +460,7 @@ class Database:
         row = self.connect().execute(
             """
             SELECT * FROM jobs
-            WHERE lower(infohash)=lower(?)
+            WHERE lower(trim(infohash))=lower(trim(?))
               AND state NOT IN (
                 'done', 'manual_review', 'duplicate', 'error_terminal', 'discarded'
               )
@@ -406,6 +484,19 @@ class Database:
             (source_path,),
         ).fetchone()
         return dict(row) if row else None
+
+    def get_active_jobs_by_source_path(self, source_path: str) -> List[Dict[str, Any]]:
+        rows = self.connect().execute(
+            """
+            SELECT * FROM jobs
+            WHERE source_path=? AND state NOT IN (
+                'done', 'manual_review', 'duplicate', 'error_terminal', 'discarded'
+            )
+            ORDER BY created_at
+            """,
+            (source_path,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def find_waiting_job(self, category: str, name: str) -> Optional[Dict[str, Any]]:
         rows = self.connect().execute(
@@ -530,6 +621,7 @@ class Database:
         ttl_seconds: int,
     ) -> None:
         now = time.time()
+        payload_json = str(sanitize_persistent_json(payload_json))
         self.connect().execute(
             """
             INSERT INTO resolver_cache(
@@ -773,6 +865,15 @@ def _result_summary(result: Any) -> Any:
     if result.get("output_media"):
         summary["output_media"] = result.get("output_media")
     return summary
+
+
+def _source_titles_for_job(
+    connection: sqlite3.Connection, job_id: str
+) -> List[str]:
+    row = connection.execute(
+        "SELECT source_meta_json FROM jobs WHERE job_id=?", (job_id,)
+    ).fetchone()
+    return source_titles_from_meta(row["source_meta_json"] if row else None)
 
 
 def _collect_report_paths(payload: Any, reports: List[str], seen: Set[str]) -> None:

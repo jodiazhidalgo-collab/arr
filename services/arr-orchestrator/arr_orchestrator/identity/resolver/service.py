@@ -11,6 +11,13 @@ import requests
 
 from ...diagnostic_sanitizer import sanitize_for_export
 from ...name_parser import parse_release_name
+from ..source_fallback import (
+    fallback_job,
+    recoverable_resolution_error,
+    source_fallback_block_reason,
+    source_title_contexts,
+)
+from ..source_privacy import source_title_fingerprint
 from .cache import RESOLVER_CACHE_VERSION, cache_key as _cache_key
 from .candidate_data import (
     candidate_from_payload as _candidate_from_payload,
@@ -107,6 +114,183 @@ class NameResolver:
         input_root: Path,
         rules_snapshot: Optional[Dict[str, object]] = None,
     ) -> ResolvedIdentity:
+        """Resuelve primero el nombre físico y solo después un respaldo válido."""
+
+        self._deadline = 0.0
+        active_snapshot = self._rules_snapshot if rules_snapshot is None else rules_snapshot
+        try:
+            return self._resolve_once(job, input_root, active_snapshot)
+        except ResolverAmbiguous as primary_error:
+            if not recoverable_resolution_error(primary_error):
+                raise
+            block_reason = source_fallback_block_reason(job, active_snapshot)
+            if block_reason:
+                details = copy.deepcopy(
+                    primary_error.details
+                    if isinstance(primary_error.details, dict)
+                    else {}
+                )
+                details["source_fallback_block_reason"] = block_reason
+                primary_error.details = details
+                raise
+            contexts = source_title_contexts(job, active_snapshot)
+            if not contexts:
+                raise
+            primary_trace = copy.deepcopy(self._trace)
+            attempts: List[Dict[str, object]] = []
+            accepted: List[
+                Tuple[ResolvedIdentity, Dict[str, object], Dict[str, object]]
+            ] = []
+            rejected: List[
+                Tuple[ResolverAmbiguous, Dict[str, object], Dict[str, object]]
+            ] = []
+            for context in contexts:
+                try:
+                    identity = self._resolve_once(
+                        fallback_job(job, context),
+                        input_root,
+                        active_snapshot,
+                    )
+                    trace = copy.deepcopy(self._trace)
+                    attempts.append(
+                        {
+                            "source": context.source,
+                            "event_id": context.event_id,
+                            "source_title": context.source_title,
+                            "status": "ACCEPTED",
+                            "tmdb_id": identity.tmdb_id,
+                            "score": identity.score,
+                        }
+                    )
+                    accepted.append((identity, context.public(), trace))
+                except ResolverAmbiguous as fallback_error:
+                    details = fallback_error.details if isinstance(fallback_error.details, dict) else {}
+                    rejected.append(
+                        (
+                            fallback_error,
+                            context.public(),
+                            copy.deepcopy(self._trace),
+                        )
+                    )
+                    attempts.append(
+                        {
+                            "source": context.source,
+                            "event_id": context.event_id,
+                            "source_title": context.source_title,
+                            "status": _ambiguous_status(details),
+                            "reason_code": details.get("reason_code"),
+                            "score": details.get("top_score"),
+                            "margin": details.get("margin"),
+                        }
+                    )
+
+            if accepted:
+                tmdb_ids = {identity.tmdb_id for identity, _context, _trace in accepted}
+                if len(tmdb_ids) > 1:
+                    self._trace = primary_trace
+                    self._trace["source_fallback"] = {
+                        "applied": False,
+                        "status": "SOURCE_CONTEXT_CONFLICT",
+                        "attempts": attempts,
+                    }
+                    raise ResolverAmbiguous(
+                        "Los títulos de origen conducen a identidades diferentes",
+                        {
+                            "reason_code": "source_context_conflict",
+                            "primary_error": str(primary_error),
+                            "source_fallback_attempts": attempts,
+                        },
+                    )
+                identity, context_payload, chosen_trace = max(
+                    accepted,
+                    key=lambda item: (item[0].score, item[0].margin),
+                )
+                identity.source = "source_title_fallback"
+                identity.source_context = copy.deepcopy(context_payload)
+                fallback_trace = {
+                    "applied": True,
+                    "status": "ACCEPTED",
+                    "source": context_payload.get("source"),
+                    "event_id": context_payload.get("event_id"),
+                    "source_title": context_payload.get("source_title"),
+                    "primary_status": _ambiguous_status(primary_error.details),
+                    "primary_message": str(primary_error),
+                    "attempts": attempts,
+                }
+                chosen_trace["primary_attempt"] = primary_trace
+                chosen_trace["source_fallback"] = fallback_trace
+                decision = chosen_trace.get("decision")
+                if isinstance(decision, dict):
+                    decision["source_fallback"] = copy.deepcopy(fallback_trace)
+                self._trace = chosen_trace
+                return identity
+
+            if rejected and all(
+                _ambiguous_status(error.details) == "REJECTED_SOURCE_TITLE"
+                for error, _context, _trace in rejected
+            ):
+                fallback_error, context_payload, rejected_trace = max(
+                    rejected,
+                    key=lambda item: float(
+                        item[0].details.get("top_score") or 0
+                        if isinstance(item[0].details, dict)
+                        else 0
+                    ),
+                )
+                fallback_trace = {
+                    "applied": False,
+                    "status": "REJECTED_SOURCE_TITLE",
+                    "source": context_payload.get("source"),
+                    "event_id": context_payload.get("event_id"),
+                    "source_title": context_payload.get("source_title"),
+                    "primary_status": _ambiguous_status(primary_error.details),
+                    "primary_message": str(primary_error),
+                    "attempts": attempts,
+                }
+                rejected_trace["primary_attempt"] = primary_trace
+                rejected_trace["source_fallback"] = fallback_trace
+                decision = rejected_trace.get("decision")
+                if isinstance(decision, dict):
+                    decision["source_fallback"] = copy.deepcopy(fallback_trace)
+                self._trace = rejected_trace
+                details = copy.deepcopy(
+                    fallback_error.details
+                    if isinstance(fallback_error.details, dict)
+                    else {}
+                )
+                details.update(
+                    {
+                        "reason_code": "source_title_policy",
+                        "primary_error": str(primary_error),
+                        "primary_status": _ambiguous_status(primary_error.details),
+                        "primary_details": copy.deepcopy(primary_error.details),
+                        "source_fallback_attempts": attempts,
+                    }
+                )
+                raise ResolverAmbiguous(
+                    "Ningún título validado del buscador supera sus límites de seguridad",
+                    details,
+                ) from None
+
+            self._trace = primary_trace
+            self._trace["source_fallback"] = {
+                "applied": False,
+                "status": "REJECTED",
+                "attempts": attempts,
+            }
+            details = copy.deepcopy(
+                primary_error.details if isinstance(primary_error.details, dict) else {}
+            )
+            details["source_fallback_attempts"] = attempts
+            primary_error.details = details
+            raise primary_error
+
+    def _resolve_once(
+        self,
+        job: Dict[str, object],
+        input_root: Path,
+        rules_snapshot: Optional[Dict[str, object]] = None,
+    ) -> ResolvedIdentity:
         self._trace = {"queries": [], "candidates": [], "cache_hit": False}
         if not self.enabled:
             raise ResolverUnavailable("TMDB_API_TOKEN no configurado")
@@ -155,6 +339,21 @@ class NameResolver:
         self.total_budget = effective_budget_ms / 1000
         evidence = self._evidence(job, input_root)
         guessed = self._best_guess(evidence, media_type)
+        source_context = job.get("_source_context")
+        if isinstance(source_context, dict):
+            guessed["_source_context_title"] = str(
+                guessed.get("title") or source_context.get("source_title") or ""
+            ).strip()
+            guessed["_source_context_source"] = str(
+                source_context.get("source") or ""
+            ).strip()
+            if media_type == "tv":
+                primary = parse_release_name(
+                    str(job.get("_source_primary_name") or ""),
+                    category,
+                    rules=parser_rules,
+                )
+                _merge_tv_coordinates(guessed, primary)
         query = str(guessed.get("title") or "").strip()
         if not query:
             raise ResolverAmbiguous(
@@ -166,8 +365,9 @@ class NameResolver:
                 },
             )
 
-        direct_tmdb = self._first_match(TMDB_ID_PATTERN, evidence)
-        direct_imdb = self._first_match(IMDB_ID_PATTERN, evidence)
+        source_attempt = isinstance(source_context, dict)
+        direct_tmdb = None if source_attempt else self._first_match(TMDB_ID_PATTERN, evidence)
+        direct_imdb = None if source_attempt else self._first_match(IMDB_ID_PATTERN, evidence)
         forced_match = None
         if not direct_tmdb and not direct_imdb:
             forced_match = self._matching_forced_rule(guessed, rules["forced_matches"])
@@ -196,7 +396,8 @@ class NameResolver:
             identity.source = "cache"
             return identity
 
-        self._deadline = time.monotonic() + self.total_budget
+        if self._deadline <= 0:
+            self._deadline = time.monotonic() + self.total_budget
         source = "search"
         if direct_tmdb:
             candidates = [self._details(media_type, int(direct_tmdb), str(rules["language"]))]
@@ -225,6 +426,7 @@ class NameResolver:
                     "evidence": evidence,
                     "guess": guessed,
                     "query": query,
+                    "identity_source": source,
                 },
             )
 
@@ -271,6 +473,9 @@ class NameResolver:
         margin = top.score - second_score
         score_passed = top.score >= min_score
         margin_passed = margin >= min_margin
+        source_title_policy_passed = not source_attempt or bool(
+            getattr(top, "source_title_qualified", False)
+        )
         self._trace["candidates"] = [candidate.to_dict() for candidate in ranked]
         preference_rules = (
             rules.get("original_language_preference")
@@ -294,10 +499,15 @@ class NameResolver:
         }
         decision_status = (
             "ACCEPTED"
-            if bypass
-            or (score_passed and margin_passed)
-            or preference_applied
-            or oldest_preference_applied
+            if source_title_policy_passed
+            and (
+                bypass
+                or (score_passed and margin_passed)
+                or preference_applied
+                or oldest_preference_applied
+            )
+            else "REJECTED_SOURCE_TITLE"
+            if not source_title_policy_passed
             else "REJECTED_SCORE"
             if not score_passed
             else "REJECTED_MARGIN"
@@ -316,25 +526,40 @@ class NameResolver:
             "margin": margin,
             "min_margin": min_margin,
             "margin_passed": margin_passed,
+            "source_title_policy_passed": source_title_policy_passed,
             "original_language_preference": preference_decision,
             "oldest_exact_title_preference": oldest_preference_decision,
         }
         if (
-            not bypass
-            and not preference_applied
-            and not oldest_preference_applied
-            and (top.score < min_score or margin < min_margin)
+            not source_title_policy_passed
+            or (
+                not bypass
+                and not preference_applied
+                and not oldest_preference_applied
+                and (top.score < min_score or margin < min_margin)
+            )
         ):
             raise ResolverAmbiguous(
-                "La identidad no supera el umbral de seguridad",
+                (
+                    "El título de origen no supera sus límites de seguridad"
+                    if not source_title_policy_passed
+                    else "La identidad no supera el umbral de seguridad"
+                ),
                 {
+                    "reason_code": (
+                        "source_title_policy"
+                        if not source_title_policy_passed
+                        else "score_or_margin"
+                    ),
                     "evidence": evidence,
                     "guess": guessed,
                     "query": query,
+                    "identity_source": source,
                     "top_score": top.score,
                     "margin": margin,
                     "min_score": min_score,
                     "min_margin": min_margin,
+                    "source_title_policy_passed": source_title_policy_passed,
                     "candidates": [candidate.to_dict() for candidate in ranked[:5]],
                 },
             )
@@ -360,15 +585,29 @@ class NameResolver:
             ),
         )
         if cache_enabled and bool(cache_rules.get("write_enabled", True)) and not self._preview_mode:
+            cache_source_titles = []
+            if isinstance(source_context, dict):
+                cache_source_titles.extend(
+                    [
+                        str(source_context.get("source_title") or ""),
+                        str(guessed.get("_source_context_title") or ""),
+                        query,
+                    ]
+                )
+            persistent_identity = identity.to_persistent_dict(cache_source_titles)
             self.db.set_resolver_cache(
                 cache_key,
                 media_type,
-                json.dumps(identity.to_dict(), ensure_ascii=False),
+                json.dumps(persistent_identity, ensure_ascii=False),
                 max(1, int(cache_rules.get("ttl_seconds") or 30 * 24 * 3600)),
             )
         self.log.info(
             "Identidad resuelta: %s -> TMDb %s %s (%s), score %.1f, margen %.1f",
-            query,
+            (
+                f"<source-title:{source_title_fingerprint(query)[:12]}>"
+                if source_attempt
+                else query
+            ),
             identity.tmdb_id,
             identity.title,
             identity.year or "sin ano",
@@ -382,6 +621,8 @@ class NameResolver:
         name: str,
         category: str,
         rules_snapshot: Optional[Dict[str, object]] = None,
+        source_title: str = "",
+        source: str = "preview",
     ) -> Dict[str, object]:
         """Resuelve un titulo sin crear jobs ni tocar la cache productiva."""
 
@@ -399,9 +640,36 @@ class NameResolver:
         snapshot = copy.deepcopy(
             rules_snapshot if isinstance(rules_snapshot, dict) else self._rules_snapshot
         )
+        preview_hash = "0" * 40
+        preview_job: Dict[str, object] = {
+            "name": str(name or "").strip(),
+            "category": str(category or "").strip(),
+        }
+        clean_source_title = str(source_title or "").strip()
+        if clean_source_title:
+            preview_now = time.time()
+            preview_job["infohash"] = preview_hash
+            preview_job["source_meta_json"] = json.dumps(
+                {
+                    "source_contexts": [
+                        {
+                            "event_id": "preview",
+                            "source": str(source or "preview").strip() or "preview",
+                            "infohash": preview_hash,
+                            "destination": str(category or "").strip(),
+                            "source_title": clean_source_title,
+                            "route": "PREVIEW",
+                            "delivery_state": "accepted",
+                            "created_at": preview_now,
+                            "received_at": preview_now,
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
         try:
             identity = preview.resolve(
-                {"name": str(name or "").strip(), "category": str(category or "").strip()},
+                preview_job,
                 Path("preview"),
                 snapshot,
             )
@@ -419,9 +687,14 @@ class NameResolver:
             status = (
                 "NO_CANDIDATES"
                 if details.get("reason_code") == "no_candidates"
+                else "REJECTED_SOURCE_TITLE"
+                if details.get("reason_code") == "source_title_policy"
                 else "REJECTED"
             )
-            if details.get("top_score") is not None:
+            if (
+                details.get("top_score") is not None
+                and details.get("reason_code") != "source_title_policy"
+            ):
                 score = float(details.get("top_score") or 0)
                 margin = float(details.get("margin") or 0)
                 min_score = (
@@ -519,7 +792,7 @@ class NameResolver:
         )
 
     def _evidence(self, job: Dict[str, object], input_root: Path) -> List[str]:
-        if self._preview_mode:
+        if self._preview_mode or bool(job.get("_source_context_only")):
             return collect_name_evidence(
                 str(job.get("name") or ""),
                 str(job.get("category") or ""),
@@ -577,6 +850,7 @@ class NameResolver:
             direct_identity,
             self._active_policy.get("scoring"),
             self._active_policy.get("title_matching"),
+            self._active_policy.get("source_title_fallback"),
         )
 
     def _score_candidate(
@@ -593,6 +867,7 @@ class NameResolver:
             direct_identity,
             self._active_policy.get("scoring"),
             self._active_policy.get("title_matching"),
+            self._active_policy.get("source_title_fallback"),
         )
 
     def _get(self, endpoint: str, params: Dict[str, object]) -> Dict[str, object]:
@@ -608,6 +883,65 @@ class NameResolver:
 
     _first_match = staticmethod(_first_match)
     _cache_key = staticmethod(_cache_key)
+
+
+def _ambiguous_status(details: object) -> str:
+    payload = details if isinstance(details, dict) else {}
+    if payload.get("reason_code") == "no_candidates":
+        return "NO_CANDIDATES"
+    if payload.get("reason_code") == "source_title_policy":
+        return "REJECTED_SOURCE_TITLE"
+    if payload.get("top_score") is not None:
+        score = float(payload.get("top_score") or 0)
+        margin = float(payload.get("margin") or 0)
+        min_score_value = payload.get("min_score")
+        min_margin_value = payload.get("min_margin")
+        min_score = float(75 if min_score_value is None else min_score_value)
+        min_margin = float(12 if min_margin_value is None else min_margin_value)
+        return "REJECTED_SCORE" if score < min_score else (
+            "REJECTED_MARGIN" if margin < min_margin else "REJECTED"
+        )
+    return "REJECTED"
+
+
+def _merge_tv_coordinates(guessed: Dict[str, object], primary: object) -> None:
+    """Combina por campo; cada coordenada fisica gana si esta disponible."""
+
+    physical_season = _as_int(getattr(primary, "season", None))
+    physical_episodes = _as_int_list(getattr(primary, "episodes", None))
+    physical_absolute = _as_int(getattr(primary, "absolute_episode", None))
+    source_season = _as_int(guessed.get("season"))
+    source_episodes = _as_int_list(guessed.get("episode"))
+    source_absolute = _as_int(guessed.get("absolute_episode"))
+
+    final_season = physical_season if physical_season is not None else source_season
+    if physical_episodes:
+        final_episodes = physical_episodes
+    elif physical_absolute is not None and final_season is not None:
+        final_episodes = [physical_absolute]
+    elif source_episodes:
+        final_episodes = source_episodes
+    elif source_absolute is not None and final_season is not None:
+        final_episodes = [source_absolute]
+    else:
+        final_episodes = []
+
+    if final_season is not None:
+        guessed["season"] = final_season
+    else:
+        guessed.pop("season", None)
+    if final_episodes:
+        guessed["episode"] = final_episodes
+        guessed.pop("absolute_episode", None)
+        return
+    guessed.pop("episode", None)
+    final_absolute = (
+        physical_absolute if physical_absolute is not None else source_absolute
+    )
+    if final_absolute is not None:
+        guessed["absolute_episode"] = final_absolute
+    else:
+        guessed.pop("absolute_episode", None)
 
 
 def _preview_decision(status: str, trace: Dict[str, object]) -> Dict[str, object]:

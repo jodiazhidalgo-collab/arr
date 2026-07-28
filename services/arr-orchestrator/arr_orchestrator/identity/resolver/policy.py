@@ -5,7 +5,11 @@ import hashlib
 import json
 from typing import Dict
 
-from ..resolver_defaults import DEFAULT_SERIES_CANDIDATES, DEFAULT_TITLE_MATCHING
+from ..resolver_defaults import (
+    DEFAULT_SERIES_CANDIDATES,
+    DEFAULT_SOURCE_TITLE_FALLBACK,
+    DEFAULT_TITLE_MATCHING,
+)
 from .scoring import DEFAULT_SCORING
 
 
@@ -41,6 +45,7 @@ DEFAULT_POLICY: Dict[str, object] = {
         "use_spanish_correction": True,
     },
     "title_matching": copy.deepcopy(DEFAULT_TITLE_MATCHING),
+    "source_title_fallback": copy.deepcopy(DEFAULT_SOURCE_TITLE_FALLBACK),
     "search_limits": {
         "max_searches": 8,
         "results_per_search": 10,
@@ -127,6 +132,7 @@ def effective_policy(
             "series_candidates",
             "query_variants",
             "title_matching",
+            "source_title_fallback",
             "search_limits",
             "scoring",
             "acceptance",

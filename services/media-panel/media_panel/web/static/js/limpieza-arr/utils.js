@@ -13,6 +13,7 @@
     testRequestIds: { parser: 0, resolver: 0 },
     activeTest: null,
     testNames: { parser: "", resolver: "" },
+    testSourceTitles: { parser: "", resolver: "" },
     testCategories: { parser: "auto", resolver: "movies" }
   };
 

@@ -792,6 +792,105 @@ class ResolverPolicyTests(unittest.TestCase):
         self.assertEqual(matches[0][0], "Aceptacion y validacion")
         self.assertEqual(matches[0][1]["type"], "toggle")
 
+    def test_source_title_fallback_has_one_complete_visual_group(self):
+        schema = identity_settings_schema()
+        groups = [
+            group
+            for group in schema["resolver"]["groups"]
+            if group["id"] == "resolver_source_title_fallback"
+        ]
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["title"], "Título del buscador como respaldo")
+        self.assertEqual(
+            {control["path"] for control in groups[0]["controls"]},
+            {
+                "resolver.source_title_fallback.enabled",
+                "resolver.source_title_fallback.movies",
+                "resolver.source_title_fallback.tv",
+                "resolver.source_title_fallback.score_bonus",
+                "resolver.source_title_fallback.min_similarity",
+                "resolver.source_title_fallback.require_compatible_year_for_fuzzy",
+            },
+        )
+
+    def test_source_title_bonus_is_visible_and_uses_its_configuration_path(self):
+        candidate = ResolverCandidate(
+            1734,
+            "movie",
+            "El regreso de la momia",
+            "The Mummy Returns",
+            2001,
+            ["El regreso de la momia", "The Mummy Returns"],
+        )
+        guessed = {
+            "title": "El regreso de la momia",
+            "year": 2001,
+            "_source_context_title": "El regreso de la momia",
+        }
+
+        _score, breakdown = score_candidate(
+            candidate,
+            guessed,
+            [],
+            False,
+            source_title_fallback={
+                "enabled": True,
+                "score_bonus": 30,
+                "min_similarity": 0.8,
+                "require_compatible_year_for_fuzzy": True,
+            },
+        )
+
+        source_row = next(
+            item
+            for item in breakdown
+            if item["key"] == "source_title_match"
+        )
+        self.assertEqual(
+            source_row["path"], "resolver.source_title_fallback.score_bonus"
+        )
+        self.assertEqual(source_row["configured"], 30)
+        self.assertEqual(source_row["applied"], 30)
+
+    def test_fuzzy_source_title_requires_a_compatible_year_by_default(self):
+        candidate = ResolverCandidate(
+            1734,
+            "movie",
+            "El regreso de la momia",
+            "The Mummy Returns",
+            2001,
+            ["El regreso de la momia"],
+        )
+        settings = {
+            "enabled": True,
+            "score_bonus": 30,
+            "min_similarity": 0.5,
+            "require_compatible_year_for_fuzzy": True,
+        }
+
+        _score, without_year = score_candidate(
+            candidate,
+            {"title": "regreso momia", "_source_context_title": "regreso momia"},
+            [],
+            False,
+            source_title_fallback=settings,
+        )
+        _score, with_year = score_candidate(
+            candidate,
+            {
+                "title": "regreso momia",
+                "year": 2001,
+                "_source_context_title": "regreso momia",
+            },
+            [],
+            False,
+            source_title_fallback=settings,
+        )
+
+        self.assertNotIn("source_title_match", self._breakdown_keys(without_year))
+        self.assertIn("source_title_match", self._breakdown_keys(with_year))
+
     def test_zero_and_decimal_weights_keep_an_exact_additive_breakdown(self):
         candidate = ResolverCandidate(8, "movie", "Titulo parcial", "", 2024, ["Titulo parcial"])
         guessed = {"title": "Titulo", "year": 2024}

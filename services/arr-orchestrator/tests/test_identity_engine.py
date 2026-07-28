@@ -1,6 +1,7 @@
 import copy
 import json
 import tempfile
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import patch
 from arr_orchestrator.db import Database
 from arr_orchestrator.engine import Engine
 from arr_orchestrator.identity.fingerprint import identity_fingerprint
+from arr_orchestrator.identity.parser_models import MediaDecision
 from test_core import test_config
 
 
@@ -314,6 +316,98 @@ class IdentityEngineIntegrationTests(unittest.TestCase):
             self.assertEqual(updated["category"], "movies")
             self.assertEqual(updated["qbt_hash"], "d" * 40)
             database.close()
+
+    def test_parser_uses_source_title_only_after_physical_name_is_unusable(self) -> None:
+        RUNTIME_TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=RUNTIME_TEST_ROOT) as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "orchestrator.db")
+            database.initialize()
+            engine = Engine(config, database)
+            input_root = root / "1080p"
+            input_root.mkdir()
+            (input_root / "1080p.mkv").write_bytes(b"movie")
+            infohash = "e" * 40
+            context = {
+                "event_id": "source-title-1",
+                "source": "buscador-pro",
+                "infohash": infohash,
+                "destination": "movies",
+                "source_title": "El regreso de la momia 2001",
+                "route": "RD_VERIFIED_MAGNET_NATIVE",
+                "delivery_state": "accepted",
+                "created_at": "2026-07-28T00:00:00Z",
+                "received_at": time.time(),
+            }
+            job = {
+                "name": "1080p.mkv",
+                "category": "movies",
+                "infohash": infohash,
+                "source_meta_json": json.dumps({"source_contexts": [context]}),
+            }
+
+            decision = engine._media_decision_for_job(
+                job, input_root, engine.identity.job_snapshot()["rules"]
+            )
+
+            self.assertEqual(decision.media_type, "movies")
+            self.assertIsNone(decision.block_reason)
+            self.assertIn("source_title_fallback", decision.reason_codes)
+            database.close()
+
+    def test_parser_source_title_switch_and_exact_hash_are_enforced(self) -> None:
+        RUNTIME_TEST_ROOT.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=RUNTIME_TEST_ROOT) as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "orchestrator.db")
+            database.initialize()
+            engine = Engine(config, database)
+            input_root = root / "1080p"
+            input_root.mkdir()
+            (input_root / "1080p.mkv").write_bytes(b"movie")
+            infohash = "f" * 40
+            context = {
+                "event_id": "source-title-2",
+                "source": "buscador-jackett",
+                "infohash": "0" * 40,
+                "destination": "movies",
+                "source_title": "El regreso de la momia 2001",
+                "route": "QBIT_FORCED",
+                "delivery_state": "accepted",
+                "created_at": "2026-07-28T00:00:00Z",
+                "received_at": time.time(),
+            }
+            job = {
+                "name": "1080p.mkv",
+                "category": "movies",
+                "infohash": infohash,
+                "source_meta_json": json.dumps({"source_contexts": [context]}),
+            }
+            rules = engine.identity.job_snapshot()["rules"]
+
+            wrong_hash = engine._media_decision_for_job(job, input_root, rules)
+            rules["resolver"]["source_title_fallback"]["enabled"] = False
+            context["infohash"] = infohash
+            job["source_meta_json"] = json.dumps({"source_contexts": [context]})
+            disabled = engine._media_decision_for_job(job, input_root, rules)
+
+            self.assertEqual(wrong_hash.block_reason, "no_usable_title")
+            self.assertEqual(disabled.block_reason, "no_usable_title")
+            database.close()
+
+    def test_tv_cannot_bypass_a_failed_resolver_after_parser_source_fallback(self) -> None:
+        decision = Engine._can_continue_tv_without_identity
+        source_based = MediaDecision(
+            media_type="tv",
+            confidence="high",
+            reason_codes=["source_title_fallback"],
+        )
+
+        self.assertFalse(decision({"category": "tv"}, source_based))
 
 
 if __name__ == "__main__":

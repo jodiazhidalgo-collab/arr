@@ -289,6 +289,8 @@ services:
       ARR_RESOLVER_HTTP_TIMEOUT_MS: "2500"
       ARR_RESOLVER_TOTAL_BUDGET_MS: "5000"
       ARR_RESOLVER_RETRY_SECONDS: "60"
+      ARR_SOURCE_CONTEXT_TOKEN: "${ARR_SOURCE_CONTEXT_TOKEN}"
+      ARR_SOURCE_CONTEXT_CORRELATION_GRACE_SECONDS: "90"
       CODEX_DIAG_ROOT: "/diagnosticos_codex"
       ARR_DIAGNOSTICS_ROOT: "/diagnostics/arr"
       ARR_HOST_ROOT: "${ARR_ROOT}"
@@ -360,6 +362,7 @@ services:
       ARR_MOVIES_ROOT: "/data/media/movies"
       ARR_TV_ROOT: "/data/media/tv"
       ARR_ORCHESTRATOR_URL: "http://arr-orchestrator:8787"
+      ARR_SOURCE_CONTEXT_TOKEN: "${ARR_SOURCE_CONTEXT_TOKEN}"
       MEDIA_WORKER_URL: "http://media-worker:8790"
       CODEX_DIAG_ROOT: "/diagnosticos_codex"
     volumes:

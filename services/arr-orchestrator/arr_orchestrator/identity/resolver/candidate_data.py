@@ -68,9 +68,13 @@ def rank_candidates(
     direct_identity: bool,
     scoring: object,
     title_matching: object = None,
+    source_title_fallback: object = None,
 ) -> list[ResolverCandidate]:
     settings = scoring if isinstance(scoring, dict) else None
     matching_settings = title_matching if isinstance(title_matching, dict) else None
+    source_settings = (
+        source_title_fallback if isinstance(source_title_fallback, dict) else None
+    )
     for candidate in candidates:
         candidate.score, candidate.breakdown = score_candidate(
             candidate,
@@ -79,5 +83,6 @@ def rank_candidates(
             direct_identity,
             settings,
             matching_settings,
+            source_settings,
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)

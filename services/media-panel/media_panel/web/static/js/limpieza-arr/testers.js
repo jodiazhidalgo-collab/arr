@@ -24,6 +24,8 @@
           <option value="tv" ${category === "tv" ? "selected" : ""}>Serie</option>
         </select>
         <button type="button" class="btn primary" id="identity-test-button" ${testing ? "disabled" : ""}>${testingHere ? "Probando…" : testing ? "Prueba en curso…" : "Probar título"}</button>
+        ${parser ? "" : `<label class="identity-sr-only" for="identity-test-source-title">Título mostrado en el buscador</label>
+        <input class="identity-test-source-title" id="identity-test-source-title" type="text" maxlength="512" value="${ui.esc(ui.state.testSourceTitles[section])}" placeholder="Título mostrado en el buscador (opcional)" autocomplete="off" spellcheck="false">`}
       </div>
       <div id="identity-test-result">${testingHere ? `<div class="identity-test-loading">Analizando el título…</div>` : ui.renderTestResult(section, ui.state.lastResult[section], ui.state.testContext[section])}</div>
     </section>`;
@@ -32,6 +34,7 @@
   ui.bindTester = function () {
     const name = document.getElementById("identity-test-name");
     const category = document.getElementById("identity-test-category");
+    const sourceTitle = document.getElementById("identity-test-source-title");
     const button = document.getElementById("identity-test-button");
     if (!name || !category || !button) return;
     const section = ui.state.section;
@@ -40,6 +43,15 @@
       ui.invalidateTestResult(section);
     });
     name.addEventListener("keydown", event => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      button.click();
+    });
+    sourceTitle?.addEventListener("input", () => {
+      ui.state.testSourceTitles[section] = sourceTitle.value;
+      ui.invalidateTestResult(section);
+    });
+    sourceTitle?.addEventListener("keydown", event => {
       if (event.key !== "Enter") return;
       event.preventDefault();
       button.click();
@@ -71,8 +83,10 @@
     const section = ui.state.section;
     const name = document.getElementById("identity-test-name")?.value.trim() || "";
     const category = document.getElementById("identity-test-category")?.value || (section === "parser" ? "auto" : "movies");
+    const sourceTitle = document.getElementById("identity-test-source-title")?.value.trim() || "";
     ui.state.testNames[section] = name;
     ui.state.testCategories[section] = category;
+    ui.state.testSourceTitles[section] = sourceTitle;
     if (!name) {
       ui.status("Escribe un nombre antes de probar.", "warn");
       document.getElementById("identity-test-name")?.focus();
@@ -93,7 +107,7 @@
       try {
         result = await ui.api(`/api/identity-rules/test-${section}`, {
           method: "POST",
-          body: JSON.stringify({ name, category, rules: submittedRules })
+          body: JSON.stringify({ name, category, source_title: sourceTitle, rules: submittedRules })
         });
       } catch (error) {
         const errorPayload = error?.payload;
@@ -113,7 +127,8 @@
         parserTitle: String(parserResult.title || "").trim(),
         parserYear: parserResult.year === null || parserResult.year === undefined
           ? ""
-          : String(parserResult.year).trim()
+          : String(parserResult.year).trim(),
+        sourceTitle
       });
       ui.state.lastResult[section] = result;
       ui.state.testContext[section] = context;
@@ -149,7 +164,8 @@
         name,
         category,
         parserTitle: "",
-        parserYear: ""
+        parserYear: "",
+        sourceTitle
       }) : null;
       ui.state.lastResult[section] = resolverFailure;
       ui.state.testContext[section] = failureContext;

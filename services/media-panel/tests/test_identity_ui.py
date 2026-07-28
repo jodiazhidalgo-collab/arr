@@ -150,6 +150,9 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("rules: submittedRules", self.testers)
         self.assertIn("/api/identity-rules/test-${section}", self.testers)
         self.assertIn("Probar título", self.testers)
+        self.assertIn("Título mostrado en el buscador (opcional)", self.testers)
+        self.assertIn('maxlength="512"', self.testers)
+        self.assertIn("source_title: sourceTitle", self.testers)
         self.assertIn("error?.payload", self.testers)
         self.assertNotIn("% del umbral", self.testers)
         self.assertNotIn("candidate.reasons", self.testers)
@@ -162,6 +165,9 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("Aplicado", self.resolver_result)
         self.assertIn("Ventaja sobre el segundo", self.resolver_result)
         self.assertIn("Diagnóstico técnico", self.resolver_result)
+        self.assertIn("Origen usado", self.resolver_result)
+        self.assertIn("Respaldo: ${sourceName}", self.resolver_result)
+        self.assertIn("Título validado del buscador utilizado", self.resolver_result)
         self.assertIn("ui.bindCandidateActions();", self.testers)
         self.assertIn("if (ui.state.activeTest)", self.testers)
         self.assertNotIn('id="identity-test-result" aria-live', self.testers)
@@ -182,6 +188,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
               { path: "resolver.scoring.title_exact", label: "Titulo exacto" },
               { path: "resolver.scoring.title_similarity_max", label: "Similitud de titulo" },
               { path: "resolver.scoring.season_invalid", label: "Temporada imposible" },
+              { path: "resolver.source_title_fallback.score_bonus", label: "Puntos por coincidencia con el título del buscador" },
               { path: "resolver.acceptance.min_score", label: "Puntuacion minima" },
               { path: "resolver.acceptance.min_margin", label: "Margen minimo" }
             ] }] } } };
@@ -216,7 +223,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
                 { endpoint: "/movie/10", params: { language: "es-ES" }, status_code: 200 }
               ]
             });
-            ["ACEPTADA", "único candidato", "CUMPLIDA", "Titulo exacto", "Configurado", "Aplicado", "+35", "Segundo candidato", "No existe", "Reglas aplicadas", "Equivalencia romana aplicada: III = 3", "Número de saga omitido aceptado", "Título auxiliar utilizado: Titulo &lt;auxiliar&gt;", "2 consultas · 2 correctas", "Buscar película", "Idioma es-ES · Año 2024", "Correcta"].forEach(text => requireText(accepted, text));
+            ["ACEPTADA", "único candidato", "CUMPLIDA", "Titulo exacto", "Configurado", "Aplicado", "+35", "Segundo candidato", "No existe", "Reglas aplicadas", "Equivalencia romana aplicada: III = 3", "Número de saga omitido aceptado", "Título auxiliar utilizado: Titulo &lt;auxiliar&gt;", "2 consultas · 2 correctas", "Buscar película", "Idioma es-ES · Año 2024", "Correcta", "Origen usado", "Nombre físico"].forEach(text => requireText(accepted, text));
             rejectText(accepted, "Ventaja sobre el segundo");
             rejectText(accepted, "RESUELTO POR IDIOMA");
             rejectText(accepted, "grupo ambiguo");
@@ -225,6 +232,42 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             rejectText(accepted, "<seguro>");
             rejectText(accepted, "Titulo <auxiliar>");
             requireText(accepted, "Titulo &lt;seguro&gt;");
+
+            const acceptedBySourceTitle = render({
+              status: "ACCEPTED", ok: true,
+              decision: decision("ACCEPTED", {
+                score: 85, min_score: 75, score_passed: true,
+                margin: 85, margin_passed: true,
+                source_fallback: {
+                  applied: true, source: "buscador-pro", event_id: "trace-1"
+                }
+              }),
+              candidates: [{
+                ...candidate,
+                score: 85,
+                matching_rules: [{
+                  path: "resolver.source_title_fallback.score_bonus",
+                  detail: "Título validado del buscador: El regreso de la momia 2001"
+                }],
+                breakdown: [
+                  ...candidate.breakdown,
+                  {
+                    key: "source_title_match",
+                    path: "resolver.source_title_fallback.score_bonus",
+                    configured: 30,
+                    applied: 30
+                  }
+                ]
+              }]
+            });
+            [
+              "Respaldo: Buscador Pro",
+              "Origen usado",
+              "nombre físico no fue suficiente",
+              "Puntos por coincidencia con el título del buscador",
+              "Título validado del buscador utilizado: El regreso de la momia 2001",
+              "+30"
+            ].forEach(text => requireText(acceptedBySourceTitle, text));
 
             const withoutRules = ui.renderResolverCandidate(
               { ...candidate, matching_rules: [] }, 0, context
@@ -295,6 +338,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             });
             ["RECHAZADA POR EMPATE", "misma puntuación", "NO CUMPLIDO"].forEach(text => requireText(tie, text));
             rejectText(tie, "REJECTED_MARGIN");
+            rejectText(tie, "Origen usado");
 
             const singleMargin = render({
               status: "REJECTED_MARGIN",
@@ -326,6 +370,33 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             const noCandidates = render({ status: "NO_CANDIDATES", decision: { status: "NO_CANDIDATES", has_scoring: false }, candidates: [] });
             requireText(noCandidates, "SIN CANDIDATOS");
             rejectText(noCandidates, "Puntuación obtenida");
+            rejectText(noCandidates, "Origen usado");
+
+            const unsafeSourceTitle = render({
+              status: "REJECTED_SOURCE_TITLE",
+              decision: decision("REJECTED_SOURCE_TITLE", {
+                source_title_policy_passed: false,
+                source_fallback: {
+                  applied: false,
+                  status: "REJECTED_SOURCE_TITLE",
+                  source: "buscador-jackett"
+                }
+              }),
+              candidates: [candidate]
+            });
+            ["RESPALDO NO SEGURO", "similitud mínima", "Puntuación obtenida"].forEach(text => requireText(unsafeSourceTitle, text));
+            rejectText(unsafeSourceTitle, "Origen usado");
+            rejectText(unsafeSourceTitle, "Nombre físico");
+            rejectText(unsafeSourceTitle, "Respaldo: Buscador Jackett");
+
+            const sourceConflict = render({
+              status: "REJECTED",
+              details: { reason_code: "source_context_conflict" },
+              decision: { status: "REJECTED", has_scoring: false },
+              source_fallback: { applied: false, status: "SOURCE_CONTEXT_CONFLICT", source: "buscador-pro" }
+            });
+            requireText(sourceConflict, "RESPALDOS CONTRADICTORIOS");
+            rejectText(sourceConflict, "Origen usado");
 
             for (const [status, title] of [
               ["REJECTED", "IDENTIDAD NO SEGURA"],
@@ -340,6 +411,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
               const html = render({ status, decision: { status, has_scoring: false } });
               requireText(html, title);
               rejectText(html, "Puntuación obtenida");
+              rejectText(html, "Origen usado");
             }
             for (const [reason_code, title] of [
               ["category_conflict", "CATEGORÍA CONTRADICTORIA"],

@@ -18,6 +18,7 @@ from arr_orchestrator.identity.parser_rules import DEFAULT_PARSER_RULES
 from arr_orchestrator.identity.resolver.policy import effective_policy
 from arr_orchestrator.identity.resolver_defaults import (
     DEFAULT_SERIES_CANDIDATES,
+    DEFAULT_SOURCE_TITLE_FALLBACK,
     DEFAULT_TITLE_MATCHING,
 )
 
@@ -239,6 +240,14 @@ class IdentityRulesTests(unittest.TestCase):
             DEFAULT_TITLE_MATCHING,
         )
         self.assertIsNot(rules["resolver"]["title_matching"], DEFAULT_TITLE_MATCHING)
+        self.assertEqual(
+            rules["resolver"]["source_title_fallback"],
+            DEFAULT_SOURCE_TITLE_FALLBACK,
+        )
+        self.assertIsNot(
+            rules["resolver"]["source_title_fallback"],
+            DEFAULT_SOURCE_TITLE_FALLBACK,
+        )
 
     def test_active_v1_document_gains_new_defaults_without_losing_values(self):
         legacy = changed_rules(language="fr-FR", score=83)
@@ -257,6 +266,7 @@ class IdentityRulesTests(unittest.TestCase):
         ]
         del legacy["resolver"]["series_candidates"]
         del legacy["resolver"]["title_matching"]
+        del legacy["resolver"]["source_title_fallback"]
 
         normalized = normalize_identity_rules(legacy)
 
@@ -281,6 +291,10 @@ class IdentityRulesTests(unittest.TestCase):
         self.assertEqual(
             normalized["resolver"]["title_matching"],
             DEFAULT_TITLE_MATCHING,
+        )
+        self.assertEqual(
+            normalized["resolver"]["source_title_fallback"],
+            DEFAULT_SOURCE_TITLE_FALLBACK,
         )
 
     def test_season_number_words_are_canonical_and_contradictions_fail(self):
@@ -433,6 +447,10 @@ class IdentityRulesTests(unittest.TestCase):
             ("title_matching", "score_parser_candidates"),
             ("title_matching", "roman_arabic_equivalence"),
             ("title_matching", "allow_omitted_part_number"),
+            ("source_title_fallback", "enabled"),
+            ("source_title_fallback", "movies"),
+            ("source_title_fallback", "tv"),
+            ("source_title_fallback", "require_compatible_year_for_fuzzy"),
         )
         for block, key in boolean_paths:
             with self.subTest(block=block, key=key):
@@ -462,6 +480,29 @@ class IdentityRulesTests(unittest.TestCase):
                     with self.assertRaises(IdentityRulesValidationError):
                         normalize_identity_rules(rules)
 
+        source_numeric_ranges = (
+            ("score_bonus", 0, 100),
+            ("min_similarity", 0.50, 1.00),
+        )
+        for key, minimum, maximum in source_numeric_ranges:
+            for value in (minimum, maximum):
+                with self.subTest(block="source_title_fallback", key=key, valid=value):
+                    rules = factory_identity_rules()
+                    rules["resolver"]["source_title_fallback"][key] = value
+                    self.assertEqual(
+                        normalize_identity_rules(rules)["resolver"][
+                            "source_title_fallback"
+                        ][key],
+                        value,
+                    )
+            delta = 1 if key == "score_bonus" else 0.01
+            for value in (minimum - delta, maximum + delta, True):
+                with self.subTest(block="source_title_fallback", key=key, invalid=value):
+                    rules = factory_identity_rules()
+                    rules["resolver"]["source_title_fallback"][key] = value
+                    with self.assertRaises(IdentityRulesValidationError):
+                        normalize_identity_rules(rules)
+
     def test_effective_policy_and_fingerprints_include_new_blocks(self):
         normalized = normalize_identity_rules(changed_rules())
         policy = effective_policy(normalized, "tv")
@@ -474,6 +515,10 @@ class IdentityRulesTests(unittest.TestCase):
             policy["title_matching"],
             normalized["resolver"]["title_matching"],
         )
+        self.assertEqual(
+            policy["source_title_fallback"],
+            normalized["resolver"]["source_title_fallback"],
+        )
 
         changed_series = copy.deepcopy(normalized)
         changed_series["resolver"]["series_candidates"][
@@ -483,6 +528,8 @@ class IdentityRulesTests(unittest.TestCase):
         changed_matching["resolver"]["title_matching"][
             "roman_arabic_equivalence"
         ] = True
+        changed_source = copy.deepcopy(normalized)
+        changed_source["resolver"]["source_title_fallback"]["score_bonus"] = 31
         self.assertNotEqual(
             policy["fingerprint"],
             effective_policy(changed_series, "tv")["fingerprint"],
@@ -494,6 +541,14 @@ class IdentityRulesTests(unittest.TestCase):
         self.assertNotEqual(
             identity_fingerprint(normalized),
             identity_fingerprint(changed_matching),
+        )
+        self.assertNotEqual(
+            policy["fingerprint"],
+            effective_policy(changed_source, "tv")["fingerprint"],
+        )
+        self.assertNotEqual(
+            identity_fingerprint(normalized),
+            identity_fingerprint(changed_source),
         )
 
     def test_legacy_v1_rules_gain_language_preference_without_losing_values(self):
