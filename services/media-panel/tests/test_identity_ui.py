@@ -3,6 +3,7 @@ import subprocess
 import textwrap
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from media_panel import server
 
@@ -51,6 +52,21 @@ class IdentityUiStaticContractTests(unittest.TestCase):
                 "resolver-result.css",
             )
         )
+
+    def test_favicon_is_published_and_linked(self) -> None:
+        favicon = self.web / "static" / "favicon.ico"
+        self.assertTrue(favicon.is_file())
+        self.assertGreater(favicon.stat().st_size, 0)
+        self.assertIn(
+            '<link rel="icon" href="/favicon.ico?v=20260731" type="image/x-icon">',
+            self.index,
+        )
+
+        handler = object.__new__(server.Handler)
+        handler.path = "/favicon.ico"
+        with patch.object(server.Handler, "_send") as send:
+            server.Handler.do_GET(handler)
+        send.assert_called_once_with(200, favicon.read_bytes(), "image/x-icon")
 
     def test_top_tab_and_modular_assets_are_loaded_in_order(self) -> None:
         navigation = (

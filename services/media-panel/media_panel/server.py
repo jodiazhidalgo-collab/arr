@@ -17,6 +17,7 @@ from .identity_proxy import IdentityProxy
 BASE_DIR = Path(__file__).resolve().parent
 WEB_DIR = BASE_DIR / "web"
 STATIC_DIR = WEB_DIR / "static"
+FAVICON_PATH = STATIC_DIR / "favicon.ico"
 
 RULES_PATH = Path(os.environ.get("MEDIA_RULES_PATH", "/config/media-rules/reglas_motor.json"))
 DEFAULT_RULES_PATH = Path(os.environ.get("MEDIA_DEFAULT_RULES_PATH", "/defaults/reglas_motor_default.json"))
@@ -1329,7 +1330,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok"})
             return
         if path == "/favicon.ico":
-            self._send(204, b"", "image/x-icon")
+            self._send(200, FAVICON_PATH.read_bytes(), "image/x-icon")
             return
         if path == "/api/status":
             self._json(200, _status_payload())
