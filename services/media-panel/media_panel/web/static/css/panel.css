@@ -201,6 +201,7 @@ h3 {
 
 .panel {
   padding: 18px;
+  min-width: 0;
 }
 
 .grid {
@@ -414,12 +415,16 @@ textarea {
 .review-list,
 .report-list {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 10px;
+  min-width: 0;
 }
 
 .hist,
 .review-item {
   padding: 13px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .hist-top,
@@ -428,11 +433,22 @@ textarea {
   justify-content: space-between;
   gap: 12px;
   align-items: flex-start;
+  min-width: 0;
+}
+
+.review-top > div,
+.review-top b,
+.review-top .muted {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .pre,
 .report-view pre {
   overflow: auto;
+  min-width: 0;
+  max-width: 100%;
   max-height: 58vh;
   margin: 10px 0 0;
   padding: 12px;
@@ -441,6 +457,8 @@ textarea {
   border-radius: 7px;
   color: #dbeafe;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .report-row {
@@ -448,10 +466,20 @@ textarea {
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 10px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   padding: 10px;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
+}
+
+.report-row > b {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .fold-group {
@@ -587,5 +615,60 @@ textarea {
   }
   .identity-profile-tabs {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .jobs-table,
+  .jobs-table tbody,
+  .jobs-table tr,
+  .jobs-table td {
+    display: block;
+    width: 100%;
+  }
+  .jobs-table {
+    table-layout: auto;
+    overflow: visible;
+  }
+  .jobs-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+  .jobs-table tr {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .jobs-table td {
+    display: grid;
+    grid-template-columns: minmax(92px, 38%) minmax(0, 1fr);
+    gap: 10px;
+    padding: 7px 0;
+    border-bottom: 0;
+    align-items: start;
+  }
+  .jobs-table td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .jobs-table .btn,
+  .jobs-table .pill {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .report-row > *,
+  .report-actions {
+    min-width: 0;
+    max-width: 100%;
+  }
+  .report-actions {
+    flex-wrap: wrap;
   }
 }

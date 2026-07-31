@@ -9,6 +9,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .core import normalize_bluray, process_movie, process_trailer
+from .heavy_lock import HeavyLockTimeout, media_heavy_lock
 from .legacy import reglas as media_rules
 
 
@@ -472,11 +473,12 @@ class Handler(BaseHTTPRequestHandler):
         response_status = 200
         rules_snapshot = MEDIA_RULES_STORE.snapshot() if kind in {"movie", "trailer"} else None
         try:
-            if rules_snapshot is None:
-                raw_result = _processor(kind)(payload)
-            else:
-                with media_rules.usar_reglas(rules_snapshot):
+            with media_heavy_lock():
+                if rules_snapshot is None:
                     raw_result = _processor(kind)(payload)
+                else:
+                    with media_rules.usar_reglas(rules_snapshot):
+                        raw_result = _processor(kind)(payload)
             raw_status_value = raw_result.get("status") if isinstance(raw_result, dict) else None
             raw_status = raw_status_value.strip() if isinstance(raw_status_value, str) else ""
             valid_result = bool(raw_status) and (
@@ -492,6 +494,17 @@ class Handler(BaseHTTPRequestHandler):
             _write_terminal_atomic(kind, job_id, result)
             if raw_status == "error":
                 response_status = 500
+        except HeavyLockTimeout as error:
+            response_status = 409
+            result = _typed_error(
+                "media_worker_busy",
+                _safe_error_text(error),
+                kind=kind,
+                job_id=job_id,
+                retryable=True,
+            )
+            if rules_snapshot is not None:
+                result["rules_fingerprint"] = rules_snapshot.fingerprint
         except Exception as error:
             response_status = 500
             result = _typed_error(

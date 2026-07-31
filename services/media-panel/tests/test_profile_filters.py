@@ -20,20 +20,26 @@ def _write_reason(folder: Path, payload: dict) -> None:
 
 
 class ReviewProfileFilterTests(unittest.TestCase):
-    def test_real_untagged_movie_and_series_structures_are_classified(self) -> None:
+    def test_real_movie_and_series_roots_are_strictly_separated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            movie = root / "Blade Runner 2049 (2017)"
+            base = Path(temporary)
+            movie_root = base / "movie-review"
+            series_root = base / "series-review"
+            movie = movie_root / "Blade Runner 2049 (2017)"
             _write_reason(movie, {"job_id": MOVIE_JOB, "phase": "filebot"})
             (movie / "Blade Runner 2049 (2017).mkv").write_bytes(b"")
 
-            series = root / "La Agencia"
+            series = series_root / "La Agencia"
             _write_reason(series, {"job_id": SERIES_JOB, "phase": "filebot"})
             season = series / "Season 02"
             season.mkdir()
             (season / "La Agencia - S02E03.mkv").write_bytes(b"")
 
-            with patch.object(server, "REVIEW_DIR", root), patch.object(
+            with patch.object(server, "REVIEW_DIR", movie_root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                series_root,
+            ), patch.object(
                 server,
                 "_jobs_payload",
             ) as jobs:
@@ -45,69 +51,115 @@ class ReviewProfileFilterTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in shows["items"]], [series.name])
         self.assertEqual(movies["items"][0]["classification"], "movies")
         self.assertEqual(shows["items"][0]["classification"], "series")
+        self.assertEqual(
+            shows["items"][0]["path"],
+            f"{server.SERIES_REVIEW_ALIAS}/La Agencia",
+        )
+        self.assertTrue(shows["connected"])
 
-    def test_untagged_ambiguous_folder_uses_job_source_meta(self) -> None:
+    def test_series_review_skips_hidden_tmp_and_symlink_folders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            folder = root / "Dark"
+            root = Path(temporary) / "series-review"
+            visible = root / "Visible Show"
+            hidden = root / ".Partial Show"
+            staging = root / "Visible Show.123.tmp"
+            partial_staging = root / "Another Show.tmp.partial"
+            linked = root / "Linked Show"
+            for folder in (visible, hidden, staging, partial_staging, linked):
+                _write_reason(folder, {"job_id": SERIES_JOB, "phase": "review"})
+
+            real_is_symlink = Path.is_symlink
+
+            def reported_symlink(path: Path) -> bool:
+                return path == linked or real_is_symlink(path)
+
+            with patch.object(server, "SERIES_REVIEW_DIR", root), patch.object(
+                Path,
+                "is_symlink",
+                reported_symlink,
+            ), patch.object(
+                server,
+                "_read_json",
+                wraps=server._read_json,
+            ) as read_json:
+                shows = server._review_payload(profile="series")
+
+        self.assertEqual([item["name"] for item in shows["items"]], [visible.name])
+        self.assertEqual(
+            [call.args[0].parent.name for call in read_json.call_args_list],
+            [visible.name],
+        )
+
+    def test_series_root_ownership_does_not_query_movie_job_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            movie_root = base / "movie-review"
+            series_root = base / "series-review"
+            movie_root.mkdir()
+            folder = series_root / "Dark"
             _write_reason(folder, {"job_id": SERIES_JOB, "phase": "identity"})
-            jobs_payload = {
-                "ok": True,
-                "jobs": [
-                    {
-                        "job_id": SERIES_JOB,
-                        "source_meta_json": json.dumps({"category": "tv"}),
-                    }
-                ],
-            }
-            with patch.object(server, "REVIEW_DIR", root), patch.object(
+            with patch.object(server, "REVIEW_DIR", movie_root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                series_root,
+            ), patch.object(
                 server,
                 "_jobs_payload",
-                return_value=jobs_payload,
             ) as jobs:
                 shows = server._review_payload(profile="series")
                 movies = server._review_payload(profile="movies")
 
-        self.assertEqual(jobs.call_count, 2)
+        jobs.assert_not_called()
         self.assertEqual([item["name"] for item in shows["items"]], ["Dark"])
         self.assertEqual(movies["items"], [])
         self.assertEqual(shows["items"][0]["profile"], "series")
 
-    def test_unclassified_review_item_is_not_hidden_by_profile_views(self) -> None:
+    def test_unclassified_items_stay_inside_their_owner_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            folder = root / "Sin datos suficientes"
-            _write_reason(folder, {"phase": "manual"})
-            with patch.object(server, "REVIEW_DIR", root):
+            base = Path(temporary)
+            movie_root = base / "movie-review"
+            series_root = base / "series-review"
+            movie_folder = movie_root / "Sin datos suficientes"
+            series_folder = series_root / "Otra sin datos"
+            _write_reason(movie_folder, {"phase": "manual"})
+            _write_reason(series_folder, {"phase": "manual"})
+            with patch.object(server, "REVIEW_DIR", movie_root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                series_root,
+            ):
                 movies = server._review_payload(profile="movies")
                 shows = server._review_payload(profile="series")
 
-        self.assertEqual([item["name"] for item in movies["items"]], [folder.name])
-        self.assertEqual([item["name"] for item in shows["items"]], [folder.name])
+        self.assertEqual([item["name"] for item in movies["items"]], [movie_folder.name])
+        self.assertEqual([item["name"] for item in shows["items"]], [series_folder.name])
         self.assertEqual(movies["items"][0]["classification"], "unclassified")
         self.assertIsNone(movies["items"][0]["profile"])
+        self.assertEqual(shows["items"][0]["classification"], "series")
 
 
 class ReportProfileFilterTests(unittest.TestCase):
-    def test_untagged_reports_use_job_lookup_structure_and_worker_ownership(self) -> None:
+    def test_report_roots_are_separate_and_series_paths_are_aliased(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            movie_report = root / MOVIE_JOB / "media_result.json"
-            movie_report.parent.mkdir()
+            base = Path(temporary)
+            movie_root = base / "movie-reports"
+            series_root = base / "series-reports"
+            movie_report = movie_root / MOVIE_JOB / "media_result.json"
+            movie_report.parent.mkdir(parents=True)
             movie_report.write_text(
                 json.dumps({"job_id": MOVIE_JOB, "status": "done"}),
                 encoding="utf-8",
             )
-            series_report = root / SERIES_JOB / "media_result.json"
-            series_report.parent.mkdir()
+            series_report = series_root / SERIES_JOB / "series_result.json"
+            series_report.parent.mkdir(parents=True)
             series_report.write_text(
                 json.dumps({"job_id": SERIES_JOB, "status": "done"}),
                 encoding="utf-8",
             )
-            structure_report = root / "series" / "Season 01" / "informe.txt"
+            structure_report = series_root / "series" / "Season 01" / "informe.txt"
             structure_report.parent.mkdir(parents=True)
             structure_report.write_text("sin etiqueta", encoding="utf-8")
-            legacy_report = root / "legacy" / "media_verify.json"
+            legacy_report = movie_root / "legacy" / "media_verify.json"
             legacy_report.parent.mkdir()
             legacy_report.write_text("{}", encoding="utf-8")
 
@@ -115,13 +167,13 @@ class ReportProfileFilterTests(unittest.TestCase):
                 "ok": True,
                 "jobs": [
                     {"job_id": MOVIE_JOB, "category": "movies"},
-                    {
-                        "job_id": SERIES_JOB,
-                        "source_meta": {"media_type": "tv"},
-                    },
                 ],
             }
-            with patch.object(server, "REPORT_ROOT", root), patch.object(
+            with patch.object(server, "REPORT_ROOT", movie_root), patch.object(
+                server,
+                "SERIES_REPORT_ROOT",
+                series_root,
+            ), patch.object(
                 server,
                 "_jobs_payload",
                 return_value=jobs_payload,
@@ -141,13 +193,38 @@ class ReportProfileFilterTests(unittest.TestCase):
         self.assertEqual(
             series_paths,
             {
-                f"{SERIES_JOB}/media_result.json",
-                "series/Season 01/informe.txt",
+                f"{SERIES_JOB}/series_result.json",
             },
         )
         self.assertTrue(all(item["profile"] == "movies" for item in movies["files"]))
         self.assertTrue(all(item["profile"] == "series" for item in shows["files"]))
+        self.assertTrue(shows["connected"])
+        self.assertEqual(shows["report_root"], server.SERIES_REPORT_ALIAS)
+        self.assertTrue(
+            all(
+                item["path"].startswith(server.SERIES_REPORT_ALIAS + "/")
+                for item in shows["files"]
+            )
+        )
+        self.assertNotIn(str(series_root), json.dumps(shows))
+
+    def test_missing_series_roots_report_disconnected_without_movie_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            movie_root = base / "movie-reports"
+            movie_root.mkdir()
+            (movie_root / "movie.json").write_text("{}", encoding="utf-8")
+            missing_series = base / "missing-series"
+            with patch.object(server, "REPORT_ROOT", movie_root), patch.object(
+                server,
+                "SERIES_REPORT_ROOT",
+                missing_series,
+            ):
+                shows = server._reports_payload(profile="series")
+
+        self.assertEqual(shows["files"], [])
         self.assertFalse(shows["connected"])
+        self.assertEqual(shows["report_root"], server.SERIES_REPORT_ALIAS)
         self.assertEqual(shows["message"], "Motor de series no conectado")
 
 

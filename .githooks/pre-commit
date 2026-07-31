@@ -22,8 +22,11 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "ARR pre-commit: node --check panel.js"
-node --check services/media-panel/media_panel/web/static/js/panel.js
+echo "ARR pre-commit: node --check services/media-panel/media_panel/web/static/js/panel.js y todos los modulos JS"
+git ls-files '*.js' | while IFS= read -r JS_FILE; do
+  [ -n "$JS_FILE" ] || continue
+  node --check "$JS_FILE"
+done
 
 echo "ARR pre-commit: contratos rapidos"
 "$PYTHON_BIN" -m pytest -q \
@@ -31,4 +34,5 @@ echo "ARR pre-commit: contratos rapidos"
   tests/test_pytest_contracts.py \
   services/arr-orchestrator/tests/test_arr_blackbox.py \
   services/arr-orchestrator/tests/test_arr_follow.py \
+  services/series-worker/tests \
   services/buscador-puente-arr/tests/test_arr_trace.py

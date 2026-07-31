@@ -21,11 +21,18 @@ RULES_PATH = Path(os.environ.get("MEDIA_RULES_PATH", "/config/media-rules/reglas
 DEFAULT_RULES_PATH = Path(os.environ.get("MEDIA_DEFAULT_RULES_PATH", "/defaults/reglas_motor_default.json"))
 REPORT_ROOT = Path(os.environ.get("MEDIA_REPORT_ROOT", "/config/media-worker"))
 REVIEW_DIR = Path(os.environ.get("MEDIA_REVIEW_DIR", "/data/media/repetidas_vs_error"))
+SERIES_REPORT_ROOT = Path("/config/series-worker")
+SERIES_REVIEW_DIR = Path("/data/media/repetidas_vs_error_series")
+SERIES_REPORT_ALIAS = "<CONFIG>/series-worker"
+SERIES_REVIEW_ALIAS = "<DATA_MEDIA>/repetidas_vs_error_series"
 COMPLETE_ROOT = Path(os.environ.get("ARR_COMPLETE_ROOT", "/data/downloads/torrents/complete"))
 MOVIES_ROOT = Path(os.environ.get("ARR_MOVIES_ROOT", "/data/media/movies"))
 TV_ROOT = Path(os.environ.get("ARR_TV_ROOT", "/data/media/tv"))
 ORCH_URL = os.environ.get("ARR_ORCHESTRATOR_URL", "http://arr-orchestrator:8787").rstrip("/")
 WORKER_URL = os.environ.get("MEDIA_WORKER_URL", "http://media-worker:8790").rstrip("/")
+SERIES_WORKER_URL = os.environ.get(
+    "SERIES_WORKER_URL", "http://series-worker:8791"
+).rstrip("/")
 CODEX_DIAG_ROOT = Path(os.environ.get("CODEX_DIAG_ROOT", "/diagnosticos_codex"))
 IDENTITY_PROXY = IdentityProxy(ORCH_URL)
 MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
@@ -47,6 +54,18 @@ MOVIE_EVIDENCE_RE = re.compile(
 )
 MAX_PROFILE_EVIDENCE_PATHS = 200
 MAX_REPORT_METADATA_BYTES = 512 * 1024
+SERIES_JOB_DIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SERIES_TECHNICAL_REPORT_FILES = frozenset(
+    {
+        "journal.json",
+        "journal.jsonl",
+        "manifest.json",
+        "request.json",
+        "rules_snapshot.json",
+        "series_result.json",
+    }
+)
+SERIES_RESERVED_REPORT_DIRS = frozenset({"backups", "logs", "runtime", "temp"})
 
 
 class PayloadTooLargeError(ValueError):
@@ -157,6 +176,34 @@ def _safe_child(root: Path, value: str) -> Optional[Path]:
         target = (root / value).resolve()
         target.relative_to(root)
         return target
+    except (OSError, ValueError):
+        return None
+
+
+def _safe_regular_child(root: Path, value: str) -> Optional[Path]:
+    normalized = str(value or "").replace("\\", "/")
+    parts = normalized.split("/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:", normalized)
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return None
+    try:
+        if root.is_symlink():
+            return None
+        resolved_root = root.resolve(strict=True)
+        if not resolved_root.is_dir():
+            return None
+        candidate = root
+        for part in parts:
+            candidate /= part
+            if candidate.is_symlink():
+                return None
+        target = candidate.resolve(strict=True)
+        target.relative_to(resolved_root)
+        return target if target.is_file() else None
     except (OSError, ValueError):
         return None
 
@@ -481,40 +528,72 @@ def _save_media_rules_profile(
     )
 
 
-def _series_rules_payload() -> Dict[str, Any]:
-    defaults = _rules_block_view(
-        _read_json(DEFAULT_RULES_PATH),
-        MOVIE_RULE_BLOCKS,
-        fill_missing=True,
-    )
+def _series_rules_disconnected(upstream_status: int) -> Dict[str, Any]:
     return {
         "ok": True,
         "profile": "series",
         "connected": False,
         "editable": False,
         "message": SERIES_NOT_CONNECTED_MESSAGE,
-        "rules": copy.deepcopy(defaults),
+        "rules": {},
         "active": {},
-        "defaults": defaults,
+        "defaults": {},
         "rules_path": None,
-        "defaults_path": str(DEFAULT_RULES_PATH),
         "fingerprint": None,
         "saved_at": None,
         "applied": False,
         "applies_to": "none",
+        "upstream_status": upstream_status,
     }
 
 
-def _series_rules_unavailable() -> Tuple[int, Dict[str, Any]]:
-    return 503, {
-        "ok": False,
-        "error": "series_engine_not_connected",
-        "message": SERIES_NOT_CONNECTED_MESSAGE,
-        "profile": "series",
-        "connected": False,
-        "editable": False,
-        "applied": False,
-    }
+def _series_rules_payload() -> Tuple[int, Dict[str, Any]]:
+    status, payload = _proxy_upstream_json(
+        f"{SERIES_WORKER_URL}/settings/rules",
+        timeout=8,
+    )
+    valid_document = bool(
+        isinstance(payload.get("rules"), dict)
+        and isinstance(payload.get("fingerprint"), str)
+        and payload.get("fingerprint")
+    )
+    if status >= 400 or payload.get("ok") is False or not valid_document:
+        return 200, _series_rules_disconnected(status)
+    result = copy.deepcopy(payload)
+    result.update(
+        {
+            "profile": "series",
+            "connected": True,
+            "editable": True,
+        }
+    )
+    return status, result
+
+
+def _save_series_rules(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+    status, result = _proxy_upstream_json(
+        f"{SERIES_WORKER_URL}/settings/rules",
+        payload,
+        timeout=20,
+    )
+    if status >= 500:
+        unavailable = _series_rules_disconnected(status)
+        unavailable.update(
+            {
+                "ok": False,
+                "error": "series_worker_unavailable",
+            }
+        )
+        return 503, unavailable
+    enriched = copy.deepcopy(result)
+    enriched.update(
+        {
+            "profile": "series",
+            "connected": True,
+            "editable": True,
+        }
+    )
+    return status, enriched
 
 
 def _watcher_rules_payload() -> Tuple[int, Dict[str, Any]]:
@@ -582,6 +661,7 @@ def _save_watcher_rules_profile(
 def _status_payload() -> Dict[str, Any]:
     orch = _upstream_json(f"{ORCH_URL}/health")
     worker = _upstream_json(f"{WORKER_URL}/health")
+    series_worker = _upstream_json(f"{SERIES_WORKER_URL}/health")
     orchestrator_connected = bool(
         isinstance(orch, dict)
         and not orch.get("error")
@@ -591,6 +671,14 @@ def _status_payload() -> Dict[str, Any]:
         isinstance(worker, dict)
         and not worker.get("error")
         and (worker.get("ok") is True or worker.get("status") == "ok")
+    )
+    series_worker_connected = bool(
+        isinstance(series_worker, dict)
+        and not series_worker.get("error")
+        and (
+            series_worker.get("ok") is True
+            or series_worker.get("status") == "ok"
+        )
     )
     orchestrator_service = copy.deepcopy(orch)
     orchestrator_service.update(
@@ -604,19 +692,25 @@ def _status_payload() -> Dict[str, Any]:
     trailers_service.update(
         {"connected": worker_connected, "editable": worker_connected}
     )
+    series_service = copy.deepcopy(series_worker)
+    series_service.update(
+        {
+            "connected": series_worker_connected,
+            "editable": series_worker_connected,
+        }
+    )
+    if not series_worker_connected:
+        series_service.setdefault("status", "not_connected")
+        series_service.setdefault("message", SERIES_NOT_CONNECTED_MESSAGE)
     return {
         "ok": True,
         "orchestrator": orch,
         "media_worker": worker,
+        "series_worker": series_worker,
         "services": {
             "orchestrator": orchestrator_service,
             "movies": movies_service,
-            "series": {
-                "status": "not_connected",
-                "connected": False,
-                "editable": False,
-                "message": SERIES_NOT_CONNECTED_MESSAGE,
-            },
+            "series": series_service,
             "trailers": trailers_service,
         },
         "paths": {
@@ -770,23 +864,118 @@ def _job_id_from_path(path: Path) -> str:
     return ""
 
 
+def _series_alias(alias_root: str, relative: Path | str = "") -> str:
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return alias_root
+    value = relative_path.as_posix()
+    return f"{alias_root}/{value}" if value not in {"", "."} else alias_root
+
+
+def _series_report_relative_allowed(value: Path | str) -> bool:
+    normalized = str(value or "").replace("\\", "/")
+    parts = normalized.split("/")
+    return bool(
+        len(parts) == 2
+        and SERIES_JOB_DIR_RE.fullmatch(parts[0])
+        and parts[0].lower() not in SERIES_RESERVED_REPORT_DIRS
+        and parts[1] in SERIES_TECHNICAL_REPORT_FILES
+    )
+
+
+def _sanitize_series_text(value: str) -> str:
+    text = str(value or "")
+    replacements = (
+        (str(SERIES_REVIEW_DIR), SERIES_REVIEW_ALIAS),
+        (SERIES_REVIEW_DIR.as_posix(), SERIES_REVIEW_ALIAS),
+        (str(SERIES_REPORT_ROOT), SERIES_REPORT_ALIAS),
+        (SERIES_REPORT_ROOT.as_posix(), SERIES_REPORT_ALIAS),
+    )
+    for source, alias in replacements:
+        if source:
+            text = text.replace(source, alias)
+    return text
+
+
+def _sanitize_series_report_text(value: str) -> str:
+    text = _sanitize_series_text(value).replace("\\/", "/")
+    for source, alias in (
+        ("/data/downloads", "<DATA_DOWNLOADS>"),
+        ("/data/media", "<DATA_MEDIA>"),
+        ("/config", "<CONFIG>"),
+    ):
+        text = text.replace(source, alias)
+    text = re.sub(
+        r"(?i)(?<![A-Za-z0-9_])/(?:data|config)(?=$|[/\\\s\"'])",
+        "<REDACTED_PATH>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(?:[a-z][a-z0-9+.-]*://|magnet:)[^\s\"'<>]+",
+        "<REDACTED_URL>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+        "Bearer <REDACTED>",
+        text,
+    )
+    text = re.sub(
+        r'(?i)(?P<prefix>"[^"\r\n]*(?:token|secret|password|api[_-]?key|apikey|authorization|auth)[^"\r\n]*"\s*:\s*")(?P<value>[^"\r\n]*)',
+        lambda match: f'{match.group("prefix")}<REDACTED>',
+        text,
+    )
+    return re.sub(
+        r"(?i)(?P<prefix>\b(?:[A-Za-z0-9_-]*_)?(?:token|secret|password|api[_-]?key|apikey|authorization|auth)\s*[=:]\s*)(?P<value>[^&,\s]+)",
+        lambda match: f'{match.group("prefix")}<REDACTED>',
+        text,
+    )
+
+
 def _review_payload(
     limit: int = 80,
     profile: Optional[str] = None,
 ) -> Dict[str, Any]:
+    series_owned = profile == "series"
+    review_root = SERIES_REVIEW_DIR if series_owned else REVIEW_DIR
+    root_connected = review_root.is_dir() and (
+        not series_owned or not review_root.is_symlink()
+    )
     records: List[Dict[str, Any]] = []
-    if REVIEW_DIR.is_dir():
-        for folder in sorted(REVIEW_DIR.iterdir(), key=_mtime, reverse=True):
-            if not folder.is_dir():
+    if root_connected:
+        for folder in sorted(review_root.iterdir(), key=_mtime, reverse=True):
+            if series_owned:
+                folder_name = folder.name.lower()
+                if (
+                    folder.name.startswith(".")
+                    or folder_name.endswith(".tmp")
+                    or ".tmp." in folder_name
+                    or folder.is_symlink()
+                    or not folder.is_dir()
+                ):
+                    continue
+            elif not folder.is_dir():
                 continue
-            txts = sorted(folder.glob("*.txt"))
+            txts = sorted(
+                path
+                for path in folder.glob("*.txt")
+                if not series_owned or not path.is_symlink()
+            )
             reason_json = folder / "reason.json"
-            payload = _read_json(reason_json)
+            payload = (
+                {}
+                if series_owned and reason_json.is_symlink()
+                else _read_json(reason_json)
+            )
             reason_file = txts[0].name if txts else ""
-            item_profile = _review_item_profile(
-                payload,
-                reason_file,
-                folder=folder,
+            item_profile = (
+                "series"
+                if series_owned
+                else _review_item_profile(
+                    payload,
+                    reason_file,
+                    folder=folder,
+                )
             )
             records.append(
                 {
@@ -803,7 +992,11 @@ def _review_payload(
         if record["profile"] is None
         and JOB_ID_RE.fullmatch(str(record["payload"].get("job_id") or ""))
     }
-    contexts = _job_contexts(unresolved_job_ids) if profile is not None else {}
+    contexts = (
+        _job_contexts(unresolved_job_ids)
+        if profile is not None and not series_owned
+        else {}
+    )
     items: List[Dict[str, Any]] = []
     for record in records:
         if len(items) >= limit:
@@ -811,19 +1004,32 @@ def _review_payload(
         folder = record["folder"]
         payload = record["payload"]
         job_id = str(payload.get("job_id") or "")
-        item_profile = record["profile"] or _profile_from_metadata(
-            contexts.get(job_id)
+        item_profile = (
+            "series"
+            if series_owned
+            else record["profile"]
+            or _profile_from_metadata(contexts.get(job_id))
         )
-        if profile is not None and item_profile not in {None, profile}:
+        if not series_owned and profile is not None and item_profile not in {None, profile}:
             continue
         reason_path = record["reason_path"]
+        reason_text = _short_text(reason_path, 2000) if reason_path else ""
+        if series_owned:
+            reason_text = _sanitize_series_text(reason_text)
         items.append(
             {
                 "name": folder.name,
-                "path": str(folder),
+                "path": (
+                    _series_alias(
+                        SERIES_REVIEW_ALIAS,
+                        folder.relative_to(review_root),
+                    )
+                    if series_owned
+                    else str(folder)
+                ),
                 "mtime": _mtime(folder),
                 "reason_file": record["reason_file"],
-                "reason_text": _short_text(reason_path, 2000) if reason_path else "",
+                "reason_text": reason_text,
                 "phase": payload.get("phase", ""),
                 "job_id": job_id,
                 "file_count": _count_children(folder),
@@ -833,11 +1039,15 @@ def _review_payload(
         )
     result: Dict[str, Any] = {
         "ok": True,
-        "review_dir": str(REVIEW_DIR),
+        "review_dir": SERIES_REVIEW_ALIAS if series_owned else str(REVIEW_DIR),
         "items": items,
     }
     if profile is not None:
         result["profile"] = profile
+    if series_owned:
+        result["connected"] = root_connected
+        if not root_connected:
+            result["message"] = SERIES_NOT_CONNECTED_MESSAGE
     return result
 
 
@@ -845,8 +1055,17 @@ def _reports_payload(
     limit: int = 120,
     profile: Optional[str] = None,
 ) -> Dict[str, Any]:
+    series_owned = profile == "series"
+    report_root = SERIES_REPORT_ROOT if series_owned else REPORT_ROOT
+    root_connected = report_root.is_dir() and (
+        not series_owned or not report_root.is_symlink()
+    )
     records: List[Dict[str, Any]] = []
-    roots = [REPORT_ROOT / "runtime", REPORT_ROOT / "logs", REPORT_ROOT]
+    roots = (
+        [report_root / "runtime", report_root / "logs", report_root]
+        if not series_owned or root_connected
+        else []
+    )
     seen = set()
     scan_limit = max(limit, limit * 10 if profile is not None else limit)
     for root in roots:
@@ -855,11 +1074,17 @@ def _reports_payload(
         for path in sorted(root.rglob("*"), key=_mtime, reverse=True):
             if len(records) >= scan_limit:
                 break
-            if not path.is_file():
+            if not path.is_file() or (series_owned and path.is_symlink()):
                 continue
-            if any(part in {"temp", "backups"} for part in path.relative_to(REPORT_ROOT).parts):
+            relative_path = path.relative_to(report_root)
+            if any(part in {"temp", "backups"} for part in relative_path.parts):
                 continue
-            rel = str(path.relative_to(REPORT_ROOT))
+            if series_owned and (
+                not _series_report_relative_allowed(relative_path)
+                or _safe_regular_child(report_root, relative_path.as_posix()) is None
+            ):
+                continue
+            rel = relative_path.as_posix() if series_owned else str(relative_path)
             if rel in seen:
                 continue
             seen.add(rel)
@@ -867,11 +1092,11 @@ def _reports_payload(
             size = path.stat().st_size
             if path.suffix.lower() == ".json" and size <= MAX_REPORT_METADATA_BYTES:
                 metadata = _read_json(path)
-            item_profile = _profile_from_metadata(metadata)
-            if item_profile is None:
+            item_profile = "series" if series_owned else _profile_from_metadata(metadata)
+            if item_profile is None and not series_owned:
                 item_profile = _profile_from_text_evidence(rel)
             job_id = str(metadata.get("job_id") or "") or _job_id_from_path(
-                path.relative_to(REPORT_ROOT)
+                relative_path
             )
             records.append(
                 {
@@ -890,13 +1115,20 @@ def _reports_payload(
         if record.get("profile") is None
         and JOB_ID_RE.fullmatch(str(record.get("job_id") or ""))
     }
-    contexts = _job_contexts(unresolved_job_ids) if profile is not None else {}
+    contexts = (
+        _job_contexts(unresolved_job_ids)
+        if profile is not None and not series_owned
+        else {}
+    )
     files: List[Dict[str, Any]] = []
     for record in records:
         if len(files) >= limit:
             break
-        item_profile = record.get("profile") or _profile_from_metadata(
-            contexts.get(str(record.get("job_id") or ""))
+        item_profile = (
+            "series"
+            if series_owned
+            else record.get("profile")
+            or _profile_from_metadata(contexts.get(str(record.get("job_id") or "")))
         )
         if item_profile is None:
             # Este root pertenece al Media Worker de peliculas/trailers.
@@ -906,20 +1138,22 @@ def _reports_payload(
         item = dict(record)
         item["profile"] = item_profile
         item.pop("job_id", None)
+        if series_owned:
+            item["path"] = _series_alias(SERIES_REPORT_ALIAS, item["relative"])
         files.append(item)
     result: Dict[str, Any] = {
         "ok": True,
-        "report_root": str(REPORT_ROOT),
+        "report_root": SERIES_REPORT_ALIAS if series_owned else str(REPORT_ROOT),
         "files": files,
     }
     if profile is not None:
         result.update(
             {
                 "profile": profile,
-                "connected": profile == "movies" and REPORT_ROOT.is_dir(),
+                "connected": root_connected,
             }
         )
-        if profile == "series":
+        if series_owned and not root_connected:
             result["message"] = SERIES_NOT_CONNECTED_MESSAGE
     return result
 
@@ -1039,7 +1273,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(status, result)
             return
         if path == "/api/series-rules":
-            self._json(200, _series_rules_payload())
+            status, result = _series_rules_payload()
+            self._json(status, result)
             return
         if path == "/api/watcher-rules":
             status, result = _watcher_rules_payload()
@@ -1101,11 +1336,35 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/report":
             rel = query.get("file", [""])[0]
-            target = _safe_child(REPORT_ROOT, rel)
+            profile = query.get("profile", [None])[0]
+            if profile not in {None, "movies", "series"}:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_profile",
+                        "message": "profile debe ser movies o series.",
+                    },
+                )
+                return
+            series_owned = profile == "series"
+            report_root = SERIES_REPORT_ROOT if series_owned else REPORT_ROOT
+            target = (
+                _safe_regular_child(report_root, rel)
+                if not series_owned or _series_report_relative_allowed(rel)
+                else None
+            )
             if not target or not target.is_file():
                 self._send(404, b"No hay informe.", "text/plain; charset=utf-8")
                 return
-            self._send(200, _short_text(target, 512000).encode("utf-8"), "text/plain; charset=utf-8")
+            text = _short_text(target, 512000)
+            if series_owned:
+                text = _sanitize_series_report_text(text)
+            self._send(
+                200,
+                text.encode("utf-8"),
+                "text/plain; charset=utf-8",
+            )
             return
         if path.startswith("/static/"):
             self._static(path)
@@ -1167,10 +1426,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": type(error).__name__})
             return
         if parsed.path == "/api/series-rules":
-            if _read_protected_json_object(self) is None:
+            payload = _read_protected_json_object(self)
+            if payload is None:
                 return
-            status, result = _series_rules_unavailable()
-            self._json(status, result)
+            try:
+                status, result = _save_series_rules(payload)
+                self._json(status, result)
+            except Exception as error:
+                self._json(500, {"ok": False, "error": type(error).__name__})
             return
         if parsed.path == "/api/watcher-rules":
             try:

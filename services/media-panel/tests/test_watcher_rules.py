@@ -222,11 +222,15 @@ class WatcherRulesProxyTests(unittest.TestCase):
                         "_save_media_rules_profile",
                     ) as media_save, patch.object(
                         server,
+                        "_save_series_rules",
+                    ) as series_save, patch.object(
+                        server,
                         "_save_watcher_rules_profile",
                     ) as watcher_save:
                         server.Handler.do_POST(handler)
 
                     media_save.assert_not_called()
+                    series_save.assert_not_called()
                     watcher_save.assert_not_called()
                     self.assertEqual(handler.response[0], expected_status)
                     self.assertEqual(handler.response[1]["error"], expected_error)
@@ -235,6 +239,7 @@ class WatcherRulesProxyTests(unittest.TestCase):
         for path in (
             "/api/movie-rules",
             "/api/trailer-rules",
+            "/api/series-rules",
             "/api/watcher-rules/movies",
             "/api/watcher-rules/tv",
         ):
@@ -258,11 +263,15 @@ class WatcherRulesProxyTests(unittest.TestCase):
                         "_save_media_rules_profile",
                     ) as media_save, patch.object(
                         server,
+                        "_save_series_rules",
+                    ) as series_save, patch.object(
+                        server,
                         "_save_watcher_rules_profile",
                     ) as watcher_save:
                         server.Handler.do_POST(handler)
 
                     media_save.assert_not_called()
+                    series_save.assert_not_called()
                     watcher_save.assert_not_called()
                     self.assertEqual(captured[0][0], 400)
                     self.assertEqual(captured[0][1]["error"], "invalid_json")

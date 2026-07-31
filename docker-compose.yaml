@@ -2,16 +2,17 @@
 #  MAPA DEL FLUJO COMPLETO - ARR                          #
 #  TRES CAMINOS: DESCARGA, MEDIA, TRAILER                 #
 # ======================================================= #
-# gluetun 153
-# qbittorrent 197
-# jackett 215
-# flaresolverr 230
-# rdtclient 241
-# arr-orchestrator 256
-# media-worker 305
-# media-panel 332
-# buscador-puente-arr 369
-# compose-backup 410
+# gluetun 154
+# qbittorrent 198
+# jackett 216
+# flaresolverr 231
+# rdtclient 242
+# arr-orchestrator 257
+# media-worker 312
+# series-worker 347
+# media-panel 377
+# buscador-puente-arr 416
+# compose-backup 462
 #
 # ======================================================= #
 #  IDEA GENERAL                                           #
@@ -276,6 +277,7 @@ services:
       ARR_REVIEW_DIR: "/data/media/repetidas_vs_error"
       ARR_MOVIES_FINAL: "/data/media/movies"
       ARR_TV_FINAL: "/data/media/tv"
+      ARR_SERIES_MODE: "legacy"
       MEDIA_WORKER_URL: "http://media-worker:8790"
       QBT_URL: "http://gluetun:8080"
       QBT_USER: "${QBT_USER}"
@@ -329,6 +331,8 @@ services:
       MEDIA_WORKER_REVIEW_ROOT: "/data/media/repetidas_vs_error"
       MEDIA_WORKER_CALLBACK_ORIGIN: "http://arr-orchestrator:8787"
       MEDIA_WORKER_ALLOWED_ROOTS: "/data/downloads/torrents/complete/taller"
+      MEDIA_HEAVY_LOCK_PATH: "/config/worker-locks/media-heavy.lock"
+      MEDIA_HEAVY_LOCK_TIMEOUT_SEC: "3600"
     volumes:
       - ${ARR_ROOT}/config:/config
       - ${ARR_DATA_ROOT}:/data
@@ -336,6 +340,50 @@ services:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8790/health"]
       interval: 30s
       timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  # Fase 3: accesible desde el panel, sin trafico TV desde arr-orchestrator.
+  series-worker:
+    build:
+      context: ./services/series-worker
+    image: arr-series-worker:local
+    container_name: arr-series-worker
+    user: "1000:10"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      TZ: Europe/Madrid
+      SERIES_WORKER_PORT: "8791"
+      SERIES_WORKER_RULES_PATH: "/config/series-rules/reglas_series.json"
+      SERIES_WORKER_SEED_RULES_PATH: "/seed/reglas_motor.json"
+      SERIES_WORKER_REPORT_ROOT: "/config/series-worker"
+      SERIES_WORKER_FINAL_ROOT: "/data/media/tv"
+      SERIES_WORKER_REVIEW_ROOT: "/data/media/repetidas_vs_error_series"
+      SERIES_WORKER_ALLOWED_ROOTS: "/data/downloads/torrents/complete/taller"
+      SERIES_HEAVY_LOCK_PATH: "/config/worker-locks/media-heavy.lock"
+      SERIES_HEAVY_LOCK_TIMEOUT_SEC: "3600"
+      SERIES_ATOMIC_PREFLIGHT_LOCK_PATH: "/config/worker-locks/series-atomic-preflight.lock"
+    volumes:
+      - ${ARR_DATA_ROOT}/downloads/torrents/complete/taller:/data/downloads/torrents/complete/taller
+      - ${ARR_DATA_ROOT}/media/tv:/data/media/tv
+      - ${ARR_DATA_ROOT}/media/repetidas_vs_error_series:/data/media/repetidas_vs_error_series
+      - ${ARR_ROOT}/config/series-worker:/config/series-worker
+      - ${ARR_ROOT}/config/series-rules:/config/series-rules
+      - ${ARR_ROOT}/config/worker-locks:/config/worker-locks
+      - ${ARR_ROOT}/config/media-rules/reglas_motor.json:/seed/reglas_motor.json:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=512m,uid=1000,gid=10
+    expose:
+      - "8791"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8791/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 8s
       retries: 3
       start_period: 30s
     restart: unless-stopped
@@ -349,6 +397,7 @@ services:
     depends_on:
       - arr-orchestrator
       - media-worker
+      - series-worker
     environment:
       TZ: Europe/Madrid
       MEDIA_PANEL_PORT: "8080"
@@ -361,6 +410,7 @@ services:
       ARR_TV_ROOT: "/data/media/tv"
       ARR_ORCHESTRATOR_URL: "http://arr-orchestrator:8787"
       MEDIA_WORKER_URL: "http://media-worker:8790"
+      SERIES_WORKER_URL: "http://series-worker:8791"
       CODEX_DIAG_ROOT: "/diagnosticos_codex"
     volumes:
       - ${ARR_ROOT}/config:/config:ro

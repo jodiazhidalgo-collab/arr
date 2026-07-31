@@ -2,6 +2,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -84,6 +85,66 @@ def _bluray_payload(report_root: Path, job_id: str, source: Path = None):
         "reports_root": str(report_root),
         "callback_url": "",
     }
+
+
+def test_movie_execution_is_inside_shared_heavy_lock(service, monkeypatch):
+    base_url, report_root = service
+    observed = []
+
+    @contextmanager
+    def lock():
+        observed.append("lock_enter")
+        try:
+            yield {"enabled": True}
+        finally:
+            observed.append("lock_exit")
+
+    def process(_payload):
+        observed.append("process")
+        return {"status": "review"}
+
+    monkeypatch.setattr(server, "media_heavy_lock", lock)
+    monkeypatch.setattr(server, "process_movie", process)
+    status, result = _request(
+        f"{base_url}/process-movie",
+        method="POST",
+        payload=_payload(report_root, "heavy-lock-job"),
+    )
+    assert status == 200
+    assert result["status"] == "review"
+    assert observed == ["lock_enter", "process", "lock_exit"]
+
+
+def test_heavy_lock_timeout_is_retryable_and_not_persisted(service, monkeypatch):
+    base_url, report_root = service
+    calls = []
+
+    @contextmanager
+    def busy_lock():
+        raise server.HeavyLockTimeout("motor ocupado")
+        yield
+
+    monkeypatch.setattr(server, "media_heavy_lock", busy_lock)
+    monkeypatch.setattr(
+        server,
+        "process_movie",
+        lambda payload: calls.append(payload) or {"status": "done"},
+    )
+    payload = _payload(report_root, "heavy-lock-busy")
+
+    status, result = _request(
+        f"{base_url}/process-movie", method="POST", payload=payload
+    )
+    missing_status, missing = _request(
+        f"{base_url}/jobs/heavy-lock-busy/status?kind=movie"
+    )
+
+    assert status == 409
+    assert result["error_code"] == "media_worker_busy"
+    assert result["retryable"] is True
+    assert calls == []
+    assert missing_status == 404 and missing["status"] == "not_found"
+    assert not (report_root / "heavy-lock-busy/media_result.json").exists()
 
 
 def test_concurrent_post_runs_movie_once_and_exposes_active_status(service, monkeypatch):

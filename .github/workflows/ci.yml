@@ -48,14 +48,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "COMPILEALL_OK" | Set-Content "_codex_runtime/artifacts/compileall-${{ matrix.os }}.txt"
 
-      - name: Check panel.js syntax
+      - name: Check all JavaScript modules
         shell: pwsh
         run: |
-          node --check services/media-panel/media_panel/web/static/js/panel.js
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Output "node --check services/media-panel/media_panel/web/static/js/panel.js y todos los modulos JS"
+          $jsFiles = git ls-files "*.js"
+          foreach ($jsFile in $jsFiles) {
+            node --check $jsFile
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           "NODE_CHECK_OK" | Set-Content "_codex_runtime/artifacts/node-check-${{ matrix.os }}.txt"
 
+      - name: Validate Docker Compose
+        if: runner.os == 'Linux'
+        run: docker compose config --quiet
+
+      - name: Build isolated Series Worker image
+        if: runner.os == 'Linux'
+        run: docker build --tag arr-series-worker-ci ./services/series-worker
+
       - name: Run pytest
+        # pytest.ini incluye services/series-worker/tests y su pythonpath.
         run: python -m pytest -q --junitxml _codex_runtime/artifacts/pytest-junit-${{ matrix.os }}.xml --durations=20
 
       - name: Write review summary

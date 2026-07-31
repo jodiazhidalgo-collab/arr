@@ -401,14 +401,14 @@ function serviceStatusCard(label, service, legacyOk = false) {
 function jobsTable(jobs, options = {}) {
   if (!jobs.length) return `<div class="empty">No hay trabajos registrados.</div>`;
   const actions = options.actions !== false;
-  return `<table class="table">
+  return `<table class="table jobs-table">
     <thead><tr><th>Nombre</th><th>Categoria</th><th>Estado</th><th>Actualizado</th>${actions ? "<th>Diagnostico</th>" : ""}</tr></thead>
     <tbody>${jobs.map(job => `<tr>
-      <td>${esc(job.name)}</td>
-      <td>${esc(job.category)}</td>
-      <td>${pill(stateLabel(job.state), stateTone(job.state))}</td>
-      <td>${esc(formatTime(job.updated_at))}</td>
-      ${actions ? `<td><button class="btn ghost small" data-codex-job="${esc(job.job_id)}">Informe Codex</button></td>` : ""}
+      <td data-label="Nombre">${esc(job.name)}</td>
+      <td data-label="Categoría">${esc(job.category)}</td>
+      <td data-label="Estado">${pill(stateLabel(job.state), stateTone(job.state))}</td>
+      <td data-label="Actualizado">${esc(formatTime(job.updated_at))}</td>
+      ${actions ? `<td data-label="Diagnóstico"><button class="btn ghost small" data-codex-job="${esc(job.job_id)}">Informe Codex</button></td>` : ""}
     </tr>`).join("")}</tbody>
   </table>`;
 }
@@ -563,7 +563,7 @@ async function showInformes(context) {
   }));
   document.querySelectorAll("[data-report]").forEach(btn => btn.addEventListener("click", async () => {
     const file = btn.dataset.report;
-    const text = await fetch(`/api/report?file=${encodeURIComponent(file)}`, { cache: "no-store" }).then(r => r.text());
+    const text = await fetch(`/api/report?profile=${encodeURIComponent(profile)}&file=${encodeURIComponent(file)}`, { cache: "no-store" }).then(r => r.text());
     if (!isCurrentViewContext(context)) return;
     const box = document.getElementById("report-view");
     if (!box) return;

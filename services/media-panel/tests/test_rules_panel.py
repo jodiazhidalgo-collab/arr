@@ -138,8 +138,23 @@ class RulesPanelContractTests(unittest.TestCase):
     def test_review_and_reports_are_profile_scoped(self) -> None:
         self.assertIn("/api/review?profile=${encodeURIComponent(profile)}", self.panel_js)
         self.assertIn("/api/reports?profile=${encodeURIComponent(profile)}", self.panel_js)
+        self.assertIn(
+            "/api/report?profile=${encodeURIComponent(profile)}&file=${encodeURIComponent(file)}",
+            self.panel_js,
+        )
         self.assertIn("arr-media-panel-revision-profile", self.panel_js)
         self.assertIn("arr-media-panel-informes-profile", self.panel_js)
+
+    def test_mobile_history_and_review_are_width_safe(self) -> None:
+        self.assertIn('class="table jobs-table"', self.panel_js)
+        for label in ("Nombre", "Categoría", "Estado", "Actualizado", "Diagnóstico"):
+            self.assertIn(f'data-label="{label}"', self.panel_js)
+        self.assertIn(".jobs-table td::before", self.panel_css)
+        self.assertIn("content: attr(data-label);", self.panel_css)
+        self.assertIn(".review-top > div", self.panel_css)
+        self.assertIn("overflow-wrap: anywhere;", self.panel_css)
+        self.assertIn("grid-template-columns: minmax(0, 1fr);", self.panel_css)
+        self.assertIn(".report-row > b", self.panel_css)
 
     def test_removed_filebot_editor_and_proxy_are_not_exposed(self) -> None:
         for text in (
