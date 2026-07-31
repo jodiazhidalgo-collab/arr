@@ -13,6 +13,9 @@ HOST_DATA_ROOT = os.environ.get("ARR_HOST_DATA_ROOT", "/host/data").rstrip("/")
 HOST_ARR_ROOT = os.environ.get("ARR_HOST_ROOT", "/host/arr").rstrip("/")
 WIN_ARR_ROOT = os.environ.get("ARR_ROOT_WIN", r"C:\arr").rstrip("\\")
 UNC_ARR_ROOT = (os.environ.get("ARR_ROOT_UNC") or r"\\nas\docker\arr").rstrip("\\")
+NAS_DATA_ROOT = "/volume1/UGREEN/data"
+FIXED_WIN_ARR_ROOT = r"Z:\arr"
+FIXED_WIN_ARR_ROOT_SLASH = "Z:/arr"
 
 SENSITIVE_KEY_PARTS = (
     "token",
@@ -33,10 +36,14 @@ SENSITIVE_KEY_PARTS = (
 )
 
 PATH_ALIASES = (
+    (f"{NAS_DATA_ROOT}/downloads", "<DATA_DOWNLOADS>"),
+    (f"{NAS_DATA_ROOT}/media", "<DATA_MEDIA>"),
+    (NAS_DATA_ROOT, "<DATA_ROOT>"),
     ("/data/downloads", "<DATA_DOWNLOADS>"),
     ("/data/media", "<DATA_MEDIA>"),
     (f"{HOST_DATA_ROOT}/downloads", "<DATA_DOWNLOADS>"),
     (f"{HOST_DATA_ROOT}/media", "<DATA_MEDIA>"),
+    (HOST_DATA_ROOT, "<DATA_ROOT>"),
     (f"{HOST_ARR_ROOT}/diagnosticos_codex", "<CODEX_DIAGS>"),
     (f"{HOST_ARR_ROOT}/diagnostics", "<DIAGNOSTICS>"),
     (f"{HOST_ARR_ROOT}/config", "<CONFIG>"),
@@ -45,7 +52,16 @@ PATH_ALIASES = (
     ("/config", "<CONFIG>"),
     ("/app/data", "<APP_DATA>"),
     ("/app/logs", "<APP_LOGS>"),
+    ("/data", "<DATA_ROOT>"),
     (HOST_ARR_ROOT, "<ARR_ROOT>"),
+    (f"{FIXED_WIN_ARR_ROOT}\\diagnosticos_codex", "<CODEX_DIAGS>"),
+    (f"{FIXED_WIN_ARR_ROOT}\\diagnostics", "<DIAGNOSTICS>"),
+    (f"{FIXED_WIN_ARR_ROOT}\\config", "<CONFIG>"),
+    (FIXED_WIN_ARR_ROOT, "<ARR_ROOT_WIN>"),
+    (f"{FIXED_WIN_ARR_ROOT_SLASH}/diagnosticos_codex", "<CODEX_DIAGS>"),
+    (f"{FIXED_WIN_ARR_ROOT_SLASH}/diagnostics", "<DIAGNOSTICS>"),
+    (f"{FIXED_WIN_ARR_ROOT_SLASH}/config", "<CONFIG>"),
+    (FIXED_WIN_ARR_ROOT_SLASH, "<ARR_ROOT_WIN>"),
     (f"{WIN_ARR_ROOT}\\diagnosticos_codex", "<CODEX_DIAGS>"),
     (f"{WIN_ARR_ROOT}\\diagnostics", "<DIAGNOSTICS>"),
     (f"{WIN_ARR_ROOT}\\config", "<CONFIG>"),
@@ -57,7 +73,12 @@ PATH_ALIASES = (
 )
 
 USEFUL_RELATED_KEYS = {
+    "filebot_output",
+    "final_series_dir",
+    "journal_path",
     "log_file",
+    "manifest_path",
+    "preserved_path",
     "reports_dir",
     "report_path",
     "review_path",
@@ -69,6 +90,7 @@ USEFUL_RELATED_KEYS = {
     "stage_path",
     "output_root",
     "torrent_path",
+    "work_dir",
 }
 
 
@@ -131,8 +153,15 @@ def redact_sensitive_fragments(text: str) -> str:
 
 def alias_paths(text: str) -> str:
     result = text
-    for prefix, alias in PATH_ALIASES:
-        result = result.replace(prefix, alias)
+    variants = list(PATH_ALIASES)
+    variants.extend(
+        (prefix.replace("\\", "\\\\"), alias)
+        for prefix, alias in PATH_ALIASES
+        if "\\" in prefix
+    )
+    for prefix, alias in sorted(variants, key=lambda item: len(item[0]), reverse=True):
+        if prefix:
+            result = re.sub(re.escape(prefix), lambda _match: alias, result, flags=re.IGNORECASE)
     return result
 
 
@@ -164,6 +193,12 @@ def phase_label(phase: Any) -> str:
         "media_verify": "Verificacion media",
         "media_finalize": "Finalizacion",
         "manual_review": "Revision manual",
+        "series": "Series",
+        "series_worker": "Series Worker",
+        "series_postprocess": "Postproceso de Series",
+        "series_verify": "Verificacion de Series",
+        "series_publish": "Publicacion de Series",
+        "series_review": "Revision de Series",
         "received": "Entrada",
         "extract": "Extraccion",
         "extraction": "Extraccion",
@@ -176,6 +211,72 @@ def phase_label(phase: Any) -> str:
         "diagnostic": "Diagnostico",
         "finish": "Final",
     }.get(key, str(phase or "Sin fase"))
+
+
+def series_worker_status(phase: Any, structured: Any, previous: Any = "") -> str:
+    """Resume el estado del worker usando solo datos ya presentes en job_events."""
+
+    phase_key = str(phase or "").strip().lower()
+    payload = structured if isinstance(structured, dict) else {}
+    previous_status = str(previous or "").strip().lower()
+    state = str(payload.get("state") or "").strip().lower()
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+    if result is None and isinstance(payload.get("result_summary"), dict):
+        result = payload["result_summary"]
+    if result is None and isinstance(payload.get("result_json"), str):
+        try:
+            loaded = json.loads(payload["result_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            result = loaded
+
+    result_status = str((result or {}).get("status") or "").strip().lower()
+    explicit_status = result_status or str(payload.get("status") or "").strip().lower()
+    series_phases = {
+        "series",
+        "series_worker",
+        "series_postprocess",
+        "series_verify",
+        "series_publish",
+        "series_review",
+    }
+    series_evidence = bool(
+        phase_key in series_phases
+        or state.startswith("series_")
+        or (result or {}).get("kind") == "series"
+        or payload.get("kind") == "series"
+        or previous_status
+    )
+    if not series_evidence:
+        return previous_status
+
+    if explicit_status == "terminal" and result_status:
+        explicit_status = result_status
+    if explicit_status in {"accepted", "active", "processing", "recoverable", "running"}:
+        return "running"
+    if explicit_status in {"not_found", "queued", "ready"}:
+        return "ready"
+    if explicit_status in {
+        "review_cleanup_pending",
+        "status_unavailable",
+        "workshop_cleanup_pending",
+    }:
+        return "running"
+    if explicit_status in {"done", "review", "failed"}:
+        return explicit_status
+
+    if state == "series_postprocess_ready":
+        return "ready"
+    if state in {"series_postprocess_running", "series_review_cleanup"}:
+        return "running"
+    if state == "ready_cleanup" and (phase_key in series_phases or previous_status):
+        return "done"
+    if state == "manual_review" and (phase_key == "series_review" or previous_status):
+        return "review"
+    if state == "done" and previous_status:
+        return "done"
+    return previous_status
 
 
 def collect_related_paths(value: Any) -> List[str]:

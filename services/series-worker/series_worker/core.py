@@ -13,7 +13,6 @@ import time
 import unicodedata
 import urllib.request
 import uuid
-from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -153,6 +152,15 @@ class PreparedJob:
 
 
 @dataclass(frozen=True)
+class ReservedJob:
+    payload: ValidatedPayload
+    rules_snapshot: RulesSnapshot
+    payload_digest: str
+    generation: str
+    journal: DurableJournal
+
+
+@dataclass(frozen=True)
 class Submission:
     http_status: int
     payload: dict[str, Any]
@@ -160,6 +168,24 @@ class Submission:
 
 def _configured_path(name: str, default: str) -> Path:
     return Path(str(os.environ.get(name, default) or default).strip()).resolve()
+
+
+def _configured_reports_root() -> Path:
+    lexical = Path(
+        str(
+            os.environ.get("SERIES_WORKER_REPORT_ROOT", DEFAULT_REPORT_ROOT)
+            or DEFAULT_REPORT_ROOT
+        ).strip()
+    )
+    if lexical.is_symlink():
+        raise ServiceUnavailable("La raíz de informes no puede ser un enlace simbólico")
+    try:
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise ServiceUnavailable("La raíz de informes no existe") from error
+    if not resolved.is_dir():
+        raise ServiceUnavailable("La raíz de informes no es una carpeta")
+    return resolved
 
 
 def _allowed_roots() -> tuple[Path, ...]:
@@ -261,7 +287,7 @@ def _validated_payload(payload: Any, *, require_directories: bool) -> ValidatedP
         raise RequestValidationError("final_root no es la raíz TV canónica")
     if review_root != _configured_path("SERIES_WORKER_REVIEW_ROOT", DEFAULT_REVIEW_ROOT):
         raise RequestValidationError("review_root no es la raíz de revisión canónica")
-    if reports_root != _configured_path("SERIES_WORKER_REPORT_ROOT", DEFAULT_REPORT_ROOT):
+    if reports_root != _configured_reports_root():
         raise RequestValidationError("reports_root no es la raíz de informes canónica")
     return ValidatedPayload(
         job_id=job_id,
@@ -286,10 +312,25 @@ def _digest(payload: Any) -> str:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise ServiceUnavailable(
+                f"Estado durable atraviesa un enlace simbólico: {path.name}"
+            )
     if not path.is_file():
         return None
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ServiceUnavailable(f"Estado durable no regular: {path.name}")
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
+                value = json.load(handle)
+        finally:
+            os.close(descriptor)
     except (OSError, json.JSONDecodeError) as error:
         raise ServiceUnavailable(f"Estado durable ilegible: {path.name}") from error
     if not isinstance(value, dict):
@@ -311,6 +352,81 @@ def _path_key(value: str) -> str:
     """Clave uniforme para comparar rutas logicas sin perder fail-closed."""
 
     return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _collision_to_dict(collision: CollisionPlan) -> dict[str, Any]:
+    final_series_root = ""
+    if collision.final_series_root is not None:
+        final_series_root = collision.final_series_root.name
+    return {
+        "final_series_root": final_series_root,
+        "pending": [entry.source_relpath for entry in collision.pending],
+        "satisfied": [entry.source_relpath for entry in collision.satisfied],
+        "review_reasons": list(collision.review_reasons),
+    }
+
+
+def _collision_from_dict(
+    value: Any,
+    payload: ValidatedPayload,
+    manifest: SeriesManifest,
+) -> CollisionPlan:
+    if not isinstance(value, dict) or set(value) != {
+        "final_series_root",
+        "pending",
+        "satisfied",
+        "review_reasons",
+    }:
+        raise ServiceUnavailable("Plan de colisiones durable no válido")
+    final_name = value.get("final_series_root")
+    pending_values = value.get("pending")
+    satisfied_values = value.get("satisfied")
+    reasons = value.get("review_reasons")
+    if (
+        not isinstance(final_name, str)
+        or not isinstance(pending_values, list)
+        or not isinstance(satisfied_values, list)
+        or not isinstance(reasons, list)
+        or any(not isinstance(reason, str) or not reason for reason in reasons)
+        or len(set(reasons)) != len(reasons)
+    ):
+        raise ServiceUnavailable("Plan de colisiones durable no válido")
+    by_source = {entry.source_relpath: entry for entry in manifest.entries}
+
+    def select(values: list[Any], label: str) -> tuple[ManifestEntry, ...]:
+        if (
+            any(not isinstance(item, str) for item in values)
+            or len(set(values)) != len(values)
+            or any(item not in by_source for item in values)
+        ):
+            raise ServiceUnavailable(f"Plan de colisiones durable: {label} no válido")
+        return tuple(by_source[item] for item in values)
+
+    pending = select(pending_values, "pending")
+    satisfied = select(satisfied_values, "satisfied")
+    if set(pending_values) & set(satisfied_values):
+        raise ServiceUnavailable("Plan de colisiones durable solapado")
+    if not manifest.review_reasons and not reasons and (
+        set(pending_values) | set(satisfied_values) != set(by_source)
+    ):
+        raise ServiceUnavailable("Plan de colisiones durable incompleto")
+    final_root: Path | None = None
+    if final_name:
+        try:
+            normalized = validate_relative_path(final_name)
+        except ManifestError as error:
+            raise ServiceUnavailable("Raíz final durable no válida") from error
+        if len(PurePosixPath(normalized).parts) != 1:
+            raise ServiceUnavailable("Raíz final durable no válida")
+        final_root = payload.final_root / final_name
+    elif manifest.ready and not reasons:
+        raise ServiceUnavailable("Plan durable sin raíz final")
+    return CollisionPlan(
+        final_series_root=final_root,
+        pending=pending,
+        satisfied=satisfied,
+        review_reasons=tuple(reasons),
+    )
 
 
 def _manifest_from_dict(payload: dict[str, Any]) -> SeriesManifest:
@@ -820,6 +936,50 @@ def _copy_provisional_to_prepared(
     return tuple(sorted(expected_files, key=str.casefold))
 
 
+def _allowed_existing_publication_files(
+    prepared: PreparedJob,
+    expected_files: tuple[str, ...],
+) -> dict[str, str]:
+    """Congela solo destinos existentes cuyo contenido conocido es aceptable.
+
+    Los vídeos se comparan con la huella inmutable del manifiesto de entrada.
+    Los sidecars generados se comparan con el archivo ya preparado. La entrega
+    vuelve a comprobar estas huellas dentro de su lock, cerrando la carrera
+    entre esta captura y el intercambio atómico.
+    """
+
+    final_series_root = prepared.collision.final_series_root
+    prepared_series_root = prepared.prepared_series_root
+    if final_series_root is None or prepared_series_root is None:
+        raise SeriesWorkerError("Faltan rutas de publicación")
+
+    video_digests: dict[str, str] = {}
+    for entry in prepared.manifest.entries:
+        parts = PurePosixPath(entry.target_relpath).parts
+        if len(parts) < 2:
+            raise SeriesWorkerError("El manifiesto contiene un destino sin raíz")
+        relative = PurePosixPath(*parts[1:]).as_posix()
+        video_digests[_path_key(relative)] = entry.content_sha256
+
+    allowed: dict[str, str] = {}
+    for raw_relative in expected_files:
+        relative = validate_relative_path(raw_relative)
+        relative_path = Path(*PurePosixPath(relative).parts)
+        target = final_series_root / relative_path
+        if not target.exists():
+            continue
+        if target.is_symlink() or not target.is_file():
+            continue
+        _target_size, target_digest = _hash_published_file(target)
+        expected_digest = video_digests.get(_path_key(relative))
+        if expected_digest is None:
+            prepared_path = prepared_series_root / relative_path
+            _prepared_size, expected_digest = _hash_published_file(prepared_path)
+        if target_digest == expected_digest:
+            allowed[relative] = target_digest
+    return allowed
+
+
 _REVIEW_METADATA = frozenset({"reason.json", "Revision de serie.txt"})
 
 
@@ -1003,6 +1163,162 @@ def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, A
     }
 
 
+def _hash_published_file(path: Path) -> tuple[int, str]:
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SeriesWorkerError("La biblioteca publicada contiene un archivo no regular")
+    digest = hashlib.sha256()
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    with os.fdopen(descriptor, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise SeriesWorkerError("El archivo publicado cambió antes de su hash")
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        opened_after = os.fstat(handle.fileno())
+    after = path.lstat()
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    identity_opened_after = (
+        opened_after.st_dev,
+        opened_after.st_ino,
+        opened_after.st_size,
+        opened_after.st_mtime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or not stat.S_ISREG(after.st_mode)
+        or identity_before != identity_opened_after
+        or identity_before != identity_after
+    ):
+        raise SeriesWorkerError("La biblioteca publicada cambió durante su manifiesto")
+    return int(after.st_size), digest.hexdigest()
+
+
+def _published_manifest(prepared: PreparedJob) -> dict[str, Any]:
+    series_root = prepared.collision.final_series_root
+    if (
+        series_root is None
+        or series_root.parent != prepared.payload.final_root
+        or series_root.is_symlink()
+        or not series_root.is_dir()
+    ):
+        raise SeriesWorkerError("La raíz publicada de la serie no es segura")
+    entries: list[dict[str, Any]] = []
+    for current, directories, filenames in os.walk(series_root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            directory = current_path / name
+            info = directory.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise SeriesWorkerError(
+                    "La biblioteca publicada contiene una carpeta no regular"
+                )
+        for name in filenames:
+            path = current_path / name
+            relative = path.relative_to(prepared.payload.final_root).as_posix()
+            if path.parent == series_root and name == MARKER_NAME:
+                continue
+            relative = validate_relative_path(relative)
+            size, content_sha256 = _hash_published_file(path)
+            entries.append(
+                {
+                    "path": relative,
+                    "size": size,
+                    "content_sha256": content_sha256,
+                }
+            )
+    entries.sort(key=lambda item: (_path_key(item["path"]), item["path"]))
+    if not entries:
+        raise SeriesWorkerError("La serie publicada no contiene archivos")
+    folded = [_path_key(item["path"]) for item in entries]
+    if len(set(folded)) != len(folded):
+        raise SeriesWorkerError("La serie publicada contiene rutas equivalentes")
+    return {
+        "schema": "series-published-manifest-v1",
+        "digest": _digest(entries),
+        "entries": entries,
+    }
+
+
+def _validate_published_manifest(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {"schema", "digest", "entries"}:
+        raise ServiceUnavailable("Manifiesto publicado terminal no válido")
+    if value.get("schema") != "series-published-manifest-v1":
+        raise ServiceUnavailable("Esquema de manifiesto publicado no soportado")
+    raw_entries = value.get("entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ServiceUnavailable("Manifiesto publicado terminal vacío")
+    entries: list[dict[str, Any]] = []
+    for item in raw_entries:
+        if not isinstance(item, dict) or set(item) != {
+            "path",
+            "size",
+            "content_sha256",
+        }:
+            raise ServiceUnavailable("Entrada de manifiesto publicado no válida")
+        path = item.get("path")
+        size = item.get("size")
+        content_sha256 = item.get("content_sha256")
+        if (
+            not isinstance(path, str)
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+            or not _is_sha256(content_sha256)
+        ):
+            raise ServiceUnavailable("Entrada de manifiesto publicado no válida")
+        try:
+            normalized_path = validate_relative_path(path)
+        except ManifestError as error:
+            raise ServiceUnavailable("Ruta de manifiesto publicado no válida") from error
+        normalized_parts = PurePosixPath(normalized_path).parts
+        if len(normalized_parts) == 2 and normalized_parts[-1] == MARKER_NAME:
+            raise ServiceUnavailable("El manifiesto publicado expone el marcador interno")
+        entries.append(
+            {
+                "path": normalized_path,
+                "size": size,
+                "content_sha256": content_sha256,
+            }
+        )
+    if entries != sorted(
+        entries,
+        key=lambda item: (_path_key(item["path"]), item["path"]),
+    ):
+        raise ServiceUnavailable("Manifiesto publicado fuera de orden")
+    folded = [_path_key(item["path"]) for item in entries]
+    if len(set(folded)) != len(folded):
+        raise ServiceUnavailable("Manifiesto publicado contiene rutas equivalentes")
+    digest = value.get("digest")
+    if not _is_sha256(digest) or digest != _digest(entries):
+        raise ServiceUnavailable("Huella de manifiesto publicado no coincide")
+    return {
+        "schema": "series-published-manifest-v1",
+        "digest": digest,
+        "entries": entries,
+    }
+
+
 def _safe_error(error: BaseException) -> str:
     text = str(error).strip() or type(error).__name__
     text = re.sub(r"(?i)(token|password|secret|auth)\s*[:=]\s*\S+", r"\1=<REDACTED>", text)
@@ -1174,13 +1490,44 @@ class SeriesCoordinator:
             },
         )
 
-    def _existing_candidate(
+    def _request_identity(
         self,
         validated: ValidatedPayload,
         existing: dict[str, Any],
-    ) -> tuple[PreparedJob, bool, dict[str, Any]]:
-        if existing.get("schema") != "series-worker-request-v1":
+    ) -> tuple[ValidatedPayload, str, str, str, str]:
+        schema = existing.get("schema")
+        if schema not in {"series-worker-request-v1", "series-worker-request-v2"}:
             raise ServiceUnavailable("request.json durable no es válido")
+        stage = "prepared" if schema == "series-worker-request-v1" else existing.get("stage")
+        if stage not in {"reserved", "preparing", "prepared"}:
+            raise ServiceUnavailable("request.json durable no conserva una fase válida")
+        common_keys = {
+            "schema",
+            "payload",
+            "payload_digest",
+            "rules_fingerprint",
+            "generation",
+        }
+        if schema == "series-worker-request-v1":
+            required_keys = common_keys | {
+                "manifest_digest",
+                "request_digest",
+                "prepared_series_root",
+            }
+            allowed_keys = required_keys | {"atomic_preflight"}
+        elif stage == "prepared":
+            required_keys = common_keys | {
+                "stage",
+                "manifest_digest",
+                "request_digest",
+                "prepared_series_root",
+            }
+            allowed_keys = required_keys | {"atomic_preflight", "collision_plan"}
+        else:
+            required_keys = common_keys | {"stage"}
+            allowed_keys = required_keys | {"atomic_preflight"}
+        if not required_keys.issubset(existing) or not set(existing).issubset(allowed_keys):
+            raise ServiceUnavailable("request.json durable tiene una estructura inválida")
         stored_payload = existing.get("payload")
         if not isinstance(stored_payload, dict):
             raise ServiceUnavailable("request.json durable no conserva el payload")
@@ -1197,6 +1544,328 @@ class SeriesCoordinator:
             raise ServiceUnavailable("request.json durable no coincide con su payload")
         if validated.persisted() != persisted_payload:
             raise JobConflict("job_id ya está ligado a otro payload")
+        rules_fingerprint_value = existing.get("rules_fingerprint")
+        if not _is_sha256(rules_fingerprint_value):
+            raise ServiceUnavailable("request.json durable no conserva reglas válidas")
+        generation = existing.get("generation")
+        if not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None:
+            raise ServiceUnavailable("El job durable no tiene una generación válida")
+        return (
+            persisted_validated,
+            payload_digest,
+            rules_fingerprint_value,
+            generation,
+            stage,
+        )
+
+    def _new_reservation(
+        self,
+        validated: ValidatedPayload,
+    ) -> tuple[ReservedJob, dict[str, Any]]:
+        if self.rules_store is None:
+            raise ServiceUnavailable("Las reglas de series no son válidas")
+        rules_snapshot = self.rules_store.snapshot()
+        persisted_payload = validated.persisted()
+        payload_digest = _digest(persisted_payload)
+        generation = uuid.uuid4().hex
+        journal = DurableJournal(validated.reports_root / validated.job_id)
+        if journal.snapshot() is not None or _read_json(journal.job_dir / RESULT_FILE) is not None:
+            raise ServiceUnavailable("Job durable sin request.json commit marker")
+        record = {
+            "schema": "series-worker-request-v2",
+            "stage": "reserved",
+            "payload": persisted_payload,
+            "payload_digest": payload_digest,
+            "rules_fingerprint": rules_snapshot.fingerprint,
+            "generation": generation,
+        }
+        journal.write_json_atomic(
+            RULES_SNAPSHOT_FILE,
+            {
+                "rules": rules_snapshot.rules,
+                "fingerprint": rules_snapshot.fingerprint,
+            },
+        )
+        journal.write_json_atomic(REQUEST_FILE, record)
+        return (
+            ReservedJob(
+                payload=validated,
+                rules_snapshot=rules_snapshot,
+                payload_digest=payload_digest,
+                generation=generation,
+                journal=journal,
+            ),
+            record,
+        )
+
+    def _reservation_from_record(
+        self,
+        validated: ValidatedPayload,
+        existing: dict[str, Any],
+    ) -> tuple[ReservedJob, dict[str, Any]]:
+        (
+            persisted_validated,
+            payload_digest,
+            rules_fingerprint_value,
+            generation,
+            stage,
+        ) = self._request_identity(validated, existing)
+        if existing.get("schema") != "series-worker-request-v2" or stage == "prepared":
+            raise ServiceUnavailable("El job durable ya no es una reserva")
+        rules_payload = _read_json(
+            persisted_validated.reports_root
+            / persisted_validated.job_id
+            / RULES_SNAPSHOT_FILE
+        )
+        if rules_payload is None:
+            raise ServiceUnavailable("Reserva durable sin snapshot de reglas")
+        rules_snapshot = _rules_from_dict(rules_payload)
+        if rules_snapshot.fingerprint != rules_fingerprint_value:
+            raise ServiceUnavailable("Reserva durable contradice sus reglas")
+        return (
+            ReservedJob(
+                payload=persisted_validated,
+                rules_snapshot=rules_snapshot,
+                payload_digest=payload_digest,
+                generation=generation,
+                journal=DurableJournal(
+                    persisted_validated.reports_root / persisted_validated.job_id
+                ),
+            ),
+            existing,
+        )
+
+    def _prepare_reserved(
+        self,
+        reserved: ReservedJob,
+        request_record: dict[str, Any],
+    ) -> PreparedJob:
+        current = _read_json(reserved.journal.job_dir / REQUEST_FILE)
+        if current is None:
+            raise ServiceUnavailable("La reserva durable desapareció")
+        _, current = self._reservation_from_record(reserved.payload, current)
+        stage = str(current["stage"])
+        trust_existing_manifest = stage == "preparing"
+        if stage == "reserved":
+            current = {**current, "stage": "preparing"}
+            reserved.journal.write_json_atomic(REQUEST_FILE, current)
+        persisted_manifest = (
+            _read_json(reserved.journal.job_dir / MANIFEST_FILE)
+            if trust_existing_manifest
+            else None
+        )
+        if persisted_manifest is None:
+            try:
+                manifest = discover_manifest(
+                    reserved.payload.source_root,
+                    reserved.rules_snapshot,
+                )
+            except ManifestError as error:
+                raise RequestValidationError(_safe_error(error)) from error
+            reserved.journal.write_json_atomic(MANIFEST_FILE, manifest.to_dict())
+        else:
+            manifest = _manifest_from_dict(persisted_manifest)
+        collision = plan_collisions(reserved.payload, manifest)
+        request_digest = _digest(
+            {
+                "payload_digest": reserved.payload_digest,
+                "manifest_digest": manifest.digest,
+                "rules_fingerprint": reserved.rules_snapshot.fingerprint,
+            }
+        )
+        prepared_root = None
+        if manifest.ready and manifest.series_name:
+            prepared_root = _prepared_root(
+                reserved.payload.final_root,
+                collision.final_series_root.name
+                if collision.final_series_root is not None
+                else manifest.series_name,
+                reserved.payload.job_id,
+                reserved.generation,
+            )
+        prepared = PreparedJob(
+            payload=reserved.payload,
+            manifest=manifest,
+            rules_snapshot=reserved.rules_snapshot,
+            payload_digest=reserved.payload_digest,
+            request_digest=request_digest,
+            journal=reserved.journal,
+            collision=collision,
+            generation=reserved.generation,
+            prepared_series_root=prepared_root,
+        )
+        prepared_record = {
+            **current,
+            "stage": "prepared",
+            "manifest_digest": manifest.digest,
+            "request_digest": request_digest,
+            "prepared_series_root": str(prepared_root) if prepared_root else "",
+            "collision_plan": _collision_to_dict(collision),
+        }
+        reserved.journal.write_json_atomic(REQUEST_FILE, prepared_record)
+        self._transition_prepared(prepared)
+        return prepared
+
+    def _operational_preflight(self, final_root: Path) -> dict[str, Any]:
+        try:
+            missing = self.tool_checker()
+        except Exception as error:
+            raise ServiceUnavailable("No se pudieron validar las herramientas") from error
+        if missing:
+            raise ServiceUnavailable("Faltan herramientas: " + ", ".join(missing))
+        try:
+            atomic_result = self.atomic_preflight(final_root)
+            current_device = int(final_root.stat().st_dev)
+            if (
+                not isinstance(atomic_result, dict)
+                or atomic_result.get("supported") is not True
+                or int(atomic_result.get("st_dev", -1)) != current_device
+            ):
+                raise AtomicDeliveryUnsupported(
+                    "El preflight no verificó el dispositivo actual"
+                )
+        except Exception as error:
+            with self._health_atomicity_lock:
+                self._health_atomicity_cache = None
+            raise ServiceUnavailable(
+                "Publicación atómica no disponible: " + _safe_error(error)
+            ) from error
+        with self._health_atomicity_lock:
+            self._health_atomicity_cache = dict(atomic_result)
+        return dict(atomic_result)
+
+    def _preflight_prepared(
+        self,
+        prepared: PreparedJob,
+        atomic_result: dict[str, Any] | None = None,
+    ) -> None:
+        if atomic_result is None:
+            atomic_result = self._operational_preflight(prepared.payload.final_root)
+        current_device = int(prepared.payload.final_root.stat().st_dev)
+        if int(atomic_result.get("st_dev", -1)) != current_device:
+            raise ServiceUnavailable("El preflight no pertenece al dispositivo actual")
+        request_record = _read_json(prepared.journal.job_dir / REQUEST_FILE)
+        if request_record is None:
+            raise ServiceUnavailable("request.json durable desapareció durante preflight")
+        prepared.journal.write_json_atomic(
+            REQUEST_FILE,
+            {**request_record, "atomic_preflight": atomic_result},
+        )
+
+    def _preparation_failure_job(
+        self,
+        validated: ValidatedPayload,
+        request_record: dict[str, Any],
+        error: BaseException,
+    ) -> PreparedJob:
+        (
+            persisted,
+            payload_digest,
+            rules_fingerprint_value,
+            generation,
+            _stage,
+        ) = self._request_identity(validated, request_record)
+        reason = "preparacion_fallida:" + _safe_error(error)
+        reasons = (reason,)
+        manifest = SeriesManifest(
+            status="review",
+            digest=_digest({"entries": [], "review_reasons": sorted(reasons)}),
+            entries=(),
+            series_name=None,
+            series_key=None,
+            review_reasons=reasons,
+        )
+        rules_snapshot_payload = _read_json(
+            persisted.reports_root / persisted.job_id / RULES_SNAPSHOT_FILE
+        )
+        try:
+            rules_snapshot = (
+                _rules_from_dict(rules_snapshot_payload)
+                if rules_snapshot_payload is not None
+                else None
+            )
+        except ServiceUnavailable:
+            rules_snapshot = None
+        if rules_snapshot is None or rules_snapshot.fingerprint != rules_fingerprint_value:
+            rules_snapshot = RulesSnapshot(
+                rules={},
+                fingerprint=rules_fingerprint_value,
+            )
+        request_digest = _digest(
+            {
+                "payload_digest": payload_digest,
+                "manifest_digest": manifest.digest,
+                "rules_fingerprint": rules_snapshot.fingerprint,
+            }
+        )
+        journal = DurableJournal(persisted.reports_root / persisted.job_id)
+        prepared = PreparedJob(
+            payload=persisted,
+            manifest=manifest,
+            rules_snapshot=rules_snapshot,
+            payload_digest=payload_digest,
+            request_digest=request_digest,
+            journal=journal,
+            collision=CollisionPlan(None, (), (), ()),
+            generation=generation,
+            prepared_series_root=None,
+        )
+        journal.write_json_atomic(MANIFEST_FILE, manifest.to_dict())
+        journal.write_json_atomic(
+            REQUEST_FILE,
+            {
+                "schema": "series-worker-request-v2",
+                "stage": "prepared",
+                "payload": persisted.persisted(),
+                "payload_digest": payload_digest,
+                "rules_fingerprint": rules_snapshot.fingerprint,
+                "generation": generation,
+                "manifest_digest": manifest.digest,
+                "request_digest": request_digest,
+                "prepared_series_root": "",
+                "collision_plan": _collision_to_dict(prepared.collision),
+            },
+        )
+        self._transition_prepared(prepared)
+        return prepared
+
+    def _finish_preparation_failure(
+        self,
+        prepared: PreparedJob,
+        error: BaseException,
+    ) -> dict[str, Any]:
+        reasons = ("preparacion_fallida:" + _safe_error(error),)
+        try:
+            result = _review_pack(prepared, reasons)
+        except Exception as review_error:
+            result = self._failed_result(prepared, review_error)
+        result = self._finish_without_publish(prepared, result)
+        _emit_callback(
+            prepared,
+            "series_review",
+            "finished" if result["status"] == "review" else "error",
+            (
+                "Preparación fallida; pack enviado a revisión"
+                if result["status"] == "review"
+                else "Falló la revisión tras preparar el job"
+            ),
+        )
+        return result
+
+    def _existing_candidate(
+        self,
+        validated: ValidatedPayload,
+        existing: dict[str, Any],
+    ) -> tuple[PreparedJob, bool, dict[str, Any]]:
+        (
+            persisted_validated,
+            payload_digest,
+            rules_fingerprint_value,
+            generation,
+            stage,
+        ) = self._request_identity(validated, existing)
+        if stage != "prepared":
+            raise ServiceUnavailable("El job durable todavía no está preparado")
 
         job_dir = persisted_validated.reports_root / persisted_validated.job_id
         journal = DurableJournal(job_dir)
@@ -1219,10 +1888,18 @@ class SeriesCoordinator:
             or existing.get("request_digest") != request_digest
         ):
             raise ServiceUnavailable("request.json durable contradice sus snapshots")
-        generation = existing.get("generation")
-        if not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None:
-            raise ServiceUnavailable("El job durable no tiene una generación válida")
-        collision = plan_collisions(persisted_validated, manifest)
+        if rules_snapshot.fingerprint != rules_fingerprint_value:
+            raise ServiceUnavailable("request.json durable contradice sus reglas")
+        persisted_collision = existing.get("collision_plan")
+        collision = (
+            _collision_from_dict(
+                persisted_collision,
+                persisted_validated,
+                manifest,
+            )
+            if persisted_collision is not None
+            else plan_collisions(persisted_validated, manifest)
+        )
         prepared_value = existing.get("prepared_series_root")
         if not isinstance(prepared_value, str):
             raise ServiceUnavailable("request.json durable no conserva el staging")
@@ -1365,10 +2042,16 @@ class SeriesCoordinator:
             )
         journal.transition("PREPARED", **details)
 
-    def _terminal(self, prepared: PreparedJob) -> dict[str, Any] | None:
-        result = _read_json(prepared.journal.job_dir / RESULT_FILE)
+    def _terminal_from_job(
+        self,
+        journal: DurableJournal,
+        job_id: str,
+        *,
+        prepared: PreparedJob | None = None,
+    ) -> dict[str, Any] | None:
+        result = _read_json(journal.job_dir / RESULT_FILE)
         try:
-            snapshot = prepared.journal.snapshot()
+            snapshot = journal.snapshot()
         except JournalContradiction as error:
             raise ServiceUnavailable("Journal durable contradictorio") from error
         if snapshot is not None and snapshot["state"] == "ROLLED_BACK":
@@ -1376,7 +2059,7 @@ class SeriesCoordinator:
             if journal_result is not None and not isinstance(journal_result, dict):
                 raise ServiceUnavailable("Resultado terminal inválido en el journal")
             if result is None and isinstance(journal_result, dict):
-                self._write_result(prepared, journal_result)
+                journal.write_json_atomic(RESULT_FILE, journal_result)
                 result = journal_result
             elif result is not None and journal_result is not None and result != journal_result:
                 raise ServiceUnavailable("Resultado y journal durable se contradicen")
@@ -1390,6 +2073,8 @@ class SeriesCoordinator:
         }.get(status)
         if expected_state is None:
             raise ServiceUnavailable("series_result.json tiene un estado inválido")
+        if result.get("job_id") != job_id or result.get("kind") != "series":
+            raise ServiceUnavailable("series_result.json no pertenece al job")
         if snapshot is None:
             raise ServiceUnavailable("Resultado terminal sin journal durable")
         if snapshot["state"] != expected_state:
@@ -1400,83 +2085,143 @@ class SeriesCoordinator:
             (result.get("delivery") or {}).get("cleanup_pending")
         ):
             return None
+        if status == "done":
+            published_manifest = result.get("published_manifest")
+            if published_manifest is None:
+                if prepared is None:
+                    return None
+                result = {**result, "published_manifest": _published_manifest(prepared)}
+                snapshot = journal.transition(
+                    "COMMITTED",
+                    published_manifest_digest=result["published_manifest"]["digest"],
+                    published_manifest_entries=len(
+                        result["published_manifest"]["entries"]
+                    ),
+                )
+                journal.write_json_atomic(RESULT_FILE, result)
+            else:
+                normalized_manifest = _validate_published_manifest(published_manifest)
+                if normalized_manifest != published_manifest:
+                    raise ServiceUnavailable("Manifiesto publicado no canónico")
+                details = snapshot["details"]
+                bound_digest = details.get("published_manifest_digest")
+                bound_entries = details.get("published_manifest_entries")
+                if bound_digest is None and bound_entries is None:
+                    if prepared is None:
+                        return None
+                    snapshot = journal.transition(
+                        "COMMITTED",
+                        published_manifest_digest=normalized_manifest["digest"],
+                        published_manifest_entries=len(normalized_manifest["entries"]),
+                    )
+                elif (
+                    bound_digest != normalized_manifest["digest"]
+                    or bound_entries != len(normalized_manifest["entries"])
+                ):
+                    raise ServiceUnavailable(
+                        "Manifiesto publicado contradice el journal durable"
+                    )
+            published = result.get("published")
+            if (
+                not isinstance(published, list)
+                or any(
+                    not isinstance(path, str)
+                    or not path.casefold().endswith(".mkv")
+                    for path in published
+                )
+            ):
+                raise ServiceUnavailable("Lista de MKV publicados no válida")
+            manifested = {
+                item["path"] for item in result["published_manifest"]["entries"]
+            }
+            if not set(published).issubset(manifested):
+                raise ServiceUnavailable("Los MKV del pack no están en el manifiesto final")
         return result
+
+    def _terminal(self, prepared: PreparedJob) -> dict[str, Any] | None:
+        return self._terminal_from_job(
+            prepared.journal,
+            prepared.payload.job_id,
+            prepared=prepared,
+        )
+
+    def _committed_recovery_only(
+        self,
+        journal: DurableJournal,
+    ) -> bool:
+        try:
+            snapshot = journal.snapshot()
+        except JournalContradiction as error:
+            raise ServiceUnavailable("Journal durable contradictorio") from error
+        return snapshot is not None and snapshot["state"] == "COMMITTED"
 
     def submit(self, raw_payload: Any) -> Submission:
         replay_validated = _validated_payload(raw_payload, require_directories=False)
         with self._mutex:
-            if self._active is not None and self._active["job_id"] != replay_validated.job_id:
-                raise SeriesWorkerBusy("Otro job de series está activo")
+            operational_preflight: dict[str, Any] | None = None
+            committed_recovery_only = False
+            incoming_payload_digest = _digest(replay_validated.persisted())
+            if self._active is not None:
+                if self._active["job_id"] != replay_validated.job_id:
+                    raise SeriesWorkerBusy("Otro job de series está activo")
+                if self._active["payload_digest"] != incoming_payload_digest:
+                    raise JobConflict("job_id activo con otro payload")
+                return Submission(202, self._active_response(self._active))
             job_dir = replay_validated.reports_root / replay_validated.job_id
             existing_record = _read_json(job_dir / REQUEST_FILE)
             if existing_record is not None:
-                prepared, existed, request_record = self._existing_candidate(
+                (
+                    validated,
+                    payload_digest,
+                    rules_fingerprint_value,
+                    _generation,
+                    _stage,
+                ) = self._request_identity(
                     replay_validated,
                     existing_record,
                 )
-                validated = prepared.payload
+                journal = DurableJournal(job_dir)
+                terminal = self._terminal_from_job(journal, validated.job_id)
+                if terminal is not None:
+                    return Submission(
+                        200,
+                        self._terminal_response(validated.job_id, terminal),
+                    )
+                committed_recovery_only = self._committed_recovery_only(journal)
+                existed = True
             else:
                 validated = validate_payload(raw_payload)
-                prepared, existed, request_record = self._candidate(validated)
-            if self._active is not None:
-                if self._active["request_digest"] != prepared.request_digest:
-                    raise JobConflict("job_id activo con otro payload")
-                return Submission(202, self._active_response(prepared))
-            terminal = self._terminal(prepared)
-            if terminal is not None:
-                return Submission(200, self._terminal_response(prepared, terminal))
-
-            lock_context: ContextManager[Any] = nullcontext({"enabled": False})
-            needs_processing = (
-                prepared.journal.state in {None, "PREPARED", "PROCESSING"}
-                and not prepared.collision.review_reasons
-            )
-            if needs_processing:
-                try:
-                    missing = self.tool_checker()
-                except Exception as error:
-                    raise ServiceUnavailable("No se pudieron validar las herramientas") from error
-                if missing:
-                    raise ServiceUnavailable("Faltan herramientas: " + ", ".join(missing))
-                try:
-                    atomic_result = self.atomic_preflight(validated.final_root)
-                    current_device = int(validated.final_root.stat().st_dev)
-                    if int(atomic_result.get("st_dev", -1)) != current_device:
-                        raise AtomicDeliveryUnsupported(
-                            "El preflight no verificó el dispositivo actual"
-                        )
-                except Exception as error:
-                    with self._health_atomicity_lock:
-                        self._health_atomicity_cache = None
-                    raise ServiceUnavailable(
-                        "Publicación atómica no disponible: " + _safe_error(error)
-                    ) from error
-                with self._health_atomicity_lock:
-                    self._health_atomicity_cache = dict(atomic_result)
-                lock_context = self.lock_factory(
-                    self.lock_path,
-                    timeout_sec=0,
+                operational_preflight = self._operational_preflight(
+                    validated.final_root
                 )
-                try:
-                    lock_context.__enter__()
-                except HeavyLockTimeout as error:
-                    raise SeriesWorkerBusy("El motor audiovisual compartido está ocupado") from error
+                reserved, existing_record = self._new_reservation(validated)
+                payload_digest = reserved.payload_digest
+                rules_fingerprint_value = reserved.rules_snapshot.fingerprint
+                existed = False
+            if existing_record is not None and existed and not committed_recovery_only:
+                operational_preflight = self._operational_preflight(
+                    validated.final_root
+                )
+            lock_context = self.lock_factory(
+                self.lock_path,
+                timeout_sec=0,
+            )
             try:
-                if not existed:
-                    if needs_processing:
-                        request_record["atomic_preflight"] = atomic_result
-                    self._persist_prepared(prepared, request_record)
-                elif prepared.journal.state is None:
-                    self._transition_prepared(prepared)
-                self._active = {
+                lock_context.__enter__()
+            except HeavyLockTimeout as error:
+                raise SeriesWorkerBusy("El motor audiovisual compartido está ocupado") from error
+            try:
+                active_record = {
                     "job_id": validated.job_id,
-                    "request_digest": prepared.request_digest,
-                    "rules_fingerprint": prepared.rules_snapshot.fingerprint,
+                    "payload_digest": payload_digest,
+                    "rules_fingerprint": rules_fingerprint_value,
                     "started_at": time.time(),
                 }
+                self._last_errors.pop(validated.job_id, None)
+                self._active = active_record
                 thread = threading.Thread(
                     target=self._background,
-                    args=(prepared, lock_context, needs_processing),
+                    args=(validated, lock_context, operational_preflight),
                     name=f"series-worker-{validated.job_id}",
                     daemon=True,
                 )
@@ -1485,66 +2230,161 @@ class SeriesCoordinator:
             except Exception:
                 self._active = None
                 self._threads.pop(validated.job_id, None)
-                if needs_processing:
-                    lock_context.__exit__(None, None, None)
+                lock_context.__exit__(None, None, None)
                 raise
             response = (
-                self._active_response(prepared)
+                self._active_response(active_record)
                 if existed
-                else self._accepted_response(prepared)
+                else self._accepted_response(active_record)
             )
             return Submission(202, response)
 
-    def _accepted_response(self, prepared: PreparedJob) -> dict[str, Any]:
+    def _accepted_response(self, active: dict[str, Any]) -> dict[str, Any]:
         return {
             "ok": True,
             "status": "accepted",
-            "job_id": prepared.payload.job_id,
+            "job_id": active["job_id"],
             "kind": "series",
-            "rules_fingerprint": prepared.rules_snapshot.fingerprint,
+            "rules_fingerprint": active["rules_fingerprint"],
+            "started_at": active["started_at"],
         }
 
-    def _active_response(self, prepared: PreparedJob) -> dict[str, Any]:
+    def _active_response(self, active: dict[str, Any]) -> dict[str, Any]:
         return {
             "ok": True,
             "status": "active",
-            "job_id": prepared.payload.job_id,
+            "job_id": active["job_id"],
             "kind": "series",
-            "rules_fingerprint": prepared.rules_snapshot.fingerprint,
+            "rules_fingerprint": active["rules_fingerprint"],
+            "started_at": active["started_at"],
         }
 
     def _terminal_response(
-        self, prepared: PreparedJob, result: dict[str, Any]
+        self, job_id: str, result: dict[str, Any]
     ) -> dict[str, Any]:
         return {
             "ok": True,
             "status": "terminal",
-            "job_id": prepared.payload.job_id,
+            "job_id": job_id,
             "kind": "series",
             "result": result,
         }
 
     def _background(
         self,
-        prepared: PreparedJob,
+        validated: ValidatedPayload,
         lock_context: ContextManager[Any],
-        lock_entered: bool,
+        operational_preflight: dict[str, Any] | None,
     ) -> None:
+        gate_entered = True
+        processing_context: ContextManager[Any] | None = None
+        processing_lock_entered = False
+
+        def release_gate() -> None:
+            nonlocal gate_entered
+            if not gate_entered:
+                return
+            lock_context.__exit__(None, None, None)
+            gate_entered = False
+
+        def release_heavy_lock() -> None:
+            nonlocal processing_lock_entered
+            if not processing_lock_entered or processing_context is None:
+                return
+            processing_context.__exit__(None, None, None)
+            processing_lock_entered = False
+
+        def acquire_heavy_lock() -> None:
+            nonlocal processing_context, processing_lock_entered
+            if processing_lock_entered:
+                return
+            processing_context = self.lock_factory(
+                self.lock_path,
+                timeout_sec=0,
+            )
+            try:
+                processing_context.__enter__()
+            except HeavyLockTimeout as error:
+                processing_context = None
+                raise SeriesWorkerBusy(
+                    "El motor audiovisual compartido está ocupado"
+                ) from error
+            processing_lock_entered = True
+
         try:
-            self._run_job(prepared)
+            # El primer flock es solo un gate no bloqueante: evita aceptar y
+            # hashear mientras otro worker ya procesa, pero no monopoliza el
+            # motor audiovisual durante manifest, hardlinks o SHA finales.
+            release_gate()
+            request_record = _read_json(
+                validated.reports_root / validated.job_id / REQUEST_FILE
+            )
+            if request_record is None:
+                raise ServiceUnavailable("La reserva durable desapareció")
+            _persisted, _digest_value, _fingerprint, _generation, stage = (
+                self._request_identity(validated, request_record)
+            )
+            try:
+                if (
+                    request_record.get("schema") == "series-worker-request-v2"
+                    and stage in {"reserved", "preparing"}
+                ):
+                    reserved, request_record = self._reservation_from_record(
+                        validated,
+                        request_record,
+                    )
+                    prepared = self._prepare_reserved(reserved, request_record)
+                else:
+                    prepared, _existed, _request_record = self._existing_candidate(
+                        validated,
+                        request_record,
+                    )
+                    if prepared.journal.state is None:
+                        self._transition_prepared(prepared)
+            except Exception as preparation_error:
+                prepared = self._preparation_failure_job(
+                    validated,
+                    request_record,
+                    preparation_error,
+                )
+                self._finish_preparation_failure(prepared, preparation_error)
+                return
+
+            state = prepared.journal.state
+            ready_for_work = (
+                not prepared.manifest.review_reasons
+                and not prepared.collision.review_reasons
+                and state in {"PREPARED", "PROCESSING"}
+            )
+            if ready_for_work:
+                self._preflight_prepared(prepared, operational_preflight)
+            self._run_job(
+                prepared,
+                acquire_heavy_lock=acquire_heavy_lock,
+                release_heavy_lock=release_heavy_lock,
+            )
+        except SeriesWorkerBusy:
+            # PREPARED ya es durable; el siguiente POST/poll reintenta sin
+            # redescubrir ni rehashear el manifiesto.
+            pass
         except Exception as error:
             with self._mutex:
-                self._last_errors[prepared.payload.job_id] = _safe_error(error)
+                self._last_errors[validated.job_id] = _safe_error(error)
         finally:
-            if lock_entered:
+            if processing_lock_entered:
                 try:
-                    lock_context.__exit__(None, None, None)
+                    release_heavy_lock()
+                except Exception:
+                    pass
+            if gate_entered:
+                try:
+                    release_gate()
                 except Exception:
                     pass
             with self._mutex:
-                if self._active and self._active["job_id"] == prepared.payload.job_id:
+                if self._active and self._active["job_id"] == validated.job_id:
                     self._active = None
-                self._threads.pop(prepared.payload.job_id, None)
+                self._threads.pop(validated.job_id, None)
 
     def _write_result(self, prepared: PreparedJob, result: dict[str, Any]) -> None:
         prepared.journal.write_json_atomic(RESULT_FILE, result)
@@ -1601,9 +2441,22 @@ class SeriesCoordinator:
         *,
         recovered: bool,
     ) -> dict[str, Any]:
-        published = [entry.target_relpath for entry in prepared.manifest.entries]
-        satisfied = [entry.target_relpath for entry in prepared.collision.satisfied]
         final_root = prepared.collision.final_series_root
+        if final_root is None:
+            raise SeriesWorkerError("La publicación terminal no conserva raíz de serie")
+
+        def final_relpath(entry: ManifestEntry) -> str:
+            parts = PurePosixPath(entry.target_relpath).parts
+            return PurePosixPath(final_root.name, *parts[1:]).as_posix()
+
+        published = [final_relpath(entry) for entry in prepared.manifest.entries]
+        satisfied = [final_relpath(entry) for entry in prepared.collision.satisfied]
+        published_manifest = _published_manifest(prepared)
+        prepared.journal.transition(
+            "COMMITTED",
+            published_manifest_digest=published_manifest["digest"],
+            published_manifest_entries=len(published_manifest["entries"]),
+        )
         return {
             "status": "done",
             "job_id": prepared.payload.job_id,
@@ -1611,6 +2464,7 @@ class SeriesCoordinator:
             "rules_fingerprint": prepared.rules_snapshot.fingerprint,
             "manifest": prepared.manifest.to_dict(),
             "published": published,
+            "published_manifest": published_manifest,
             "satisfied": satisfied,
             "series_root": final_root.name if final_root else prepared.manifest.series_name,
             "review_path": "",
@@ -1661,7 +2515,13 @@ class SeriesCoordinator:
         self._write_result(prepared, result)
         return result
 
-    def _run_job(self, prepared: PreparedJob) -> dict[str, Any]:
+    def _run_job(
+        self,
+        prepared: PreparedJob,
+        *,
+        acquire_heavy_lock: Callable[[], None] = lambda: None,
+        release_heavy_lock: Callable[[], None] = lambda: None,
+    ) -> dict[str, Any]:
         existing = self._terminal(prepared)
         if existing is not None:
             return existing
@@ -1684,6 +2544,7 @@ class SeriesCoordinator:
                     (*prepared.manifest.review_reasons, *prepared.collision.review_reasons)
                 )
             )
+            release_heavy_lock()
             try:
                 result = _review_pack(prepared, reasons)
             except Exception as error:
@@ -1715,6 +2576,7 @@ class SeriesCoordinator:
                     series_key=prepared.manifest.series_key,
                     review_reasons=(),
                 )
+                acquire_heavy_lock()
                 processing = self.processor_factory().process(
                     manifest=subset,
                     source_root=prepared.payload.source_root,
@@ -1723,6 +2585,7 @@ class SeriesCoordinator:
                 )
                 if len(processing.episodes) != len(prepared.collision.pending):
                     raise SeriesWorkerError("No se verificaron todos los episodios pendientes")
+                release_heavy_lock()
             latest_collision = plan_collisions(prepared.payload, prepared.manifest)
             expected_pending = {entry.source_relpath for entry in prepared.collision.pending}
             expected_satisfied = {
@@ -1746,6 +2609,7 @@ class SeriesCoordinator:
                         )
                     )
                 )
+                release_heavy_lock()
                 result = _review_pack(prepared, reasons)
                 self._finish_without_publish(prepared, result)
                 _emit_callback(
@@ -1756,6 +2620,10 @@ class SeriesCoordinator:
                 )
                 return result
             expected_files = _copy_provisional_to_prepared(prepared, processing)
+            allowed_existing_files = _allowed_existing_publication_files(
+                prepared,
+                expected_files,
+            )
             if prepared.prepared_series_root is None or prepared.collision.final_series_root is None:
                 raise SeriesWorkerError("Faltan rutas de publicación")
             delivery_result = self.publisher(
@@ -1764,6 +2632,7 @@ class SeriesCoordinator:
                 prepared.collision.final_series_root,
                 prepared.journal,
                 expected_files=expected_files,
+                allowed_existing_files=allowed_existing_files,
             )
             if delivery_result.get("status") != "committed":
                 raise DeliveryError("La publicación no terminó COMMITTED")
@@ -1771,6 +2640,8 @@ class SeriesCoordinator:
             self._write_result(prepared, result)
             _emit_callback(prepared, "series", "finished", "Serie publicada")
             return result
+        except SeriesWorkerBusy:
+            raise
         except Exception as error:
             state = prepared.journal.state
             if state in {"COMMITTING", "COMMITTED"}:
@@ -1782,6 +2653,7 @@ class SeriesCoordinator:
                 )
                 raise
             if _caused_by(error, ReviewRequiredError):
+                release_heavy_lock()
                 try:
                     result = _review_pack(
                         prepared,
@@ -1797,15 +2669,31 @@ class SeriesCoordinator:
                     "Procesamiento enviado a revisión",
                 )
                 return result
-            result = self._failed_result(prepared, error)
+            release_heavy_lock()
+            try:
+                result = _review_pack(
+                    prepared,
+                    ("procesamiento_fallido:" + _safe_error(error),),
+                )
+            except Exception as review_error:
+                result = self._failed_result(prepared, review_error)
             self._finish_without_publish(prepared, result)
-            _emit_callback(prepared, "series", "error", "Procesado de serie fallido")
+            _emit_callback(
+                prepared,
+                "series_review",
+                "finished" if result["status"] == "review" else "error",
+                (
+                    "Procesamiento fallido; pack enviado a revisión"
+                    if result["status"] == "review"
+                    else "Falló la revisión tras el error de procesamiento"
+                ),
+            )
             return result
 
     def status(self, job_id: str) -> Submission:
         if not JOB_ID_RE.fullmatch(str(job_id or "")):
             raise RequestValidationError("job_id no es válido")
-        reports_root = _configured_path("SERIES_WORKER_REPORT_ROOT", DEFAULT_REPORT_ROOT)
+        reports_root = _configured_reports_root()
         job_dir = reports_root / job_id
         with self._mutex:
             if self._active is not None and self._active["job_id"] == job_id:
@@ -1822,48 +2710,52 @@ class SeriesCoordinator:
                 )
         journal = DurableJournal(job_dir)
         request_record = _read_json(job_dir / REQUEST_FILE)
-        prepared: PreparedJob | None = None
-        if request_record is not None:
-            stored_payload = request_record.get("payload")
-            if not isinstance(stored_payload, dict):
-                raise ServiceUnavailable("request.json durable no conserva el payload")
+        if request_record is None:
+            if _read_json(job_dir / RESULT_FILE) is not None:
+                raise ServiceUnavailable("Resultado terminal sin request.json durable")
             try:
-                replay_validated = _validated_payload(
-                    stored_payload,
-                    require_directories=False,
-                )
-            except RequestValidationError as error:
-                raise ServiceUnavailable("request.json durable contiene rutas no válidas") from error
-            prepared, _, _ = self._existing_candidate(replay_validated, request_record)
-            terminal = self._terminal(prepared)
-            if terminal is not None:
-                return Submission(200, self._terminal_response(prepared, terminal))
+                orphan_snapshot = journal.snapshot()
+            except JournalContradiction as error:
+                raise ServiceUnavailable("Journal durable contradictorio") from error
+            if orphan_snapshot is not None:
+                raise ServiceUnavailable("Journal durable sin request.json")
+            return Submission(
+                404,
+                {
+                    "ok": False,
+                    "status": "not_found",
+                    "error": "series_job_not_found",
+                    "retryable": False,
+                    "job_id": job_id,
+                    "kind": "series",
+                },
+            )
+        stored_payload = request_record.get("payload")
+        if not isinstance(stored_payload, dict):
+            raise ServiceUnavailable("request.json durable no conserva el payload")
+        try:
+            replay_validated = _validated_payload(
+                stored_payload,
+                require_directories=False,
+            )
+        except RequestValidationError as error:
+            raise ServiceUnavailable("request.json durable contiene rutas no válidas") from error
+        _persisted, _payload_digest, _fingerprint, _generation, stage = (
+            self._request_identity(replay_validated, request_record)
+        )
+        terminal = self._terminal_from_job(journal, job_id)
+        if terminal is not None:
+            return Submission(200, self._terminal_response(job_id, terminal))
         try:
             snapshot = journal.snapshot()
         except JournalContradiction as error:
             raise ServiceUnavailable("Journal durable contradictorio") from error
-        if (
-            prepared is not None
-            and snapshot is not None
+        stored_result = _read_json(job_dir / RESULT_FILE)
+        delivery_recoverable = (
+            snapshot is not None
             and snapshot["state"] in {"VERIFIED", "COMMITTING", "COMMITTED"}
-        ):
-            try:
-                self._resume_delivery(prepared)
-            except Exception as error:
-                with self._mutex:
-                    self._last_errors[job_id] = _safe_error(error)
-            terminal = self._terminal(prepared)
-            if terminal is not None:
-                return Submission(200, self._terminal_response(prepared, terminal))
-            snapshot = journal.snapshot()
-        elif prepared is None and _read_json(job_dir / RESULT_FILE) is not None:
-            raise ServiceUnavailable("Resultado terminal sin request.json durable")
-        if (
-            prepared is not None
-            and snapshot is not None
-            and snapshot["state"] in {"PREPARED", "PROCESSING"}
-            and _read_json(job_dir / RESULT_FILE) is None
-        ):
+        )
+        if stored_result is None or delivery_recoverable:
             try:
                 resumed = self.submit(stored_payload)
             except SeriesWorkerBusy:
@@ -1872,30 +2764,20 @@ class SeriesCoordinator:
                 with self._mutex:
                     self._last_errors[job_id] = _safe_error(error)
             else:
-                if resumed.http_status == 202:
+                if resumed.http_status in {200, 202}:
+                    with self._mutex:
+                        self._last_errors.pop(job_id, None)
                     return resumed
-        if snapshot is not None:
-            return Submission(
-                202,
-                {
-                    "ok": True,
-                    "status": "recoverable",
-                    "job_id": job_id,
-                    "kind": "series",
-                    "journal_state": snapshot["state"],
-                    "retryable": True,
-                    "last_error": self._last_errors.get(job_id, ""),
-                },
-            )
         return Submission(
-            404,
+            202,
             {
-                "ok": False,
-                "status": "not_found",
-                "error": "series_job_not_found",
-                "retryable": False,
+                "ok": True,
+                "status": "recoverable",
                 "job_id": job_id,
                 "kind": "series",
+                "journal_state": snapshot["state"] if snapshot is not None else stage.upper(),
+                "retryable": True,
+                "last_error": self._last_errors.get(job_id, ""),
             },
         )
 

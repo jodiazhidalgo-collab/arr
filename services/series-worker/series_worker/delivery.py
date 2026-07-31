@@ -23,7 +23,7 @@ import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Mapping
 
 from .journal import DurableJournal, JournalContradiction, fsync_directory
 from .journal import write_json_file_atomic
@@ -218,7 +218,20 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
         return
     if os.name == "nt":
         # MoveFile en Windows falla si el destino existe; no reemplaza.
-        os.rename(source, destination)
+        try:
+            os.rename(source, destination)
+        except OSError as error:
+            if (
+                source.exists()
+                and destination.exists()
+                and error.errno in {errno.EACCES, errno.EEXIST, errno.EPERM}
+            ):
+                raise FileExistsError(
+                    errno.EEXIST,
+                    os.strerror(errno.EEXIST),
+                    str(destination),
+                ) from error
+            raise
         return
     raise OSError(errno.ENOSYS, "No hay rename atomico NOREPLACE seguro")
 
@@ -292,6 +305,36 @@ def _normalize_expected_files(
     if not normalized:
         raise DeliveryError("expected_files no puede estar vacio")
     return frozenset(normalized)
+
+
+def _normalize_allowed_existing_files(
+    allowed: Mapping[Path | str, str] | None,
+    expected_files: frozenset[str] | None,
+) -> dict[str, str]:
+    if allowed is None:
+        return {}
+    if not isinstance(allowed, Mapping):
+        raise TypeError("allowed_existing_files debe ser un mapa ruta -> sha256")
+    normalized: dict[str, str] = {}
+    for raw_path, raw_digest in allowed.items():
+        text = os.fspath(raw_path)
+        if not isinstance(text, str):
+            raise TypeError("allowed_existing_files solo admite rutas de texto")
+        relative = PurePosixPath(text.replace("\\", "/"))
+        value = relative.as_posix()
+        digest = str(raw_digest or "")
+        if (
+            relative.is_absolute()
+            or relative == PurePosixPath(".")
+            or ".." in relative.parts
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or (expected_files is not None and value not in expected_files)
+        ):
+            raise DeliveryError(f"Colisión prevista no segura: {text!r}")
+        if value in normalized:
+            raise DeliveryError(f"Colisión prevista duplicada: {value}")
+        normalized[value] = digest
+    return normalized
 
 
 def _prepared_file_set(root: Path, *, allow_marker: bool) -> frozenset[str]:
@@ -704,7 +747,93 @@ def _overlay_prepared_with_hardlinks(prepared: Path, shadow: Path) -> None:
             os.link(source_file, target_file)
 
 
+def _stable_file_sha256(path: Path) -> str:
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise DeliveryConflict(f"La colisión prevista no es un archivo regular: {path.name}")
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise DeliveryConflict("La colisión prevista cambió antes de su hash")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        after_open = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = path.lstat()
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    opened_identity = (
+        after_open.st_dev,
+        after_open.st_ino,
+        after_open.st_size,
+        after_open.st_mtime_ns,
+    )
+    if before_identity != after_identity or before_identity != opened_identity:
+        raise DeliveryConflict("La colisión prevista cambió durante su hash")
+    return digest.hexdigest()
+
+
+def _reject_late_prepared_collisions(
+    prepared: Path,
+    final: Path,
+    allowed_existing_files: Mapping[str, str] | None = None,
+) -> None:
+    """Impide que una alta posterior al plan sea sobrescrita en la sombra."""
+
+    for source in sorted(prepared.rglob("*")):
+        relative = source.relative_to(prepared)
+        if _reserved_marker(relative):
+            continue
+        target = final / relative
+        if source.is_symlink():
+            raise DeliveryError(f"Symlink no soportado: {source}")
+        if source.is_dir():
+            if target.is_symlink() or (target.exists() and not target.is_dir()):
+                raise DeliveryConflict(
+                    f"La biblioteca creó una colisión tardía: {relative.as_posix()}"
+                )
+            continue
+        if not source.is_file():
+            raise DeliveryError(f"Archivo no soportado: {source}")
+        if target.exists() or target.is_symlink():
+            relative_text = relative.as_posix()
+            expected_digest = allowed_existing_files.get(relative_text)
+            if expected_digest is None or _stable_file_sha256(target) != expected_digest:
+                raise DeliveryConflict(
+                    f"La biblioteca creó una colisión tardía: {relative_text}"
+                )
+
+
 def _tree_signature(root: Path) -> tuple[tuple[Any, ...], ...]:
+    root_info = root.lstat()
+    # Crear un hardlink puede hacer que SMB actualice el mtime del directorio
+    # de origen aunque su inventario no haya cambiado. La identidad y las
+    # rutas de los directorios ya detectan altas, bajas y renombres; los datos
+    # mutables se comprueban en cada archivo.
+    entries: list[tuple[Any, ...]] = [("root", ".", root_info.st_ino)]
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        relative = current_path.relative_to(root)
+        for name in sorted(directories):
+            path = current_path / name
+            info = path.lstat()
+            entries.append(("d", str(relative / name), info.st_ino))
+        for name in sorted(filenames):
+            path = current_path / name
+            info = path.lstat()
+            entries.append(
+                ("f", str(relative / name), info.st_ino, info.st_size, info.st_mtime_ns)
+            )
+    return tuple(entries)
+
+
+def _legacy_tree_signature(root: Path) -> tuple[tuple[Any, ...], ...]:
+    """Firma anterior, aceptada solo al recuperar journals ya persistidos."""
+
     root_info = root.lstat()
     entries: list[tuple[Any, ...]] = [
         ("root", ".", root_info.st_ino, root_info.st_mtime_ns)
@@ -745,10 +874,52 @@ def _required_signature(details: dict[str, Any], key: str) -> str:
     return value
 
 
+def _required_allowed_existing_files(details: dict[str, Any]) -> dict[str, str]:
+    raw = details.get("allowed_existing_files")
+    if not isinstance(raw, dict):
+        _raise_ambiguous("falta allowlist durable de colisiones")
+    try:
+        return _normalize_allowed_existing_files(raw, None)
+    except (DeliveryError, TypeError) as error:
+        raise RecoveryAmbiguous(
+            "recovery_ambiguous: allowlist durable de colisiones inválida"
+        ) from error
+
+
+def _verify_allowed_existing_files(
+    root: Path,
+    allowed_existing_files: Mapping[str, str],
+    *,
+    recovery: bool,
+) -> None:
+    for relative, expected_digest in allowed_existing_files.items():
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            actual_digest = _stable_file_sha256(path)
+        except (DeliveryConflict, OSError) as error:
+            if recovery:
+                raise RecoveryAmbiguous(
+                    "recovery_ambiguous: una colisión prevista ya no es verificable"
+                ) from error
+            raise DeliveryConflict(
+                f"La colisión prevista cambió antes de EXCHANGE: {relative}"
+            ) from error
+        if actual_digest != expected_digest:
+            if recovery:
+                _raise_ambiguous(
+                    f"la colisión prevista cambió antes de recuperar: {relative}"
+                )
+            raise DeliveryConflict(
+                f"La colisión prevista cambió antes de EXCHANGE: {relative}"
+            )
+
+
 def _verify_tree_signature(path: Path, expected: str, label: str) -> None:
     if path.is_symlink() or not path.is_dir():
         _raise_ambiguous(f"{label} ya no es un directorio físico")
-    if _tree_signature_digest(path) != expected:
+    current = _tree_signature_digest(path)
+    legacy = _signature_digest(_legacy_tree_signature(path))
+    if expected not in {current, legacy}:
         _raise_ambiguous(f"{label} cambió desde VERIFIED")
 
 
@@ -820,6 +991,7 @@ def _build_shadow(
     *,
     job_id: str,
     generation: str,
+    allowed_existing_files: Mapping[str, str] | None = None,
 ) -> tuple[
     tuple[tuple[Any, ...], ...],
     tuple[tuple[Any, ...], ...],
@@ -835,6 +1007,11 @@ def _build_shadow(
     final_signature = _tree_signature(final)
     prepared_signature = _tree_signature(prepared)
     try:
+        _reject_late_prepared_collisions(
+            prepared,
+            final,
+            allowed_existing_files or {},
+        )
         _clone_existing_with_hardlinks(final, shadow)
         _overlay_prepared_with_hardlinks(prepared, shadow)
         _validate_logical_tree(shadow)
@@ -1198,6 +1375,45 @@ def _commit_exchange(shadow: Path, final: Path) -> None:
     fsync_directory(final.parent)
 
 
+def _rollback_completed_exchange(
+    journal: DurableJournal,
+    *,
+    shadow: Path,
+    final: Path,
+    job_id: str,
+    generation: str,
+    reason: BaseException,
+) -> dict[str, Any]:
+    if not _is_generation(_read_marker(final), job_id, generation):
+        _raise_ambiguous("no se puede revertir: la generación nueva no está publicada")
+    if not shadow.is_dir() or shadow.is_symlink() or _read_marker(shadow) is not None:
+        _raise_ambiguous("no se puede revertir: la biblioteca anterior no es inequívoca")
+    _commit_exchange(shadow, final)
+    if _read_marker(final) is not None:
+        _raise_ambiguous("el rollback dejó un marcador inesperado en biblioteca")
+    if not _is_generation(_read_marker(shadow), job_id, generation):
+        _raise_ambiguous("el rollback no recuperó la generación candidata")
+    journal.transition(
+        "ROLLED_BACK",
+        failure_code=getattr(reason, "code", type(reason).__name__),
+        rollback_after_exchange=True,
+    )
+    _remove_owned_shadow(
+        shadow,
+        final=final,
+        job_id=job_id,
+        generation=generation,
+        allow_unmarked=False,
+    )
+    return {
+        "status": "rolled_back",
+        "job_id": job_id,
+        "generation": generation,
+        "mode": "exchange",
+        "recovered": True,
+    }
+
+
 def _confirm_published_durable(
     *,
     mode: str,
@@ -1272,6 +1488,7 @@ def _recover_delivery_locked(
     prepared_signature: str | None = None
     base_signature: str | None = None
     candidate_identity: dict[str, int] | None = None
+    allowed_existing_files: dict[str, str] = {}
     if state in {"VERIFIED", "COMMITTING", "COMMITTED"}:
         candidate_signature = _required_signature(details, "candidate_signature")
         prepared_signature = _required_signature(details, "prepared_signature")
@@ -1279,6 +1496,7 @@ def _recover_delivery_locked(
         _required_cleanup_identities(details, mode)
         if mode == "exchange":
             base_signature = _required_signature(details, "base_signature")
+            allowed_existing_files = _required_allowed_existing_files(details)
 
     if state == "COMMITTED":
         if not final_is_new:
@@ -1369,6 +1587,22 @@ def _recover_delivery_locked(
             if shadow_is_new:
                 _raise_ambiguous("la generacion nueva aparece en ambos lados")
             _verify_root_identity(final, candidate_identity, "biblioteca publicada")
+            assert shadow is not None
+            try:
+                _verify_allowed_existing_files(
+                    shadow,
+                    allowed_existing_files,
+                    recovery=True,
+                )
+            except RecoveryAmbiguous as error:
+                return _rollback_completed_exchange(
+                    journal,
+                    shadow=shadow,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    reason=error,
+                )
         elif shadow_is_new and final.is_dir():
             if not prepared.exists():
                 _raise_ambiguous("falta prepared_series_root antes de EXCHANGE")
@@ -1380,6 +1614,29 @@ def _recover_delivery_locked(
             _verify_tree_signature(final, base_signature, "biblioteca base")
             _verify_tree_signature(shadow, candidate_signature, "candidato shadow")
             _verify_root_identity(shadow, candidate_identity, "candidato shadow")
+            try:
+                _verify_allowed_existing_files(
+                    final,
+                    allowed_existing_files,
+                    recovery=True,
+                )
+            except RecoveryAmbiguous as error:
+                _rollback_before_exchange(
+                    journal,
+                    reason=error,
+                    prepared=prepared,
+                    shadow=shadow,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                )
+                return {
+                    "status": "rolled_back",
+                    "job_id": job,
+                    "generation": generation,
+                    "mode": mode,
+                    "recovered": True,
+                }
             preflight_atomic_exchange(final.parent)
             _commit_exchange(shadow, final)
         else:
@@ -1440,6 +1697,7 @@ def publish_series(
     journal: DurableJournal,
     *,
     expected_files: Iterable[Path | str] | None = None,
+    allowed_existing_files: Mapping[Path | str, str] | None = None,
 ) -> dict[str, Any]:
     """Publica una raiz no vacia y valida exactamente ``expected_files``."""
 
@@ -1448,6 +1706,10 @@ def publish_series(
         raise ValueError("job_id no puede estar vacio")
     prepared, final = _canonical_paths(prepared_series_root, final_series_root)
     expected = _normalize_expected_files(expected_files)
+    allowed_existing = _normalize_allowed_existing_files(
+        allowed_existing_files,
+        expected,
+    )
     with _series_delivery_lock(final):
         _require_directory(prepared, "prepared_series_root")
         allow_marker = _prepared_marker_allowed_for_retry(
@@ -1462,7 +1724,14 @@ def publish_series(
             allow_marker=allow_marker,
         )
         _validate_logical_tree(prepared)
-        return _publish_series_locked(job, prepared, final, journal, expected)
+        return _publish_series_locked(
+            job,
+            prepared,
+            final,
+            journal,
+            expected,
+            allowed_existing,
+        )
 
 
 def _publish_series_locked(
@@ -1471,6 +1740,7 @@ def _publish_series_locked(
     final: Path,
     journal: DurableJournal,
     expected_files: frozenset[str] | None,
+    allowed_existing_files: Mapping[str, str],
 ) -> dict[str, Any]:
     try:
         snapshot = journal.snapshot()
@@ -1534,6 +1804,7 @@ def _publish_series_locked(
                 shadow,
                 job_id=job,
                 generation=generation,
+                allowed_existing_files=allowed_existing_files,
             )
             base_signature = final_signature
             candidate_signature = shadow_signature
@@ -1552,6 +1823,9 @@ def _publish_series_locked(
         }
         if base_signature is not None:
             verification_details["base_signature"] = _signature_digest(base_signature)
+            verification_details["allowed_existing_files"] = dict(
+                sorted(allowed_existing_files.items())
+            )
         journal.transition("VERIFIED", **verification_details)
         journal.transition("COMMITTING")
         _validate_prepared_contents(prepared, expected_files, allow_marker=mode == "new")
@@ -1561,14 +1835,25 @@ def _publish_series_locked(
             if final.exists():
                 raise DeliveryConflict("La serie final aparecio antes de NOREPLACE")
             _commit_new(prepared, final)
+            atomic_done = True
         else:
             assert shadow is not None
             if _tree_signature(final) != final_signature:
                 raise DeliveryConflict("La serie final cambio antes de EXCHANGE")
             if _tree_signature(shadow) != shadow_signature:
                 raise DeliveryConflict("La sombra cambió antes de EXCHANGE")
+            _verify_allowed_existing_files(
+                final,
+                allowed_existing_files,
+                recovery=False,
+            )
             _commit_exchange(shadow, final)
-        atomic_done = True
+            atomic_done = True
+            _verify_allowed_existing_files(
+                shadow,
+                allowed_existing_files,
+                recovery=False,
+            )
 
         if not _is_generation(_read_marker(final), job, generation):
             _raise_ambiguous("la raiz publicada no lleva el marcador esperado")

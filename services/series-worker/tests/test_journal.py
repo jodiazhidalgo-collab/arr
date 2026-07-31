@@ -1,4 +1,5 @@
 import json
+import os
 
 import pytest
 
@@ -114,3 +115,39 @@ def test_write_json_atomic_uses_temporary_replace_and_safe_relative_name(
     assert destination.parent in synced_directories
     with pytest.raises(ValueError):
         durable.write_json_atomic("../outside.json", {})
+
+
+def test_dangling_job_directory_symlink_is_rejected(tmp_path):
+    target = tmp_path / "missing-outside"
+    job_dir = tmp_path / "job-link"
+    try:
+        os.symlink(target, job_dir, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symlink no disponible: {error}")
+    durable = journal.DurableJournal(job_dir)
+
+    with pytest.raises(journal.JournalError, match="enlace simbólico"):
+        durable.snapshot()
+    with pytest.raises(journal.JournalError, match="enlace simbólico"):
+        durable.transition("PREPARED", job_id="job-link")
+
+    assert not target.exists()
+
+
+def test_symlinked_jsonl_is_never_read_or_truncated(tmp_path):
+    job_dir = tmp_path / "job-jsonl-link"
+    job_dir.mkdir()
+    outside = tmp_path / "outside.jsonl"
+    original = b'{"external":"keep"}'
+    outside.write_bytes(original)
+    events = job_dir / "journal.jsonl"
+    try:
+        os.symlink(outside, events)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symlink no disponible: {error}")
+    durable = journal.DurableJournal(job_dir)
+
+    with pytest.raises(journal.JournalError, match="enlace simbólico"):
+        durable.snapshot()
+
+    assert outside.read_bytes() == original

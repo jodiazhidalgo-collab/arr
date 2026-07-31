@@ -8,7 +8,7 @@ from unittest.mock import patch
 from arr_orchestrator.arr_blackbox import ArrBlackbox
 from arr_orchestrator.codex_diagnostics import create_codex_diagnostic
 from arr_orchestrator.db import Database
-from arr_orchestrator.diagnostic_sanitizer import sanitize_text
+from arr_orchestrator.diagnostic_sanitizer import phase_label, sanitize_text
 
 
 EXPECTED_READ_ORDER = [
@@ -21,6 +21,17 @@ EXPECTED_READ_ORDER = [
     "related_files.json",
     "meta.json",
 ]
+RUNTIME_TMP_ROOT = (
+    Path(__file__).resolve().parents[3]
+    / "_codex_runtime"
+    / "tmp"
+    / "test_arr_blackbox"
+)
+
+
+def _temporary_directory(**kwargs):
+    RUNTIME_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=RUNTIME_TMP_ROOT, **kwargs)
 
 
 def _trace_dir(root: Path, job_id: str) -> Path:
@@ -36,7 +47,7 @@ def _jsonl(path: Path) -> list[dict]:
 
 class ArrBlackboxTests(unittest.TestCase):
     def test_create_job_starts_trace_files_and_running_summary(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             blackbox = ArrBlackbox(root / "diagnostics" / "arr")
             database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -88,18 +99,22 @@ class ArrBlackboxTests(unittest.TestCase):
     def test_config_snapshot_is_written_to_meta_and_summary(self) -> None:
         env = {
             "ARR_MODE": "active",
+            "ARR_SERIES_MODE": "active",
             "ARR_STABLE_SECONDS": "8",
             "ARR_WORKSHOP_ROOT": "/data/downloads/torrents/complete/taller",
             "ARR_REVIEW_DIR": "/data/media/repetidas_vs_error",
+            "ARR_SERIES_REVIEW_DIR": "/volume1/UGREEN/data/media/repetidas_vs_error_series",
             "CODEX_DIAG_ROOT": "/diagnosticos_codex",
             "ARR_DIAGNOSTICS_ROOT": "/diagnostics/arr",
             "MEDIA_WORKER_URL": "http://media-worker:8790",
+            "SERIES_WORKER_URL": "http://series-worker:8791",
+            "SERIES_WORKER_REPORT_ROOT": "/config/series-worker",
             "QBT_URL": "http://gluetun:8080",
             "QBT_PASSWORD": "qbt-secret",
             "TMDB_API_TOKEN": "tmdb-secret",
         }
         with patch.dict("os.environ", env, clear=False):
-            with tempfile.TemporaryDirectory() as temporary:
+            with _temporary_directory() as temporary:
                 root = Path(temporary)
                 blackbox = ArrBlackbox(root / "diagnostics" / "arr")
                 database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -119,6 +134,9 @@ class ArrBlackboxTests(unittest.TestCase):
                 self.assertEqual(meta["config_snapshot"]["schema"], "arr-config-snapshot-v1")
                 self.assertEqual(summary["config_snapshot"], meta["config_snapshot"])
                 self.assertEqual(meta["config_snapshot"]["mode"], "active")
+                self.assertEqual(meta["config_snapshot"]["series_mode"], "active")
+                self.assertEqual(meta["series_mode"], "active")
+                self.assertEqual(summary["series_mode"], "active")
                 self.assertEqual(meta["config_snapshot"]["timing"]["stable_seconds"], "8")
                 self.assertEqual(
                     meta["config_snapshot"]["paths"]["workshop"],
@@ -129,14 +147,28 @@ class ArrBlackboxTests(unittest.TestCase):
                     "<DATA_MEDIA>/repetidas_vs_error",
                 )
                 self.assertEqual(meta["config_snapshot"]["services"]["media_worker"], "http://media-worker:8790")
+                self.assertEqual(
+                    meta["config_snapshot"]["services"]["series_worker"],
+                    "http://series-worker:8791",
+                )
+                self.assertEqual(
+                    meta["config_snapshot"]["paths"]["series_worker_reports"],
+                    "<CONFIG>/series-worker",
+                )
+                self.assertEqual(
+                    meta["config_snapshot"]["paths"]["series_review"],
+                    "<DATA_MEDIA>/repetidas_vs_error_series",
+                )
                 self.assertTrue(meta["config_snapshot"]["credential_flags"]["qbt_login_secret_present"])
                 self.assertTrue(meta["config_snapshot"]["credential_flags"]["tmdb_credential_present"])
                 self.assertNotIn("qbt-secret", meta_text)
                 self.assertNotIn("tmdb-secret", meta_text)
+                self.assertNotIn("/config/", meta_text)
+                self.assertNotIn("/volume1/UGREEN", meta_text)
                 database.close()
 
     def test_command_event_is_preserved_in_blackbox_timeline(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             blackbox = ArrBlackbox(root / "diagnostics" / "arr")
             database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -174,7 +206,7 @@ class ArrBlackboxTests(unittest.TestCase):
             database.close()
 
     def test_add_event_grows_events_jsonl_and_updates_last_event(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             blackbox = ArrBlackbox(root / "diagnostics" / "arr")
             database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -206,7 +238,7 @@ class ArrBlackboxTests(unittest.TestCase):
             database.close()
 
     def test_warning_and_error_are_split_to_job_files(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             blackbox = ArrBlackbox(root / "diagnostics" / "arr")
             database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -238,7 +270,7 @@ class ArrBlackboxTests(unittest.TestCase):
             database.close()
 
     def test_synthetic_job_walkthrough_writes_expected_phases(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             blackbox = ArrBlackbox(root / "diagnostics" / "arr")
             database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -270,7 +302,7 @@ class ArrBlackboxTests(unittest.TestCase):
             database.close()
 
     def test_database_events_are_mirrored_to_blackbox(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             blackbox = ArrBlackbox(root / "diagnostics" / "arr")
             database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -324,7 +356,7 @@ class ArrBlackboxTests(unittest.TestCase):
         def broken_recorder(_event):
             raise RuntimeError("blackbox unavailable")
 
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             database = Database(root / "test.db", event_recorder=broken_recorder)
             database.initialize()
@@ -342,7 +374,7 @@ class ArrBlackboxTests(unittest.TestCase):
             database.close()
 
     def test_blackbox_sanitizes_secrets_paths_truncates_and_limits_related_files(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+        with _temporary_directory(ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             blackbox = ArrBlackbox(root / "diagnostics" / "arr")
             database = Database(root / "test.db", event_recorder=blackbox.record_event)
@@ -404,7 +436,7 @@ class ArrBlackboxTests(unittest.TestCase):
             database.close()
 
     def test_codex_diagnostic_export_sanitizes_live_trace_and_human_files(self) -> None:
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temporary:
+        with _temporary_directory(ignore_cleanup_errors=True) as temporary:
             root = Path(temporary)
             diagnostics_root = root / "diagnostics" / "arr"
             blackbox = ArrBlackbox(diagnostics_root)
@@ -468,6 +500,197 @@ class ArrBlackboxTests(unittest.TestCase):
             self.assertIn("Verificacion media [media_verify]", combined)
             database.close()
 
+    def test_series_flow_updates_status_labels_related_files_and_codex_summary(self) -> None:
+        env = {
+            "ARR_SERIES_MODE": "active",
+            "SERIES_WORKER_URL": "http://series-worker:8791",
+            "SERIES_WORKER_REPORT_ROOT": "/config/series-worker",
+            "ARR_SERIES_REVIEW_DIR": "/volume1/UGREEN/data/media/repetidas_vs_error_series",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            with _temporary_directory(ignore_cleanup_errors=True) as temporary:
+                root = Path(temporary)
+                diagnostics_root = root / "diagnostics" / "arr"
+                blackbox = ArrBlackbox(diagnostics_root)
+                database = Database(root / "test.db", event_recorder=blackbox.record_event)
+                database.initialize()
+                job = database.create_job(
+                    "fs:tv:blackbox-series-done",
+                    "fs",
+                    "tv",
+                    "Serie Blackbox S01",
+                    state="series_postprocess_ready",
+                    source_path="/volume1/UGREEN/data/downloads/Serie Blackbox S01",
+                    stage_path="/data/downloads/torrents/complete/taller/series-job",
+                    source_meta_json=json.dumps(
+                        {
+                            "series_pipeline": {
+                                "schema": "arr-series-pipeline-v1",
+                                "profile": "tv",
+                                "configured_mode": "active",
+                                "canary_eligible": False,
+                                "route": "series-worker",
+                            }
+                        }
+                    ),
+                )
+                job_dir = _trace_dir(root, job["job_id"])
+
+                summary = json.loads((job_dir / "summary.json").read_text(encoding="utf-8"))
+                meta = json.loads((job_dir / "meta.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["series_worker_status"], "ready")
+                self.assertEqual(meta["series_worker_status"], "ready")
+
+                database.transition(
+                    job["job_id"],
+                    "series_postprocess_running",
+                    "series_worker",
+                    "Series Worker iniciado",
+                )
+                summary = json.loads((job_dir / "summary.json").read_text(encoding="utf-8"))
+                meta = json.loads((job_dir / "meta.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["series_worker_status"], "running")
+                self.assertEqual(meta["series_worker_status"], "running")
+
+                database.add_event(
+                    job["job_id"],
+                    "series_postprocess",
+                    "progress",
+                    "Postproceso de Series en marcha",
+                    {
+                        "status": "active",
+                        "work_dir": "/volume1/UGREEN/data/work/series-job",
+                        "filebot_output": r"Z:\arr\_codex_runtime\test-data\series_filebot_output",
+                    },
+                )
+                database.add_event(
+                    job["job_id"],
+                    "series_verify",
+                    "decision",
+                    "Pack de Series verificado",
+                    {
+                        "journal_path": "/config/series-worker/series-job/journal.json",
+                        "manifest_path": "/config/series-worker/series-job/manifest.json",
+                        "preserved_path": "/volume1/UGREEN/data/media/repetidas_vs_error_series/Serie Blackbox",
+                        "final_series_dir": "/volume1/UGREEN/data/media/tv/Serie Blackbox",
+                    },
+                )
+                database.transition(
+                    job["job_id"],
+                    "ready_cleanup",
+                    "series_publish",
+                    "Series Worker publicó el pack completo",
+                    result_json=json.dumps(
+                        {
+                            "kind": "series",
+                            "status": "done",
+                            "manifest_path": "/config/series-worker/series-job/manifest.json",
+                            "work_dir": r"Z:\arr\_codex_runtime\tmp\series-job",
+                        }
+                    ),
+                )
+                database.transition(
+                    job["job_id"],
+                    "done",
+                    "cleanup",
+                    "Trabajo de Series terminado",
+                )
+
+                summary = json.loads((job_dir / "summary.json").read_text(encoding="utf-8"))
+                meta = json.loads((job_dir / "meta.json").read_text(encoding="utf-8"))
+                related = json.loads((job_dir / "related_files.json").read_text(encoding="utf-8"))
+                related_paths = {item["path"] for item in related["files"]}
+                self.assertEqual(summary["series_mode"], "active")
+                self.assertEqual(summary["series_worker_status"], "done")
+                self.assertEqual(meta["series_worker_status"], "done")
+                self.assertIn("<CONFIG>/series-worker/series-job/journal.json", related_paths)
+                self.assertIn("<CONFIG>/series-worker/series-job/manifest.json", related_paths)
+                self.assertIn("<DATA_ROOT>/work/series-job", related_paths)
+                self.assertIn("<DATA_MEDIA>/tv/Serie Blackbox", related_paths)
+                self.assertIn(
+                    r"<ARR_ROOT_WIN>\_codex_runtime\test-data\series_filebot_output",
+                    related_paths,
+                )
+
+                labels = {
+                    "series": "Series",
+                    "series_worker": "Series Worker",
+                    "series_postprocess": "Postproceso de Series",
+                    "series_verify": "Verificacion de Series",
+                    "series_publish": "Publicacion de Series",
+                    "series_review": "Revision de Series",
+                }
+                for phase, label in labels.items():
+                    self.assertEqual(phase_label(phase), label)
+
+                result = create_codex_diagnostic(
+                    database,
+                    job["job_id"],
+                    root / "diagnosticos_codex",
+                    {
+                        "orchestrator": {"status": "ok", "series_mode": "active"},
+                        "series_worker": {"status": "ok", "mode": "active"},
+                    },
+                    force=True,
+                    diagnostics_root=diagnostics_root,
+                )
+                with zipfile.ZipFile(result["path"]) as archive:
+                    readme = archive.read("LEEME_PRIMERO.txt").decode("utf-8")
+                    combined = "\n".join(
+                        archive.read(name).decode("utf-8", errors="replace")
+                        for name in archive.namelist()
+                        if name.endswith((".txt", ".json", ".jsonl", ".md"))
+                    )
+                self.assertIn("Modo Series: active", readme)
+                self.assertIn("Series worker: ok", readme)
+                self.assertIn("Estado Series worker del job: done", readme)
+                for raw_path in (
+                    "/data/",
+                    "/config/",
+                    "/volume1/UGREEN",
+                    r"Z:\arr",
+                    r"Z:\\arr",
+                ):
+                    self.assertNotIn(raw_path, combined)
+                database.close()
+
+    def test_series_review_status_is_preserved_in_summary_and_meta(self) -> None:
+        with patch.dict("os.environ", {"ARR_SERIES_MODE": "canary"}, clear=False):
+            with _temporary_directory() as temporary:
+                root = Path(temporary)
+                blackbox = ArrBlackbox(root / "diagnostics" / "arr")
+                database = Database(root / "test.db", event_recorder=blackbox.record_event)
+                database.initialize()
+                job = database.create_job(
+                    "fs:tv:blackbox-series-review",
+                    "fs",
+                    "tv",
+                    "Serie Blackbox Review S01",
+                    state="series_postprocess_ready",
+                )
+                database.transition(
+                    job["job_id"],
+                    "series_postprocess_running",
+                    "series",
+                    "Series Worker iniciado",
+                )
+                database.transition(
+                    job["job_id"],
+                    "manual_review",
+                    "series_review",
+                    "Pack completo preservado para revisión",
+                    result_json=json.dumps({"kind": "series", "status": "review"}),
+                )
+
+                job_dir = _trace_dir(root, job["job_id"])
+                summary = json.loads((job_dir / "summary.json").read_text(encoding="utf-8"))
+                meta = json.loads((job_dir / "meta.json").read_text(encoding="utf-8"))
+                self.assertEqual(summary["series_mode"], "canary")
+                self.assertEqual(summary["series_worker_status"], "review")
+                self.assertEqual(meta["series_worker_status"], "review")
+                self.assertEqual(summary["last_phase_label"], "Revision de Series")
+                database.close()
+
     def test_sanitizer_aliases_extra_paths_and_query_secrets(self) -> None:
         text = sanitize_text(
             "url=https://example.test/file.torrent?token=secret&api_key=abc "
@@ -489,7 +712,7 @@ class ArrBlackboxTests(unittest.TestCase):
         self.assertIn("<DIAGNOSTICS>\\arr\\jobs", text)
 
     def test_codex_diagnostic_includes_live_trace_when_available(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with _temporary_directory() as temporary:
             root = Path(temporary)
             diagnostics_root = root / "diagnostics" / "arr"
             blackbox = ArrBlackbox(diagnostics_root)

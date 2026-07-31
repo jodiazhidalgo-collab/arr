@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from media_panel import server
@@ -17,6 +18,68 @@ def _write_reason(folder: Path, payload: dict) -> None:
         json.dumps(payload),
         encoding="utf-8",
     )
+
+
+def _write_codex_zip(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("job.json", json.dumps(payload))
+
+
+class JobAndCodexProfileFilterTests(unittest.TestCase):
+    def test_jobs_are_filtered_by_real_category(self) -> None:
+        jobs = [
+            {"job_id": MOVIE_JOB, "category": "movies"},
+            {"job_id": SERIES_JOB, "category": "tv"},
+            {"job_id": "trailer", "category": "trailers_automatizacion"},
+            {"job_id": "automatic", "category": "movies_automatizacion"},
+            {
+                "job_id": "manual-series",
+                "category": "manual",
+                "source_meta_json": json.dumps({"media_type": "tv"}),
+            },
+        ]
+        with patch.object(server, "_upstream_json", return_value=jobs):
+            movies = server._jobs_payload(profile="movies")
+            shows = server._jobs_payload(profile="series")
+            legacy = server._jobs_payload()
+
+        self.assertEqual(
+            [job["job_id"] for job in movies["jobs"]],
+            [MOVIE_JOB, "trailer", "automatic"],
+        )
+        self.assertEqual(
+            [job["job_id"] for job in shows["jobs"]],
+            [SERIES_JOB, "manual-series"],
+        )
+        self.assertEqual(len(legacy["jobs"]), 5)
+
+    def test_codex_zips_are_filtered_by_job_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _write_codex_zip(
+                root / "movies" / "movie.zip",
+                {"name": "Movie", "category": "movies"},
+            )
+            _write_codex_zip(
+                root / "tv" / "series.zip",
+                {"name": "Series", "category": "tv"},
+            )
+            _write_codex_zip(
+                root / "repetidas_vs_error" / "series-review.zip",
+                {"name": "Series review", "category": "tv"},
+            )
+            with patch.object(server, "CODEX_DIAG_ROOT", root):
+                movies = server._codex_diagnostics_payload(profile="movies")
+                shows = server._codex_diagnostics_payload(profile="series")
+
+        self.assertEqual([item["name"] for item in movies["files"]], ["movie.zip"])
+        self.assertEqual(
+            {item["name"] for item in shows["files"]},
+            {"series.zip", "series-review.zip"},
+        )
+        self.assertTrue(all(item["profile"] == "movies" for item in movies["files"]))
+        self.assertTrue(all(item["profile"] == "series" for item in shows["files"]))
 
 
 class ReviewProfileFilterTests(unittest.TestCase):

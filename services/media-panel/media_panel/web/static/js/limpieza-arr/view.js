@@ -203,7 +203,11 @@
             ? "Limpia el release, extrae título, año, temporada y episodios antes de consultar servicios externos."
             : "Construye candidatos, puntúa las coincidencias y decide cuándo una identidad es suficientemente segura."}</p>
         </div>
-        <div class="identity-hero-state"><span class="pill ${state.dirty ? "warn" : "ok"}">${dirtyText}</span><small>${ui.esc(ui.activeMetadata(state.profile))}</small></div>
+        <div class="identity-hero-state">
+          ${state.profile === "common" ? '<span class="pill warn">Afecta a ambos</span>' : ""}
+          <span class="pill ${state.dirty ? "warn" : "ok"}">${dirtyText}</span>
+          <small>${ui.esc(ui.activeMetadata(state.profile))}</small>
+        </div>
       </header>
 
       <nav class="identity-subtabs" role="tablist" aria-label="Sección de Identidad ARR">

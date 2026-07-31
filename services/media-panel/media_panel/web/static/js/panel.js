@@ -6,6 +6,7 @@ const PANEL_ROUTE_STORAGE_KEY = "arr-media-panel-route";
 const LEGACY_RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
 let viewEpoch = 0;
 const auxiliaryProfiles = {
+  historial: storageGet("arr-media-panel-historial-profile", "movies") === "series" ? "series" : "movies",
   revision: storageGet("arr-media-panel-revision-profile", "movies") === "series" ? "series" : "movies",
   informes: storageGet("arr-media-panel-informes-profile", "movies") === "series" ? "series" : "movies"
 };
@@ -280,11 +281,24 @@ function readStoredRuleSection(view) {
   return config.sections.includes(stored) ? stored : config.defaultSection;
 }
 
+function readStoredWatcherProfile() {
+  return storageGet("arr-media-panel-ajustes-vigilante", "movies") === "tv" ? "tv" : "movies";
+}
+
+function ruleRouteHash(view, section, watcherProfile = readStoredWatcherProfile()) {
+  if (view === "ajustes" && section === "vigilantes") {
+    return watcherProfile === "tv"
+      ? "#ajustes/vigilante-series"
+      : "#ajustes/vigilante-peliculas";
+  }
+  return `#${view}/${section}`;
+}
+
 function createRuleViewState(view) {
   return {
     view,
     section: readStoredRuleSection(view),
-    watcherProfile: storageGet("arr-media-panel-ajustes-vigilante", "movies") === "tv" ? "tv" : "movies",
+    watcherProfile: readStoredWatcherProfile(),
     documents: {},
     drafts: {},
     dirty: {},
@@ -431,15 +445,22 @@ async function showHistorial(context) {
   context = ensureViewContext("historial", context);
   setActive("historial");
   title.textContent = "Historial";
-  app.innerHTML = `<section class="panel">Cargando historial...</section>`;
-  const data = await api("/api/jobs");
+  const profile = auxiliaryProfiles.historial;
+  app.innerHTML = `<section class="panel">Cargando historial de ${profile === "series" ? "series" : "películas"}...</section>`;
+  const data = await api(`/api/jobs?profile=${encodeURIComponent(profile)}`);
   if (!isCurrentViewContext(context)) return;
   const jobs = data.jobs || [];
-  app.innerHTML = `<section class="panel"><h2>Trabajos recientes</h2>${jobsTable(jobs)}</section>`;
+  app.innerHTML = `<section class="panel">
+    ${renderAuxiliaryProfileSelector("historial", profile)}
+    <h2>Trabajos recientes · ${profile === "series" ? "Series" : "Películas"}</h2>
+    ${jobsTable(jobs)}
+  </section>`;
+  bindAuxiliaryProfileSelector("historial", showHistorial);
 }
 
 function renderAuxiliaryProfileSelector(view, profile) {
-  return `<div class="segmented-tabs auxiliary-profile-tabs" role="group" aria-label="Perfil de ${view === "revision" ? "revisión" : "informes"}">
+  const labels = { historial: "historial", revision: "revisión", informes: "informes" };
+  return `<div class="segmented-tabs auxiliary-profile-tabs" role="group" aria-label="Perfil de ${labels[view] || view}">
     <button type="button" class="${profile === "movies" ? "active" : ""}" data-aux-profile="movies">Películas</button>
     <button type="button" class="${profile === "series" ? "active" : ""}" data-aux-profile="series">Series</button>
   </div>`;
@@ -466,8 +487,9 @@ async function showRevision(context) {
   const items = data.items || [];
   app.innerHTML = `<section class="panel">
     ${renderAuxiliaryProfileSelector("revision", profile)}
-    <h2>repetidas_vs_error</h2>
+    <h2>${profile === "series" ? "repetidas_vs_error_series" : "repetidas_vs_error"}</h2>
     <div class="muted">${esc(data.review_dir)}</div>
+    ${data.connected === false ? `<div class="locked-notice" role="status"><span class="pill warn">No disponible</span><strong>${esc(data.message || "Motor no conectado")}</strong></div>` : ""}
     <div class="review-list" style="margin-top:12px">
       ${items.length ? items.map(item => `
         <article class="review-item">
@@ -491,7 +513,7 @@ async function showInformes(context) {
   app.innerHTML = `<section class="panel">Cargando informes de ${profile === "series" ? "series" : "películas"}...</section>`;
   const [data, codex] = await Promise.all([
     api(`/api/reports?profile=${encodeURIComponent(profile)}`),
-    api("/api/codex-diagnostics")
+    api(`/api/codex-diagnostics?profile=${encodeURIComponent(profile)}`)
   ]);
   if (!isCurrentViewContext(context)) return;
   const files = data.files || [];
@@ -546,6 +568,7 @@ async function showInformes(context) {
         <span class="muted">${files.length} informes</span>
       </summary>
       <div class="muted fold-path">${esc(data.report_root)}</div>
+      ${data.connected === false ? `<div class="locked-notice" role="status"><span class="pill warn">No disponible</span><strong>${esc(data.message || "Motor no conectado")}</strong></div>` : ""}
       <div class="report-list" style="margin-top:12px">
         ${files.length ? files.map(file => `
           <div class="report-row">
@@ -603,6 +626,15 @@ function ruleDocumentStatus(documentState, sourceConfig) {
     return documentState.message || documentState.error || `No se pudo cargar ${sourceConfig.label.toLowerCase()}.`;
   }
   const fingerprint = String(documentState.fingerprint || "").slice(0, 12);
+  if (sourceConfig.endpoint === "/api/series-rules") {
+    const mode = String(documentState.series_mode || "unknown");
+    const modeText = {
+      legacy: "preparado · modo legacy · no enruta trabajos nuevos",
+      canary: "preparado · modo canary · solo pruebas seleccionadas",
+      active: "activo para todos los trabajos nuevos"
+    }[mode] || "conectado · enrutado no disponible";
+    return `${sourceConfig.label} ${modeText}${fingerprint ? ` · Huella ${fingerprint}` : ""}`;
+  }
   return `${sourceConfig.label} activo para trabajos nuevos${fingerprint ? ` · Huella ${fingerprint}` : ""}`;
 }
 
@@ -666,7 +698,7 @@ function renderRuleProfile(view) {
     const sectionTarget = button.dataset.ruleSection;
     state.section = sectionTarget;
     storageSet(ruleSectionStorageKey(view), sectionTarget);
-    const targetHash = `#${view}/${sectionTarget}`;
+    const targetHash = ruleRouteHash(view, sectionTarget, state.watcherProfile);
     if (location.hash === targetHash) renderRuleProfile(view);
     else location.hash = targetHash;
   }));
@@ -674,7 +706,9 @@ function renderRuleProfile(view) {
     state.watcherProfile = button.dataset.watcherProfile === "tv" ? "tv" : "movies";
     storageSet("arr-media-panel-ajustes-vigilante", state.watcherProfile);
     const nextSource = ruleSourceKey(view, state);
-    if (state.documents[nextSource]) renderRuleProfile(view);
+    const targetHash = ruleRouteHash(view, "vigilantes", state.watcherProfile);
+    if (location.hash !== targetHash) location.hash = targetHash;
+    else if (state.documents[nextSource]) renderRuleProfile(view);
     else loadRuleSource(view, nextSource);
   }));
   document.querySelectorAll("[data-rule-path]").forEach(input => {
@@ -771,6 +805,16 @@ async function loadRuleSource(view, source, { replace = false } = {}) {
   }
   try {
     const payload = await api(sourceConfig.endpoint);
+    if (sourceConfig.endpoint === "/api/series-rules") {
+      try {
+        const runtimeStatus = await api("/api/status");
+        payload.series_mode = ["legacy", "canary", "active"].includes(runtimeStatus.series_mode)
+          ? runtimeStatus.series_mode
+          : "unknown";
+      } catch (_error) {
+        payload.series_mode = "unknown";
+      }
+    }
     if (state.requestEpoch[source] !== requestEpoch) return;
     if (!payload || typeof payload !== "object" || Array.isArray(payload) || typeof payload.rules !== "object") {
       throw new Error("El servidor no devolvió el contrato completo de reglas.");
@@ -778,7 +822,11 @@ async function loadRuleSource(view, source, { replace = false } = {}) {
     state.documents[source] = payload;
     state.drafts[source] = clone(payload.rules);
     state.dirty[source] = false;
-    state.notice[source] = replace ? "Configuración recargada desde el motor." : "";
+    state.notice[source] = replace
+      ? sourceConfig.endpoint === "/api/series-rules"
+        ? `Configuración recargada. ${ruleDocumentStatus(payload, sourceConfig)}`
+        : "Configuración recargada desde el motor."
+      : "";
     if (isRuleSourceActive(view, source)) renderRuleProfile(view);
   } catch (error) {
     if (state.requestEpoch[source] !== requestEpoch) return;
@@ -814,6 +862,9 @@ async function saveRuleSource(view, source) {
     if (!savedState || savedState.ok === false || typeof savedState.rules !== "object") {
       throw new Error(savedState?.message || savedState?.error || "El motor no confirmó las reglas guardadas.");
     }
+    if (sourceConfig.endpoint === "/api/series-rules") {
+      savedState.series_mode = documentState.series_mode || "unknown";
+    }
     const changedWhileSaving = JSON.stringify(state.drafts[source]) !== JSON.stringify(submittedDraft);
     const currentDraft = state.drafts[source];
     state.documents[source] = savedState;
@@ -822,7 +873,9 @@ async function saveRuleSource(view, source) {
       && JSON.stringify(currentDraft) !== JSON.stringify(savedState.rules);
     state.notice[source] = changedWhileSaving
       ? "La revisión enviada se guardó; los cambios posteriores siguen en el borrador."
-      : "Reglas guardadas y activas para trabajos nuevos.";
+      : sourceConfig.endpoint === "/api/series-rules"
+        ? `Reglas guardadas. ${ruleDocumentStatus(savedState, sourceConfig)}`
+        : "Reglas guardadas y activas para trabajos nuevos.";
   } catch (error) {
     state.notice[source] = error.status === 409
       ? `Conflicto al guardar: ${error.message} Recarga y vuelve a intentarlo.`
@@ -840,7 +893,13 @@ async function showRuleProfile(view, context) {
   setActive(view);
   title.textContent = config.label;
   const route = canonicalRouteFromHash(location.hash);
-  if (route?.view === view && config.sections.includes(route.section)) state.section = route.section;
+  if (route?.view === view && config.sections.includes(route.section)) {
+    state.section = route.section;
+    if (view === "ajustes" && route.watcherProfile) {
+      state.watcherProfile = route.watcherProfile;
+      storageSet("arr-media-panel-ajustes-vigilante", state.watcherProfile);
+    }
+  }
   storageSet(ruleSectionStorageKey(view), state.section);
   const source = ruleSourceKey(view, state);
   if (state.documents[source]) renderRuleProfile(view);
@@ -901,8 +960,17 @@ function exactCanonicalRoute(hash) {
   if (identity) return { ...identity, view: "identidad" };
   const cleaning = String(hash || "").match(/^#(limpieza-peliculas|limpieza-series)\/(entrada|video|audio|subtitulos|limpieza)$/);
   if (cleaning) return { view: cleaning[1], section: cleaning[2], hash: `#${cleaning[1]}/${cleaning[2]}` };
-  const settings = String(hash || "").match(/^#ajustes\/(trailers|vigilantes)$/);
-  if (settings) return { view: "ajustes", section: settings[1], hash: `#ajustes/${settings[1]}` };
+  const settings = String(hash || "").match(/^#ajustes\/(trailers|vigilante-peliculas|vigilante-series)$/);
+  if (settings) {
+    if (settings[1] === "trailers") return { view: "ajustes", section: "trailers", hash: "#ajustes/trailers" };
+    const watcherProfile = settings[1] === "vigilante-series" ? "tv" : "movies";
+    return {
+      view: "ajustes",
+      section: "vigilantes",
+      watcherProfile,
+      hash: ruleRouteHash("ajustes", "vigilantes", watcherProfile)
+    };
+  }
   const simple = String(hash || "").match(/^#(motor|historial|revision|informes)$/);
   if (simple) return { view: simple[1], hash: `#${simple[1]}` };
   return null;
@@ -921,20 +989,35 @@ function canonicalRouteFromHash(hash = location.hash) {
   if (legacyRules) {
     const legacySection = legacyRules[1] || storageGet(LEGACY_RULE_SECTION_STORAGE_KEY, "entrada");
     if (legacySection === "trailers") return { view: "ajustes", section: "trailers", hash: "#ajustes/trailers", legacy: true };
-    if (["vigilante", "vigilantes"].includes(legacySection)) return { view: "ajustes", section: "vigilantes", hash: "#ajustes/vigilantes", legacy: true };
+    if (["vigilante", "vigilantes"].includes(legacySection)) {
+      const watcherProfile = readStoredWatcherProfile();
+      return { view: "ajustes", section: "vigilantes", watcherProfile, hash: ruleRouteHash("ajustes", "vigilantes", watcherProfile), legacy: true };
+    }
     const section = CLEANING_SECTIONS.includes(legacySection) ? legacySection : "entrada";
     return { view: "limpieza-peliculas", section, hash: `#limpieza-peliculas/${section}`, legacy: true };
+  }
+
+  const legacyWatchers = String(hash || "").match(/^#ajustes\/vigilantes$/);
+  if (legacyWatchers) {
+    const watcherProfile = readStoredWatcherProfile();
+    return { view: "ajustes", section: "vigilantes", watcherProfile, hash: ruleRouteHash("ajustes", "vigilantes", watcherProfile), legacy: true };
   }
 
   const partialRules = String(hash || "").match(/^#(limpieza-peliculas|limpieza-series|ajustes)$/);
   if (partialRules) {
     const view = partialRules[1];
     const section = readStoredRuleSection(view);
-    return { view, section, hash: `#${view}/${section}`, partial: true };
+    const watcherProfile = view === "ajustes" ? readStoredWatcherProfile() : undefined;
+    return { view, section, watcherProfile, hash: ruleRouteHash(view, section, watcherProfile), partial: true };
   }
 
-  const stored = exactCanonicalRoute(storageGet(PANEL_ROUTE_STORAGE_KEY, ""));
+  const storedHash = storageGet(PANEL_ROUTE_STORAGE_KEY, "");
+  const stored = exactCanonicalRoute(storedHash);
   if (stored) return stored;
+  if (storedHash === "#ajustes/vigilantes") {
+    const watcherProfile = readStoredWatcherProfile();
+    return { view: "ajustes", section: "vigilantes", watcherProfile, hash: ruleRouteHash("ajustes", "vigilantes", watcherProfile), legacy: true };
+  }
   return { view: "identidad", profile: "common", section: "parser", hash: "#identidad/comun/parser", fallback: true };
 }
 
@@ -959,7 +1042,10 @@ function tabTarget(view) {
     return window.ArrIdentityUI.resolveTarget("#identidad").hash;
   }
   if (view === "identidad") return "#identidad/comun/parser";
-  if (RULE_VIEW_CONFIG[view]) return `#${view}/${readStoredRuleSection(view)}`;
+  if (RULE_VIEW_CONFIG[view]) {
+    const section = readStoredRuleSection(view);
+    return ruleRouteHash(view, section);
+  }
   return `#${view}`;
 }
 

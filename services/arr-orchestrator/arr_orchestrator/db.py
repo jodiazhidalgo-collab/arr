@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 
 SCHEMA = """
@@ -80,7 +80,10 @@ RUNNING_STATES = {
     "staging",
     "extracting",
     "filebot_running",
+    "bluray_running",
     "media_postprocess_running",
+    "series_postprocess_running",
+    "series_review_cleanup",
     "trailer_running",
     "verifying_output",
 }
@@ -89,6 +92,7 @@ FINISHED_STATES = {
     "ready_extract",
     "ready_filebot",
     "media_postprocess_ready",
+    "series_postprocess_ready",
     "trailer_ready",
     "ready_cleanup",
     "done",
@@ -453,7 +457,14 @@ class Database:
         if not job:
             return None
         rows = self.connect().execute(
-            "SELECT * FROM job_events WHERE job_id=? ORDER BY event_id ASC LIMIT ?",
+            """
+            SELECT * FROM (
+                SELECT * FROM job_events
+                WHERE job_id=?
+                ORDER BY event_id DESC
+                LIMIT ?
+            ) ORDER BY event_id ASC
+            """,
             (job_id, limit),
         ).fetchall()
         previous_ts: Optional[float] = None
@@ -552,12 +563,19 @@ class Database:
         self.connect().commit()
         return int(cursor.rowcount)
 
-    def resolver_cache_stats(self) -> Dict[str, Any]:
-        """Resumen ligero para el panel, sin exponer claves ni payloads."""
+    def resolver_cache_stats(self, profile: Optional[str] = None) -> Dict[str, Any]:
+        """Resumen ligero y acotado por perfil, sin exponer claves ni payloads."""
 
         now = time.time()
+        media_type = _resolver_cache_media_type(profile)
+        where = " WHERE media_type=?" if media_type else ""
+        params: Tuple[Any, ...] = (
+            (now, now, now, media_type)
+            if media_type
+            else (now, now, now)
+        )
         row = self.connect().execute(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total,
                 COALESCE(SUM(CASE WHEN expires_at > ? THEN 1 ELSE 0 END), 0) AS active,
@@ -566,20 +584,26 @@ class Database:
                 MAX(created_at) AS newest_created_at,
                 MIN(CASE WHEN expires_at > ? THEN expires_at END) AS next_expires_at
             FROM resolver_cache
+            {where}
             """,
-            (now, now, now),
+            params,
         ).fetchone()
+        grouped_where = "WHERE expires_at > ?"
+        grouped_params: Tuple[Any, ...] = (now,)
+        if media_type:
+            grouped_where += " AND media_type=?"
+            grouped_params = (now, media_type)
         by_media_type = {
             str(item["media_type"]): int(item["entries"])
             for item in self.connect().execute(
-                """
+                f"""
                 SELECT media_type, COUNT(*) AS entries
                 FROM resolver_cache
-                WHERE expires_at > ?
+                {grouped_where}
                 GROUP BY media_type
                 ORDER BY media_type
                 """,
-                (now,),
+                grouped_params,
             ).fetchall()
         }
         return {
@@ -592,12 +616,30 @@ class Database:
             "by_media_type": by_media_type,
         }
 
-    def clear_resolver_cache(self) -> int:
-        """Elimina solo la cache derivada del resolver de identidad."""
+    def clear_resolver_cache(self, profile: Optional[str] = None) -> int:
+        """Elimina la cache del perfil pedido; ``common`` conserva el legado global."""
 
-        cursor = self.connect().execute("DELETE FROM resolver_cache")
+        media_type = _resolver_cache_media_type(profile)
+        if media_type:
+            cursor = self.connect().execute(
+                "DELETE FROM resolver_cache WHERE media_type=?",
+                (media_type,),
+            )
+        else:
+            cursor = self.connect().execute("DELETE FROM resolver_cache")
         self.connect().commit()
         return int(cursor.rowcount)
+
+
+def _resolver_cache_media_type(profile: Optional[str]) -> Optional[str]:
+    normalized = str(profile or "common").strip().lower()
+    if normalized == "common":
+        return None
+    if normalized == "movies":
+        return "movie"
+    if normalized == "tv":
+        return "tv"
+    raise ValueError("profile debe ser common, movies o tv")
 
 
 def _setting_revision(value: Optional[str]) -> int:

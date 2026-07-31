@@ -16,7 +16,24 @@ from arr_orchestrator.engine import Engine
 )
 class LiveEngineTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
+        candidates = [
+            Path(__file__).resolve().parents[3] / "_codex_runtime" / "tmp",
+            Path(tempfile.gettempdir()) / "_codex_runtime" / "tmp",
+        ]
+        self.temporary = None
+        for candidate in candidates:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                temporary = tempfile.TemporaryDirectory(
+                    prefix="live-engine-",
+                    dir=candidate,
+                )
+                self.temporary = temporary
+                break
+            except OSError:
+                continue
+        if self.temporary is None:
+            self.fail("No existe una ubicación escribible para _codex_runtime/tmp")
         self.root = Path(self.temporary.name)
         base = Config.from_env()
         data = self.root / "data"
@@ -38,6 +55,9 @@ class LiveEngineTests(unittest.TestCase):
             review_dir=data / "media" / "repetidas_vs_error",
             media_reports_root=self.root / "config" / "media-worker",
             codex_diag_root=self.root / "diagnosticos_codex",
+            series_reports_root=self.root / "config" / "series-worker",
+            series_review_dir=data / "media" / "repetidas_vs_error_series",
+            series_mode="active",
         )
         self.config.ensure_directories()
         self.database = Database(self.config.db_path)
@@ -49,7 +69,18 @@ class LiveEngineTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def create_job(self, category, name):
-        job_root = self.config.workshop_root / f"job-{category}"
+        job = self.database.create_job(
+            f"live:{category}:{Path(name).stem}",
+            "fs",
+            category,
+            name,
+            state="ready_filebot",
+            source_meta_json=self.engine._new_job_source_meta_json(
+                category=category,
+                name=name,
+            ),
+        )
+        job_root = self.config.workshop_root / str(job["job_id"])
         original = job_root / "original"
         original.mkdir(parents=True)
         video = original / name
@@ -63,12 +94,8 @@ class LiveEngineTests(unittest.TestCase):
             "1\n00:00:00,000 --> 00:00:01,000\nPrueba\n",
             encoding="utf-8",
         )
-        job = self.database.create_job(
-            f"live:{category}:{video.stem}",
-            "fs",
-            category,
-            name,
-            state="ready_filebot",
+        job = self.database.update_job(
+            str(job["job_id"]),
             source_path=str(original),
             stage_path=str(job_root),
         )
@@ -95,11 +122,17 @@ class LiveEngineTests(unittest.TestCase):
         self.engine._run_filebot(job)
 
         updated = self.database.get_job(job["job_id"])
-        self.assertEqual(updated["state"], "ready_cleanup")
+        self.assertEqual(updated["state"], "series_postprocess_ready")
         self.assertIn('"tmdb_id": 1399', updated["identity_json"])
-        output = self.config.tv_output / "Juego de tronos" / "Season 01"
+        output = (
+            Path(updated["stage_path"])
+            / "series_filebot_output"
+            / "Juego de tronos"
+            / "Season 01"
+        )
         self.assertTrue((output / "Juego de tronos - S01E01.mkv").is_file())
         self.assertTrue((output / "Juego de tronos - S01E01.srt").is_file())
+        self.assertFalse(any(self.config.tv_output.rglob("*.mkv")))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .diagnostic_sanitizer import collect_related_paths, phase_label, sanitize_for_export, sanitize_text
+from .diagnostic_sanitizer import (
+    collect_related_paths,
+    phase_label,
+    sanitize_for_export,
+    sanitize_text,
+    series_worker_status,
+)
 
 
 WARNING_TYPES = {"warning", "retry", "skipped"}
@@ -22,6 +28,7 @@ SUMMARY_READ_ORDER = [
 ]
 CONFIG_SNAPSHOT_KEYS = {
     "mode": "ARR_MODE",
+    "series_mode": "ARR_SERIES_MODE",
     "timing": {
         "stable_seconds": "ARR_STABLE_SECONDS",
         "reconcile_seconds": "ARR_RECONCILE_SECONDS",
@@ -37,11 +44,14 @@ CONFIG_SNAPSHOT_KEYS = {
         "review": "ARR_REVIEW_DIR",
         "movies_final": "ARR_MOVIES_FINAL",
         "tv_final": "ARR_TV_FINAL",
+        "series_worker_reports": "SERIES_WORKER_REPORT_ROOT",
+        "series_review": "ARR_SERIES_REVIEW_DIR",
         "codex_diagnostics": "CODEX_DIAG_ROOT",
         "diagnostics": "ARR_DIAGNOSTICS_ROOT",
     },
     "services": {
         "media_worker": "MEDIA_WORKER_URL",
+        "series_worker": "SERIES_WORKER_URL",
         "callback": "ARR_CALLBACK_URL",
         "qbit": "QBT_URL",
         "rdt": "RDT_URL",
@@ -112,9 +122,7 @@ def _normalize_event(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _write_meta_if_missing(path: Path, event: Dict[str, Any]) -> None:
-    if path.exists():
-        return
-    payload = {
+    payload = _read_json(path) or {
         "schema": "arr-blackbox-meta-v1",
         "source": "orchestrator.db:job_events",
         "canonical_source": "config/arr-orchestrator/orchestrator.db",
@@ -128,6 +136,7 @@ def _write_meta_if_missing(path: Path, event: Dict[str, Any]) -> None:
         "config_snapshot": _config_snapshot(),
         "read_order": SUMMARY_READ_ORDER,
     }
+    _apply_series_context(payload, event)
     _write_json(path, payload)
 
 
@@ -151,6 +160,7 @@ def _write_summary(path: Path, event: Dict[str, Any]) -> None:
     }
     event_type = str(event.get("event_type") or "")
     structured = event.get("structured") if isinstance(event.get("structured"), dict) else {}
+    _apply_series_context(summary, event)
 
     summary["event_count"] = int(summary.get("event_count") or 0) + 1
     summary["last_ts"] = event.get("ts")
@@ -199,6 +209,21 @@ def _write_summary(path: Path, event: Dict[str, Any]) -> None:
         current.update(correlation)
         summary["correlation"] = current
     _write_json(path, summary)
+
+
+def _apply_series_context(payload: Dict[str, Any], event: Dict[str, Any]) -> None:
+    config_snapshot = payload.get("config_snapshot")
+    if isinstance(config_snapshot, dict) and config_snapshot.get("series_mode"):
+        payload["series_mode"] = sanitize_text(config_snapshot["series_mode"])
+
+    structured = event.get("structured") if isinstance(event.get("structured"), dict) else {}
+    status = series_worker_status(
+        event.get("phase"),
+        structured,
+        payload.get("series_worker_status"),
+    )
+    if status:
+        payload["series_worker_status"] = status
 
 
 def _write_human_follow(path: Path, event: Dict[str, Any]) -> None:

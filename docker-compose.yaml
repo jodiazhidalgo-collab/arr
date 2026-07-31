@@ -261,10 +261,16 @@ services:
     container_name: arr-orchestrator
     user: "1000:10"
     depends_on:
-      - gluetun
-      - qbittorrent
-      - rdtclient
-      - media-worker
+      gluetun:
+        condition: service_started
+      qbittorrent:
+        condition: service_started
+      rdtclient:
+        condition: service_started
+      media-worker:
+        condition: service_started
+      series-worker:
+        condition: service_started
     environment:
       TZ: Europe/Madrid
       ARR_MODE: "active"
@@ -277,8 +283,11 @@ services:
       ARR_REVIEW_DIR: "/data/media/repetidas_vs_error"
       ARR_MOVIES_FINAL: "/data/media/movies"
       ARR_TV_FINAL: "/data/media/tv"
-      ARR_SERIES_MODE: "legacy"
+      ARR_SERIES_MODE: "active"
       MEDIA_WORKER_URL: "http://media-worker:8790"
+      SERIES_WORKER_URL: "http://series-worker:8791"
+      SERIES_WORKER_REPORT_ROOT: "/config/series-worker"
+      ARR_SERIES_REVIEW_DIR: "/data/media/repetidas_vs_error_series"
       QBT_URL: "http://gluetun:8080"
       QBT_USER: "${QBT_USER}"
       QBT_PASSWORD: "${QBT_PASSWORD}"
@@ -299,6 +308,7 @@ services:
     volumes:
       - ${ARR_ROOT}/config/arr-orchestrator:/config
       - ${ARR_ROOT}/config/media-worker:/config/media-worker:ro
+      - ${ARR_ROOT}/config/series-worker:/config/series-worker:ro
       - ${ARR_DATA_ROOT}:/data
       - ${ARR_ROOT}/diagnosticos_codex:/diagnosticos_codex
       - ${ARR_ROOT}/diagnostics:/diagnostics
@@ -344,7 +354,7 @@ services:
       start_period: 30s
     restart: unless-stopped
 
-  # Fase 3: accesible desde el panel, sin trafico TV desde arr-orchestrator.
+  # Motor TV independiente; el enrutado por trabajo lo congela ARR_SERIES_MODE.
   series-worker:
     build:
       context: ./services/series-worker
@@ -365,6 +375,7 @@ services:
       SERIES_WORKER_FINAL_ROOT: "/data/media/tv"
       SERIES_WORKER_REVIEW_ROOT: "/data/media/repetidas_vs_error_series"
       SERIES_WORKER_ALLOWED_ROOTS: "/data/downloads/torrents/complete/taller"
+      SERIES_WORKER_CALLBACK_ORIGIN: "http://arr-orchestrator:8787"
       SERIES_HEAVY_LOCK_PATH: "/config/worker-locks/media-heavy.lock"
       SERIES_HEAVY_LOCK_TIMEOUT_SEC: "3600"
       SERIES_ATOMIC_PREFLIGHT_LOCK_PATH: "/config/worker-locks/series-atomic-preflight.lock"

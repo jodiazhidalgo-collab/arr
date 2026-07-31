@@ -69,12 +69,15 @@ class WatcherRulesProxyTests(unittest.TestCase):
         }
         with patch.object(
             server,
-            "_watcher_rules_payload",
+            "_proxy_upstream_json",
             return_value=(200, current),
-        ) as legacy:
+        ) as upstream:
             status, result = server._watcher_rules_profile_payload("movies")
 
-        legacy.assert_called_once_with()
+        upstream.assert_called_once_with(
+            f"{server.ORCH_URL}/settings/watcher/movies",
+            timeout=8,
+        )
         self.assertEqual(status, 200)
         self.assertEqual(result["rules"], current["rules"])
         self.assertEqual(result["profile"], "movies")
@@ -90,7 +93,7 @@ class WatcherRulesProxyTests(unittest.TestCase):
         for status, error in cases:
             with self.subTest(status=status), patch.object(
                 server,
-                "_save_watcher_rules",
+                "_proxy_upstream_json",
                 return_value=(status, {"ok": False, "error": error}),
             ):
                 actual_status, result = server._save_watcher_rules_profile(
@@ -108,10 +111,16 @@ class WatcherRulesProxyTests(unittest.TestCase):
         legacy_handler = _CapturedHandler("/api/watcher-rules")
         with patch.object(
             server,
-            "_watcher_rules_payload",
+            "_proxy_upstream_json",
             return_value=(503, unavailable),
         ):
             status, profile = server._watcher_rules_profile_payload("movies")
+
+        with patch.object(
+            server,
+            "_watcher_rules_payload",
+            return_value=(503, unavailable),
+        ):
             server.Handler.do_GET(legacy_handler)
 
         self.assertEqual(status, 503)
@@ -143,26 +152,44 @@ class WatcherRulesProxyTests(unittest.TestCase):
 
         self.assertEqual(handler.response, (409, conflict))
 
-    def test_tv_profile_is_honestly_disconnected_without_upstream(self) -> None:
-        with patch.object(server, "_watcher_rules_payload") as read, patch.object(
+    def test_tv_profile_reads_and_saves_its_own_upstream(self) -> None:
+        loaded = {
+            "ok": True,
+            "profile": "tv",
+            "rules": {"ignored_suffixes": [".part"]},
+        }
+        saved = {**loaded, "saved": True}
+        with patch.object(
             server,
-            "_save_watcher_rules",
-        ) as save:
+            "_proxy_upstream_json",
+            side_effect=((200, loaded), (200, saved)),
+        ) as upstream:
             get_status, get_result = server._watcher_rules_profile_payload("tv")
             post_status, post_result = server._save_watcher_rules_profile(
                 "tv",
                 {"rules": {"ignored_suffixes": [".part"]}},
             )
 
-        read.assert_not_called()
-        save.assert_not_called()
         self.assertEqual(get_status, 200)
-        self.assertFalse(get_result["connected"])
-        self.assertFalse(get_result["editable"])
-        self.assertEqual(post_status, 503)
-        self.assertEqual(post_result["error"], "series_watcher_not_connected")
+        self.assertTrue(get_result["connected"])
+        self.assertTrue(get_result["editable"])
+        self.assertEqual(post_status, 200)
+        self.assertTrue(post_result["saved"])
+        self.assertEqual(
+            upstream.call_args_list[0].args,
+            (f"{server.ORCH_URL}/settings/watcher/tv",),
+        )
+        self.assertEqual(upstream.call_args_list[0].kwargs, {"timeout": 8})
+        self.assertEqual(
+            upstream.call_args_list[1].args,
+            (
+                f"{server.ORCH_URL}/settings/watcher/tv",
+                {"rules": {"ignored_suffixes": [".part"]}},
+            ),
+        )
+        self.assertEqual(upstream.call_args_list[1].kwargs, {"timeout": 20})
 
-    def test_profile_routes_keep_legacy_and_tv_blocked(self) -> None:
+    def test_profile_routes_forward_movies_and_tv(self) -> None:
         get_handler = _CapturedHandler("/api/watcher-rules/movies")
         expected = {"ok": True, "profile": "movies"}
         with patch.object(
@@ -175,18 +202,34 @@ class WatcherRulesProxyTests(unittest.TestCase):
         self.assertEqual(get_handler.response, (200, expected))
 
         post_handler = _CapturedHandler("/api/watcher-rules/tv", {"rules": {}})
-        blocked = {
-            "ok": False,
-            "error": "series_watcher_not_connected",
-        }
+        saved = {"ok": True, "profile": "tv", "saved": True}
         with patch.object(
             server,
             "_save_watcher_rules_profile",
-            return_value=(503, blocked),
+            return_value=(200, saved),
         ) as profile_save:
             server.Handler.do_POST(post_handler)
         profile_save.assert_called_once_with("tv", {"rules": {}})
-        self.assertEqual(post_handler.response, (503, blocked))
+        self.assertEqual(post_handler.response, (200, saved))
+
+    def test_missing_profile_endpoint_is_not_reported_as_editable(self) -> None:
+        with patch.object(
+            server,
+            "_proxy_upstream_json",
+            return_value=(404, {"ok": False, "error": "not_found"}),
+        ):
+            get_status, get_result = server._watcher_rules_profile_payload("tv")
+            post_status, post_result = server._save_watcher_rules_profile(
+                "tv",
+                {"rules": {}},
+            )
+
+        self.assertEqual(get_status, 404)
+        self.assertFalse(get_result["connected"])
+        self.assertFalse(get_result["editable"])
+        self.assertEqual(post_status, 404)
+        self.assertFalse(post_result["connected"])
+        self.assertFalse(post_result["editable"])
 
     def test_new_rules_posts_require_same_origin_and_json_content_type(self) -> None:
         paths = (

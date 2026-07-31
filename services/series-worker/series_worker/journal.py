@@ -11,6 +11,7 @@ import copy
 import errno
 import json
 import os
+import stat
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -96,9 +97,14 @@ def fsync_directory(path: Path | str) -> None:
     """Sincroniza una entrada de directorio cuando el sistema lo permite."""
 
     directory = Path(path)
+    _reject_symlink_chain(directory)
     if os.name == "nt":  # Windows no permite abrir directorios con os.open.
         return
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(directory, flags)
     try:
         os.fsync(descriptor)
@@ -106,9 +112,17 @@ def fsync_directory(path: Path | str) -> None:
         os.close(descriptor)
 
 
+def _reject_symlink_chain(path: Path) -> None:
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise JournalError(f"Ruta durable atraviesa un enlace simbólico: {candidate.name}")
+
+
 def _ensure_directory(path: Path) -> None:
+    _reject_symlink_chain(path)
     existed = path.exists()
     path.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_chain(path)
     if not path.is_dir():
         raise NotADirectoryError(str(path))
     if not existed:
@@ -121,6 +135,8 @@ def write_json_file_atomic(path: Path | str, payload: Any) -> Path:
 
     destination = Path(path)
     _ensure_directory(destination.parent)
+    if destination.is_symlink():
+        raise JournalError("El destino durable no puede ser un enlace simbólico")
     encoded = _encoded_json(payload)
     temporary: Path | None = None
     try:
@@ -146,8 +162,15 @@ def write_json_file_atomic(path: Path | str, payload: Any) -> Path:
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
     _ensure_directory(path.parent)
+    if path.is_symlink():
+        raise JournalError("El journal JSONL no puede ser un enlace simbólico")
     encoded = _encoded_json(payload)
-    flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
+    flags = (
+        os.O_APPEND
+        | os.O_CREAT
+        | os.O_WRONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     descriptor = os.open(path, flags, 0o600)
     try:
         view = memoryview(encoded)
@@ -230,10 +253,19 @@ class DurableJournal:
         return write_json_file_atomic(destination, payload)
 
     def _read_events(self) -> list[dict[str, Any]]:
+        _reject_symlink_chain(self.events_path)
         if not self.events_path.exists():
             return []
         try:
-            raw = self.events_path.read_bytes()
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(self.events_path, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise JournalError("journal.jsonl no es un archivo regular")
+                with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                    raw = handle.read()
+            finally:
+                os.close(descriptor)
         except OSError as exc:
             raise JournalError(f"No se puede leer journal.jsonl: {exc}") from exc
         records: list[dict[str, Any]] = []
@@ -267,7 +299,11 @@ class DurableJournal:
     def _truncate_torn_tail(self, valid_length: int) -> None:
         """Retira solo el último append incompleto; nunca repara corrupción intermedia."""
 
-        descriptor = os.open(self.events_path, os.O_RDWR)
+        _reject_symlink_chain(self.events_path)
+        descriptor = os.open(
+            self.events_path,
+            os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        )
         try:
             os.ftruncate(descriptor, valid_length)
             os.fsync(descriptor)
@@ -276,10 +312,21 @@ class DurableJournal:
         fsync_directory(self.events_path.parent)
 
     def _read_snapshot_file(self) -> dict[str, Any] | None:
+        _reject_symlink_chain(self.snapshot_path)
         if not self.snapshot_path.exists():
             return None
         try:
-            value = json.loads(self.snapshot_path.read_text(encoding="utf-8"))
+            descriptor = os.open(
+                self.snapshot_path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise JournalContradiction("journal.json no es un archivo regular")
+                with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
+                    value = json.load(handle)
+            finally:
+                os.close(descriptor)
         except (OSError, json.JSONDecodeError) as exc:
             raise JournalContradiction("journal.json truncado o invalido") from exc
         return _record_shape(value, source="journal.json")

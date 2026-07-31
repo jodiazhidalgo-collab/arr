@@ -5,7 +5,13 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .diagnostic_sanitizer import json_dumps_sanitized, phase_label, sanitize_for_export, sanitize_text
+from .diagnostic_sanitizer import (
+    json_dumps_sanitized,
+    phase_label,
+    sanitize_for_export,
+    sanitize_text,
+    series_worker_status,
+)
 
 
 MAX_RELATED_FILE_BYTES = 512 * 1024
@@ -216,6 +222,7 @@ def _codex_summary(detail: Dict[str, Any], status: Dict[str, Any], filename: str
     job = detail.get("job") or {}
     source_meta = detail.get("source_meta") if isinstance(detail.get("source_meta"), dict) else {}
     correlation = _correlation_summary(job, source_meta)
+    series = _series_diagnostic_summary(detail, status)
     timings = detail.get("timings") or []
     errors = detail.get("errors") or []
     decisions = detail.get("decisions") or []
@@ -247,6 +254,9 @@ def _codex_summary(detail: Dict[str, Any], status: Dict[str, Any], filename: str
         f"Errores: {len(errors)}",
         f"Orquestador: {(status.get('orchestrator') or {}).get('status', '-')}",
         f"Media worker: {(status.get('media_worker') or {}).get('status', '-')}",
+        f"Modo Series: {series['mode'] or '-'}",
+        f"Series worker: {series['service_status'] or '-'}",
+        f"Estado Series worker del job: {series['job_status'] or '-'}",
         "",
         "TIEMPOS POR FASE",
     ]
@@ -270,6 +280,51 @@ def _codex_summary(detail: Dict[str, Any], status: Dict[str, Any], filename: str
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def _series_diagnostic_summary(detail: Dict[str, Any], status: Dict[str, Any]) -> Dict[str, str]:
+    job = detail.get("job") if isinstance(detail.get("job"), dict) else {}
+    source_meta = detail.get("source_meta") if isinstance(detail.get("source_meta"), dict) else {}
+    pipeline = source_meta.get("series_pipeline") if isinstance(source_meta.get("series_pipeline"), dict) else {}
+    series_health = status.get("series_worker") if isinstance(status.get("series_worker"), dict) else {}
+    orchestrator_health = status.get("orchestrator") if isinstance(status.get("orchestrator"), dict) else {}
+
+    mode = (
+        pipeline.get("configured_mode")
+        or series_health.get("mode")
+        or orchestrator_health.get("series_mode")
+        or ""
+    )
+    job_status = ""
+    for event in detail.get("timeline") or []:
+        if not isinstance(event, dict):
+            continue
+        job_status = series_worker_status(
+            event.get("phase"),
+            event.get("structured"),
+            job_status,
+        )
+
+    result_summary = detail.get("result_summary")
+    route = str(pipeline.get("route") or "")
+    if isinstance(result_summary, dict) and (route == "series-worker" or job_status):
+        job_status = series_worker_status(
+            "series_worker",
+            {"kind": "series", "result_summary": result_summary},
+            job_status,
+        )
+    if not job_status and route == "series-worker":
+        job_status = series_worker_status(
+            "series",
+            {"state": job.get("state")},
+            job_status,
+        )
+
+    return {
+        "mode": sanitize_text(mode),
+        "service_status": sanitize_text(series_health.get("status") or ""),
+        "job_status": sanitize_text(job_status),
+    }
 
 
 def _correlation_summary(job: Dict[str, Any], source_meta: Dict[str, Any]) -> Dict[str, Any]:

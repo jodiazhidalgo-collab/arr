@@ -75,6 +75,7 @@ def _identity(job_id, generation, prepared, final, mode, shadow=None):
         payload["candidate_signature"] = delivery._tree_signature_digest(candidate)
         payload["base_signature"] = delivery._tree_signature_digest(base)
         payload["prepared_signature"] = delivery._tree_signature_digest(prepared_path)
+        payload["allowed_existing_files"] = {}
         payload["candidate_identity"] = delivery._cleanup_root_identity(candidate)
         payload["cleanup_identities"] = {
             "shadow": delivery._cleanup_root_identity(base),
@@ -166,7 +167,17 @@ def test_existing_series_uses_complete_shadow_and_never_edits_old_hardlinks(
     monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
     monkeypatch.setattr(delivery, "_rename_exchange", _portable_test_exchange)
 
-    result = delivery.publish_series("job-exchange", prepared, final, journal)
+    result = delivery.publish_series(
+        "job-exchange",
+        prepared,
+        final,
+        journal,
+        allowed_existing_files={
+            "Season 01/S01E02.mkv": delivery._stable_file_sha256(
+                final / "Season 01" / "S01E02.mkv"
+            )
+        },
+    )
 
     assert result["status"] == "committed"
     assert result["mode"] == "exchange"
@@ -212,7 +223,6 @@ def test_exchange_failure_rolls_back_without_a_partial_pack(tmp_path, monkeypatc
     prepared = tmp_path / "prepared" / "Serie"
     _write(final / "S01E01.mkv", "old-1")
     _write(final / "S01E02.mkv", "old-2")
-    _write(prepared / "S01E02.mkv", "new-2")
     _write(prepared / "S01E03.mkv", "new-3")
     journal = DurableJournal(tmp_path / "journal")
     monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
@@ -228,7 +238,6 @@ def test_exchange_failure_rolls_back_without_a_partial_pack(tmp_path, monkeypatc
     assert {path.name for path in final.iterdir()} == {"S01E01.mkv", "S01E02.mkv"}
     assert (final / "S01E01.mkv").read_text(encoding="utf-8") == "old-1"
     assert (final / "S01E02.mkv").read_text(encoding="utf-8") == "old-2"
-    assert (prepared / "S01E02.mkv").read_text(encoding="utf-8") == "new-2"
     assert (prepared / "S01E03.mkv").read_text(encoding="utf-8") == "new-3"
     assert not list(library.glob(".Serie.series-worker.*.shadow"))
     assert journal.state == "ROLLED_BACK"
@@ -384,6 +393,151 @@ def test_recovery_completes_exchange_after_crash_before_atomic_syscall(
     assert journal.state == "COMMITTED"
     assert not shadow.exists()
     assert not prepared.exists()
+
+
+def test_tree_signature_ignores_directory_mtime_noise_but_not_inventory(tmp_path):
+    prepared = tmp_path / "prepared" / "Serie"
+    episode = prepared / "Season 01" / "S01E01.mkv"
+    _write(episode, "episode")
+    before = delivery._tree_signature(prepared)
+
+    directory = episode.parent
+    stat_result = directory.stat()
+    os.utime(
+        directory,
+        ns=(stat_result.st_atime_ns, stat_result.st_mtime_ns + 10_000_000),
+    )
+
+    assert delivery._tree_signature(prepared) == before
+    _write(directory / "S01E02.mkv", "new")
+    assert delivery._tree_signature(prepared) != before
+
+
+def test_build_shadow_rejects_target_created_after_collision_plan(tmp_path):
+    final = tmp_path / "tv" / "Serie"
+    prepared = tmp_path / "prepared" / "Serie"
+    _write(final / "Season 01/S01E01.mkv", "old")
+    _write(prepared / "Season 01/S01E02.mkv", "processed")
+    late_target = final / "Season 01/S01E02.mkv"
+    _write(late_target, "external")
+    shadow = delivery._shadow_path(
+        final.resolve(),
+        "job-late-collision",
+        "c" * 32,
+    )
+
+    with pytest.raises(delivery.DeliveryConflict, match="colisión tardía"):
+        delivery._build_shadow(
+            prepared,
+            final,
+            shadow,
+            job_id="job-late-collision",
+            generation="c" * 32,
+        )
+
+    assert late_target.read_text(encoding="utf-8") == "external"
+    assert not shadow.exists()
+
+
+def test_allowed_collision_mutated_after_first_hash_is_rejected_before_exchange(
+    tmp_path,
+    monkeypatch,
+):
+    final = tmp_path / "tv" / "Serie"
+    prepared = tmp_path / "prepared" / "Serie"
+    relative = Path("Season 01/S01E01.mkv")
+    target = final / relative
+    _write(target, "old")
+    _write(prepared / relative, "new")
+    expected_digest = delivery._stable_file_sha256(target)
+    original_clone = delivery._clone_existing_with_hardlinks
+
+    def mutate_after_first_hash(source, shadow):
+        original_clone(source, shadow)
+        identity = target.stat()
+        target.write_text("bad", encoding="utf-8")
+        os.utime(
+            target,
+            ns=(identity.st_atime_ns, identity.st_mtime_ns),
+        )
+
+    exchange_calls = []
+    monkeypatch.setattr(
+        delivery,
+        "_clone_existing_with_hardlinks",
+        mutate_after_first_hash,
+    )
+    monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
+    monkeypatch.setattr(
+        delivery,
+        "_rename_exchange",
+        lambda *args: exchange_calls.append(args),
+    )
+    journal = DurableJournal(tmp_path / "journal-raced-allowlist")
+
+    with pytest.raises(delivery.DeliveryConflict, match="colisión prevista cambió"):
+        delivery.publish_series(
+            "job-raced-allowlist",
+            prepared,
+            final,
+            journal,
+            allowed_existing_files={relative.as_posix(): expected_digest},
+        )
+
+    assert exchange_calls == []
+    assert target.read_text(encoding="utf-8") == "bad"
+    assert (prepared / relative).read_text(encoding="utf-8") == "new"
+    assert journal.state == "ROLLED_BACK"
+
+
+def test_allowed_collision_mutated_after_exchange_is_rolled_back_atomically(
+    tmp_path,
+    monkeypatch,
+):
+    final = tmp_path / "tv" / "Serie"
+    prepared = tmp_path / "prepared" / "Serie"
+    relative = Path("Season 01/S01E01.mkv")
+    target = final / relative
+    _write(target, "old")
+    _write(prepared / relative, "new")
+    expected_digest = delivery._stable_file_sha256(target)
+    exchange_calls = 0
+
+    def mutate_old_root_after_exchange(shadow, destination):
+        nonlocal exchange_calls
+        exchange_calls += 1
+        _portable_test_exchange(shadow, destination)
+        if exchange_calls == 1:
+            old_target = shadow / relative
+            identity = old_target.stat()
+            old_target.write_text("bad", encoding="utf-8")
+            os.utime(
+                old_target,
+                ns=(identity.st_atime_ns, identity.st_mtime_ns),
+            )
+
+    monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
+    monkeypatch.setattr(
+        delivery,
+        "_rename_exchange",
+        mutate_old_root_after_exchange,
+    )
+    journal = DurableJournal(tmp_path / "journal-post-exchange-race")
+
+    result = delivery.publish_series(
+        "job-post-exchange-race",
+        prepared,
+        final,
+        journal,
+        allowed_existing_files={relative.as_posix(): expected_digest},
+    )
+
+    assert result["status"] == "rolled_back"
+    assert exchange_calls == 2
+    assert target.read_text(encoding="utf-8") == "bad"
+    assert (prepared / relative).read_text(encoding="utf-8") == "new"
+    assert journal.state == "ROLLED_BACK"
+    assert not list(final.parent.glob(".Serie.series-worker.*.shadow"))
 
 
 @pytest.mark.parametrize("mutated_side", ["base", "candidate"])
@@ -1623,7 +1777,6 @@ def test_linux_observer_sees_only_old_or_new_complete_root(tmp_path):
     prepared = tmp_path / "prepared" / "Serie"
     _write(final / "S01E01.mkv", "old-1")
     _write(final / "S01E02.mkv", "old-2")
-    _write(prepared / "S01E02.mkv", "new-2")
     _write(prepared / "S01E03.mkv", "new-3")
     old_inode = (final / "S01E01.mkv").stat().st_ino
     journal = DurableJournal(tmp_path / "journal")
@@ -1659,4 +1812,4 @@ def test_linux_observer_sees_only_old_or_new_complete_root(tmp_path):
     assert set(observations) <= {old_pack, new_pack}
     assert new_pack in observations
     assert (final / "S01E01.mkv").stat().st_ino == old_inode
-    assert (final / "S01E02.mkv").read_text(encoding="utf-8") == "new-2"
+    assert (final / "S01E02.mkv").read_text(encoding="utf-8") == "old-2"

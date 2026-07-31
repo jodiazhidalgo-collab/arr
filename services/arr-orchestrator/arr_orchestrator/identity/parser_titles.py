@@ -257,9 +257,9 @@ def guessit_input(title: str, year: Optional[int], tv: Mapping[str, object]) -> 
         parts.append(str(year))
     season = tv.get("season")
     episodes = tv.get("episodes") or []
-    if season and episodes:
+    if season is not None and episodes:
         parts.append(f"S{int(season):02d}E{int(episodes[0]):02d}")
-    elif season:
+    elif season is not None:
         parts.append(f"Season {int(season)}")
     elif tv.get("absolute_episode"):
         parts.append(f"Episode {int(tv['absolute_episode'])}")

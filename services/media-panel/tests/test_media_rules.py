@@ -45,6 +45,11 @@ class MediaRulesProxyTests(unittest.TestCase):
             "applied": True,
         }
 
+    @classmethod
+    def cleaning_rules(cls):
+        rules = cls.full_document()["rules"]
+        return {block: rules[block] for block in server.MOVIE_RULE_BLOCKS}
+
     def test_get_and_post_use_media_worker_settings_endpoint(self) -> None:
         payload = {"rules": {}, "expected_fingerprint": "abc"}
         expected = {"ok": True, "fingerprint": "def", "applied": True}
@@ -244,37 +249,64 @@ class MediaRulesProxyTests(unittest.TestCase):
             "error": "connection refused",
             "upstream_status": 502,
         }
-        with patch.object(
-            server,
-            "_proxy_upstream_json",
-            return_value=(502, unavailable),
-        ), patch.object(server, "_media_rules_payload") as media_get:
-            get_status, get_result = server._series_rules_payload()
-            post_status, post_result = server._save_series_rules(
-                {"rules": {}, "expected_fingerprint": "sha256:old"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            series_rules = root / "series.json"
+            defaults = root / "defaults.json"
+            series_rules.write_text(
+                json.dumps(self.cleaning_rules()),
+                encoding="utf-8",
             )
+            defaults.write_text(
+                json.dumps(self.cleaning_rules()),
+                encoding="utf-8",
+            )
+            with patch.object(
+                server,
+                "_proxy_upstream_json",
+                return_value=(502, unavailable),
+            ), patch.object(server, "_media_rules_payload") as media_get, patch.object(
+                server, "SERIES_RULES_PATH", series_rules
+            ), patch.object(server, "DEFAULT_RULES_PATH", defaults):
+                get_status, get_result = server._series_rules_payload()
+                post_status, post_result = server._save_series_rules(
+                    {"rules": {}, "expected_fingerprint": "sha256:old"}
+                )
 
         self.assertEqual(get_status, 200)
         self.assertTrue(get_result["ok"])
         self.assertFalse(get_result["connected"])
         self.assertFalse(get_result["editable"])
-        self.assertEqual(get_result["rules"], {})
+        self.assertEqual(get_result["rules"], self.cleaning_rules())
+        self.assertEqual(get_result["active"], self.cleaning_rules())
+        self.assertEqual(get_result["defaults"], self.cleaning_rules())
+        self.assertEqual(get_result["rules_path"], server.SERIES_RULES_ALIAS)
+        self.assertNotIn("trailers", get_result["rules"])
+        self.assertIsInstance(get_result["fingerprint"], str)
         self.assertEqual(post_status, 503)
         self.assertEqual(post_result["error"], "series_worker_unavailable")
         media_get.assert_not_called()
 
     def test_series_rules_get_rejects_an_incomplete_worker_document(self) -> None:
+        fallback = {
+            "rules": self.cleaning_rules(),
+            "active": self.cleaning_rules(),
+            "defaults": self.cleaning_rules(),
+            "rules_path": server.SERIES_RULES_ALIAS,
+            "fingerprint": "sha256:fallback",
+        }
         with patch.object(
             server,
             "_proxy_upstream_json",
             return_value=(200, {"ok": True, "rules": {}}),
-        ):
+        ), patch.object(server, "_series_rules_fallback", return_value=fallback):
             status, result = server._series_rules_payload()
 
         self.assertEqual(status, 200)
         self.assertFalse(result["connected"])
         self.assertFalse(result["editable"])
-        self.assertIsNone(result["fingerprint"])
+        self.assertEqual(result["rules"], self.cleaning_rules())
+        self.assertEqual(result["fingerprint"], "sha256:fallback")
 
     def test_series_rules_preserve_worker_cas_conflict(self) -> None:
         conflict = {
@@ -428,7 +460,12 @@ class PanelProfilePayloadTests(unittest.TestCase):
         self.assertNotIn(str(series_root), json.dumps(series))
 
     def test_status_keeps_legacy_and_adds_per_service_truth(self) -> None:
-        orchestrator = {"status": "ok", "dependencies": {"db": True}}
+        orchestrator = {
+            "status": "ok",
+            "mode": "active",
+            "series_mode": "legacy",
+            "dependencies": {"db": True},
+        }
         worker = {"status": "ok"}
         series_worker = {"status": "ok", "atomic_rules": True}
 
@@ -451,6 +488,15 @@ class PanelProfilePayloadTests(unittest.TestCase):
         self.assertTrue(result["services"]["trailers"]["connected"])
         self.assertTrue(result["services"]["series"]["connected"])
         self.assertTrue(result["services"]["series"]["editable"])
+        self.assertEqual(result["mode"], "active")
+        self.assertEqual(result["series_mode"], "legacy")
+        self.assertTrue(result["health"]["series"])
+        self.assertEqual(result["services"]["series"]["mode"], "legacy")
+        self.assertFalse(result["services"]["series"]["routing_active"])
+        self.assertEqual(
+            result["services"]["series"]["message"],
+            "Motor sano · modo legacy",
+        )
 
     def test_status_marks_only_series_disconnected_when_its_health_fails(self) -> None:
         def health(url, timeout=8):
@@ -496,6 +542,35 @@ class PanelProfilePayloadTests(unittest.TestCase):
         server.Handler.do_GET(invalid)
         self.assertEqual(invalid.response[0], 400)
         self.assertEqual(invalid.response[1]["error"], "invalid_profile")
+
+    def test_history_and_codex_routes_forward_and_validate_profile(self) -> None:
+        jobs_handler = _CapturedHandler("/api/jobs?profile=series")
+        codex_handler = _CapturedHandler("/api/codex-diagnostics?profile=movies")
+        with patch.object(
+            server,
+            "_jobs_payload",
+            return_value={"ok": True, "jobs": [], "profile": "series"},
+        ) as jobs, patch.object(
+            server,
+            "_codex_diagnostics_payload",
+            return_value={"ok": True, "files": [], "profile": "movies"},
+        ) as codex:
+            server.Handler.do_GET(jobs_handler)
+            server.Handler.do_GET(codex_handler)
+
+        jobs.assert_called_once_with(profile="series")
+        codex.assert_called_once_with(profile="movies")
+        self.assertEqual(jobs_handler.response[0], 200)
+        self.assertEqual(codex_handler.response[0], 200)
+
+        for path in (
+            "/api/jobs?profile=tv",
+            "/api/codex-diagnostics?profile=common",
+        ):
+            handler = _CapturedHandler(path)
+            server.Handler.do_GET(handler)
+            self.assertEqual(handler.response[0], 400)
+            self.assertEqual(handler.response[1]["error"], "invalid_profile")
 
 
 class MediaRulesPanelContractTests(unittest.TestCase):

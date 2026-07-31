@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,16 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parent
 ORCHESTRATOR_DIR = PROJECT_ROOT / "services" / "arr-orchestrator"
 BUSCADOR_DIR = PROJECT_ROOT / "services" / "buscador-puente-arr"
-PYTEST_DATA_DIR = PROJECT_ROOT / "_codex_runtime" / "test-data" / "pytest-session"
+PYTEST_SESSION_TOKEN = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+PYTEST_TEMP_DIR = (
+    PROJECT_ROOT / "_codex_runtime" / "tmp" / f"pytest-{PYTEST_SESSION_TOKEN}"
+)
+PYTEST_DATA_DIR = (
+    PROJECT_ROOT
+    / "_codex_runtime"
+    / "test-data"
+    / f"pytest-session-{PYTEST_SESSION_TOKEN}"
+)
 ARR_DATA_DIR = PYTEST_DATA_DIR / "arr"
 BUSCADOR_DATA_DIR = PYTEST_DATA_DIR / "buscador"
 
@@ -39,6 +49,13 @@ def _remove_pytest_session_data() -> None:
 def pytest_sessionfinish(session, exitstatus) -> None:
     if exitstatus == pytest.ExitCode.OK:
         _remove_pytest_session_data()
+        shutil.rmtree(PYTEST_TEMP_DIR, ignore_errors=True)
+
+
+def pytest_configure(config) -> None:
+    """Aísla tmp_path por proceso para permitir revisiones simultáneas."""
+
+    config.option.basetemp = str(PYTEST_TEMP_DIR)
 
 
 for path in (ORCHESTRATOR_DIR, BUSCADOR_DIR):

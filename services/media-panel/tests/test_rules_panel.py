@@ -118,12 +118,15 @@ class RulesPanelContractTests(unittest.TestCase):
         self.assertIn("function exactCanonicalRoute(hash)", self.panel_js)
         self.assertIn("function canonicalRouteFromHash", self.panel_js)
         self.assertIn("const exact = exactCanonicalRoute(hash);", self.panel_js)
-        self.assertIn("const stored = exactCanonicalRoute(storageGet(", self.panel_js)
+        self.assertIn("const storedHash = storageGet(", self.panel_js)
+        self.assertIn("const stored = exactCanonicalRoute(storedHash);", self.panel_js)
         self.assertIn('history.replaceState(null, "", route.hash)', self.panel_js)
         self.assertIn("#identidad/comun/parser", self.panel_js)
         self.assertIn("#limpieza-peliculas/${section}", self.panel_js)
         self.assertIn("#ajustes/trailers", self.panel_js)
-        self.assertIn("#ajustes/vigilantes", self.panel_js)
+        self.assertIn("#ajustes/vigilante-peliculas", self.panel_js)
+        self.assertIn("#ajustes/vigilante-series", self.panel_js)
+        self.assertIn('/^#ajustes\\/vigilantes$/', self.panel_js)
         self.assertIn("/^#reglas", self.panel_js)
         self.assertIn("window.ArrIdentityUI.resolveTarget(hash)", self.panel_js)
 
@@ -136,14 +139,26 @@ class RulesPanelContractTests(unittest.TestCase):
         self.assertIn("config.sections.map", self.panel_js)
 
     def test_review_and_reports_are_profile_scoped(self) -> None:
+        self.assertIn("/api/jobs?profile=${encodeURIComponent(profile)}", self.panel_js)
         self.assertIn("/api/review?profile=${encodeURIComponent(profile)}", self.panel_js)
         self.assertIn("/api/reports?profile=${encodeURIComponent(profile)}", self.panel_js)
+        self.assertIn(
+            "/api/codex-diagnostics?profile=${encodeURIComponent(profile)}",
+            self.panel_js,
+        )
         self.assertIn(
             "/api/report?profile=${encodeURIComponent(profile)}&file=${encodeURIComponent(file)}",
             self.panel_js,
         )
+        self.assertIn("arr-media-panel-historial-profile", self.panel_js)
         self.assertIn("arr-media-panel-revision-profile", self.panel_js)
         self.assertIn("arr-media-panel-informes-profile", self.panel_js)
+
+    def test_series_status_distinguishes_legacy_canary_and_active(self) -> None:
+        self.assertIn("modo legacy · no enruta trabajos nuevos", self.panel_js)
+        self.assertIn("modo canary · solo pruebas seleccionadas", self.panel_js)
+        self.assertIn("activo para todos los trabajos nuevos", self.panel_js)
+        self.assertIn('const runtimeStatus = await api("/api/status")', self.panel_js)
 
     def test_mobile_history_and_review_are_width_safe(self) -> None:
         self.assertIn('class="table jobs-table"', self.panel_js)

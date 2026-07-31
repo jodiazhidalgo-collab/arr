@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 import os
 import re
@@ -23,8 +24,12 @@ REPORT_ROOT = Path(os.environ.get("MEDIA_REPORT_ROOT", "/config/media-worker"))
 REVIEW_DIR = Path(os.environ.get("MEDIA_REVIEW_DIR", "/data/media/repetidas_vs_error"))
 SERIES_REPORT_ROOT = Path("/config/series-worker")
 SERIES_REVIEW_DIR = Path("/data/media/repetidas_vs_error_series")
+SERIES_RULES_PATH = Path(
+    os.environ.get("SERIES_RULES_PATH", "/config/series-rules/reglas_series.json")
+)
 SERIES_REPORT_ALIAS = "<CONFIG>/series-worker"
 SERIES_REVIEW_ALIAS = "<DATA_MEDIA>/repetidas_vs_error_series"
+SERIES_RULES_ALIAS = "<CONFIG>/series-rules/reglas_series.json"
 COMPLETE_ROOT = Path(os.environ.get("ARR_COMPLETE_ROOT", "/data/downloads/torrents/complete"))
 MOVIES_ROOT = Path(os.environ.get("ARR_MOVIES_ROOT", "/data/media/movies"))
 TV_ROOT = Path(os.environ.get("ARR_TV_ROOT", "/data/media/tv"))
@@ -321,7 +326,10 @@ def _codex_zip_metadata(path: Path) -> Dict[str, Any]:
     return metadata
 
 
-def _codex_diagnostics_payload(limit: int = 80) -> Dict[str, Any]:
+def _codex_diagnostics_payload(
+    limit: int = 80,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
     files: List[Dict[str, Any]] = []
     if CODEX_DIAG_ROOT.is_dir():
         candidates = [
@@ -329,13 +337,20 @@ def _codex_diagnostics_payload(limit: int = 80) -> Dict[str, Any]:
             for path in CODEX_DIAG_ROOT.rglob("*.zip")
             if path.is_file() and not path.name.startswith(".")
         ]
-        for path in sorted(candidates, key=_mtime, reverse=True)[:limit]:
+        for path in sorted(candidates, key=_mtime, reverse=True):
+            if len(files) >= limit:
+                break
             rel = str(path.relative_to(CODEX_DIAG_ROOT)).replace("\\", "/")
             folder = path.parent.name if path.parent != CODEX_DIAG_ROOT else ""
             job = _codex_zip_metadata(path)
             display_name = str(job.get("name") or path.stem.replace("_informe_codex", ""))
             category = str(job.get("category") or "")
             state = str(job.get("state") or "")
+            item_profile = _profile_from_metadata(job)
+            if item_profile is None:
+                item_profile = "series" if folder == "tv" else "movies"
+            if profile is not None and item_profile != profile:
+                continue
             files.append(
                 {
                     "name": path.name,
@@ -344,6 +359,7 @@ def _codex_diagnostics_payload(limit: int = 80) -> Dict[str, Any]:
                     "folder_label": _codex_bucket_label(folder) if folder else "Antiguos",
                     "display_name": display_name,
                     "category": category,
+                    "profile": item_profile,
                     "state": state,
                     "updated_at": job.get("updated_at"),
                     "size": path.stat().st_size,
@@ -351,7 +367,14 @@ def _codex_diagnostics_payload(limit: int = 80) -> Dict[str, Any]:
                     "download_url": f"/api/codex-diagnostic?file={urllib.parse.quote(rel)}",
                 }
             )
-    return {"ok": True, "root": str(CODEX_DIAG_ROOT), "files": files}
+    result: Dict[str, Any] = {
+        "ok": True,
+        "root": str(CODEX_DIAG_ROOT),
+        "files": files,
+    }
+    if profile is not None:
+        result["profile"] = profile
+    return result
 
 
 def _create_codex_diagnostic(job_id: str) -> Dict[str, Any]:
@@ -528,18 +551,49 @@ def _save_media_rules_profile(
     )
 
 
+def _series_rules_fallback() -> Dict[str, Any]:
+    stored = (
+        _read_json(SERIES_RULES_PATH)
+        if SERIES_RULES_PATH.is_file() and not SERIES_RULES_PATH.is_symlink()
+        else {}
+    )
+    defaults_source = (
+        _read_json(DEFAULT_RULES_PATH)
+        if DEFAULT_RULES_PATH.is_file() and not DEFAULT_RULES_PATH.is_symlink()
+        else {}
+    )
+    defaults = _rules_block_view(
+        defaults_source,
+        MOVIE_RULE_BLOCKS,
+        fill_missing=True,
+    )
+    rules = _rules_block_view(stored, MOVIE_RULE_BLOCKS, fill_missing=True)
+    if not any(rules.values()):
+        rules = copy.deepcopy(defaults)
+    canonical = json.dumps(
+        rules,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "rules": rules,
+        "active": copy.deepcopy(rules),
+        "defaults": defaults,
+        "rules_path": SERIES_RULES_ALIAS,
+        "fingerprint": hashlib.sha256(canonical).hexdigest() if rules else None,
+    }
+
+
 def _series_rules_disconnected(upstream_status: int) -> Dict[str, Any]:
+    fallback = _series_rules_fallback()
     return {
         "ok": True,
         "profile": "series",
         "connected": False,
         "editable": False,
         "message": SERIES_NOT_CONNECTED_MESSAGE,
-        "rules": {},
-        "active": {},
-        "defaults": {},
-        "rules_path": None,
-        "fingerprint": None,
+        **fallback,
         "saved_at": None,
         "applied": False,
         "applies_to": "none",
@@ -611,51 +665,53 @@ def _save_watcher_rules(
 
 
 def _watcher_rules_profile_payload(profile: str) -> Tuple[int, Dict[str, Any]]:
-    if profile == "movies":
-        status, upstream = _watcher_rules_payload()
-        result = copy.deepcopy(upstream)
-        result.update(
-            {
-                "profile": "movies",
-                "connected": status < 500,
-                "editable": status < 500,
-            }
-        )
-        return status, result
-    return 200, {
-        "ok": True,
-        "profile": "tv",
-        "connected": False,
-        "editable": False,
-        "message": "Vigilante de series no conectado",
-        "rules": {"ignored_suffixes": []},
-        "scope": str(COMPLETE_ROOT / "tv"),
-    }
+    if profile not in {"movies", "tv"}:
+        return 400, {
+            "ok": False,
+            "error": "invalid_profile",
+            "message": "profile debe ser movies o tv.",
+        }
+    status, upstream = _proxy_upstream_json(
+        f"{ORCH_URL}/settings/watcher/{profile}",
+        timeout=8,
+    )
+    available = status < 500 and status not in {404, 405}
+    result = copy.deepcopy(upstream)
+    result.update(
+        {
+            "profile": profile,
+            "connected": available,
+            "editable": available,
+        }
+    )
+    return status, result
 
 
 def _save_watcher_rules_profile(
     profile: str,
     payload: Dict[str, Any],
 ) -> Tuple[int, Dict[str, Any]]:
-    if profile == "movies":
-        status, upstream = _save_watcher_rules(payload)
-        result = copy.deepcopy(upstream)
-        result.update(
-            {
-                "profile": "movies",
-                "connected": status < 500,
-                "editable": status < 500,
-            }
-        )
-        return status, result
-    return 503, {
-        "ok": False,
-        "error": "series_watcher_not_connected",
-        "message": "Vigilante de series no conectado",
-        "profile": "tv",
-        "connected": False,
-        "editable": False,
-    }
+    if profile not in {"movies", "tv"}:
+        return 400, {
+            "ok": False,
+            "error": "invalid_profile",
+            "message": "profile debe ser movies o tv.",
+        }
+    status, upstream = _proxy_upstream_json(
+        f"{ORCH_URL}/settings/watcher/{profile}",
+        payload,
+        timeout=20,
+    )
+    available = status < 500 and status not in {404, 405}
+    result = copy.deepcopy(upstream)
+    result.update(
+        {
+            "profile": profile,
+            "connected": available,
+            "editable": available,
+        }
+    )
+    return status, result
 
 
 def _status_payload() -> Dict[str, Any]:
@@ -680,6 +736,10 @@ def _status_payload() -> Dict[str, Any]:
             or series_worker.get("status") == "ok"
         )
     )
+    orchestrator_mode = str(orch.get("mode") or "unknown")
+    series_mode = str(orch.get("series_mode") or "unknown")
+    if series_mode not in {"legacy", "canary", "active"}:
+        series_mode = "unknown"
     orchestrator_service = copy.deepcopy(orch)
     orchestrator_service.update(
         {"connected": orchestrator_connected, "editable": False}
@@ -697,13 +757,26 @@ def _status_payload() -> Dict[str, Any]:
         {
             "connected": series_worker_connected,
             "editable": series_worker_connected,
+            "healthy": series_worker_connected,
+            "mode": series_mode,
+            "routing_active": series_mode in {"canary", "active"},
         }
     )
-    if not series_worker_connected:
+    if series_worker_connected:
+        series_service["message"] = f"Motor sano · modo {series_mode}"
+    else:
         series_service.setdefault("status", "not_connected")
         series_service.setdefault("message", SERIES_NOT_CONNECTED_MESSAGE)
     return {
         "ok": True,
+        "mode": orchestrator_mode,
+        "series_mode": series_mode,
+        "health": {
+            "orchestrator": orchestrator_connected,
+            "movies": worker_connected,
+            "series": series_worker_connected,
+            "trailers": worker_connected,
+        },
         "orchestrator": orch,
         "media_worker": worker,
         "series_worker": series_worker,
@@ -734,11 +807,30 @@ def _status_payload() -> Dict[str, Any]:
     }
 
 
-def _jobs_payload() -> Dict[str, Any]:
+def _jobs_payload(profile: Optional[str] = None) -> Dict[str, Any]:
     jobs = _upstream_json(f"{ORCH_URL}/jobs", timeout=12)
     if isinstance(jobs, list):
-        return {"ok": True, "jobs": jobs}
-    return {"ok": False, "jobs": [], "error": jobs.get("error", "No se pudo leer jobs.")}
+        filtered = [
+            job
+            for job in jobs
+            if profile is None
+            or (
+                isinstance(job, dict)
+                and _profile_from_metadata(job) == profile
+            )
+        ]
+        result: Dict[str, Any] = {"ok": True, "jobs": filtered}
+        if profile is not None:
+            result["profile"] = profile
+        return result
+    result = {
+        "ok": False,
+        "jobs": [],
+        "error": jobs.get("error", "No se pudo leer jobs."),
+    }
+    if profile is not None:
+        result["profile"] = profile
+    return result
 
 
 def _job_detail_payload(job_id: str) -> Dict[str, Any]:
@@ -767,7 +859,7 @@ def _normalized_profile(value: object) -> Optional[str]:
     if text in {"tv", "series", "serie", "show", "shows"}:
         return "series"
     if text in {"movie", "movies", "pelicula", "película"} or text.startswith(
-        "trailer"
+        ("movie", "trailer")
     ):
         return "movies"
     return None
@@ -1243,7 +1335,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, _status_payload())
             return
         if path == "/api/jobs":
-            self._json(200, _jobs_payload())
+            profile = query.get("profile", [None])[0]
+            if profile not in {None, "movies", "series"}:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_profile",
+                        "message": "profile debe ser movies o series.",
+                    },
+                )
+                return
+            self._json(200, _jobs_payload(profile=profile))
             return
         if path.startswith("/api/jobs/"):
             suffix = urllib.parse.unquote(path.removeprefix("/api/jobs/")).strip("/")
@@ -1324,7 +1427,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, _reports_payload(profile=profile))
             return
         if path == "/api/codex-diagnostics":
-            self._json(200, _codex_diagnostics_payload())
+            profile = query.get("profile", [None])[0]
+            if profile not in {None, "movies", "series"}:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_profile",
+                        "message": "profile debe ser movies o series.",
+                    },
+                )
+                return
+            self._json(200, _codex_diagnostics_payload(profile=profile))
             return
         if path == "/api/codex-diagnostic":
             rel = query.get("file", [""])[0]

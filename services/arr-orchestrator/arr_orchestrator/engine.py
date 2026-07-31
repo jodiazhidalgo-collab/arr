@@ -1,10 +1,14 @@
+import hashlib
 import json
 import logging
+import os
 import queue
 import re
 import shutil
+import stat
+import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Dict, List, Optional, Tuple
 
 from watchdog.observers import Observer
@@ -13,6 +17,7 @@ from .clients import QbitLikeClient
 from .config import Config
 from .codex_diagnostics import create_codex_diagnostic
 from .db import Database
+from .diagnostic_sanitizer import sanitize_for_export
 from .filebot import FileBotRunner
 from .identity.controller import IdentityController
 from .filesystem import (
@@ -26,10 +31,12 @@ from .filesystem import (
     media_worker_source,
     move_extraction_failure_to_review,
     move_into_job,
+    move_job_to,
     move_job_to_review_clean,
     move_tv_job_to_review,
     move_trailer_package_into_job,
     prepare_filebot_input,
+    review_content_signature,
     top_level_item,
     trailer_package_manifest,
     trailer_ready_source,
@@ -40,6 +47,15 @@ from .media_worker import (
     MediaWorkerError,
     MediaWorkerJobActive,
     MediaWorkerTransportError,
+)
+from .series_worker import (
+    SeriesWorkerBadRequest,
+    SeriesWorkerBusy,
+    SeriesWorkerClient,
+    SeriesWorkerConflict,
+    SeriesWorkerError,
+    SeriesWorkerTransportError,
+    SeriesWorkerUnavailable,
 )
 from .name_resolver import (
     ResolutionError,
@@ -65,6 +81,9 @@ PROCESSABLE_STATES = {
     "bluray_running",
     "media_postprocess_ready",
     "media_postprocess_running",
+    "series_postprocess_ready",
+    "series_postprocess_running",
+    "series_review_cleanup",
     "trailer_ready",
     "trailer_running",
     "verifying_output",
@@ -88,10 +107,17 @@ def _sanitize_extraction_details(job_root: Path, details: Dict[str, object]) -> 
     return sanitize(details)  # type: ignore[return-value]
 COMPLETE_CATEGORIES = ("movies", "tv", "manual", "movies_automatizacion", "trailers_automatizacion")
 WATCHER_RULES_SETTING_KEY = "watcher.movies.ignored_suffixes"
+TV_WATCHER_RULES_SETTING_KEY = "watcher.tv.ignored_suffixes"
 DEFAULT_IGNORED_MOVIES_SUFFIXES = (".delay-audio-part",)
+DEFAULT_IGNORED_TV_SUFFIXES: Tuple[str, ...] = ()
 WORKER_STATUS_POLL_SECONDS = 5.0
 WORKER_ACTIVE_MAX_SECONDS = 4 * 60 * 60 + 5 * 60
 MAX_WORKER_RESULT_BYTES = 16 * 1024 * 1024
+SERIES_PIPELINE_SCHEMA = "arr-series-pipeline-v1"
+SERIES_CANARY_PREFIX = "codex_live_flow_probe_"
+SERIES_PUBLISHED_MANIFEST_SCHEMA = "series-published-manifest-v1"
+SERIES_GENERATION_MARKER = ".series-worker-generation.json"
+SERIES_VERIFY_MAX_CONCURRENCY = 2
 
 
 class Engine:
@@ -113,6 +139,10 @@ class Engine:
         )
         self.name_resolver = self.identity.resolver
         self.media_worker = MediaWorkerClient(config.media_worker_url, config.callback_url)
+        self.series_worker = SeriesWorkerClient(
+            config.series_worker_url,
+            config.callback_url,
+        )
         self.events: "queue.Queue[Tuple[str, Path]]" = queue.Queue()
         self.observer = Observer()
         self._stable: Dict[str, Tuple[str, float]] = {}
@@ -120,11 +150,17 @@ class Engine:
         self._worker_status_log_at: Dict[str, float] = {}
         self._worker_status_checked_at: Dict[str, float] = {}
         self._worker_started_at: Dict[str, float] = {}
+        self._series_retry_at: Dict[str, float] = {}
+        self._series_verification_threads: Dict[str, threading.Thread] = {}
+        self._series_verification_lock = threading.Lock()
         self._last_reconcile = 0.0
         self._last_heartbeat = 0.0
+        self._last_series_dependency_check = 0.0
+        self._series_dependency_refreshing = False
         self.running = True
         self.dependencies: Dict[str, str] = {}
         self._watcher_rules_snapshot = self._load_ignored_movies_suffixes()
+        self._tv_watcher_rules_snapshot = self._load_watcher_suffixes("tv")
 
     @staticmethod
     def _normalize_ignored_movies_suffixes(values: object) -> Tuple[str, ...]:
@@ -154,12 +190,53 @@ class Engine:
         float,
         Tuple[Tuple[float, Tuple[str, ...]], ...],
     ]:
-        stored = self.db.get_setting(WATCHER_RULES_SETTING_KEY)
+        return self._load_watcher_suffixes("movies")
+
+    @staticmethod
+    def _watcher_profile(profile: str) -> str:
+        normalized = str(profile or "movies").strip().lower()
+        if normalized not in {"movies", "tv"}:
+            raise ValueError("El perfil del vigilante debe ser movies o tv.")
+        return normalized
+
+    def _watcher_snapshot(
+        self, profile: str
+    ) -> Tuple[
+        Tuple[str, ...],
+        float,
+        Tuple[Tuple[float, Tuple[str, ...]], ...],
+    ]:
+        normalized = self._watcher_profile(profile)
+        return (
+            self._watcher_rules_snapshot
+            if normalized == "movies"
+            else self._tv_watcher_rules_snapshot
+        )
+
+    def _load_watcher_suffixes(
+        self, profile: str
+    ) -> Tuple[
+        Tuple[str, ...],
+        float,
+        Tuple[Tuple[float, Tuple[str, ...]], ...],
+    ]:
+        normalized = self._watcher_profile(profile)
+        setting_key = (
+            WATCHER_RULES_SETTING_KEY
+            if normalized == "movies"
+            else TV_WATCHER_RULES_SETTING_KEY
+        )
+        defaults = (
+            DEFAULT_IGNORED_MOVIES_SUFFIXES
+            if normalized == "movies"
+            else DEFAULT_IGNORED_TV_SUFFIXES
+        )
+        stored = self.db.get_setting(setting_key)
         if stored is None:
             return (
-                DEFAULT_IGNORED_MOVIES_SUFFIXES,
+                defaults,
                 0.0,
-                ((0.0, DEFAULT_IGNORED_MOVIES_SUFFIXES),),
+                ((0.0, defaults),),
             )
         try:
             payload = json.loads(stored)
@@ -184,7 +261,7 @@ class Engine:
                     )
                     history.append((entry_at, entry_suffixes))
             if not history:
-                history.append((0.0, DEFAULT_IGNORED_MOVIES_SUFFIXES))
+                history.append((0.0, defaults))
             if history[-1] != (effective_at, suffixes):
                 history.append((effective_at, suffixes))
             history.sort(key=lambda entry: entry[0])
@@ -195,21 +272,34 @@ class Engine:
                 error,
             )
             return (
-                DEFAULT_IGNORED_MOVIES_SUFFIXES,
+                defaults,
                 0.0,
-                ((0.0, DEFAULT_IGNORED_MOVIES_SUFFIXES),),
+                ((0.0, defaults),),
             )
 
-    def watcher_rules(self) -> Dict[str, object]:
-        suffixes, _effective_at, _history = self._watcher_rules_snapshot
+    def watcher_rules(self, profile: str = "movies") -> Dict[str, object]:
+        normalized = self._watcher_profile(profile)
+        suffixes, _effective_at, _history = self._watcher_snapshot(normalized)
+        setting_key = (
+            WATCHER_RULES_SETTING_KEY
+            if normalized == "movies"
+            else TV_WATCHER_RULES_SETTING_KEY
+        )
         return {
             "ok": True,
+            "profile": normalized,
             "rules": {"ignored_suffixes": list(suffixes)},
-            "rules_path": f"{self.db.path}:settings/{WATCHER_RULES_SETTING_KEY}",
-            "scope": str(self.config.complete_root / "movies"),
+            "rules_path": f"{self.db.path}:settings/{setting_key}",
+            "scope": str(self.config.complete_root / normalized),
         }
 
-    def update_watcher_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
+    def update_watcher_rules(
+        self, payload: Dict[str, object], profile: str = "movies"
+    ) -> Dict[str, object]:
+        try:
+            normalized = self._watcher_profile(profile)
+        except ValueError as error:
+            return {"ok": False, "error": str(error)}
         rules = payload.get("rules") if isinstance(payload, dict) else None
         if not isinstance(rules, dict) or "ignored_suffixes" not in rules:
             return {"ok": False, "error": "Payload de reglas no valido."}
@@ -218,12 +308,17 @@ class Engine:
         except ValueError as error:
             return {"ok": False, "error": str(error)}
         effective_at = time.time()
-        _current_suffixes, _current_effective_at, current_history = (
-            self._watcher_rules_snapshot
+        _current_suffixes, _current_effective_at, current_history = self._watcher_snapshot(
+            normalized
         )
         history = current_history + ((effective_at, suffixes),)
+        setting_key = (
+            WATCHER_RULES_SETTING_KEY
+            if normalized == "movies"
+            else TV_WATCHER_RULES_SETTING_KEY
+        )
         self.db.set_setting(
-            WATCHER_RULES_SETTING_KEY,
+            setting_key,
             json.dumps(
                 {
                     "ignored_suffixes": list(suffixes),
@@ -239,8 +334,11 @@ class Engine:
                 ensure_ascii=False,
             ),
         )
-        self._watcher_rules_snapshot = (suffixes, effective_at, history)
-        result = self.watcher_rules()
+        if normalized == "movies":
+            self._watcher_rules_snapshot = (suffixes, effective_at, history)
+        else:
+            self._tv_watcher_rules_snapshot = (suffixes, effective_at, history)
+        result = self.watcher_rules(normalized)
         result["saved"] = True
         return result
 
@@ -277,7 +375,9 @@ class Engine:
         *,
         identity_context: Optional[Dict[str, object]] = None,
         category: Optional[str] = None,
+        name: str = "",
     ) -> str:
+        normalized_category = str(category or "common").strip().lower()
         return json.dumps(
             {
                 "identity_rules": (
@@ -285,9 +385,131 @@ class Engine:
                     if isinstance(identity_context, dict)
                     else self.identity.job_snapshot_for_category(category)
                 ),
+                "series_pipeline": self._new_series_pipeline_snapshot(
+                    normalized_category,
+                    name,
+                ),
             },
             ensure_ascii=False,
             sort_keys=True,
+        )
+
+    def _new_series_pipeline_snapshot(
+        self,
+        category: str,
+        name: str,
+        *,
+        configured_mode: Optional[str] = None,
+    ) -> Dict[str, object]:
+        normalized = str(category or "common").strip().lower()
+        mode = str(configured_mode or self.config.series_mode).strip().lower()
+        if mode not in {"legacy", "canary", "active"}:
+            raise ValueError("Modo de Series no valido")
+        canary_eligible = str(name or "").casefold().startswith(SERIES_CANARY_PREFIX)
+        if normalized == "tv":
+            selected = mode == "active" or (mode == "canary" and canary_eligible)
+            route = "series-worker" if selected else "legacy"
+            profile = "tv"
+        elif normalized == "movies":
+            route = "not-applicable"
+            profile = "movies"
+        else:
+            route = "pending"
+            profile = "common"
+        return {
+            "schema": SERIES_PIPELINE_SCHEMA,
+            "profile": profile,
+            "configured_mode": mode,
+            "canary_eligible": canary_eligible,
+            "route": route,
+        }
+
+    @staticmethod
+    def _source_meta(job: Dict[str, object]) -> Dict[str, object]:
+        raw = job.get("source_meta_json")
+        if isinstance(raw, dict):
+            return dict(raw)
+        try:
+            payload = json.loads(str(raw or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _series_source_meta(job: Dict[str, object]) -> Dict[str, object]:
+        """Lee metadatos para enrutar TV sin convertir corrupción en legado."""
+
+        raw = job.get("source_meta_json")
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            return {}
+        if isinstance(raw, dict):
+            return dict(raw)
+        try:
+            payload = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("Metadatos del snapshot de Series no son JSON valido") from error
+        if not isinstance(payload, dict):
+            raise ValueError("Metadatos del snapshot de Series no son un objeto")
+        return dict(payload)
+
+    def _series_pipeline_for_job(self, job: Dict[str, object]) -> Dict[str, object]:
+        source_meta = self._series_source_meta(job)
+        pipeline = source_meta.get("series_pipeline")
+        if pipeline is None:
+            identity_snapshot = source_meta.get("identity_rules")
+            if isinstance(identity_snapshot, dict) and identity_snapshot.get(
+                "profile"
+            ) in {"common", "movies", "tv"}:
+                raise ValueError("Trabajo nuevo sin snapshot de ruta de Series")
+            return {
+                "schema": SERIES_PIPELINE_SCHEMA,
+                "profile": "tv" if str(job.get("category") or "") == "tv" else "common",
+                "configured_mode": "legacy",
+                "canary_eligible": False,
+                "route": "legacy",
+                "source": "historical_fallback",
+            }
+        if not isinstance(pipeline, dict):
+            raise ValueError("Snapshot de Series no valido")
+        normalized = dict(pipeline)
+        mode = str(normalized.get("configured_mode") or "")
+        route = str(normalized.get("route") or "")
+        profile = str(normalized.get("profile") or "")
+        if (
+            normalized.get("schema") != SERIES_PIPELINE_SCHEMA
+            or mode not in {"legacy", "canary", "active"}
+            or route not in {"legacy", "series-worker", "pending", "not-applicable"}
+            or profile not in {"common", "movies", "tv"}
+            or not isinstance(normalized.get("canary_eligible"), bool)
+        ):
+            raise ValueError("Snapshot de Series contradictorio")
+        if str(job.get("category") or "") == "tv" and (
+            profile != "tv" or route not in {"legacy", "series-worker"}
+        ):
+            raise ValueError("Snapshot de Series no esta congelado para TV")
+        if str(job.get("category") or "") == "tv":
+            expected = self._new_series_pipeline_snapshot(
+                "tv",
+                str(job.get("name") or ""),
+                configured_mode=mode,
+            )
+            if any(
+                normalized.get(key) != expected.get(key)
+                for key in (
+                    "schema",
+                    "profile",
+                    "configured_mode",
+                    "canary_eligible",
+                    "route",
+                )
+            ):
+                raise ValueError("Snapshot de Series contradice la ruta congelada")
+        return normalized
+
+    def _series_selected_for_job(self, job: Dict[str, object]) -> bool:
+        return bool(
+            str(job.get("category") or "") == "tv"
+            and self._series_pipeline_for_job(job).get("route") == "series-worker"
         )
 
     def _ignored_movies_item(
@@ -295,13 +517,23 @@ class Engine:
         item: Path,
         suffixes: Optional[Tuple[str, ...]] = None,
     ) -> bool:
+        return self._ignored_watcher_item("movies", item, suffixes)
+
+    def _ignored_watcher_item(
+        self,
+        category: str,
+        item: Path,
+        suffixes: Optional[Tuple[str, ...]] = None,
+    ) -> bool:
+        if category not in {"movies", "tv"}:
+            return False
         if suffixes is None:
-            suffixes, _effective_at, _history = self._watcher_rules_snapshot
+            suffixes, _effective_at, _history = self._watcher_snapshot(category)
         if not suffixes:
             return False
-        movies_root = self.config.complete_root / "movies"
+        category_root = self.config.complete_root / category
         try:
-            item.resolve().relative_to(movies_root.resolve())
+            item.resolve().relative_to(category_root.resolve())
         except (OSError, ValueError):
             return False
         # Conserva la regla historica del elemento superior, sea archivo o carpeta.
@@ -318,14 +550,24 @@ class Engine:
         return False
 
     def _ignored_movies_job(self, job: Dict[str, object], source_path: Path) -> bool:
-        _current_suffixes, _effective_at, history = self._watcher_rules_snapshot
+        return self._ignored_watcher_job(job, source_path)
+
+    def _ignored_watcher_job(self, job: Dict[str, object], source_path: Path) -> bool:
+        category = str(job.get("category") or "")
+        if category not in {"movies", "tv"}:
+            return False
+        _current_suffixes, _effective_at, history = self._watcher_snapshot(category)
         created_at = float(job.get("created_at") or 0.0)
-        suffixes = DEFAULT_IGNORED_MOVIES_SUFFIXES
+        suffixes = (
+            DEFAULT_IGNORED_MOVIES_SUFFIXES
+            if category == "movies"
+            else DEFAULT_IGNORED_TV_SUFFIXES
+        )
         for entry_at, entry_suffixes in history:
             if entry_at > created_at:
                 break
             suffixes = entry_suffixes
-        return self._ignored_movies_item(source_path, suffixes)
+        return self._ignored_watcher_item(category, source_path, suffixes)
 
     def start(self) -> None:
         self._check_dependencies()
@@ -357,6 +599,7 @@ class Engine:
         return {
             "status": "ok",
             "mode": self.config.mode,
+            "series_mode": self.config.series_mode,
             "heartbeat": self._last_heartbeat,
             "dependencies": self.dependencies,
             "identity_rules": {
@@ -421,6 +664,28 @@ class Engine:
         (self.config.config_dir / "heartbeat").write_text(
             str(self._last_heartbeat), encoding="ascii"
         )
+        if self._last_heartbeat - self._last_series_dependency_check >= 30.0:
+            self._schedule_series_worker_dependency_refresh()
+
+    def _schedule_series_worker_dependency_refresh(self) -> None:
+        if self._series_dependency_refreshing:
+            return
+        self._series_dependency_refreshing = True
+        self._last_series_dependency_check = time.time()
+        threading.Thread(
+            target=self._refresh_series_worker_dependency,
+            name="arr-series-worker-health",
+            daemon=True,
+        ).start()
+
+    def _refresh_series_worker_dependency(self) -> None:
+        try:
+            try:
+                self.dependencies["series-worker"] = self.series_worker.version()
+            except Exception as error:
+                self.dependencies["series-worker"] = f"error: {error}"
+        finally:
+            self._series_dependency_refreshing = False
 
     def _check_dependencies(self) -> None:
         for name, client in (("qbittorrent", self.qbt), ("rdtclient", self.rdt)):
@@ -434,6 +699,12 @@ class Engine:
         except Exception as error:
             self.dependencies["media-worker"] = f"error: {error}"
             self.log.warning("media-worker no disponible al arrancar: %s", error)
+        try:
+            self.dependencies["series-worker"] = self.series_worker.version()
+        except Exception as error:
+            self.dependencies["series-worker"] = f"error: {error}"
+            self.log.warning("series-worker no disponible al arrancar: %s", error)
+        self._last_series_dependency_check = time.time()
         self.dependencies["name-resolver"] = (
             "configured" if self.name_resolver.enabled else "legacy: TMDB_API_TOKEN missing"
         )
@@ -518,7 +789,7 @@ class Engine:
                 str(torrent.get("name") or ""),
                 identity_rules,
             )
-            if not job and self._ignored_movies_item(source_path):
+            if not job and self._ignored_watcher_item(category, source_path):
                 continue
             if not job:
                 identity_context = self.identity.job_snapshot_for_category(category)
@@ -533,7 +804,9 @@ class Engine:
                     source_path=str(source_path),
                     submitted_at=float(torrent.get("added_on") or time.time()),
                     source_meta_json=self._new_job_source_meta_json(
-                        identity_context=identity_context
+                        identity_context=identity_context,
+                        category=category,
+                        name=str(torrent.get("name") or content_path.name),
                     ),
                 )
             elif job["state"] not in TERMINAL_STATES:
@@ -620,7 +893,9 @@ class Engine:
                 infohash=infohash,
                 torrent_path=str(path),
                 source_meta_json=self._new_job_source_meta_json(
-                    identity_context=identity_context
+                    identity_context=identity_context,
+                    category=category,
+                    name=name,
                 ),
             )
         else:
@@ -737,7 +1012,7 @@ class Engine:
             str(torrent.get("name") or ""),
             identity_rules,
         )
-        if not job and self._ignored_movies_item(source_path):
+        if not job and self._ignored_watcher_item(category, source_path):
             path.unlink(missing_ok=True)
             return
         if not job:
@@ -753,7 +1028,9 @@ class Engine:
                 source_path=str(source_path),
                 submitted_at=float(torrent.get("added_on") or time.time()),
                 source_meta_json=self._new_job_source_meta_json(
-                    identity_context=identity_context
+                    identity_context=identity_context,
+                    category=category,
+                    name=str(torrent.get("name") or content_path.name),
                 ),
             )
         else:
@@ -787,7 +1064,7 @@ class Engine:
         job = self.db.get_job_by_source_path(str(item))
         if not job:
             job = self._job_for_materialized(category, item)
-        if not job and self._ignored_movies_item(item):
+        if not job and self._ignored_watcher_item(category, item):
             return
         if not job:
             source_uid = self._new_source_uid(f"fs:{category}", item.name)
@@ -798,7 +1075,10 @@ class Engine:
                 item.name,
                 state="waiting_stable",
                 source_path=str(item),
-                source_meta_json=self._new_job_source_meta_json(category=category),
+                source_meta_json=self._new_job_source_meta_json(
+                    category=category,
+                    name=item.name,
+                ),
             )
         elif job["state"] not in TERMINAL_STATES:
             job = self._freeze_category_identity_snapshot(job, category)
@@ -905,7 +1185,7 @@ class Engine:
     def _freeze_category_identity_snapshot(
         self, job: Dict[str, object], category: str
     ) -> Dict[str, object]:
-        """Sustituye common solo al resolver por primera vez movies/tv.
+        """Congela identidad y ruta de Series al resolver movies/tv.
 
         Los snapshots historicos no incluian ``profile`` y se dejan intactos.
         El marcador explicito permite completar de forma segura trabajos nuevos
@@ -914,21 +1194,33 @@ class Engine:
 
         if category not in {"movies", "tv"}:
             return job
-        raw_source_meta = job.get("source_meta_json")
-        if isinstance(raw_source_meta, dict):
-            source_meta = dict(raw_source_meta)
-        else:
-            try:
-                source_meta = json.loads(str(raw_source_meta or "{}"))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return job
-        if not isinstance(source_meta, dict):
+        current = self.db.get_job(str(job["job_id"])) or job
+        source_meta = self._source_meta(current)
+        if not source_meta:
             return job
         stored = source_meta.get("identity_rules")
-        if not isinstance(stored, dict) or stored.get("profile") != "common":
+        identity_snapshot: Optional[Dict[str, object]] = None
+        if isinstance(stored, dict) and stored.get("profile") == "common":
+            identity_snapshot = self.identity.job_snapshot_for_category(category)
+            source_meta["identity_rules"] = identity_snapshot
+
+        pipeline = source_meta.get("series_pipeline")
+        pipeline_snapshot: Optional[Dict[str, object]] = None
+        if (
+            isinstance(pipeline, dict)
+            and pipeline.get("schema") == SERIES_PIPELINE_SCHEMA
+            and pipeline.get("profile") == "common"
+            and pipeline.get("route") == "pending"
+        ):
+            pipeline_snapshot = self._new_series_pipeline_snapshot(
+                category,
+                str(job.get("name") or ""),
+                configured_mode=str(pipeline.get("configured_mode") or ""),
+            )
+            source_meta["series_pipeline"] = pipeline_snapshot
+
+        if identity_snapshot is None and pipeline_snapshot is None:
             return job
-        snapshot = self.identity.job_snapshot_for_category(category)
-        source_meta["identity_rules"] = snapshot
         updated = self.db.update_job(
             str(job["job_id"]),
             source_meta_json=json.dumps(
@@ -941,12 +1233,21 @@ class Engine:
             str(job["job_id"]),
             "settings",
             "decision",
-            f"Perfil de identidad {category} congelado tras clasificacion",
+            f"Perfil {category} congelado tras clasificacion",
             {
                 "category": category,
                 "identity_profile": category,
-                "identity_revision": int(snapshot.get("revision") or 0),
-                "identity_fingerprint": str(snapshot.get("fingerprint") or ""),
+                "identity_revision": int(
+                    (identity_snapshot or stored or {}).get("revision") or 0
+                )
+                if isinstance(identity_snapshot or stored, dict)
+                else 0,
+                "identity_fingerprint": str(
+                    (identity_snapshot or stored or {}).get("fingerprint") or ""
+                )
+                if isinstance(identity_snapshot or stored, dict)
+                else "",
+                "series_pipeline": pipeline_snapshot or pipeline,
             },
         )
         return updated
@@ -1040,6 +1341,7 @@ class Engine:
             "orchestrator": {
                 "status": "ok",
                 "mode": self.config.mode,
+                "series_mode": self.config.series_mode,
                 "dependencies": dict(self.dependencies),
                 "identity_rules": {
                     "revision": identity_rules.get("revision"),
@@ -1058,10 +1360,23 @@ class Engine:
                 if str(self.dependencies.get("media-worker") or "").startswith("media-worker")
                 else self.dependencies.get("media-worker", "-"),
             },
+            "series_worker": {
+                "status": "ok"
+                if str(self.dependencies.get("series-worker") or "") == "ok"
+                else self.dependencies.get("series-worker", "-"),
+                "mode": self.config.series_mode,
+            },
         }
 
     def _process_job(self, job: Dict[str, object]) -> None:
-        source_path = Path(str(job.get("source_path") or ""))
+        source_value = str(job.get("source_path") or "").strip()
+        source_path = Path(source_value) if source_value else None
+        if job["state"] == "series_review_cleanup":
+            self._run_series_review_cleanup(job)
+            return
+        if job["state"] == "series_postprocess_running":
+            self._reconcile_running_series(job)
+            return
         if job["state"] == "media_postprocess_running":
             self._reconcile_running_worker(job, "media")
             return
@@ -1084,9 +1399,9 @@ class Engine:
             )
             job = self.db.get_job(str(job["job_id"]))
         if job["state"] == "waiting_stable":
-            if not source_path.exists():
+            if source_path is None or not source_path.exists():
                 return
-            if self._ignored_movies_job(job, source_path):
+            if self._ignored_watcher_job(job, source_path):
                 job_id = str(job["job_id"])
                 self._stable_log_at.pop(job_id, None)
                 self._stable.pop(job_id, None)
@@ -1167,6 +1482,12 @@ class Engine:
         if job["state"] == "media_postprocess_ready":
             self._run_media_postprocess(job)
             job = self.db.get_job(str(job["job_id"]))
+        if job["state"] == "series_postprocess_ready":
+            retry_at = self._series_retry_at.get(str(job["job_id"]), 0.0)
+            if time.time() < retry_at:
+                return
+            self._run_series_postprocess(job)
+            job = self.db.get_job(str(job["job_id"]))
         if job["state"] == "ready_extract":
             self._run_extract(job)
             job = self.db.get_job(str(job["job_id"]))
@@ -1178,12 +1499,18 @@ class Engine:
 
     def _run_stage(self, job: Dict[str, object]) -> None:
         source = Path(str(job["source_path"]))
-        self.db.transition(str(job["job_id"]), "staging", "stage", "Moviendo a taller")
+        job_id = str(job["job_id"])
+        self._require_series_lexical_path(
+            self.config.workshop_root / job_id,
+            self.config.workshop_root,
+            "destino de taller",
+        )
+        self.db.transition(job_id, "staging", "stage", "Moviendo a taller")
         if job["category"] == "trailers_automatizacion":
             job_root, source_item = move_trailer_package_into_job(
                 source,
                 self.config.workshop_root,
-                str(job["job_id"]),
+                job_id,
             )
             self.db.transition(
                 str(job["job_id"]),
@@ -1195,7 +1522,7 @@ class Engine:
             )
             return
 
-        job_root = move_into_job(source, self.config.workshop_root, str(job["job_id"]))
+        job_root = move_into_job(source, self.config.workshop_root, job_id)
         if job["category"] == "manual":
             destination = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
             write_reason(
@@ -1244,6 +1571,40 @@ class Engine:
     def _run_extract(self, job: Dict[str, object]) -> None:
         job_root = Path(str(job["stage_path"]))
         job_id = str(job["job_id"])
+        try:
+            series_selected = self._series_selected_for_job(job)
+        except ValueError as error:
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                "series_pipeline_invalid",
+                str(error),
+                phase="extract",
+            )
+            return
+        if series_selected:
+            try:
+                expected_job_root = self._require_series_lexical_path(
+                    self.config.workshop_root / job_id,
+                    self.config.workshop_root,
+                    "taller esperado antes de extracción",
+                )
+                job_root = self._require_series_lexical_path(
+                    job_root,
+                    self.config.workshop_root,
+                    "taller de Series antes de extracción",
+                )
+                if job_root != expected_job_root:
+                    raise ValueError("El taller de Series no coincide con <taller>/<job_id>")
+            except (OSError, ValueError) as error:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_extract_path_invalid",
+                    str(error),
+                    phase="extract",
+                )
+                return
         self.db.transition(job_id, "extracting", "extract", "Extracción iniciada")
 
         def record_extract_event(
@@ -1336,11 +1697,67 @@ class Engine:
 
     def _run_filebot(self, job: Dict[str, object]) -> None:
         job_root = Path(str(job["stage_path"]))
+        try:
+            series_selected = self._series_selected_for_job(job)
+        except ValueError as error:
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                "series_pipeline_invalid",
+                str(error),
+                phase="settings",
+            )
+            return
+        source_path = Path(str(job["source_path"]))
+        if series_selected:
+            try:
+                expected_job_root = self._require_series_lexical_path(
+                    self.config.workshop_root / str(job["job_id"]),
+                    self.config.workshop_root,
+                    "taller esperado antes de FileBot",
+                )
+                job_root = self._require_series_lexical_path(
+                    job_root,
+                    self.config.workshop_root,
+                    "taller de Series antes de FileBot",
+                )
+                if job_root != expected_job_root:
+                    raise ValueError("El taller de Series no coincide con <taller>/<job_id>")
+                source_path = self._require_series_lexical_path(
+                    source_path,
+                    job_root,
+                    "entrada de Series antes de FileBot",
+                )
+            except (OSError, ValueError) as error:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_path_invalid",
+                    str(error),
+                    phase="filebot",
+                )
+                return
         input_root = prepare_filebot_input(
-            Path(str(job["source_path"])),
+            source_path,
             job_root,
             str(job.get("name") or ""),
         )
+        if series_selected:
+            try:
+                input_root = self._require_series_lexical_path(
+                    input_root,
+                    job_root,
+                    "entrada preparada de Series",
+                )
+            except (OSError, ValueError) as error:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_path_invalid",
+                    str(error),
+                    phase="filebot",
+                )
+                return
         identity_context = self.identity.configure_for_job(job)
         identity_rules = dict(identity_context.get("rules") or {})
         filebot_identity_configure = getattr(
@@ -1366,6 +1783,11 @@ class Engine:
             },
         )
         identity: Optional[ResolvedIdentity] = None
+        series_expected_episode_codes: set[Tuple[int, int]] = set()
+        series_expected_episode_groups: List[Tuple[Tuple[int, int], ...]] = []
+        series_expected_physical_manifest: List[
+            Tuple[int, int, int, str, Tuple[Tuple[int, int], ...]]
+        ] = []
         media_decision = self._media_decision_for_job(job, input_root, identity_rules)
         self.db.add_event(
             str(job["job_id"]),
@@ -1375,6 +1797,15 @@ class Engine:
             {"media_decision": media_decision.to_dict()},
         )
         if media_decision.block_reason == "category_conflict":
+            if series_selected:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "category_conflict",
+                    "Conflicto fuerte entre la categoría TV y el nombre detectado",
+                    phase="identity",
+                )
+                return
             review = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
             reason = {
                 "job_id": job["job_id"],
@@ -1410,6 +1841,15 @@ class Engine:
             )
             return
         if media_decision.block_reason == "no_usable_title":
+            if series_selected:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    media_decision.block_reason,
+                    "La decisión local no encontró un título TV utilizable",
+                    phase="identity",
+                )
+                return
             self._send_media_decision_review(job, job_root, media_decision)
             return
         if self.name_resolver.enabled:
@@ -1437,6 +1877,15 @@ class Engine:
                         last_error_message=None,
                     )
                 else:
+                    if series_selected:
+                        self._preserve_series_job_for_review(
+                            job,
+                            job_root,
+                            "identity_ambiguous",
+                            str(error),
+                            phase="identity",
+                        )
+                        return
                     self._send_identity_review(job, job_root, error)
                     return
             except ResolutionError as error:
@@ -1464,6 +1913,62 @@ class Engine:
                 "legacy",
                 "TMDB_API_TOKEN no configurado; se mantiene AMC",
             )
+        if series_selected:
+            input_media = media_files(input_root)
+            series_expected_episode_groups, unclassified_input = (
+                self._series_episode_groups(input_media)
+            )
+            series_expected_episode_codes, unclassified_input = (
+                self._series_episode_manifest(input_media)
+            )
+            if not input_media or unclassified_input or not series_expected_episode_codes:
+                details = ", ".join(unclassified_input[:8]) or "sin codigos SxxExx"
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_input_episode_manifest_invalid",
+                    f"No se puede congelar el pack de episodios antes de FileBot: {details}",
+                    phase="verify",
+                )
+                return
+            input_files = self._series_remaining_input_files(input_root)
+            series_expected_physical_manifest = self._series_bound_manifest(
+                input_files,
+            )
+            if len(series_expected_physical_manifest) != len(input_files):
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_input_physical_manifest_invalid",
+                    "No se puede congelar la identidad fisica completa del pack",
+                    phase="verify",
+                )
+                return
+            if identity is not None and identity.season is not None and identity.episodes:
+                identity_codes = {
+                    (int(identity.season), int(episode)) for episode in identity.episodes
+                }
+                if identity_codes != series_expected_episode_codes:
+                    self._preserve_series_job_for_review(
+                        job,
+                        job_root,
+                        "series_identity_episode_input_mismatch",
+                        "La identidad TV congelada no coincide con los episodios de entrada",
+                        phase="identity",
+                    )
+                    return
+            self.db.add_event(
+                str(job["job_id"]),
+                "verify",
+                "decision",
+                "Pack de episodios congelado antes de FileBot",
+                {
+                    "episode_codes": self._format_episode_codes(
+                        series_expected_episode_codes
+                    ),
+                    "media_files": len(input_media),
+                },
+            )
         if job["category"] == "movies" and full_bluray_folders(input_root):
             normalized_input = self._normalize_bluray_before_filebot(
                 job,
@@ -1473,12 +1978,54 @@ class Engine:
             if normalized_input is None:
                 return
             input_root = normalized_input
-        output_root = (
-            job_root / "filebot_output"
-            if job["category"] == "movies"
-            else self.config.tv_output
-        )
+        if job["category"] == "movies":
+            output_root = job_root / "filebot_output"
+        elif series_selected:
+            output_root = job_root / "series_filebot_output"
+        else:
+            output_root = self.config.tv_output
+        if series_selected:
+            try:
+                output_root = self._require_series_lexical_path(
+                    output_root,
+                    job_root,
+                    "salida provisional de Series",
+                )
+            except (OSError, ValueError) as error:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_path_invalid",
+                    str(error),
+                    phase="filebot",
+                )
+                return
+        if series_selected and output_root.exists() and any(output_root.iterdir()):
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                "series_filebot_output_not_empty",
+                "La salida provisional de FileBot ya contenia datos antes de empezar",
+                phase="filebot",
+            )
+            return
         output_root.mkdir(parents=True, exist_ok=True)
+        if series_selected:
+            try:
+                output_root = self._require_series_lexical_path(
+                    output_root,
+                    job_root,
+                    "salida provisional de Series",
+                )
+            except (OSError, ValueError) as error:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_path_invalid",
+                    str(error),
+                    phase="filebot",
+                )
+                return
         command_preview = self._filebot_command_preview(
             str(job["job_id"]),
             str(job["category"]),
@@ -1505,13 +2052,13 @@ class Engine:
             "filebot",
             "command",
             "Comando FileBot preparado",
-            {
+            self._sanitize_command_event({
                 "command_preview": command_preview,
                 "cwd": str(job_root),
                 "timeout_sec": command_preview.get("timeout_sec", 14400)
                 if isinstance(command_preview, dict)
                 else 14400,
-            },
+            }),
         )
         if identity:
             result = self.filebot.run(
@@ -1526,9 +2073,27 @@ class Engine:
                 str(job["job_id"]), str(job["category"]), input_root, output_root
             )
         if result.get("timed_out"):
+            if series_selected:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "filebot_timeout",
+                    "FileBot agotó el plazo antes de entregar el pack completo",
+                    phase="filebot",
+                )
+                return
             self._finish_filebot_timeout(job, job_root, input_root, output_root, result)
             return
         if result.get("duplicate"):
+            if series_selected:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_duplicate",
+                    "FileBot indicó un duplicado dentro de la salida provisional privada",
+                    phase="filebot",
+                )
+                return
             duplicate = self._move_duplicate_to_review(
                 job, job_root, identity_rules
             )
@@ -1554,6 +2119,15 @@ class Engine:
             )
             return
         if result["exit_code"] != 0:
+            if series_selected:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "filebot_failed",
+                    f"FileBot falló con código {result['exit_code']}",
+                    phase="filebot",
+                )
+                return
             failed = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
             write_reason(
                 failed,
@@ -1584,7 +2158,21 @@ class Engine:
         output_media = list(result.get("output_media") or [])
         moves = list(result.get("moves") or [])
         remaining_media = media_files(input_root)
+        remaining_relevant = (
+            self._series_remaining_input_files(input_root)
+            if series_selected
+            else remaining_media
+        )
         if not output_media and not moves:
+            if series_selected:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_no_output",
+                    "FileBot no produjo una salida provisional completa",
+                    phase="filebot",
+                )
+                return
             duplicate = self._move_duplicate_to_review(
                 job, job_root, identity_rules
             )
@@ -1609,13 +2197,22 @@ class Engine:
                 result_json=json.dumps(result, ensure_ascii=False),
             )
             return
-        if remaining_media:
+        if remaining_relevant:
             self.db.add_event(
                 str(job["job_id"]),
                 "verify",
                 "warning",
-                f"Quedan {len(remaining_media)} archivos multimedia sin mover",
+                f"Quedan {len(remaining_relevant)} archivos relevantes sin mover",
             )
+            if series_selected:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_partial_output",
+                    f"FileBot dejó {len(remaining_relevant)} archivos sin clasificar",
+                    phase="verify",
+                )
+                return
         if job["category"] == "movies":
             media_sources = self._filebot_output_roots(result, output_root)
             if len(media_sources) > 1:
@@ -1693,11 +2290,63 @@ class Engine:
             )
             return
 
+        if series_selected:
+            observed_media = media_files(output_root)
+            observed_groups, unclassified_output = self._series_episode_groups(
+                observed_media
+            )
+            observed_codes, unclassified_output = self._series_episode_manifest(
+                observed_media
+            )
+            observed_files = self._series_remaining_input_files(output_root)
+            observed_physical_manifest = self._series_bound_manifest(
+                observed_files,
+            )
+            if (
+                not observed_media
+                or unclassified_output
+                or observed_codes != series_expected_episode_codes
+                or observed_groups != series_expected_episode_groups
+                or observed_physical_manifest != series_expected_physical_manifest
+            ):
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_filebot_episode_manifest_mismatch",
+                    (
+                        "La salida provisional de FileBot no conserva exactamente "
+                        "el pack de episodios de entrada"
+                    ),
+                    phase="verify",
+                )
+                return
+            self.db.add_event(
+                str(job["job_id"]),
+                "verify",
+                "decision",
+                "Cobertura exacta de episodios verificada tras FileBot",
+                {
+                    "expected": self._format_episode_codes(
+                        series_expected_episode_codes
+                    ),
+                    "observed": self._format_episode_codes(observed_codes),
+                    "media_files": len(observed_media),
+                },
+            )
         if identity:
             output_names = self._tv_output_names(result, output_root)
             if not output_names or not self.name_resolver.output_matches(
                 identity, output_names
             ):
+                if series_selected:
+                    self._preserve_series_job_for_review(
+                        job,
+                        job_root,
+                        "series_identity_output_mismatch",
+                        "La salida provisional de FileBot no coincide con la identidad TV congelada",
+                        phase="identity",
+                    )
+                    return
                 self._reject_identity_output(
                     job,
                     job_root,
@@ -1707,13 +2356,24 @@ class Engine:
                     output_root,
                 )
                 return
-        self.db.transition(
-            str(job["job_id"]),
-            "ready_cleanup",
-            "verify",
-            f"Salida verificada: {len(output_media) or len(moves)} elementos",
-            result_json=json.dumps(result, ensure_ascii=False),
-        )
+        if series_selected:
+            self.db.transition(
+                str(job["job_id"]),
+                "series_postprocess_ready",
+                "verify",
+                f"FileBot dejo serie lista para Series Worker: {len(output_media) or len(moves)} elementos",
+                source_path=str(output_root),
+                output_root=str(self.config.tv_output),
+                result_json=json.dumps(result, ensure_ascii=False),
+            )
+        else:
+            self.db.transition(
+                str(job["job_id"]),
+                "ready_cleanup",
+                "verify",
+                f"Salida verificada: {len(output_media) or len(moves)} elementos",
+                result_json=json.dumps(result, ensure_ascii=False),
+            )
 
     def _normalize_bluray_before_filebot(
         self,
@@ -1728,10 +2388,10 @@ class Engine:
             "bluray",
             "command",
             "Llamada al normalizador Blu-ray preparada",
-            {
+            self._sanitize_command_event({
                 "event_name": "bluray_normalization_requested",
                 "command_preview": preview,
-            },
+            }),
         )
         started = self.db.transition(
             job_id,
@@ -2125,6 +2785,126 @@ class Engine:
             result_json=json.dumps(reason, ensure_ascii=False, default=str),
         )
 
+    def _preserve_series_job_for_review(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        error_code: str,
+        message: str,
+        *,
+        phase: str = "series",
+        whole_job: bool = True,
+    ) -> bool:
+        """Mueve y verifica el pack completo antes de limpiar clientes."""
+
+        review: Optional[Path] = None
+        try:
+            job_id = str(job["job_id"])
+            expected_job_root = self.config.workshop_root / job_id
+            self._require_series_lexical_path(
+                job_root,
+                self.config.workshop_root,
+                "taller de Series",
+            )
+            self._require_series_lexical_path(
+                expected_job_root,
+                self.config.workshop_root,
+                "taller esperado de Series",
+            )
+            resolved_job_root = job_root.resolve(strict=True)
+            resolved_expected = expected_job_root.resolve(strict=True)
+            if resolved_job_root != resolved_expected:
+                raise ValueError(
+                    "La preservación de Series solo puede mover <taller>/<job_id>"
+                )
+            before = review_content_signature(job_root, whole_tree=whole_job)
+            if not before:
+                raise ValueError("El taller no contiene un pack preservable")
+            review_root = self._require_series_physical_path(
+                self.config.series_review_dir,
+                "raíz de revisión de Series",
+            )
+            review_root.mkdir(parents=True, exist_ok=True)
+            review_root = self._require_series_physical_path(
+                review_root,
+                "raíz de revisión de Series",
+            )
+            if not review_root.is_dir():
+                raise ValueError("La raiz de revision de Series no es fisica")
+            resolved_review_root = review_root.resolve(strict=True)
+            lexical_review_root = Path(os.path.abspath(str(review_root)))
+            if resolved_review_root != lexical_review_root:
+                raise ValueError("La raiz de revision de Series atraviesa un enlace simbolico")
+            mover = move_job_to if whole_job else move_job_to_review_clean
+            review = mover(
+                job_root,
+                resolved_review_root,
+                str(job.get("name") or job.get("job_id") or "serie"),
+            )
+            self.db.update_job(job_id, stage_path=str(review))
+            if review.parent != resolved_review_root or review.is_symlink():
+                raise ValueError("El destino de revision de Series no es canonico")
+            after = review_content_signature(review, whole_tree=whole_job)
+            if before != after:
+                raise ValueError("La copia de revision no coincide con el pack completo")
+            if not self._path_is_inside(review, resolved_review_root):
+                raise ValueError("El destino de revision de Series no es canonico")
+            reason = {
+                "job_id": str(job["job_id"]),
+                "phase": phase,
+                "reason": error_code,
+                "message": self._safe_worker_error(message),
+                "preserved_files": len(after),
+                "timestamp": time.time(),
+            }
+            write_reason(
+                review,
+                reason,
+                "Revision de serie.txt",
+                [
+                    "El pack completo se ha conservado en la revision exclusiva de Series.",
+                    self._safe_worker_error(message),
+                ],
+            )
+        except Exception as error:
+            self.db.add_event(
+                str(job["job_id"]),
+                phase,
+                "error",
+                "No se pudo confirmar la preservacion completa del pack de Series",
+                {
+                    "error": self._safe_worker_error(error),
+                    "cleanup_blocked": True,
+                },
+            )
+            self.db.transition(
+                str(job["job_id"]),
+                "manual_review",
+                phase,
+                (
+                    "Series requiere revision; copia movida sin confirmar y clientes conservados"
+                    if review is not None
+                    else "Series requiere revision; taller y clientes se conservan"
+                ),
+                **({"stage_path": str(review)} if review is not None else {}),
+                last_error_code=f"{error_code}_preservation_unconfirmed",
+                last_error_message=self._safe_worker_error(error),
+            )
+            return False
+
+        self._cleanup_clients(job, strict=False)
+        self.db.transition(
+            str(job["job_id"]),
+            "manual_review",
+            phase,
+            "Pack completo preservado en revision exclusiva de Series",
+            stage_path=str(review),
+            last_error_code=error_code,
+            last_error_message=self._safe_worker_error(message),
+            result_json=json.dumps(reason, ensure_ascii=False),
+        )
+        return True
+
     def _defer_identity(
         self,
         job: Dict[str, object],
@@ -2390,6 +3170,1421 @@ class Engine:
         }
         return bool(observed_codes.intersection(expected_codes))
 
+    @staticmethod
+    def _series_episode_codes(path: Path) -> set[Tuple[int, int]]:
+        codes: set[Tuple[int, int]] = set()
+        for match in re.finditer(
+            r"(?i)(?<![a-z0-9])s(\d{1,3})(e\d{1,4}(?:(?:[ ._-]*e|[ ._-]+)\d{1,4})*)",
+            path.name,
+        ):
+            season = int(match.group(1))
+            episodes = Engine._episode_cluster_numbers(match.group(2))
+            codes.update((season, episode) for episode in episodes)
+        for match in re.finditer(
+            r"(?i)(?<!\d)(\d{1,3})x(\d{1,4}(?:(?:x|[ ._-]+)\d{1,4})*)(?!\d)",
+            path.name,
+        ):
+            season = int(match.group(1))
+            codes.update(
+                (season, episode)
+                for episode in Engine._episode_cluster_numbers(match.group(2))
+            )
+        return codes
+
+    @staticmethod
+    def _episode_cluster_numbers(value: str) -> List[int]:
+        numbers = [int(item) for item in re.findall(r"\d{1,4}", value)]
+        if (
+            len(numbers) == 2
+            and numbers[1] >= numbers[0]
+            and re.search(r"\d\s*-\s*(?:e\s*)?\d", value, flags=re.IGNORECASE)
+        ):
+            return list(range(numbers[0], numbers[1] + 1))
+        return list(dict.fromkeys(numbers))
+
+    @classmethod
+    def _series_episode_groups(
+        cls, paths: List[Path]
+    ) -> Tuple[List[Tuple[Tuple[int, int], ...]], List[str]]:
+        groups: List[Tuple[Tuple[int, int], ...]] = []
+        unclassified: List[str] = []
+        for path in paths:
+            observed = tuple(sorted(cls._series_episode_codes(path)))
+            if not observed:
+                unclassified.append(path.name)
+                continue
+            groups.append(observed)
+        groups.sort()
+        return groups, sorted(unclassified, key=str.casefold)
+
+    @classmethod
+    def _series_episode_manifest(
+        cls, paths: List[Path]
+    ) -> Tuple[set[Tuple[int, int]], List[str]]:
+        groups, unclassified = cls._series_episode_groups(paths)
+        return {code for group in groups for code in group}, unclassified
+
+    @staticmethod
+    def _series_bound_manifest(
+        paths: List[Path],
+    ) -> List[Tuple[int, int, int, str, Tuple[Tuple[int, int], ...]]]:
+        result: List[
+            Tuple[int, int, int, str, Tuple[Tuple[int, int], ...]]
+        ] = []
+        for path in paths:
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+                continue
+            result.append(
+                (
+                    int(info.st_dev),
+                    int(info.st_ino),
+                    int(info.st_size),
+                    path.suffix.casefold(),
+                    tuple(sorted(Engine._series_episode_codes(path))),
+                )
+            )
+        return sorted(result)
+
+    @staticmethod
+    def _series_remaining_input_files(root: Path) -> List[Path]:
+        remaining: List[Path] = []
+        if not root.exists():
+            return remaining
+        for path in root.rglob("*"):
+            try:
+                if path.is_symlink() or path.is_file():
+                    remaining.append(path)
+            except OSError:
+                remaining.append(path)
+        return sorted(remaining, key=lambda item: str(item).casefold())
+
+    @staticmethod
+    def _format_episode_codes(codes: set[Tuple[int, int]]) -> List[str]:
+        return [f"S{season:02d}E{episode:02d}" for season, episode in sorted(codes)]
+
+    @staticmethod
+    def _safe_series_relative(value: object, label: str) -> PurePosixPath:
+        text = str(value or "").replace("\\", "/")
+        relative = PurePosixPath(text)
+        if (
+            not text
+            or relative.is_absolute()
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or "\x00" in text
+        ):
+            raise ValueError(f"{label} no es una ruta relativa segura")
+        return relative
+
+    def _series_paths_for_job(
+        self,
+        job: Dict[str, object],
+    ) -> Tuple[Path, Path]:
+        job_id = str(job["job_id"])
+        stage_value = str(job.get("stage_path") or "").strip()
+        source_value = str(job.get("source_path") or "").strip()
+        if not stage_value or not source_value:
+            raise ValueError("El trabajo de Series no conserva sus rutas")
+        lexical_job_root = Path(stage_value)
+        lexical_source_root = Path(source_value)
+        lexical_job_root = self._require_series_lexical_path(
+            lexical_job_root,
+            self.config.workshop_root,
+            "taller de Series",
+        )
+        lexical_source_root = self._require_series_lexical_path(
+            lexical_source_root,
+            lexical_job_root,
+            "entrada de Series",
+        )
+        job_root = lexical_job_root.resolve(strict=True)
+        source_root = lexical_source_root.resolve(strict=True)
+        expected_job_root = self._require_series_lexical_path(
+            self.config.workshop_root / job_id,
+            self.config.workshop_root,
+            "taller esperado de Series",
+        ).resolve(strict=True)
+        if job_root != expected_job_root or job_root.name != job_id:
+            raise ValueError("El taller no coincide con <taller>/<job_id>")
+        expected_source = (job_root / "series_filebot_output").resolve(strict=True)
+        if source_root != expected_source or not source_root.is_dir():
+            raise ValueError(
+                "La entrada de Series no coincide con series_filebot_output"
+            )
+        for root, label in (
+            (self.config.tv_output, "biblioteca TV"),
+            (self.config.series_review_dir, "revisión de Series"),
+            (self.config.series_reports_root, "informes de Series"),
+        ):
+            lexical_root = self._require_series_physical_path(root, label)
+            if not lexical_root.resolve(strict=True).is_dir():
+                raise ValueError(f"No está disponible la ruta canónica de {label}")
+        return job_root, source_root
+
+    @staticmethod
+    def _require_series_physical_path(path: Path, label: str) -> Path:
+        lexical = Path(os.path.abspath(str(path)))
+        for current in reversed((lexical, *lexical.parents)):
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise ValueError(f"No se puede validar la ruta física de {label}") from error
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(f"{label} atraviesa un enlace simbólico")
+        return lexical
+
+    @classmethod
+    def _require_series_lexical_path(
+        cls,
+        path: Path,
+        root: Path,
+        label: str,
+    ) -> Path:
+        lexical = Path(os.path.abspath(str(path)))
+        lexical_root = cls._require_series_physical_path(root, label)
+        try:
+            lexical.relative_to(lexical_root)
+        except ValueError as error:
+            raise ValueError(f"{label} queda fuera de su raíz autorizada") from error
+        return cls._require_series_physical_path(lexical, label)
+
+    def _series_worker_command_preview(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        source_root: Path,
+    ) -> Dict[str, object]:
+        preview = getattr(self.series_worker, "preview_process_series", None)
+        if callable(preview):
+            return dict(
+                preview(
+                    str(job["job_id"]),
+                    job_root,
+                    source_root,
+                    self.config.tv_output,
+                    self.config.series_review_dir,
+                    self.config.series_reports_root,
+                )
+            )
+        return {
+            "method": "POST",
+            "service": "series-worker",
+            "endpoint": "/process-series",
+            "payload": {
+                "job_id": str(job["job_id"]),
+                "job_root": str(job_root),
+                "source_root": str(source_root),
+                "final_root": str(self.config.tv_output),
+                "review_root": str(self.config.series_review_dir),
+                "reports_root": str(self.config.series_reports_root),
+            },
+            "timeout_sec": 30,
+        }
+
+    def _record_series_worker_fingerprint(
+        self,
+        job: Dict[str, object],
+        payload: Dict[str, object],
+    ) -> None:
+        fingerprint = str(payload.get("rules_fingerprint") or "")
+        if not fingerprint:
+            return
+        if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+            raise ValueError("Series Worker devolvió una huella de reglas inválida")
+        current = self.db.get_job(str(job["job_id"])) or job
+        source_meta = self._source_meta(current)
+        worker_meta = source_meta.get("series_worker")
+        if worker_meta is None:
+            worker_meta = {}
+        if not isinstance(worker_meta, dict):
+            raise ValueError("El snapshot de Series Worker es contradictorio")
+        previous = str(worker_meta.get("rules_fingerprint") or "")
+        if previous and previous != fingerprint:
+            raise ValueError("Series Worker cambió las reglas durante el trabajo")
+        if previous:
+            return
+        worker_meta = {
+            **worker_meta,
+            "schema": "series-worker-job-v1",
+            "rules_fingerprint": fingerprint,
+            "accepted_at": time.time(),
+        }
+        source_meta["series_worker"] = worker_meta
+        self.db.update_job(
+            str(job["job_id"]),
+            source_meta_json=json.dumps(
+                source_meta,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        self.db.add_event(
+            str(job["job_id"]),
+            "settings",
+            "decision",
+            "Huella de reglas de Series congelada por el worker",
+            {"series_rules_fingerprint": fingerprint},
+        )
+
+    def _load_series_worker_result(
+        self,
+        job_id: str,
+    ) -> Optional[Dict[str, object]]:
+        relative_job = self._safe_series_relative(job_id, "job_id de Series")
+        if len(relative_job.parts) != 1:
+            raise ValueError("El job_id de Series no identifica un único directorio")
+        result_dir = self._require_series_lexical_path(
+            self.config.series_reports_root / relative_job.name,
+            self.config.series_reports_root,
+            "directorio durable de Series",
+        )
+        result_path = self._require_series_lexical_path(
+            result_dir / "series_result.json",
+            result_dir,
+            "resultado durable de Series",
+        )
+        descriptor = -1
+        try:
+            descriptor = self._open_series_result_descriptor(
+                self.config.series_reports_root,
+                relative_job.name,
+                result_path,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise ValueError("El resultado durable de Series no se puede abrir") from error
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("El resultado durable de Series no es un archivo regular")
+            if info.st_size > MAX_WORKER_RESULT_BYTES:
+                raise ValueError("El resultado durable de Series supera el límite")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = -1
+                result = json.load(handle)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ValueError("El resultado durable de Series no se puede leer") from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if not isinstance(result, dict):
+            raise ValueError("El resultado durable de Series no es un objeto JSON")
+        delivery = result.get("delivery")
+        if (
+            result.get("status") == "done"
+            and isinstance(delivery, dict)
+            and bool(delivery.get("cleanup_pending"))
+        ):
+            # El propio worker debe recuperar y cerrar su limpieza durable antes
+            # de que ARR trate el fichero como terminal.
+            return None
+        return result
+
+    @staticmethod
+    def _open_series_result_descriptor(
+        reports_root: Path,
+        job_id: str,
+        fallback_path: Path,
+    ) -> int:
+        """Abre el resultado sin seguir componentes intercambiados por symlinks.
+
+        En Linux se recorre desde ``/`` con descriptores de directorio y
+        ``O_NOFOLLOW``. Así, aunque un ancestro cambie después de la validación
+        léxica, el fichero se abre dentro de la cadena física ya fijada.
+        """
+
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if (
+            os.name != "posix"
+            or not nofollow
+            or not directory
+            or os.open not in os.supports_dir_fd
+        ):
+            return os.open(fallback_path, os.O_RDONLY | nofollow)
+
+        root = Path(os.path.abspath(str(reports_root)))
+        if root.anchor != "/":
+            raise OSError("La raíz durable de Series no es absoluta")
+        directory_flags = os.O_RDONLY | directory | nofollow
+        current = os.open("/", directory_flags)
+        try:
+            for part in (*root.parts[1:], job_id):
+                next_descriptor = os.open(
+                    part,
+                    directory_flags,
+                    dir_fd=current,
+                )
+                try:
+                    if not stat.S_ISDIR(os.fstat(next_descriptor).st_mode):
+                        raise OSError("La cadena durable contiene un componente no directorio")
+                except Exception:
+                    os.close(next_descriptor)
+                    raise
+                os.close(current)
+                current = next_descriptor
+            return os.open(
+                "series_result.json",
+                os.O_RDONLY | nofollow,
+                dir_fd=current,
+            )
+        finally:
+            os.close(current)
+
+    def _validate_series_manifest(
+        self,
+        result: Dict[str, object],
+        source_root: Path,
+    ) -> Tuple[Dict[str, object], List[PurePosixPath]]:
+        manifest_payload = result.get("manifest")
+        if not isinstance(manifest_payload, dict):
+            raise ValueError("El resultado de Series no contiene manifiesto")
+        expected_manifest_keys = {
+            "schema",
+            "status",
+            "digest",
+            "series_name",
+            "series_key",
+            "review_reasons",
+            "entries",
+        }
+        if set(manifest_payload) != expected_manifest_keys:
+            raise ValueError("El manifiesto de Series no respeta el contrato exacto")
+        if manifest_payload.get("schema") != "series-manifest-v1":
+            raise ValueError("El manifiesto de Series usa un esquema desconocido")
+        manifest_status = str(manifest_payload.get("status") or "")
+        review_reasons = manifest_payload.get("review_reasons")
+        if (
+            manifest_status not in {"ready", "review"}
+            or not isinstance(review_reasons, list)
+            or any(not isinstance(reason, str) or not reason for reason in review_reasons)
+            or len(set(review_reasons)) != len(review_reasons)
+        ):
+            raise ValueError("El manifiesto de Series no conserva un estado valido")
+        digest = str(manifest_payload.get("digest") or "")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("El manifiesto de Series no conserva una huella válida")
+        entries = manifest_payload.get("entries")
+        if not isinstance(entries, list):
+            raise ValueError("El manifiesto de Series no contiene entradas válidas")
+        expected_entry_keys = {
+            "source_relpath",
+            "target_relpath",
+            "series_name",
+            "series_key",
+            "season",
+            "episodes",
+            "size",
+            "mtime_ns",
+            "source_fingerprint",
+            "content_sha256",
+            "subtitle_sidecars",
+        }
+        expected_sidecar_keys = {
+            "source_relpath",
+            "size",
+            "mtime_ns",
+            "content_sha256",
+        }
+        targets: List[PurePosixPath] = []
+        seen_sources = set()
+        seen_targets = set()
+        declared_files = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != expected_entry_keys:
+                raise ValueError("El manifiesto de Series contiene una entrada inválida")
+            source = self._safe_series_relative(
+                entry.get("source_relpath"), "source_relpath"
+            )
+            target = self._safe_series_relative(
+                entry.get("target_relpath"), "target_relpath"
+            )
+            if source.as_posix() in seen_sources or target.as_posix() in seen_targets:
+                raise ValueError("El manifiesto de Series contiene rutas duplicadas")
+            seen_sources.add(source.as_posix())
+            seen_targets.add(target.as_posix())
+            series_name = str(entry.get("series_name") or "")
+            series_key = str(entry.get("series_key") or "")
+            season = entry.get("season")
+            episodes = entry.get("episodes")
+            size = entry.get("size")
+            mtime_ns = entry.get("mtime_ns")
+            source_fingerprint = str(entry.get("source_fingerprint") or "")
+            if (
+                not series_name
+                or not series_key
+                or not isinstance(season, int)
+                or isinstance(season, bool)
+                or season < 0
+                or not isinstance(episodes, list)
+                or not episodes
+                or any(
+                    not isinstance(episode, int)
+                    or isinstance(episode, bool)
+                    or episode < 0
+                    for episode in episodes
+                )
+                or len(target.parts) != 3
+                or target.parts[0] != series_name
+                or target.parts[1] != f"Season {season:02d}"
+                or target.suffix.casefold() != ".mkv"
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+                or not isinstance(mtime_ns, int)
+                or isinstance(mtime_ns, bool)
+                or mtime_ns < 0
+                or re.fullmatch(r"[0-9a-f]{64}", source_fingerprint) is None
+            ):
+                raise ValueError("El manifiesto contiene una identidad de episodio inválida")
+            source_file = source_root.joinpath(*source.parts)
+            expected_hash = str(entry.get("content_sha256") or "")
+            try:
+                source_stat = source_file.lstat()
+            except OSError as error:
+                raise ValueError("Falta un episodio de entrada declarado") from error
+            expected_source_fingerprint = hashlib.sha256(
+                f"{source.as_posix()}\0{size}\0{mtime_ns}".encode("utf-8")
+            ).hexdigest()
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+                or not stat.S_ISREG(source_stat.st_mode)
+                or not self._path_is_inside(source_file, source_root)
+                or source_stat.st_size != size
+                or source_stat.st_mtime_ns != mtime_ns
+                or source_fingerprint != expected_source_fingerprint
+            ):
+                raise ValueError("El manifiesto no coincide con el episodio de entrada")
+            declared_files.add(source.as_posix())
+            sidecars = entry.get("subtitle_sidecars")
+            if not isinstance(sidecars, list):
+                raise ValueError("El manifiesto de Series no conserva sus subtítulos")
+            for sidecar in sidecars:
+                if not isinstance(sidecar, dict) or set(sidecar) != expected_sidecar_keys:
+                    raise ValueError("El manifiesto contiene un subtítulo inválido")
+                sidecar_relative = self._safe_series_relative(
+                    sidecar.get("source_relpath"), "subtitle source_relpath"
+                )
+                if sidecar_relative.as_posix() in declared_files:
+                    raise ValueError("El manifiesto repite un archivo de entrada")
+                sidecar_file = source_root.joinpath(*sidecar_relative.parts)
+                sidecar_hash = str(sidecar.get("content_sha256") or "")
+                sidecar_size = sidecar.get("size")
+                sidecar_mtime = sidecar.get("mtime_ns")
+                try:
+                    sidecar_stat = sidecar_file.lstat()
+                except OSError as error:
+                    raise ValueError("Falta un subtitulo externo declarado") from error
+                if (
+                    re.fullmatch(r"[0-9a-f]{64}", sidecar_hash) is None
+                    or not isinstance(sidecar_size, int)
+                    or isinstance(sidecar_size, bool)
+                    or sidecar_size < 0
+                    or not isinstance(sidecar_mtime, int)
+                    or isinstance(sidecar_mtime, bool)
+                    or sidecar_mtime < 0
+                    or not stat.S_ISREG(sidecar_stat.st_mode)
+                    or not self._path_is_inside(sidecar_file, source_root)
+                    or sidecar_stat.st_size != sidecar_size
+                    or sidecar_stat.st_mtime_ns != sidecar_mtime
+                ):
+                    raise ValueError("El manifiesto no coincide con el subtítulo externo")
+                declared_files.add(sidecar_relative.as_posix())
+            targets.append(target)
+
+        canonical_manifest = json.dumps(
+            {
+                "entries": entries,
+                "review_reasons": sorted(review_reasons),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if hashlib.sha256(canonical_manifest).hexdigest() != digest:
+            raise ValueError("La huella del manifiesto de Series no coincide")
+        actual_files = self._series_regular_file_inventory(source_root)
+        if not declared_files.issubset(actual_files):
+            raise ValueError("El manifiesto declara archivos que no existen en el origen")
+        if manifest_status == "ready" and declared_files != set(actual_files):
+            raise ValueError("El manifiesto no cubre el pack completo de entrada")
+        return manifest_payload, targets
+
+    def _series_regular_file_inventory(self, root: Path) -> Dict[str, int]:
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("La raiz del pack de Series no es un directorio fisico")
+        inventory: Dict[str, int] = {}
+        for current, directories, filenames in os.walk(root, followlinks=False):
+            current_path = Path(current)
+            if current_path.is_symlink():
+                raise ValueError("El pack de Series contiene un enlace simbolico")
+            for name in directories:
+                directory = current_path / name
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode):
+                    raise ValueError("El pack de Series contiene una carpeta no regular")
+            for name in filenames:
+                path = current_path / name
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("El pack de Series contiene un archivo no regular")
+                relative = self._safe_series_relative(
+                    path.relative_to(root).as_posix(),
+                    "series inventory",
+                ).as_posix()
+                inventory[relative] = int(info.st_size)
+        return inventory
+
+    def _validate_series_published_manifest(
+        self,
+        result: Dict[str, object],
+        series_root: PurePosixPath,
+        published_paths: List[PurePosixPath],
+    ) -> None:
+        payload = result.get("published_manifest")
+        if not isinstance(payload, dict) or set(payload) != {"schema", "digest", "entries"}:
+            raise ValueError("Series Worker no conserva el manifiesto final completo")
+        if payload.get("schema") != SERIES_PUBLISHED_MANIFEST_SCHEMA:
+            raise ValueError("El manifiesto final de Series usa un esquema desconocido")
+        digest = str(payload.get("digest") or "")
+        entries = payload.get("entries")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or not isinstance(entries, list):
+            raise ValueError("El manifiesto final de Series no es valido")
+        declared: Dict[str, int] = {}
+        normalized_entries: List[Dict[str, object]] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) != {"path", "size", "content_sha256"}:
+                raise ValueError("El manifiesto final contiene una entrada invalida")
+            relative = self._safe_series_relative(entry.get("path"), "published manifest path")
+            size = entry.get("size")
+            content_hash = str(entry.get("content_sha256") or "")
+            if (
+                len(relative.parts) < 2
+                or relative.parts[0] != series_root.name
+                or (
+                    len(relative.parts) == 2
+                    and relative.name == SERIES_GENERATION_MARKER
+                )
+                or not isinstance(size, int)
+                or isinstance(size, bool)
+                or size < 0
+                or re.fullmatch(r"[0-9a-f]{64}", content_hash) is None
+                or relative.as_posix() in declared
+            ):
+                raise ValueError("El manifiesto final contiene una ruta o huella invalida")
+            declared[relative.as_posix()] = size
+            normalized_entries.append(
+                {
+                    "path": relative.as_posix(),
+                    "size": size,
+                    "content_sha256": content_hash,
+                }
+            )
+        if normalized_entries != sorted(
+            normalized_entries,
+            key=lambda entry: (str(entry["path"]).casefold(), str(entry["path"])),
+        ):
+            raise ValueError("El manifiesto final de Series no esta ordenado")
+        canonical = json.dumps(
+            normalized_entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if hashlib.sha256(canonical).hexdigest() != digest:
+            raise ValueError("La huella del manifiesto final de Series no coincide")
+        final_series = self.config.tv_output.joinpath(*series_root.parts)
+        actual_inside = self._series_regular_file_inventory(final_series)
+        actual = {
+            PurePosixPath(series_root.name, *PurePosixPath(path).parts).as_posix(): size
+            for path, size in actual_inside.items()
+            if not (
+                len(PurePosixPath(path).parts) == 1
+                and PurePosixPath(path).name == SERIES_GENERATION_MARKER
+            )
+        }
+        if actual != declared:
+            raise ValueError("La biblioteca no coincide con el manifiesto final completo")
+        if any(path.as_posix() not in declared for path in published_paths):
+            raise ValueError("Falta un episodio del pack en el manifiesto final")
+
+    def _validate_series_worker_result(
+        self,
+        job: Dict[str, object],
+        result: Dict[str, object],
+    ) -> Optional[Path]:
+        job_id = str(job["job_id"])
+        if str(result.get("job_id") or "") != job_id:
+            raise ValueError("El resultado de Series pertenece a otro trabajo")
+        if result.get("kind") != "series":
+            raise ValueError("El resultado terminal no pertenece a Series")
+        status = str(result.get("status") or "")
+        if status not in {"done", "review", "failed"}:
+            raise ValueError("El resultado terminal de Series tiene estado inválido")
+        job_root, source_root = self._series_paths_for_job(job)
+        self._record_series_worker_fingerprint(job, result)
+        manifest_payload, targets = self._validate_series_manifest(
+            result,
+            source_root,
+        )
+        if status == "done":
+            if not targets:
+                raise ValueError("Series Worker marcó done sin episodios")
+            published = result.get("published")
+            if not isinstance(published, list):
+                raise ValueError("Series Worker no declara los episodios publicados")
+            published_paths = [
+                self._safe_series_relative(value, "published") for value in published
+            ]
+            if [path.as_posix() for path in published_paths] != [
+                path.as_posix() for path in targets
+            ]:
+                raise ValueError("La publicación no coincide con el manifiesto completo")
+            series_root = self._safe_series_relative(
+                result.get("series_root"), "series_root"
+            )
+            if len(series_root.parts) != 1 or any(
+                target.parts[0] != series_root.parts[0] for target in targets
+            ):
+                raise ValueError("La raíz publicada no coincide con el pack")
+            delivery = result.get("delivery")
+            if (
+                not isinstance(delivery, dict)
+                or delivery.get("mode") not in {"new", "exchange"}
+                or delivery.get("cleanup_pending") is not False
+            ):
+                raise ValueError("La entrega atómica de Series no está completada")
+            self._validate_series_published_manifest(
+                result,
+                series_root,
+                published_paths,
+            )
+            return None
+        if status == "review":
+            review_relative = self._safe_series_relative(
+                result.get("review_path"), "review_path"
+            )
+            review = self._require_series_lexical_path(
+                self.config.series_review_dir.joinpath(*review_relative.parts),
+                self.config.series_review_dir,
+                "revisión durable de Series",
+            )
+            if (
+                not review.is_dir()
+                or not self._path_is_inside(review, self.config.series_review_dir)
+            ):
+                raise ValueError("La revisión de Series no conserva un destino válido")
+            try:
+                reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError("La revisión de Series no conserva reason.json") from error
+            if (
+                not isinstance(reason, dict)
+                or str(reason.get("job_id") or "") != job_id
+                or str(reason.get("manifest_digest") or "")
+                != str(manifest_payload.get("digest") or "")
+            ):
+                raise ValueError("La revisión de Series no coincide con el trabajo")
+            source_signature = review_content_signature(
+                source_root,
+                whole_tree=True,
+            )
+            review_signature = review_content_signature(
+                review,
+                whole_tree=True,
+                ignored_names=("reason.json", "Revision de serie.txt"),
+            )
+            if not source_signature or source_signature != review_signature:
+                raise ValueError("La revisión no conserva el pack completo")
+            return review
+        return None
+
+    def _record_series_wait(
+        self,
+        job: Dict[str, object],
+        status: str,
+        detail: object,
+    ) -> None:
+        job_id = str(job["job_id"])
+        key = f"{job_id}:series:{status}"
+        now = time.time()
+        if now - self._worker_status_log_at.get(key, 0.0) < 30:
+            return
+        self._worker_status_log_at[key] = now
+        message = self._safe_worker_error(detail)
+        if status not in {"accepted", "active", "recoverable"}:
+            self.db.update_job(
+                job_id,
+                last_error_code=f"series_worker_{status}",
+                last_error_message=message,
+            )
+        self.db.add_event(
+            job_id,
+            "series",
+            "progress",
+            f"Series Worker pendiente: {status}",
+            {"status": status, "detail": message},
+        )
+
+    def _series_started_timestamp(self, job: Dict[str, object]) -> float:
+        job_id = str(job["job_id"])
+        cached = self._worker_started_at.get(job_id)
+        if cached:
+            return cached
+        detail = self.db.job_detail(job_id) or {}
+        timeline = list(detail.get("timeline") or [])
+        for event in reversed(timeline):
+            if not isinstance(event, dict) or event.get("phase") != "series":
+                continue
+            structured = event.get("structured")
+            state = structured.get("state") if isinstance(structured, dict) else None
+            if state != "series_postprocess_running" and event.get("message") != "Series Worker iniciado":
+                continue
+            try:
+                started_at = float(event.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                started_at = 0.0
+            if started_at:
+                self._worker_started_at[job_id] = started_at
+                return started_at
+        fallback = float(job.get("created_at") or time.time())
+        self._worker_started_at[job_id] = fallback
+        return fallback
+
+    def _mark_series_active_timeout(
+        self,
+        job: Dict[str, object],
+        detail: object,
+        *,
+        recovery: bool,
+    ) -> None:
+        job_id = str(job["job_id"])
+        message = self._safe_worker_error(detail) or "Series Worker supero el plazo maximo"
+        payload = {
+            "status": "active_timeout",
+            "cleanup_blocked": True,
+            "workshop_preserved": True,
+            "clients_preserved": True,
+        }
+        key = f"{job_id}:series:active_timeout"
+        now = time.time()
+        if now - self._worker_status_log_at.get(key, 0.0) < 300:
+            return
+        self._worker_status_log_at[key] = now
+        self.db.add_event(
+            job_id,
+            "recovery" if recovery else "series",
+            "error",
+            "Series Worker superó el plazo; no se borra ni se mueve material activo",
+            payload,
+        )
+        # No se convierte en terminal mientras el worker pueda seguir activo:
+        # una publicación tardía todavía debe reconciliarse y verificarse.
+        self.db.update_job(
+            job_id,
+            last_error_code="series_worker_active_timeout",
+            last_error_message=message,
+        )
+
+    def _apply_series_worker_result(
+        self,
+        job: Dict[str, object],
+        result: Dict[str, object],
+        *,
+        recovery: bool,
+    ) -> None:
+        job_id = str(job["job_id"])
+        try:
+            review = self._validate_series_worker_result(job, result)
+        except (OSError, TypeError, ValueError) as error:
+            job_root_value = str(job.get("stage_path") or "").strip()
+            job_root = Path(job_root_value) if job_root_value else self.config.workshop_root / job_id
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                "series_worker_invalid_terminal",
+                str(error),
+                phase="series",
+            )
+            return
+        status = str(result.get("status") or "")
+        if status == "failed":
+            job_root = Path(str(job["stage_path"]))
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                str(result.get("error_code") or "series_worker_failed"),
+                str(result.get("error") or "Series Worker terminó con error"),
+                phase="series",
+            )
+            return
+        self._worker_status_checked_at.pop(job_id, None)
+        self._worker_started_at.pop(job_id, None)
+        self._series_retry_at.pop(job_id, None)
+        if recovery:
+            self.db.add_event(
+                job_id,
+                "recovery",
+                "decision",
+                "Resultado durable de Series Worker reconciliado sin repetir FileBot",
+                {"status": status},
+            )
+        if status == "done":
+            current = self.db.update_job(
+                job_id,
+                result_json=json.dumps(result, ensure_ascii=False),
+                last_error_code="series_verification_pending",
+                last_error_message="Verificacion independiente de hashes en curso",
+            )
+            self._schedule_series_terminal_verification(
+                current,
+                result,
+                recovery=recovery,
+            )
+            return
+        if review is None:
+            raise ValueError("El resultado review no conserva destino")
+        result = {
+            **result,
+            "_arr_review_signature": self._series_review_signature_digest(review),
+        }
+        current = self.db.transition(
+            job_id,
+            "series_review_cleanup",
+            "series_review",
+            "Revision completa verificada; limpieza recuperable pendiente",
+            stage_path=str(review),
+            last_error_code="series_review_cleanup_pending",
+            last_error_message="; ".join(
+                str(value) for value in list(result.get("review_reasons") or [])[:8]
+            ),
+            result_json=json.dumps(result, ensure_ascii=False),
+        )
+        self._run_series_review_cleanup(current)
+
+    @staticmethod
+    def _series_review_signature_digest(review: Path) -> str:
+        signature = review_content_signature(
+            review,
+            whole_tree=True,
+            ignored_names=("reason.json", "Revision de serie.txt"),
+        )
+        if not signature:
+            raise ValueError("La revisión de Series no contiene material verificable")
+        encoded = json.dumps(
+            signature,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        if path.is_symlink():
+            raise ValueError("No se calculan huellas a traves de enlaces simbolicos")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("La huella solo admite archivos regulares")
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        finally:
+            os.close(descriptor)
+        return digest.hexdigest()
+
+    def _verify_series_terminal_hashes(
+        self,
+        job: Dict[str, object],
+        result: Dict[str, object],
+    ) -> None:
+        _job_root, source_root = self._series_paths_for_job(job)
+        manifest = result.get("manifest")
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("entries"), list):
+            raise ValueError("No existe manifiesto de entrada verificable")
+        for entry in manifest["entries"]:
+            if not isinstance(entry, dict):
+                raise ValueError("El manifiesto de entrada cambio durante la verificacion")
+            source = self._safe_series_relative(entry.get("source_relpath"), "source hash")
+            source_file = source_root.joinpath(*source.parts)
+            if self._sha256_file(source_file) != str(entry.get("content_sha256") or ""):
+                raise ValueError("La huella de un episodio de entrada no coincide")
+            sidecars = entry.get("subtitle_sidecars")
+            if not isinstance(sidecars, list):
+                raise ValueError("El manifiesto de entrada perdio sus subtitulos")
+            for sidecar in sidecars:
+                if not isinstance(sidecar, dict):
+                    raise ValueError("El manifiesto contiene un subtitulo invalido")
+                relative = self._safe_series_relative(
+                    sidecar.get("source_relpath"),
+                    "subtitle hash",
+                )
+                path = source_root.joinpath(*relative.parts)
+                if self._sha256_file(path) != str(sidecar.get("content_sha256") or ""):
+                    raise ValueError("La huella de un subtitulo de entrada no coincide")
+
+        published = result.get("published_manifest")
+        if not isinstance(published, dict) or not isinstance(published.get("entries"), list):
+            raise ValueError("No existe manifiesto final verificable")
+        for entry in published["entries"]:
+            if not isinstance(entry, dict):
+                raise ValueError("El manifiesto final cambio durante la verificacion")
+            relative = self._safe_series_relative(entry.get("path"), "published hash")
+            path = self.config.tv_output.joinpath(*relative.parts)
+            if self._sha256_file(path) != str(entry.get("content_sha256") or ""):
+                raise ValueError("La huella de un archivo publicado no coincide")
+
+        # Segunda lectura barata para detectar altas, bajas o cambios de tamaño
+        # ocurridos mientras se calculaban las huellas.
+        self._validate_series_worker_result(job, result)
+
+    def _schedule_series_terminal_verification(
+        self,
+        job: Dict[str, object],
+        result: Dict[str, object],
+        *,
+        recovery: bool,
+    ) -> None:
+        job_id = str(job["job_id"])
+        with self._series_verification_lock:
+            current_thread = self._series_verification_threads.get(job_id)
+            if current_thread is not None and current_thread.is_alive():
+                return
+            running = sum(
+                1
+                for thread in self._series_verification_threads.values()
+                if thread.is_alive()
+            )
+            if running >= SERIES_VERIFY_MAX_CONCURRENCY:
+                return
+            thread = threading.Thread(
+                target=self._run_series_terminal_verification,
+                args=(job_id, dict(result), recovery),
+                name=f"arr-series-verify-{job_id}",
+                daemon=True,
+            )
+            self._series_verification_threads[job_id] = thread
+            self.db.add_event(
+                job_id,
+                "recovery" if recovery else "series_verify",
+                "started",
+                "Verificación independiente del pack publicado iniciada",
+                {"async": True, "hashes": True},
+            )
+            thread.start()
+
+    def _run_series_terminal_verification(
+        self,
+        job_id: str,
+        result: Dict[str, object],
+        recovery: bool,
+    ) -> None:
+        try:
+            current = self.db.get_job(job_id)
+            if current is None or str(current.get("state") or "") != "series_postprocess_running":
+                return
+            self._verify_series_terminal_hashes(current, result)
+            current = self.db.get_job(job_id)
+            if current is None or str(current.get("state") or "") != "series_postprocess_running":
+                return
+            self.db.transition(
+                job_id,
+                "ready_cleanup",
+                "series_verify",
+                "Series Worker publicó el pack y ARR verificó todas sus huellas",
+                output_root=str(self.config.tv_output),
+                last_error_code=None,
+                last_error_message=None,
+                result_json=json.dumps(result, ensure_ascii=False),
+            )
+        except (OSError, TypeError, ValueError) as error:
+            current = self.db.get_job(job_id)
+            if current is not None and str(current.get("state") or "") == "series_postprocess_running":
+                job_root = self.config.workshop_root / job_id
+                self._preserve_series_job_for_review(
+                    current,
+                    job_root,
+                    "series_worker_hash_verification_failed",
+                    str(error),
+                    phase="recovery" if recovery else "series_verify",
+                )
+        finally:
+            with self._series_verification_lock:
+                if self._series_verification_threads.get(job_id) is threading.current_thread():
+                    self._series_verification_threads.pop(job_id, None)
+
+    def _run_series_review_cleanup(self, job: Dict[str, object]) -> None:
+        job_id = str(job["job_id"])
+        try:
+            review = self._require_series_lexical_path(
+                Path(str(job.get("stage_path") or "")),
+                self.config.series_review_dir,
+                "revisión pendiente de Series",
+            )
+        except (OSError, ValueError) as error:
+            self._record_series_wait(job, "review_cleanup_invalid", error)
+            return
+        if (
+            not review.is_dir()
+            or not self._path_is_inside(review, self.config.series_review_dir)
+        ):
+            self._record_series_wait(
+                job,
+                "review_cleanup_invalid",
+                "La copia verificada de Series ya no esta en su raiz exclusiva",
+            )
+            return
+        try:
+            result = json.loads(str(job.get("result_json") or "{}"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result = {}
+        if not isinstance(result, dict):
+            result = {}
+        expected_signature = str(result.get("_arr_review_signature") or "")
+        try:
+            actual_signature = self._series_review_signature_digest(review)
+        except (OSError, TypeError, ValueError) as error:
+            self._record_series_wait(job, "review_integrity_failed", error)
+            return
+        job_root = self.config.workshop_root / job_id
+        if not expected_signature and job_root.is_dir() and not job_root.is_symlink():
+            source_root = job_root / "series_filebot_output"
+            try:
+                source_signature = review_content_signature(
+                    source_root,
+                    whole_tree=True,
+                )
+                review_signature = review_content_signature(
+                    review,
+                    whole_tree=True,
+                    ignored_names=("reason.json", "Revision de serie.txt"),
+                )
+            except (OSError, ValueError) as error:
+                self._record_series_wait(job, "review_integrity_failed", error)
+                return
+            if not source_signature or source_signature != review_signature:
+                self._record_series_wait(
+                    job,
+                    "review_integrity_failed",
+                    "La revisión ya no coincide con el pack del taller",
+                )
+                return
+            expected_signature = actual_signature
+            result["_arr_review_signature"] = expected_signature
+            job = self.db.update_job(
+                job_id,
+                result_json=json.dumps(result, ensure_ascii=False),
+            )
+        if expected_signature and actual_signature != expected_signature:
+            self._record_series_wait(
+                job,
+                "review_integrity_failed",
+                "La copia de revisión cambió después del checkpoint",
+            )
+            return
+        if not expected_signature and job_root.exists():
+            self._record_series_wait(
+                job,
+                "review_integrity_unknown",
+                "No existe una firma durable para autorizar el borrado del taller",
+            )
+            return
+        if not self._cleanup_clients(job, strict=True):
+            self._record_series_wait(
+                job,
+                "review_cleanup_pending",
+                "La copia está verificada, pero quedan clientes por limpiar",
+            )
+            return
+        if job_root.exists():
+            try:
+                job_root = self._require_series_lexical_path(
+                    job_root,
+                    self.config.workshop_root,
+                    "taller pendiente de Series",
+                )
+                if not self._inside_workshop(job_root):
+                    raise ValueError("El taller pendiente de Series no es canonico")
+                shutil.rmtree(job_root)
+            except (OSError, ValueError) as error:
+                self._record_series_wait(job, "workshop_cleanup_pending", error)
+                return
+        review_reasons = list(result.get("review_reasons") or []) if isinstance(result, dict) else []
+        self.db.transition(
+            job_id,
+            "manual_review",
+            "series_review",
+            "Pack completo preservado en revisión exclusiva de Series",
+            stage_path=str(review),
+            last_error_code="series_review",
+            last_error_message="; ".join(
+                str(value) for value in review_reasons[:8]
+            ),
+            result_json=json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else "{}",
+        )
+
+    def _handle_series_submission(
+        self,
+        job: Dict[str, object],
+        response: Dict[str, object],
+        *,
+        recovery: bool,
+    ) -> None:
+        job_id = str(job["job_id"])
+        if str(response.get("job_id") or "") != job_id or response.get("kind") != "series":
+            raise ValueError("Series Worker respondió por otro trabajo")
+        status = str(response.get("status") or "")
+        if status == "terminal":
+            result = response.get("result")
+            if not isinstance(result, dict):
+                raise ValueError("Series Worker no devolvió el resultado terminal")
+            self._apply_series_worker_result(job, dict(result), recovery=recovery)
+            return
+        if status not in {"accepted", "active", "recoverable"}:
+            raise ValueError("Series Worker devolvió un estado no soportado")
+        self._record_series_worker_fingerprint(job, response)
+        try:
+            reported_started_at = float(response.get("started_at") or 0.0)
+        except (TypeError, ValueError):
+            reported_started_at = 0.0
+        started_at = self._series_started_timestamp(job)
+        if 0.0 < reported_started_at <= time.time() + 60:
+            started_at = reported_started_at
+            self._worker_started_at[job_id] = started_at
+        if time.time() - started_at > WORKER_ACTIVE_MAX_SECONDS:
+            self._mark_series_active_timeout(
+                job,
+                RuntimeError(f"Series Worker sigue {status} fuera de plazo"),
+                recovery=recovery,
+            )
+            return
+        self._record_series_wait(job, status, "Trabajo aceptado y pendiente")
+
+    def _run_series_postprocess(self, job: Dict[str, object]) -> None:
+        job_id = str(job["job_id"])
+        other_running = any(
+            str(candidate.get("job_id") or "") != job_id
+            and str(candidate.get("last_error_code") or "")
+            != "series_worker_active_timeout"
+            for candidate in self.db.jobs_in_states(
+                {"series_postprocess_running"},
+                100,
+            )
+        )
+        with self._series_verification_lock:
+            verifier_running = any(
+                candidate_id != job_id and thread.is_alive()
+                for candidate_id, thread in self._series_verification_threads.items()
+            )
+        if other_running or verifier_running:
+            self._series_retry_at[job_id] = time.time() + WORKER_STATUS_POLL_SECONDS
+            self._record_series_wait(
+                job,
+                "pipeline_busy",
+                "Otro pack de Series sigue publicándose o verificándose",
+            )
+            return
+        try:
+            if not self._series_selected_for_job(job):
+                raise ValueError("El snapshot no autoriza Series Worker")
+            job_root, source_root = self._series_paths_for_job(job)
+        except (OSError, TypeError, ValueError) as error:
+            job_root_value = str(job.get("stage_path") or "").strip()
+            job_root = Path(job_root_value) if job_root_value else self.config.workshop_root / job_id
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                "series_worker_path_invalid",
+                str(error),
+                phase="series",
+            )
+            return
+        preview = self._series_worker_command_preview(job, job_root, source_root)
+        started = self.db.transition(
+            job_id,
+            "series_postprocess_running",
+            "series",
+            "Series Worker iniciado",
+        )
+        self._worker_started_at[job_id] = float(started.get("updated_at") or time.time())
+        self.db.add_event(
+            job_id,
+            "series",
+            "command",
+            "Llamada a Series Worker preparada",
+            self._sanitize_command_event({"command_preview": preview}),
+        )
+        current = self.db.get_job(job_id) or job
+        try:
+            response = self.series_worker.process_series(
+                job_id,
+                job_root,
+                source_root,
+                self.config.tv_output,
+                self.config.series_review_dir,
+                self.config.series_reports_root,
+            )
+            self._handle_series_submission(current, response, recovery=False)
+        except SeriesWorkerBusy as error:
+            self._worker_started_at.pop(job_id, None)
+            self._series_retry_at[job_id] = time.time() + WORKER_STATUS_POLL_SECONDS
+            self.db.transition(
+                job_id,
+                "series_postprocess_ready",
+                "series",
+                "Series Worker ocupado; reintento seguro pendiente",
+                last_error_code=error.error_code,
+                last_error_message=self._safe_worker_error(error),
+            )
+        except SeriesWorkerTransportError as error:
+            self._reconcile_running_series(current, call_error=error)
+        except (SeriesWorkerBadRequest, SeriesWorkerConflict, SeriesWorkerUnavailable) as error:
+            self._preserve_series_job_for_review(
+                current,
+                job_root,
+                error.error_code,
+                str(error),
+                phase="series",
+            )
+        except (OSError, TypeError, ValueError, SeriesWorkerError) as error:
+            self._preserve_series_job_for_review(
+                current,
+                job_root,
+                str(getattr(error, "error_code", "series_worker_invalid_response")),
+                str(error),
+                phase="series",
+            )
+
+    def _reconcile_running_series(
+        self,
+        job: Dict[str, object],
+        *,
+        call_error: Optional[object] = None,
+        recovery: bool = False,
+    ) -> None:
+        job_id = str(job["job_id"])
+        with self._series_verification_lock:
+            verifier = self._series_verification_threads.get(job_id)
+            if verifier is not None and verifier.is_alive():
+                return
+        try:
+            pending_result = json.loads(str(job.get("result_json") or "null"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pending_result = None
+        if (
+            isinstance(pending_result, dict)
+            and pending_result.get("status") == "done"
+            and pending_result.get("kind") == "series"
+        ):
+            try:
+                self._validate_series_worker_result(job, pending_result)
+            except (OSError, TypeError, ValueError) as error:
+                self._preserve_series_job_for_review(
+                    job,
+                    self.config.workshop_root / job_id,
+                    "series_worker_invalid_terminal",
+                    str(error),
+                    phase="recovery" if recovery else "series",
+                )
+                return
+            self._schedule_series_terminal_verification(
+                job,
+                pending_result,
+                recovery=True,
+            )
+            return
+        now = time.time()
+        if not call_error and not recovery:
+            last_checked = self._worker_status_checked_at.get(job_id, 0.0)
+            if now - last_checked < WORKER_STATUS_POLL_SECONDS:
+                return
+        self._worker_status_checked_at[job_id] = now
+        try:
+            durable = self._load_series_worker_result(job_id)
+        except (OSError, TypeError, ValueError) as error:
+            job_root = Path(str(job.get("stage_path") or self.config.workshop_root / job_id))
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                "series_worker_invalid_terminal",
+                str(error),
+                phase="recovery" if recovery else "series",
+            )
+            return
+        if durable is not None:
+            self._apply_series_worker_result(job, durable, recovery=True)
+            return
+        try:
+            response = self.series_worker.job_status(job_id)
+        except (SeriesWorkerTransportError, SeriesWorkerUnavailable) as status_error:
+            started_at = self._series_started_timestamp(job)
+            if now - started_at > WORKER_ACTIVE_MAX_SECONDS:
+                self._mark_series_active_timeout(
+                    job,
+                    str(call_error or status_error),
+                    recovery=recovery,
+                )
+                return
+            self._record_series_wait(
+                job,
+                "status_unavailable",
+                call_error or status_error,
+            )
+            return
+        except SeriesWorkerError as error:
+            job_root = Path(str(job.get("stage_path") or self.config.workshop_root / job_id))
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                error.error_code,
+                str(error),
+                phase="recovery" if recovery else "series",
+            )
+            return
+        status = str(response.get("status") or "")
+        if status == "not_found":
+            try:
+                self._series_paths_for_job(job)
+            except (OSError, TypeError, ValueError) as error:
+                job_root = Path(str(job.get("stage_path") or self.config.workshop_root / job_id))
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_worker_not_found_source_invalid",
+                    str(error),
+                    phase="recovery" if recovery else "series",
+                )
+                return
+            self._worker_started_at.pop(job_id, None)
+            self._series_retry_at[job_id] = time.time() + 1.0
+            self.db.transition(
+                job_id,
+                "series_postprocess_ready",
+                "recovery" if recovery else "series",
+                "Series Worker no llegó a aceptar el POST; se reintentará idempotentemente",
+                last_error_code="series_worker_not_found",
+                last_error_message="No existe estado durable; FileBot no se repetirá",
+            )
+            return
+        try:
+            self._handle_series_submission(job, response, recovery=recovery)
+        except (OSError, TypeError, ValueError) as error:
+            job_root = Path(str(job.get("stage_path") or self.config.workshop_root / job_id))
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                "series_worker_invalid_response",
+                str(error),
+                phase="recovery" if recovery else "series",
+            )
+
     def _run_media_postprocess(self, job: Dict[str, object]) -> None:
         source = Path(str(job["source_path"]))
         command_preview = self._media_worker_command_preview(
@@ -2409,7 +4604,7 @@ class Engine:
             "media",
             "command",
             "Llamada a Media Worker preparada",
-            {"command_preview": command_preview},
+            self._sanitize_command_event({"command_preview": command_preview}),
         )
         try:
             result = self.media_worker.process_movie(
@@ -2445,7 +4640,7 @@ class Engine:
             "trailer",
             "command",
             "Llamada a Media Worker preparada para trailer",
-            {"command_preview": command_preview},
+            self._sanitize_command_event({"command_preview": command_preview}),
         )
         try:
             result = self.media_worker.process_trailer(
@@ -2513,6 +4708,39 @@ class Engine:
         message = re.sub(r"(?i)(?:[A-Z]:[\\/]|\\\\)[^\s,;]+", "<PATH_REDACTED>", message)
         message = re.sub(r"(?<![>\w])/(?:[^/\s]+/)*[^\s,;]*", "<PATH_REDACTED>", message)
         return message[-1200:]
+
+    def _sanitize_command_event(self, value: object) -> Dict[str, object]:
+        """Sanea la huella canónica antes de escribirla en ``job_events``."""
+
+        replacements = sorted(
+            (
+                (str(self.config.data_root / "downloads"), "<DATA_DOWNLOADS>"),
+                (str(self.config.data_root / "media"), "<DATA_MEDIA>"),
+                (str(self.config.config_dir), "<CONFIG>"),
+                (str(self.config.diagnostics_root), "<DIAGNOSTICS>"),
+                (str(self.config.codex_diag_root), "<CODEX_DIAGS>"),
+            ),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        )
+
+        def alias(item: object) -> object:
+            if isinstance(item, dict):
+                return {str(key): alias(child) for key, child in item.items()}
+            if isinstance(item, (list, tuple)):
+                return [alias(child) for child in item]
+            if not isinstance(item, str):
+                return item
+            text = item
+            for raw, replacement in replacements:
+                if not raw:
+                    continue
+                text = text.replace(raw, replacement)
+                text = text.replace(raw.replace("\\", "/"), replacement)
+            return text
+
+        sanitized = sanitize_for_export(alias(value))
+        return dict(sanitized) if isinstance(sanitized, dict) else {"value": sanitized}
 
     def _load_worker_result(
         self,
@@ -3010,10 +5238,44 @@ class Engine:
         raise RuntimeError(f"Respuesta inesperada de Media Worker: {result}")
 
     def _run_cleanup(self, job: Dict[str, object]) -> None:
+        job_root = Path(str(job.get("stage_path") or ""))
+        lexical_job_root = Path(os.path.abspath(str(job_root)))
+        lexical_workshop = Path(os.path.abspath(str(self.config.workshop_root)))
+        remove_from_workshop = False
+        try:
+            lexical_job_root.relative_to(lexical_workshop)
+        except ValueError:
+            pass
+        else:
+            try:
+                expected_job_root = lexical_workshop / str(job["job_id"])
+                if lexical_job_root != expected_job_root:
+                    raise ValueError(
+                        "El taller pendiente de limpieza no coincide con <taller>/<job_id>"
+                    )
+                job_root = self._require_series_lexical_path(
+                    lexical_job_root,
+                    lexical_workshop,
+                    "taller pendiente de limpieza",
+                )
+                remove_from_workshop = True
+            except (OSError, ValueError) as error:
+                self.db.update_job(
+                    str(job["job_id"]),
+                    last_error_code="cleanup_path_invalid",
+                    last_error_message=self._safe_worker_error(error),
+                )
+                self.db.add_event(
+                    str(job["job_id"]),
+                    "cleanup",
+                    "error",
+                    "La limpieza se bloqueó porque el taller no es una ruta física segura",
+                    {"cleanup_blocked": True},
+                )
+                return
         if not self._cleanup_clients(job, strict=True):
             return
-        job_root = Path(str(job.get("stage_path") or ""))
-        if job_root.exists() and self._inside_workshop(job_root):
+        if remove_from_workshop and job_root.exists():
             shutil.rmtree(job_root)
         self.db.transition(
             str(job["job_id"]), "done", "cleanup", "Trabajo terminado correctamente"
@@ -3065,14 +5327,23 @@ class Engine:
                 "filebot_running",
                 "bluray_running",
                 "media_postprocess_running",
+                "series_postprocess_running",
                 "trailer_running",
                 "verifying_output",
             ],
             500,
         )
         for job in interrupted:
-            job_root = Path(str(job.get("stage_path") or ""))
-            source = Path(str(job.get("source_path") or ""))
+            job_root_value = str(job.get("stage_path") or "").strip()
+            source_value = str(job.get("source_path") or "").strip()
+            job_root = Path(job_root_value) if job_root_value else None
+            source = Path(source_value) if source_value else None
+            if job["state"] == "series_postprocess_running":
+                self._reconcile_running_series(job, recovery=True)
+                updated = self.db.get_job(str(job["job_id"]))
+                if updated and updated.get("state") in TERMINAL_STATES - {"discarded"}:
+                    self._create_terminal_diagnostic(updated)
+                continue
             if job["state"] == "media_postprocess_running":
                 self._reconcile_running_worker(job, "media", recovery=True)
                 updated = self.db.get_job(str(job["job_id"]))
@@ -3092,12 +5363,35 @@ class Engine:
                     self._create_terminal_diagnostic(updated)
                 continue
             if job["state"] == "staging":
-                target = "ready_extract" if job_root.exists() else "ready_stage"
+                target = "ready_extract" if job_root and job_root.exists() else "ready_stage"
             elif job["state"] == "extracting":
                 target = "ready_extract"
+            elif job["state"] in {"filebot_running", "verifying_output"}:
+                try:
+                    series_selected = self._series_selected_for_job(job)
+                except ValueError as error:
+                    series_selected = True
+                    self.db.add_event(
+                        str(job["job_id"]),
+                        "recovery",
+                        "error",
+                        "Snapshot de Series contradictorio durante recuperación",
+                        {"error": self._safe_worker_error(error)},
+                    )
+                if series_selected:
+                    preserve_root = job_root or self.config.workshop_root / str(job["job_id"])
+                    self._preserve_series_job_for_review(
+                        job,
+                        preserve_root,
+                        "series_filebot_interrupted",
+                        "El reinicio impide demostrar que FileBot terminó el pack completo",
+                        phase="recovery",
+                    )
+                    continue
+                target = "ready_filebot"
             else:
                 target = "ready_filebot"
-            if target == "ready_stage" and not source.exists():
+            if target == "ready_stage" and (source is None or not source.exists()):
                 self.db.transition(
                     str(job["job_id"]),
                     "manual_review",

@@ -7,6 +7,7 @@ from urllib.parse import unquote
 
 MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
 IDENTITY_PROFILES = ("common", "movies", "tv")
+WATCHER_PROFILES = ("movies", "tv")
 
 
 def start_health_server(
@@ -17,8 +18,8 @@ def start_health_server(
     event_recorder: Optional[Callable[[str, str, str, str, Optional[Dict[str, object]]], None]] = None,
     follow_provider: Optional[Callable[[str], Dict[str, object]]] = None,
     diagnostic_creator: Optional[Callable[[str, bool], Dict[str, object]]] = None,
-    watcher_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
-    watcher_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    watcher_rules_provider: Optional[Callable[..., Dict[str, object]]] = None,
+    watcher_rules_updater: Optional[Callable[..., Dict[str, object]]] = None,
     identity_rules_provider: Optional[Callable[..., Dict[str, object]]] = None,
     identity_rules_updater: Optional[Callable[..., Dict[str, object]]] = None,
     identity_rules_resetter: Optional[Callable[..., Dict[str, object]]] = None,
@@ -33,6 +34,12 @@ def start_health_server(
                 self._json(200, status_provider())
             elif path == "/settings/watcher" and watcher_rules_provider:
                 self._json(200, watcher_rules_provider())
+            elif path.startswith("/settings/watcher/") and watcher_rules_provider:
+                profile = path.removeprefix("/settings/watcher/").strip("/")
+                if profile in WATCHER_PROFILES:
+                    self._json(200, watcher_rules_provider(profile))
+                else:
+                    self._json(404, {"error": "not_found"})
             elif path == "/settings/identity" and identity_rules_provider:
                 self._json(200, identity_rules_provider())
             elif path.startswith("/settings/identity/") and identity_rules_provider:
@@ -82,6 +89,14 @@ def start_health_server(
             path = self.path.split("?", 1)[0]
             if path == "/settings/watcher" and watcher_rules_updater:
                 result = watcher_rules_updater(self._read_json())
+                self._json(200 if result.get("ok") else 400, result)
+                return
+            if path.startswith("/settings/watcher/") and watcher_rules_updater:
+                profile = path.removeprefix("/settings/watcher/").strip("/")
+                if profile not in WATCHER_PROFILES:
+                    self._json(404, {"error": "not_found"})
+                    return
+                result = watcher_rules_updater(self._read_json(), profile)
                 self._json(200 if result.get("ok") else 400, result)
                 return
             identity_handlers = {

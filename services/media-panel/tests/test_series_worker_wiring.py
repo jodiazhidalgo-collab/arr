@@ -6,18 +6,23 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 def _compose_service(name: str, next_name: str) -> str:
     compose = (PROJECT_ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
-    return compose.split(f"  {name}:\n", 1)[1].split(f"\n  {next_name}:", 1)[0]
+    start = compose.index(f"\n  {name}:\n") + len(f"\n  {name}:\n")
+    end = compose.index(f"\n  {next_name}:\n", start)
+    return compose[start:end]
 
 
-def test_series_worker_is_isolated_from_the_orchestrator() -> None:
+def test_series_worker_is_wired_to_the_orchestrator_in_active_mode() -> None:
     orchestrator = _compose_service("arr-orchestrator", "media-worker")
     series_worker = _compose_service("series-worker", "media-panel")
 
-    assert "series-worker" not in orchestrator
-    assert "SERIES_WORKER_URL" not in orchestrator
-    assert 'ARR_SERIES_MODE: "legacy"' in orchestrator
+    assert "series-worker:\n        condition: service_started" in orchestrator
+    assert 'SERIES_WORKER_URL: "http://series-worker:8791"' in orchestrator
+    assert 'SERIES_WORKER_REPORT_ROOT: "/config/series-worker"' in orchestrator
+    assert 'ARR_SERIES_REVIEW_DIR: "/data/media/repetidas_vs_error_series"' in orchestrator
+    assert "- ${ARR_ROOT}/config/series-worker:/config/series-worker:ro" in orchestrator
+    assert 'ARR_SERIES_MODE: "active"' in orchestrator
     assert "ARR_ORCHESTRATOR_URL" not in series_worker
-    assert "SERIES_WORKER_CALLBACK_ORIGIN" not in series_worker
+    assert 'SERIES_WORKER_CALLBACK_ORIGIN: "http://arr-orchestrator:8787"' in series_worker
     assert "ports:" not in series_worker
     assert 'expose:\n      - "8791"' in series_worker
 

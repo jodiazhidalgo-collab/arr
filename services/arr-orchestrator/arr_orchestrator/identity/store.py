@@ -214,7 +214,7 @@ class IdentitySettingsStore:
         if not callable(reader):
             return {"available": False}
         try:
-            status = reader()
+            status = reader(self._profile)
             result = dict(status) if isinstance(status, dict) else {}
             result["available"] = True
             return result
@@ -431,7 +431,7 @@ class IdentitySettingsStore:
                 "message": "La base de datos no permite limpiar la cache de identidad.",
             }
         try:
-            deleted = int(clearer())
+            deleted = int(clearer(self._profile))
         except Exception:
             self._logger.exception("No se pudo limpiar la cache de identidad")
             return {

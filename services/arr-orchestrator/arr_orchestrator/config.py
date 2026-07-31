@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
 def _read_secret(env_name: str, file_env_name: str, default: str = "") -> str:
@@ -11,6 +12,13 @@ def _read_secret(env_name: str, file_env_name: str, default: str = "") -> str:
         except OSError:
             pass
     return os.environ.get(env_name, default)
+
+
+def _series_mode(value: str) -> str:
+    mode = str(value or "legacy").strip().lower()
+    if mode not in {"legacy", "canary", "active"}:
+        raise ValueError("ARR_SERIES_MODE debe ser legacy, canary o active")
+    return mode
 
 
 @dataclass(frozen=True)
@@ -51,6 +59,24 @@ class Config:
     resolver_http_timeout_ms: int
     resolver_total_budget_ms: int
     resolver_retry_seconds: int
+    series_worker_url: str = "http://series-worker:8791"
+    series_reports_root: Optional[Path] = None
+    series_review_dir: Optional[Path] = None
+    series_mode: str = "legacy"
+
+    def __post_init__(self) -> None:
+        if self.series_reports_root is None:
+            object.__setattr__(
+                self,
+                "series_reports_root",
+                self.config_dir / "series-worker",
+            )
+        if self.series_review_dir is None:
+            object.__setattr__(
+                self,
+                "series_review_dir",
+                self.data_root / "media" / "repetidas_vs_error_series",
+            )
 
     @property
     def db_path(self) -> Path:
@@ -125,6 +151,22 @@ class Config:
             resolver_retry_seconds=int(
                 os.environ.get("ARR_RESOLVER_RETRY_SECONDS", "60")
             ),
+            series_worker_url=os.environ.get(
+                "SERIES_WORKER_URL", "http://series-worker:8791"
+            ).rstrip("/"),
+            series_reports_root=Path(
+                os.environ.get(
+                    "SERIES_WORKER_REPORT_ROOT",
+                    str(config_dir / "series-worker"),
+                )
+            ),
+            series_review_dir=Path(
+                os.environ.get(
+                    "ARR_SERIES_REVIEW_DIR",
+                    str(data_root / "media/repetidas_vs_error_series"),
+                )
+            ),
+            series_mode=_series_mode(os.environ.get("ARR_SERIES_MODE", "legacy")),
         )
 
     def ensure_directories(self) -> None:
@@ -136,8 +178,11 @@ class Config:
             self.review_dir,
             self.movies_output,
             self.movies_final,
+            self.tv_output,
             self.trailers_inbox,
             self.media_reports_root,
+            self.series_reports_root,
+            self.series_review_dir,
             self.codex_diag_root,
             self.diagnostics_root,
         ]

@@ -568,7 +568,9 @@ class CoreTests(unittest.TestCase):
                 source_path=str(original),
                 stage_path=str(job_root),
                 source_meta_json=engine._new_job_source_meta_json(
-                    identity_context=identity_snapshot
+                    identity_context=identity_snapshot,
+                    category="tv",
+                    name="Mi Serie Q03P07",
                 ),
             )
             frozen_context = engine.identity.rules_for_job(job)

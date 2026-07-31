@@ -41,6 +41,8 @@ class FakeSettingsDatabase:
         self.fail = fail
         self.lock = threading.Lock()
         self.cache_entries = 0
+        self.cache_stats_profiles = []
+        self.cache_clear_profiles = []
 
     def get_setting(self, key):
         return self.values.get(key)
@@ -64,7 +66,8 @@ class FakeSettingsDatabase:
             self.values[key] = value
             return True
 
-    def resolver_cache_stats(self):
+    def resolver_cache_stats(self, profile=None):
+        self.cache_stats_profiles.append(profile)
         return {
             "total": self.cache_entries,
             "active": self.cache_entries,
@@ -72,7 +75,8 @@ class FakeSettingsDatabase:
             "by_media_type": {},
         }
 
-    def clear_resolver_cache(self):
+    def clear_resolver_cache(self, profile=None):
+        self.cache_clear_profiles.append(profile)
         deleted = self.cache_entries
         self.cache_entries = 0
         return deleted
@@ -543,6 +547,19 @@ class IdentityRulesTests(unittest.TestCase):
 
 
 class IdentityStoreTests(unittest.TestCase):
+    def test_cache_status_and_clear_are_scoped_to_store_profile(self):
+        database = FakeSettingsDatabase()
+        database.cache_entries = 3
+        store = IdentitySettingsStore(database, profile="tv")
+
+        payload = store.payload()
+        cleared = store.clear_cache()
+
+        self.assertEqual(payload["cache_status"]["total"], 3)
+        self.assertEqual(cleared["deleted"], 3)
+        self.assertEqual(database.cache_stats_profiles, ["tv", "tv"])
+        self.assertEqual(database.cache_clear_profiles, ["tv"])
+
     def test_payload_has_complete_visual_schema_and_defensive_copies(self):
         database = FakeSettingsDatabase()
         store = IdentitySettingsStore(database)
@@ -751,6 +768,31 @@ class IdentityDatabaseTests(unittest.TestCase):
         self.assertEqual(stats["by_media_type"], {"movie": 1})
         self.assertEqual(self.database.clear_resolver_cache(), 2)
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
+
+    def test_database_cache_stats_and_clear_are_profile_scoped(self):
+        self.database.set_resolver_cache("movie-active", "movie", "{}", 3600)
+        self.database.set_resolver_cache("tv-active", "tv", "{}", 3600)
+        self.database.set_resolver_cache("tv-expired", "tv", "{}", -1)
+
+        movies = self.database.resolver_cache_stats("movies")
+        shows = self.database.resolver_cache_stats("tv")
+        common = self.database.resolver_cache_stats("common")
+
+        self.assertEqual((movies["total"], movies["active"], movies["expired"]), (1, 1, 0))
+        self.assertEqual(movies["by_media_type"], {"movie": 1})
+        self.assertEqual((shows["total"], shows["active"], shows["expired"]), (2, 1, 1))
+        self.assertEqual(shows["by_media_type"], {"tv": 1})
+        self.assertEqual(common["total"], 3)
+
+        self.assertEqual(self.database.clear_resolver_cache("movies"), 1)
+        self.assertEqual(self.database.resolver_cache_stats("movies")["total"], 0)
+        self.assertEqual(self.database.resolver_cache_stats("tv")["total"], 2)
+
+        self.assertEqual(self.database.clear_resolver_cache("tv"), 2)
+        self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
+
+        with self.assertRaisesRegex(ValueError, "profile debe ser"):
+            self.database.resolver_cache_stats("series")
 
     def test_database_exact_value_cas_matches_production_contract(self):
         first = "{invalid-legacy-value"

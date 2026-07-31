@@ -21,10 +21,15 @@ def test_pytest_root_configuration_matches_arr_layout():
     assert "services/media-panel/tests" in pytest_config["testpaths"]
     assert pytest_config["python_files"] == "test_*.py"
     assert "-ra" in pytest_config["addopts"]
+    assert "--basetemp" not in pytest_config["addopts"]
     assert "services/arr-orchestrator" in pytest_config["pythonpath"]
     assert "services/buscador-puente-arr" in pytest_config["pythonpath"]
     assert "services/media-worker" in pytest_config["pythonpath"]
     assert "services/media-panel" in pytest_config["pythonpath"]
+
+    conftest = (PROJECT_ROOT / "conftest.py").read_text(encoding="utf-8")
+    assert "PYTEST_SESSION_TOKEN" in conftest
+    assert "config.option.basetemp = str(PYTEST_TEMP_DIR)" in conftest
 
 
 def test_requirements_dev_documents_service_scoped_dependencies():

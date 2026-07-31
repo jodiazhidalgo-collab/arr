@@ -874,12 +874,62 @@ def move_job_to_review_clean(job_root: Path, destination_root: Path, name: str) 
 
     if not moved and job_root.exists():
         for item in sorted(job_root.iterdir(), key=lambda child: child.name.lower()):
-            if item.name in {"original", "extracted", "filebot_input", "filebot_output"}:
+            if item.name in {
+                "original",
+                "extracted",
+                "filebot_input",
+                "filebot_output",
+                "series_filebot_output",
+            }:
                 continue
             shutil.move(str(item), str(unique_destination(destination / item.name)))
 
     shutil.rmtree(job_root, ignore_errors=True)
     return destination
+
+
+def review_content_signature(
+    job_root: Path,
+    *,
+    whole_tree: bool = False,
+    ignored_names: Tuple[str, ...] = (),
+) -> List[Tuple[str, int, str]]:
+    """Firma completa del contenido que se preservará en revisión.
+
+    ``whole_tree`` se reserva para Series: conserva el taller entero cuando
+    FileBot o el worker no permiten demostrar que un pack sea completo.
+    """
+
+    source_root = job_root if whole_tree else _review_content_root(job_root)
+    if not source_root.exists():
+        return []
+    ignored = set(ignored_names)
+    if source_root.is_symlink():
+        raise ValueError("La raiz de revision no puede ser un enlace simbolico")
+    if source_root.is_file():
+        files = [source_root]
+    else:
+        files = []
+        for path in source_root.rglob("*"):
+            if path.is_symlink():
+                raise ValueError("El pack de revision contiene un enlace simbolico")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise ValueError("El pack de revision contiene una entrada no regular")
+            if path.parent == source_root and path.name in ignored:
+                continue
+            files.append(path)
+        files.sort(key=lambda path: str(path).casefold())
+    signature: List[Tuple[str, int, str]] = []
+    for path in files:
+        relative = path.name if source_root.is_file() else path.relative_to(source_root).as_posix()
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        signature.append((relative, path.stat().st_size, digest.hexdigest()))
+    return signature
 
 
 def move_extraction_failure_to_review(
@@ -934,6 +984,7 @@ def _tree_size(root: Path) -> int:
 
 def _review_content_root(job_root: Path) -> Path:
     for root in (
+        job_root / "series_filebot_output",
         job_root / "filebot_input",
         job_root / "extracted",
         job_root / "original",
@@ -980,7 +1031,8 @@ def move_tv_job_to_review(
     destination = numbered_destination(destination_root / title)
     destination.mkdir(parents=True, exist_ok=True)
 
-    season_dir = _tv_review_season_dir(destination, parsed.season or parsed.season_pack)
+    review_season = parsed.season if parsed.season is not None else parsed.season_pack
+    season_dir = _tv_review_season_dir(destination, review_season)
     used_names: set[str] = set()
     for index, video in enumerate(sorted(videos, key=lambda path: str(path).lower()), start=1):
         target_stem = _tv_review_stem(parsed, video, index)
@@ -1007,11 +1059,22 @@ def _tv_review_season_dir(destination: Path, season: Optional[int]) -> Path:
 
 def _tv_review_stem(parsed, video: Path, index: int) -> str:
     title = safe_folder_name(parsed.display_title or video.stem)
-    season = parsed.season
-    episodes = list(parsed.episodes or [])
-    episode = episodes[min(index - 1, len(episodes) - 1)] if episodes else None
-    if season is not None and episode is not None:
-        return safe_folder_name(f"{title} - S{int(season):02d}E{int(episode):02d}")
+    local = parse_release_name(video.name, "tv")
+    season = local.season if local.season is not None else parsed.season
+    local_episodes = list(local.episodes or [])
+    parsed_episodes = list(parsed.episodes or [])
+    episodes = (
+        local_episodes
+        if local_episodes
+        else (
+            [parsed_episodes[min(index - 1, len(parsed_episodes) - 1)]]
+            if parsed_episodes
+            else []
+        )
+    )
+    if season is not None and episodes:
+        episode_code = "".join(f"E{int(episode):02d}" for episode in episodes)
+        return safe_folder_name(f"{title} - S{int(season):02d}{episode_code}")
     if season is not None:
         return safe_folder_name(f"{title} - {video.stem}")
     if parsed.absolute_episode is not None:

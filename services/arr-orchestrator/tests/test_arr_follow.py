@@ -185,6 +185,55 @@ class ArrFollowTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_health_server_profiles_watchers_and_keeps_legacy_as_movies(self) -> None:
+        state = {
+            "movies": [".movie-part"],
+            "tv": [".series-part"],
+        }
+
+        def watcher_provider(profile="movies"):
+            return {
+                "ok": True,
+                "profile": profile,
+                "rules": {"ignored_suffixes": list(state[profile])},
+            }
+
+        def watcher_updater(payload, profile="movies"):
+            state[profile] = list(payload["rules"]["ignored_suffixes"])
+            return {**watcher_provider(profile), "saved": True}
+
+        server = start_health_server(
+            0,
+            lambda: {"status": "ok"},
+            lambda: [],
+            watcher_rules_provider=watcher_provider,
+            watcher_rules_updater=watcher_updater,
+        )
+        try:
+            port = server.server_address[1]
+            base = f"http://127.0.0.1:{port}/settings/watcher"
+            with urllib.request.urlopen(base, timeout=5) as response:
+                legacy = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(base + "/tv", timeout=5) as response:
+                tv = json.loads(response.read().decode("utf-8"))
+            request = urllib.request.Request(
+                base + "/tv",
+                data=b'{"rules":{"ignored_suffixes":[".tv-new"]}}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                updated = json.loads(response.read().decode("utf-8"))
+
+            self.assertEqual(legacy["profile"], "movies")
+            self.assertEqual(legacy["rules"]["ignored_suffixes"], [".movie-part"])
+            self.assertEqual(tv["rules"]["ignored_suffixes"], [".series-part"])
+            self.assertEqual(updated["rules"]["ignored_suffixes"], [".tv-new"])
+            self.assertEqual(state["movies"], [".movie-part"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

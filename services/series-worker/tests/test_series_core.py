@@ -1,13 +1,17 @@
 import errno
+import hashlib
 import json
+import os
 import shutil
 import threading
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 
 import pytest
 import series_worker.core as core_module
+import series_worker.delivery as delivery_module
 
 from series_worker.core import (
     JobConflict,
@@ -75,15 +79,43 @@ class FakeProcessor:
         )
 
 
+class FakeSidecarProcessor(FakeProcessor):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def process(self, **kwargs):
+        self.calls += 1
+        result = super().process(**kwargs)
+        for episode in result.episodes:
+            output = Path(kwargs["job_root"]) / episode.provisional_relpath
+            output.with_name(f"{output.stem}.es.forced.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHola\n",
+                encoding="utf-8",
+            )
+        return result
+
+
 class FakePublisher:
     def __init__(self):
         self.calls = []
 
-    def __call__(self, job_id, prepared, final, journal, *, expected_files):
+    def __call__(
+        self,
+        job_id,
+        prepared,
+        final,
+        journal,
+        *,
+        expected_files,
+        allowed_existing_files,
+    ):
         prepared = Path(prepared)
         final = Path(final)
         expected_files = tuple(expected_files)
-        self.calls.append((job_id, prepared, final, expected_files))
+        self.calls.append(
+            (job_id, prepared, final, expected_files, dict(allowed_existing_files))
+        )
         actual = sorted(
             path.relative_to(prepared).as_posix()
             for path in prepared.rglob("*")
@@ -171,6 +203,50 @@ def _coordinator(layout, processor=None, publisher=None, lock_factory=None):
     )
 
 
+def _real_delivery_coordinator(layout, processor):
+    return SeriesCoordinator(
+        rules_store=RulesStore(config_path=layout["root"] / "rules.json"),
+        processor_factory=lambda: processor,
+        publisher=delivery_module.publish_series,
+        recoverer=delivery_module.recover_delivery,
+        atomic_preflight=lambda root: {"supported": True, "st_dev": root.stat().st_dev},
+        tool_checker=lambda: [],
+        lock_factory=lambda *args, **kwargs: nullcontext({"enabled": True}),
+    )
+
+
+def _portable_exchange(left, right):
+    temporary = left.with_name(f".{left.name}.test-exchange")
+    os.rename(left, temporary)
+    try:
+        os.rename(right, left)
+        os.rename(temporary, right)
+    except Exception:
+        if not left.exists() and temporary.exists():
+            os.rename(temporary, left)
+        raise
+
+
+def _tree_contents(root, *, ignore_root_names=frozenset()):
+    root = Path(root)
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+        and not (path.parent == root and path.name in ignore_root_names)
+    }
+
+
+def _assert_review_matches_source(layout, payload, result):
+    review_root = layout["review"] / result["review_path"]
+    assert review_root.is_dir()
+    assert _tree_contents(
+        review_root,
+        ignore_root_names=core_module._REVIEW_METADATA,
+    ) == _tree_contents(payload["source_root"])
+    return review_root
+
+
 def test_payload_requires_exact_keys_and_canonical_roots(layout):
     payload = _payload(layout)
     assert validate_payload(payload).source_root.name == "series_filebot_output"
@@ -199,8 +275,85 @@ def test_success_persists_full_journal_and_terminal_replays(layout):
     assert len(publisher.calls) == 1
     journal_lines = (layout["reports"] / "job-1/journal.jsonl").read_text("utf-8")
     assert [__import__("json").loads(line)["state"] for line in journal_lines.splitlines()] == [
-        "PREPARED", "PROCESSING", "VERIFIED", "COMMITTING", "COMMITTED"
+        "PREPARED", "PROCESSING", "VERIFIED", "COMMITTING", "COMMITTED", "COMMITTED"
     ]
+
+
+def test_done_manifest_covers_complete_final_tree_with_sizes_and_hashes(layout):
+    payload = _payload(
+        layout,
+        videos=[("Serie/Season 01/Serie.S01E02.mkv", b"new-source")],
+    )
+    existing_video = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
+    existing_video.parent.mkdir(parents=True)
+    existing_video.write_bytes(b"existing-video")
+    poster = layout["tv"] / "Serie/poster.jpg"
+    poster.write_bytes(b"poster")
+    (layout["tv"] / "Serie" / core_module.MARKER_NAME).write_text(
+        "internal marker",
+        encoding="utf-8",
+    )
+
+    class ProcessorWithSidecar(FakeProcessor):
+        def process(self, **kwargs):
+            result = super().process(**kwargs)
+            for episode in result.episodes:
+                output = Path(kwargs["job_root"]) / episode.provisional_relpath
+                output.with_name(f"{output.stem}.es.forced.srt").write_text(
+                    "1\n00:00:00,000 --> 00:00:01,000\nHola\n",
+                    encoding="utf-8",
+                )
+            return result
+
+    coordinator = _coordinator(layout, processor=ProcessorWithSidecar())
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+    published_manifest = result["published_manifest"]
+    entries = published_manifest["entries"]
+
+    assert published_manifest["schema"] == "series-published-manifest-v1"
+    assert [entry["path"] for entry in entries] == [
+        "Serie/poster.jpg",
+        "Serie/Season 01/Serie.S01E01.mkv",
+        "Serie/Season 01/Serie.S01E02.es.forced.srt",
+        "Serie/Season 01/Serie.S01E02.mkv",
+    ]
+    assert result["published"] == ["Serie/Season 01/Serie.S01E02.mkv"]
+    for entry in entries:
+        path = layout["tv"] / Path(*PurePosixPath(entry["path"]).parts)
+        assert entry["size"] == path.stat().st_size
+        assert entry["content_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    encoded_entries = json.dumps(
+        entries,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert published_manifest["digest"] == hashlib.sha256(encoded_entries).hexdigest()
+    assert all(entry["path"].split("/")[-1] != core_module.MARKER_NAME for entry in entries)
+
+
+def test_tampered_terminal_manifest_cannot_replace_journal_bound_digest(layout):
+    payload = _payload(layout)
+    coordinator = _coordinator(layout)
+    coordinator.submit(payload)
+    assert coordinator.wait("job-1").http_status == 200
+    result_path = layout["reports"] / "job-1/series_result.json"
+    result = json.loads(result_path.read_text("utf-8"))
+    entries = result["published_manifest"]["entries"]
+    entries[0]["size"] += 1
+    result["published_manifest"]["digest"] = hashlib.sha256(
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    with pytest.raises(ServiceUnavailable, match="journal durable"):
+        _coordinator(layout).submit(payload)
 
 
 def test_prepared_publication_staging_stays_on_the_tv_atomic_mount(layout):
@@ -251,8 +404,19 @@ def test_same_active_job_with_different_payload_is_conflict(layout):
     release.set()
 
 
-def test_external_heavy_lock_busy_is_409_without_persisting_job(layout):
+def test_external_heavy_lock_busy_is_409_with_durable_reservation_and_no_hash(
+    layout,
+    monkeypatch,
+):
     payload = _payload(layout)
+    original_discover = core_module.discover_manifest
+    discoveries = []
+    monkeypatch.setattr(
+        core_module,
+        "discover_manifest",
+        lambda *_args, **_kwargs: discoveries.append(True)
+        or (_ for _ in ()).throw(AssertionError("no debe descubrir con lock ocupado")),
+    )
 
     class BusyContext:
         def __enter__(self):
@@ -262,9 +426,267 @@ def test_external_heavy_lock_busy_is_409_without_persisting_job(layout):
             return None
 
     coordinator = _coordinator(layout, lock_factory=lambda *a, **k: BusyContext())
-    with pytest.raises(SeriesWorkerBusy):
-        coordinator.submit(payload)
-    assert not (layout["reports"] / "job-1/request.json").exists()
+    for _attempt in range(2):
+        with pytest.raises(SeriesWorkerBusy):
+            coordinator.submit(payload)
+    request = json.loads(
+        (layout["reports"] / "job-1/request.json").read_text("utf-8")
+    )
+    assert request["schema"] == "series-worker-request-v2"
+    assert request["stage"] == "reserved"
+    assert discoveries == []
+    assert not (layout["reports"] / "job-1/manifest.json").exists()
+
+    monkeypatch.setattr(core_module, "discover_manifest", original_discover)
+    restarted = _coordinator(layout)
+    assert restarted.submit(payload).http_status == 202
+    assert restarted.wait("job-1").payload["result"]["status"] == "done"
+
+
+def test_submit_returns_before_slow_manifest_and_active_retry_never_rehashes(
+    layout,
+    monkeypatch,
+):
+    payload = _payload(layout)
+    original_discover = core_module.discover_manifest
+    entered = threading.Event()
+    release = threading.Event()
+    discoveries = []
+    lock_state = {"held": False, "enters": 0, "exits": 0}
+
+    class RecordingLock:
+        def __enter__(self):
+            lock_state["held"] = True
+            lock_state["enters"] += 1
+            return {"enabled": True}
+
+        def __exit__(self, *_args):
+            lock_state["held"] = False
+            lock_state["exits"] += 1
+
+    def slow_discover(*args, **kwargs):
+        assert lock_state == {"held": False, "enters": 1, "exits": 1}
+        discoveries.append(True)
+        entered.set()
+        assert release.wait(timeout=3)
+        return original_discover(*args, **kwargs)
+
+    monkeypatch.setattr(core_module, "discover_manifest", slow_discover)
+    coordinator = _coordinator(
+        layout,
+        lock_factory=lambda *_args, **_kwargs: RecordingLock(),
+    )
+
+    started = time.monotonic()
+    accepted = coordinator.submit(payload)
+    elapsed = time.monotonic() - started
+
+    assert accepted.http_status == 202
+    assert accepted.payload["status"] == "accepted"
+    assert elapsed < 1.0
+    assert entered.wait(timeout=1)
+    assert coordinator.submit(payload).payload["status"] == "active"
+    assert discoveries == [True]
+    request = json.loads(
+        (layout["reports"] / "job-1/request.json").read_text("utf-8")
+    )
+    assert request["stage"] == "preparing"
+    release.set()
+    assert coordinator.wait("job-1").payload["result"]["status"] == "done"
+    assert lock_state == {"held": False, "enters": 2, "exits": 2}
+
+
+def test_restart_reuses_manifest_written_during_interrupted_preparation(
+    layout,
+    monkeypatch,
+):
+    payload = _payload(layout)
+    original_write = core_module.DurableJournal.write_json_atomic
+    interrupted = {"done": False}
+
+    class SimulatedProcessDeath(BaseException):
+        pass
+
+    def cut_after_manifest(self, name, value):
+        result = original_write(self, name, value)
+        if str(name) == "manifest.json" and not interrupted["done"]:
+            interrupted["done"] = True
+            raise SimulatedProcessDeath("corte tras manifiesto reservado")
+        return result
+
+    monkeypatch.setattr(
+        core_module.DurableJournal,
+        "write_json_atomic",
+        cut_after_manifest,
+    )
+    first = _coordinator(layout)
+    reserved, record = first._new_reservation(validate_payload(payload))
+    with pytest.raises(SimulatedProcessDeath):
+        first._prepare_reserved(reserved, record)
+    request = json.loads(
+        (layout["reports"] / "job-1/request.json").read_text("utf-8")
+    )
+    assert request["stage"] == "preparing"
+    assert (layout["reports"] / "job-1/manifest.json").is_file()
+
+    monkeypatch.setattr(
+        core_module.DurableJournal,
+        "write_json_atomic",
+        original_write,
+    )
+    monkeypatch.setattr(
+        core_module,
+        "discover_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("la recuperación no debe rehashear el pack")
+        ),
+    )
+    restarted = _coordinator(layout)
+    assert restarted.submit(payload).http_status == 202
+    terminal = restarted.wait("job-1")
+    assert terminal.http_status == 200
+    assert terminal.payload["result"]["status"] == "done"
+
+
+def test_second_lock_busy_retries_prepared_job_without_rediscovering_or_replanning(
+    layout,
+    monkeypatch,
+):
+    payload = _payload(layout)
+    original_discover = core_module.discover_manifest
+    original_plan = core_module.plan_collisions
+    discoveries = []
+    plans = []
+
+    def counted_discover(*args, **kwargs):
+        discoveries.append(True)
+        return original_discover(*args, **kwargs)
+
+    def counted_plan(*args, **kwargs):
+        plans.append(True)
+        return original_plan(*args, **kwargs)
+
+    class OpenLock:
+        def __enter__(self):
+            return {"enabled": True}
+
+        def __exit__(self, *_args):
+            return None
+
+    class BusyLock(OpenLock):
+        def __enter__(self):
+            raise HeavyLockTimeout("busy after prepare")
+
+    lock_calls = []
+
+    def first_factory(*_args, **_kwargs):
+        lock_calls.append(True)
+        return OpenLock() if len(lock_calls) == 1 else BusyLock()
+
+    monkeypatch.setattr(core_module, "discover_manifest", counted_discover)
+    monkeypatch.setattr(core_module, "plan_collisions", counted_plan)
+    coordinator = _coordinator(layout, lock_factory=first_factory)
+    assert coordinator.submit(payload).http_status == 202
+    coordinator._threads["job-1"].join(timeout=3)
+
+    request = json.loads(
+        (layout["reports"] / "job-1/request.json").read_text("utf-8")
+    )
+    assert request["stage"] == "prepared"
+    assert request["collision_plan"]["pending"] == [
+        "Serie/Season 01/Serie.S01E01.mkv"
+    ]
+    assert discoveries == [True]
+    assert plans == [True]
+
+    coordinator.lock_factory = lambda *_args, **_kwargs: OpenLock()
+    assert coordinator.submit(payload).http_status == 202
+    terminal = coordinator.wait("job-1")
+
+    assert terminal.payload["result"]["status"] == "done"
+    assert discoveries == [True]
+    assert plans == [True, True]
+
+
+def test_manifest_preparation_error_becomes_durable_terminal_review(
+    layout,
+    monkeypatch,
+):
+    payload = _payload(layout)
+    monkeypatch.setattr(
+        core_module,
+        "discover_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            core_module.ManifestError("manifest controlado inválido")
+        ),
+    )
+    coordinator = _coordinator(layout)
+
+    assert coordinator.submit(payload).http_status == 202
+    terminal = coordinator.wait("job-1")
+
+    assert terminal.http_status == 200
+    result = terminal.payload["result"]
+    assert result["status"] == "review"
+    assert result["review_reasons"] == [
+        "preparacion_fallida:manifest controlado inválido"
+    ]
+    assert result["review_path"]
+    assert json.loads(
+        (layout["reports"] / "job-1/journal.json").read_text("utf-8")
+    )["state"] == "ROLLED_BACK"
+    assert coordinator.submit(payload).payload == terminal.payload
+
+
+def test_audiovisual_lock_is_released_before_publish_and_final_hash(
+    layout,
+    monkeypatch,
+):
+    payload = _payload(layout)
+    state = {"held": False, "enters": 0, "exits": 0}
+
+    class RecordingLock:
+        def __enter__(self):
+            assert state["held"] is False
+            state["held"] = True
+            state["enters"] += 1
+            return {"enabled": True}
+
+        def __exit__(self, *_args):
+            assert state["held"] is True
+            state["held"] = False
+            state["exits"] += 1
+
+    class CheckedProcessor(FakeProcessor):
+        def process(self, **kwargs):
+            assert state["held"] is True
+            return super().process(**kwargs)
+
+    publisher = FakePublisher()
+
+    def checked_publisher(*args, **kwargs):
+        assert state["held"] is False
+        return publisher(*args, **kwargs)
+
+    original_published_manifest = core_module._published_manifest
+
+    def checked_manifest(prepared):
+        assert state["held"] is False
+        return original_published_manifest(prepared)
+
+    monkeypatch.setattr(core_module, "_published_manifest", checked_manifest)
+    coordinator = _coordinator(
+        layout,
+        processor=CheckedProcessor(),
+        publisher=checked_publisher,
+        lock_factory=lambda *_args, **_kwargs: RecordingLock(),
+    )
+
+    coordinator.submit(payload)
+    terminal = coordinator.wait("job-1")
+
+    assert terminal.payload["result"]["status"] == "done"
+    assert state == {"held": False, "enters": 2, "exits": 2}
 
 
 def test_rules_snapshot_is_frozen_while_job_runs(layout):
@@ -291,7 +713,10 @@ def test_rules_snapshot_is_frozen_while_job_runs(layout):
     assert snapshots[0].rules["audio"]["bitrate_ac3"] == "640k"
 
 
-def test_second_episode_failure_keeps_tv_unpublished(layout):
+def test_second_episode_failure_reviews_complete_pack_without_publishing(
+    layout,
+    monkeypatch,
+):
     payload = _payload(
         layout,
         videos=[
@@ -300,6 +725,14 @@ def test_second_episode_failure_keeps_tv_unpublished(layout):
         ],
     )
     publisher = FakePublisher()
+    callbacks = []
+    monkeypatch.setattr(
+        core_module,
+        "_emit_callback",
+        lambda _prepared, phase, event_type, message: callbacks.append(
+            (phase, event_type, message)
+        ),
+    )
     coordinator = _coordinator(
         layout, processor=FakeProcessor(fail_on=2), publisher=publisher
     )
@@ -307,11 +740,63 @@ def test_second_episode_failure_keeps_tv_unpublished(layout):
     coordinator.submit(payload)
     terminal = coordinator.wait("job-1")
 
-    assert terminal.payload["result"]["status"] == "failed"
-    assert terminal.payload["result"]["published"] == []
+    result = terminal.payload["result"]
+    assert result["status"] == "review"
+    assert result["published"] == []
+    assert result["review_reasons"] == ["procesamiento_fallido:fallo controlado"]
     assert publisher.calls == []
     assert not (layout["tv"] / "Serie").exists()
-    assert (Path(payload["source_root"]) / "Serie/Season 01/Serie.S01E02.mkv").exists()
+    assert _tree_contents(payload["source_root"]) == {
+        "Serie/Season 01/Serie.S01E01.mkv": b"one",
+        "Serie/Season 01/Serie.S01E02.mkv": b"two",
+    }
+    _assert_review_matches_source(layout, payload, result)
+    assert callbacks[-1] == (
+        "series_review",
+        "finished",
+        "Procesamiento fallido; pack enviado a revisión",
+    )
+
+
+def test_processing_failure_releases_heavy_lock_before_review_copy(
+    layout,
+    monkeypatch,
+):
+    payload = _payload(layout)
+    lock_state = {"held": False, "exits": 0}
+
+    class RecordingLock:
+        def __enter__(self):
+            assert lock_state["held"] is False
+            lock_state["held"] = True
+            return {"enabled": True}
+
+        def __exit__(self, *_args):
+            assert lock_state["held"] is True
+            lock_state["held"] = False
+            lock_state["exits"] += 1
+
+    original_review = core_module._review_pack
+    review_started = threading.Event()
+
+    def checked_review(prepared, reasons):
+        assert lock_state["held"] is False
+        review_started.set()
+        return original_review(prepared, reasons)
+
+    monkeypatch.setattr(core_module, "_review_pack", checked_review)
+    coordinator = _coordinator(
+        layout,
+        processor=FakeProcessor(fail_on=1),
+        lock_factory=lambda *_args, **_kwargs: RecordingLock(),
+    )
+
+    assert coordinator.submit(payload).http_status == 202
+    terminal = coordinator.wait("job-1")
+
+    assert terminal.payload["result"]["status"] == "review"
+    assert review_started.is_set()
+    assert lock_state == {"held": False, "exits": 2}
 
 
 def test_enospc_on_second_episode_never_publishes_and_preserves_complete_source(
@@ -326,6 +811,7 @@ def test_enospc_on_second_episode_never_publishes_and_preserves_complete_source(
         ],
     )
     source_root = Path(payload["source_root"])
+    source_before = _tree_contents(source_root)
     original_write_bytes = Path.write_bytes
 
     def fail_second_processed_write(path, data):
@@ -341,31 +827,78 @@ def test_enospc_on_second_episode_never_publishes_and_preserves_complete_source(
     terminal = coordinator.wait("job-1")
     result = terminal.payload["result"]
 
-    assert result["status"] == "failed"
-    assert result["error_code"] == "OSError"
-    assert "no space left on device" in result["error"]
-    assert str(source_root) not in result["error"]
+    assert result["status"] == "review"
+    assert result["review_reasons"][0].startswith("procesamiento_fallido:")
+    assert "no space left on device" in result["review_reasons"][0]
+    assert str(source_root) not in result["review_reasons"][0]
     assert result["published"] == []
-    assert result["review_path"] == ""
+    assert result["review_path"]
     assert publisher.calls == []
     assert not (layout["tv"] / "Serie").exists()
     assert not list(layout["tv"].glob(".*.series-worker.*.prepared"))
-    assert list(layout["review"].iterdir()) == []
-    assert (
-        source_root / "Serie/Season 01/Serie.S01E01.mkv"
-    ).read_bytes() == b"source-one"
-    assert (
-        source_root / "Serie/Season 01/Serie.S01E02.mkv"
-    ).read_bytes() == b"source-two"
+    assert _tree_contents(source_root) == source_before
+    _assert_review_matches_source(layout, payload, result)
     snapshot = json.loads(
         (layout["reports"] / "job-1/journal.json").read_text("utf-8")
     )
     assert snapshot["state"] == "ROLLED_BACK"
-    assert snapshot["details"]["terminal_status"] == "failed"
+    assert snapshot["details"]["terminal_status"] == "review"
     persisted = json.loads(
         (layout["reports"] / "job-1/series_result.json").read_text("utf-8")
     )
     assert persisted == result
+
+
+def test_processing_failure_and_review_failure_returns_failed_with_source_intact(
+    layout,
+    monkeypatch,
+):
+    payload = _payload(
+        layout,
+        videos=[
+            ("Serie/Season 01/Serie.S01E01.mkv", b"source-one"),
+            ("Serie/Season 01/Serie.S01E02.mkv", b"source-two"),
+        ],
+    )
+    source_before = _tree_contents(payload["source_root"])
+    callbacks = []
+
+    def fail_review_copy(*_args, **_kwargs):
+        raise OSError(errno.EIO, "controlled review copy failure")
+
+    monkeypatch.setattr(core_module.shutil, "copytree", fail_review_copy)
+    monkeypatch.setattr(
+        core_module,
+        "_emit_callback",
+        lambda _prepared, phase, event_type, message: callbacks.append(
+            (phase, event_type, message)
+        ),
+    )
+    publisher = FakePublisher()
+    coordinator = _coordinator(
+        layout,
+        processor=FakeProcessor(fail_on=2),
+        publisher=publisher,
+    )
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "OSError"
+    assert "controlled review copy failure" in result["error"]
+    assert result["published"] == []
+    assert result["review_path"] == ""
+    assert result["provisional"] == []
+    assert publisher.calls == []
+    assert _tree_contents(payload["source_root"]) == source_before
+    assert not (layout["tv"] / "Serie").exists()
+    assert list(layout["review"].iterdir()) == []
+    assert callbacks[-1] == (
+        "series_review",
+        "error",
+        "Falló la revisión tras el error de procesamiento",
+    )
 
 
 @pytest.mark.parametrize(
@@ -482,6 +1015,7 @@ def test_identical_collision_is_satisfied_without_processing(layout):
     assert result["status"] == "done"
     assert result["satisfied"] == ["Serie/Season 01/Serie.S01E01.mkv"]
     assert publisher.calls[0][3] == ("Season 01/Serie.S01E01.mkv",)
+    assert set(publisher.calls[0][4]) == {"Season 01/Serie.S01E01.mkv"}
 
 
 def test_unicode_compatibility_identical_collision_is_reviewed_fail_closed(layout):
@@ -635,7 +1169,7 @@ def test_restart_replays_manifest_with_unicode_equivalent_sidecars(layout):
     )
 
 
-def test_missing_tools_and_atomicity_fail_with_503(layout):
+def test_missing_tools_and_atomicity_return_503_before_accept(layout):
     payload = _payload(layout)
     store = RulesStore(config_path=layout["root"] / "rules.json")
     missing = SeriesCoordinator(
@@ -643,16 +1177,27 @@ def test_missing_tools_and_atomicity_fail_with_503(layout):
         atomic_preflight=lambda root: {"supported": True},
         tool_checker=lambda: ["mkvmerge"],
     )
-    with pytest.raises(ServiceUnavailable, match="mkvmerge"):
+    with pytest.raises(ServiceUnavailable, match="mkvmerge") as missing_error:
         missing.submit(payload)
+    assert missing_error.value.http_status == 503
+    assert not (layout["reports"] / "job-1").exists()
+    assert list(layout["review"].iterdir()) == []
 
+    atomic_payload = _payload(
+        layout,
+        job_id="job-atomic",
+        videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
+    )
     atomic = SeriesCoordinator(
         rules_store=store,
         atomic_preflight=lambda root: (_ for _ in ()).throw(OSError("unsupported")),
         tool_checker=lambda: [],
     )
-    with pytest.raises(ServiceUnavailable, match="atómica"):
-        atomic.submit(payload)
+    with pytest.raises(ServiceUnavailable, match="atómica") as atomic_error:
+        atomic.submit(atomic_payload)
+    assert atomic_error.value.http_status == 503
+    assert not (layout["reports"] / "job-atomic").exists()
+    assert list(layout["review"].iterdir()) == []
 
 
 def test_terminal_replay_survives_source_cleanup_and_new_global_rules(layout):
@@ -697,8 +1242,13 @@ def test_tampered_durable_snapshot_or_manifest_fails_closed(layout, artifact):
         document["entries"][0]["content_sha256"] = "0" * 64
     path.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(ServiceUnavailable, match="durable"):
-        _coordinator(layout).submit(payload)
+    restarted = _coordinator(layout)
+    assert restarted.submit(payload).http_status == 202
+    status = restarted.wait("job-1", timeout=10)
+    assert status.http_status == 200
+    assert status.payload["result"]["status"] == "review"
+    assert "durable" in status.payload["result"]["review_reasons"][0]
+    assert not (layout["tv"] / "Serie").exists()
 
 
 @pytest.mark.parametrize(
@@ -746,6 +1296,7 @@ def test_bootstrap_recovers_after_each_durable_boundary(layout, cut_after):
 def test_rolled_back_reconstructs_result_after_crash_before_result_file(
     layout,
     terminal_status,
+    monkeypatch,
 ):
     if terminal_status == "review":
         payload = _payload(
@@ -756,6 +1307,11 @@ def test_rolled_back_reconstructs_result_after_crash_before_result_file(
     else:
         payload = _payload(layout)
         coordinator = _coordinator(layout, processor=FakeProcessor(fail_on=1))
+
+        def fail_review_copy(*_args, **_kwargs):
+            raise OSError(errno.EIO, "controlled review copy failure")
+
+        monkeypatch.setattr(core_module.shutil, "copytree", fail_review_copy)
 
     def crash_before_result(*_args, **_kwargs):
         raise OSError("corte antes de series_result")
@@ -798,6 +1354,46 @@ def test_status_does_not_publish_a_result_that_contradicts_journal(layout):
     assert status.payload["journal_state"] == "PROCESSING"
 
 
+def test_status_retries_after_transient_error_in_same_process(layout):
+    payload = _payload(layout)
+    coordinator = _coordinator(layout)
+    coordinator._new_reservation(validate_payload(payload))
+    coordinator._last_errors["job-1"] = "fallo transitorio anterior"
+
+    resumed = coordinator.status("job-1")
+    terminal = coordinator.wait("job-1")
+
+    assert resumed.http_status == 202
+    assert resumed.payload["status"] in {"accepted", "active"}
+    assert terminal.http_status == 200
+    assert terminal.payload["result"]["status"] == "done"
+    assert "job-1" not in coordinator._last_errors
+
+
+@pytest.mark.parametrize("entrypoint", ["submit", "status"])
+def test_report_job_symlink_is_rejected_without_external_write(
+    layout,
+    entrypoint,
+):
+    payload = _payload(layout)
+    outside = layout["root"] / "outside-reports"
+    outside.mkdir()
+    job_dir = layout["reports"] / "job-1"
+    try:
+        os.symlink(outside, job_dir, target_is_directory=True)
+    except (OSError, NotImplementedError) as error:
+        pytest.skip(f"symlink no disponible: {error}")
+    coordinator = _coordinator(layout)
+
+    with pytest.raises(ServiceUnavailable, match="enlace simbólico"):
+        if entrypoint == "submit":
+            coordinator.submit(payload)
+        else:
+            coordinator.status("job-1")
+
+    assert list(outside.iterdir()) == []
+
+
 def test_equivalent_nfkc_series_roots_are_always_ambiguous(layout):
     payload = _payload(layout)
     (layout["tv"] / "Serie").mkdir()
@@ -828,23 +1424,7 @@ def test_identical_video_with_new_sidecar_is_processed_and_published(layout):
     existing.parent.mkdir(parents=True)
     shutil.copy2(source, existing)
 
-    class SidecarProcessor(FakeProcessor):
-        def __init__(self):
-            super().__init__()
-            self.calls = 0
-
-        def process(self, **kwargs):
-            self.calls += 1
-            result = super().process(**kwargs)
-            for episode in result.episodes:
-                output = Path(kwargs["job_root"]) / episode.provisional_relpath
-                output.with_name(f"{output.stem}.es.forced.srt").write_text(
-                    "1\n00:00:00,000 --> 00:00:01,000\nHola\n",
-                    encoding="utf-8",
-                )
-            return result
-
-    processor = SidecarProcessor()
+    processor = FakeSidecarProcessor()
     coordinator = _coordinator(layout, processor=processor)
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
@@ -852,6 +1432,91 @@ def test_identical_video_with_new_sidecar_is_processed_and_published(layout):
     assert result["status"] == "done"
     assert processor.calls == 1
     assert (layout["tv"] / "Serie/Season 01/Serie.S01E01.es.forced.srt").is_file()
+    assert set(coordinator.publisher.calls[0][4]) == {
+        "Season 01/Serie.S01E01.mkv"
+    }
+
+
+def test_real_publisher_accepts_identical_existing_video_and_sidecar(
+    layout,
+    monkeypatch,
+):
+    subtitle = "1\n00:00:00,000 --> 00:00:01,000\nHola\n"
+    payload = _payload(
+        layout,
+        sidecars=[("Serie/Season 01/Serie.S01E01.es.srt", subtitle)],
+    )
+    source = Path(payload["source_root"]) / "Serie/Season 01/Serie.S01E01.mkv"
+    final_episode = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
+    final_sidecar = final_episode.with_name("Serie.S01E01.es.forced.srt")
+    final_episode.parent.mkdir(parents=True)
+    shutil.copy2(source, final_episode)
+    final_sidecar.write_text(subtitle, encoding="utf-8")
+    monkeypatch.setattr(
+        delivery_module,
+        "preflight_atomic_exchange",
+        lambda root: {"supported": True, "st_dev": root.stat().st_dev},
+    )
+    monkeypatch.setattr(delivery_module, "_rename_exchange", _portable_exchange)
+    processor = FakeSidecarProcessor()
+    coordinator = _real_delivery_coordinator(layout, processor)
+
+    coordinator.submit(payload)
+    terminal = coordinator.wait("job-1")
+
+    assert terminal.http_status == 200
+    result = terminal.payload["result"]
+    assert result["status"] == "done"
+    assert processor.calls == 1
+    assert final_episode.read_bytes().startswith(b"processed-")
+    assert final_sidecar.read_text(encoding="utf-8") == subtitle
+    assert not list(layout["tv"].glob(".*.series-worker.*"))
+
+
+def test_target_changed_after_collision_comparison_is_never_authorized(
+    layout,
+    monkeypatch,
+):
+    subtitle = "1\n00:00:00,000 --> 00:00:01,000\nHola\n"
+    payload = _payload(
+        layout,
+        sidecars=[("Serie/Season 01/Serie.S01E01.es.srt", subtitle)],
+    )
+    source = Path(payload["source_root"]) / "Serie/Season 01/Serie.S01E01.mkv"
+    final_episode = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
+    final_episode.parent.mkdir(parents=True)
+    shutil.copy2(source, final_episode)
+    monkeypatch.setattr(
+        delivery_module,
+        "preflight_atomic_exchange",
+        lambda root: {"supported": True, "st_dev": root.stat().st_dev},
+    )
+    monkeypatch.setattr(delivery_module, "_rename_exchange", _portable_exchange)
+    original_same_file = core_module._same_file
+    comparisons = 0
+
+    def replace_after_comparison(left, right):
+        nonlocal comparisons
+        identical = original_same_file(left, right)
+        if identical and Path(right) == final_episode:
+            comparisons += 1
+            if comparisons == 2:
+                final_episode.write_bytes(b"external-change")
+        return identical
+
+    monkeypatch.setattr(core_module, "_same_file", replace_after_comparison)
+    coordinator = _real_delivery_coordinator(layout, FakeSidecarProcessor())
+
+    coordinator.submit(payload)
+    terminal = coordinator.wait("job-1")
+
+    assert comparisons >= 2
+    assert terminal.http_status == 200
+    result = terminal.payload["result"]
+    assert result["status"] == "review"
+    assert result["published"] == []
+    assert final_episode.read_bytes() == b"external-change"
+    _assert_review_matches_source(layout, payload, result)
 
 
 def test_satisfied_episode_hardlink_failure_reviews_without_copy_fallback(
@@ -876,7 +1541,7 @@ def test_satisfied_episode_hardlink_failure_reviews_without_copy_fallback(
     assert not list(layout["tv"].glob(".*.series-worker.*.prepared"))
 
 
-def test_partial_prepared_copy_is_removed_before_terminal_failure(layout, monkeypatch):
+def test_partial_prepared_copy_is_removed_before_terminal_review(layout, monkeypatch):
     payload = _payload(
         layout,
         videos=[
@@ -900,9 +1565,10 @@ def test_partial_prepared_copy_is_removed_before_terminal_failure(layout, monkey
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
-    assert result["status"] == "failed"
+    assert result["status"] == "review"
     assert publisher.calls == []
     assert not list(layout["tv"].glob(".*.series-worker.*.prepared"))
+    _assert_review_matches_source(layout, payload, result)
 
 
 @pytest.mark.parametrize("owned_partial", [False, True])
@@ -1096,14 +1762,16 @@ def test_failed_or_stale_preflight_invalidates_health_cache(layout):
     coordinator.wait("job-cache-1")
     assert coordinator.health().payload["checks"]["atomicity"]["verified"] is True
 
-    with pytest.raises(ServiceUnavailable, match="atómica"):
-        coordinator.submit(
-            _payload(
-                layout,
-                job_id="job-cache-2",
-                videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
-            )
-        )
+    second = _payload(
+        layout,
+        job_id="job-cache-2",
+        videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
+    )
+    with pytest.raises(ServiceUnavailable, match="atómica") as failed:
+        coordinator.submit(second)
+    assert failed.value.http_status == 503
+    assert not (layout["reports"] / "job-cache-2").exists()
+    assert list(layout["review"].iterdir()) == []
     assert coordinator.health().payload["checks"]["atomicity"]["verified"] is False
 
     coordinator._health_atomicity_cache = {
@@ -1139,20 +1807,27 @@ def test_unexpected_preflight_failure_invalidates_health_cache(layout):
     coordinator.wait("job-unexpected-cache-1")
     assert coordinator.health().payload["checks"]["atomicity"]["verified"] is True
 
-    with pytest.raises(ServiceUnavailable, match="atómica"):
-        coordinator.submit(
-            _payload(
-                layout,
-                job_id="job-unexpected-cache-2",
-                videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
-            )
-        )
+    second = _payload(
+        layout,
+        job_id="job-unexpected-cache-2",
+        videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
+    )
+    with pytest.raises(ServiceUnavailable, match="atómica") as failed:
+        coordinator.submit(second)
+    assert failed.value.http_status == 503
+    assert not (layout["reports"] / "job-unexpected-cache-2").exists()
+    assert list(layout["review"].iterdir()) == []
 
     assert coordinator.health().payload["checks"]["atomicity"]["verified"] is False
 
 
 @pytest.mark.parametrize("entrypoint", ["status", "submit"])
-def test_replay_retries_committed_cleanup_without_tools_or_source(layout, entrypoint):
+@pytest.mark.parametrize("terminal_gap", ["cleanup_pending", "missing_result"])
+def test_replay_retries_committed_cleanup_without_tools_or_source(
+    layout,
+    entrypoint,
+    terminal_gap,
+):
     class PendingCleanupPublisher(FakePublisher):
         def __call__(self, *args, **kwargs):
             result = super().__call__(*args, **kwargs)
@@ -1168,6 +1843,8 @@ def test_replay_retries_committed_cleanup_without_tools_or_source(layout, entryp
         (layout["reports"] / "job-1/series_result.json").read_text("utf-8")
     )
     assert pending["delivery"]["cleanup_pending"] is True
+    if terminal_gap == "missing_result":
+        (layout["reports"] / "job-1/series_result.json").unlink()
     shutil.rmtree(payload["job_root"])
     recovery_calls = []
 
@@ -1192,6 +1869,8 @@ def test_replay_retries_committed_cleanup_without_tools_or_source(layout, entryp
 
     if entrypoint == "status":
         status = restarted.status("job-1")
+        if status.http_status == 202:
+            status = restarted.wait("job-1")
     else:
         accepted = restarted.submit(payload)
         assert accepted.http_status == 202

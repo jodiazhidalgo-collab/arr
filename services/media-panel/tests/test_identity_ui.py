@@ -104,6 +104,65 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("ui.storageSet", self.controls)
         self.assertNotIn("localStorage.setItem", self.controls)
 
+    def test_common_profile_is_explicitly_marked_as_shared(self) -> None:
+        self.assertIn("Afecta a ambos", self.view)
+        self.assertIn('state.profile === "common"', self.view)
+
+    def test_watcher_deep_links_are_distinct_and_old_alias_migrates(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const values = new Map([
+              ["arr-media-panel-ajustes-vigilante", "tv"],
+              ["arr-media-panel-section-settings", "vigilantes"],
+              ["arr-media-panel-route", "#ajustes/vigilantes"]
+            ]);
+            global.location = { hash: "" };
+            global.history = { replaceState: () => {} };
+            global.localStorage = {
+              getItem: key => values.has(key) ? values.get(key) : null,
+              setItem: (key, value) => values.set(key, value)
+            };
+            global.document = {
+              getElementById: () => ({}),
+              querySelectorAll: () => [],
+              addEventListener: () => {}
+            };
+            global.window = {
+              ArrIdentityUI: {
+                identityRouteFromHash: () => null,
+                resolveTarget: () => null,
+                show: async () => {}
+              },
+              addEventListener: () => {}
+            };
+            const source = fs.readFileSync(process.argv[1], "utf8")
+              .replace(/\ndispatchRoute\(\);\s*$/, "");
+            vm.runInThisContext(source + `
+              globalThis.__watcherRoutes = {
+                movies: exactCanonicalRoute("#ajustes/vigilante-peliculas"),
+                series: exactCanonicalRoute("#ajustes/vigilante-series"),
+                alias: canonicalRouteFromHash("#ajustes/vigilantes"),
+                partial: canonicalRouteFromHash("#ajustes"),
+                stored: canonicalRouteFromHash("#desconocido")
+              };
+            `);
+            const watcherResults = global.__watcherRoutes;
+            const requireRoute = (route, hash, profile) => {
+              if (route.hash !== hash || route.watcherProfile !== profile) {
+                throw new Error(`Ruta incorrecta: ${JSON.stringify(route)}`);
+              }
+            };
+            requireRoute(watcherResults.movies, "#ajustes/vigilante-peliculas", "movies");
+            requireRoute(watcherResults.series, "#ajustes/vigilante-series", "tv");
+            requireRoute(watcherResults.alias, "#ajustes/vigilante-series", "tv");
+            requireRoute(watcherResults.partial, "#ajustes/vigilante-series", "tv");
+            requireRoute(watcherResults.stored, "#ajustes/vigilante-series", "tv");
+            """,
+            self.web / "static" / "js" / "panel.js",
+        )
+
     def test_late_identity_response_cannot_paint_or_replace_another_profile(self) -> None:
         run_node_contract(
             r"""
