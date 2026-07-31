@@ -7,6 +7,7 @@ import threading
 import time
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -60,12 +61,17 @@ class FakeProcessor:
             output = output.with_suffix(".mkv")
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(f"processed-{entry.source_relpath}".encode())
+            output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
             completed.append(
                 ProcessedEpisode(
                     source_relpath=entry.source_relpath,
                     target_relpath=entry.target_relpath,
                     provisional_relpath=output.relative_to(job_root).as_posix(),
                     output_size=output.stat().st_size,
+                    output_sha256=output_sha256,
+                    subtitle_provisional_relpath=None,
+                    subtitle_size=None,
+                    subtitle_sha256=None,
                     audio_mode="copy",
                     subtitle_mode="none",
                     verification={"ok": True},
@@ -87,13 +93,25 @@ class FakeSidecarProcessor(FakeProcessor):
     def process(self, **kwargs):
         self.calls += 1
         result = super().process(**kwargs)
+        episodes = []
         for episode in result.episodes:
             output = Path(kwargs["job_root"]) / episode.provisional_relpath
-            output.with_name(f"{output.stem}.es.forced.srt").write_text(
+            sidecar = output.with_name(f"{output.stem}.es.forced.srt")
+            sidecar.write_text(
                 "1\n00:00:00,000 --> 00:00:01,000\nHola\n",
                 encoding="utf-8",
             )
-        return result
+            episodes.append(
+                replace(
+                    episode,
+                    subtitle_provisional_relpath=sidecar.relative_to(
+                        kwargs["job_root"]
+                    ).as_posix(),
+                    subtitle_size=sidecar.stat().st_size,
+                    subtitle_sha256=hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+                )
+            )
+        return replace(result, episodes=tuple(episodes))
 
 
 class FakePublisher:
@@ -108,13 +126,21 @@ class FakePublisher:
         journal,
         *,
         expected_files,
+        expected_file_digests,
         allowed_existing_files,
     ):
         prepared = Path(prepared)
         final = Path(final)
         expected_files = tuple(expected_files)
         self.calls.append(
-            (job_id, prepared, final, expected_files, dict(allowed_existing_files))
+            (
+                job_id,
+                prepared,
+                final,
+                expected_files,
+                dict(expected_file_digests),
+                dict(allowed_existing_files),
+            )
         )
         actual = sorted(
             path.relative_to(prepared).as_posix()
@@ -122,6 +148,8 @@ class FakePublisher:
             if path.is_file()
         )
         assert actual == sorted(expected_files)
+        for relative, digest in expected_file_digests.items():
+            assert hashlib.sha256((prepared / relative).read_bytes()).hexdigest() == digest
         journal.transition("VERIFIED", preflight={"supported": True})
         journal.transition("COMMITTING")
         final.mkdir(parents=True, exist_ok=True)
@@ -187,6 +215,14 @@ def _payload(layout, job_id="job-1", videos=None, sidecars=None):
         "reports_root": str(layout["reports"]),
         "callback_url": "",
     }
+
+
+def _mutate_same_size_and_mtime(path: Path) -> None:
+    previous = path.stat()
+    content = bytearray(path.read_bytes())
+    content[0] ^= 1
+    path.write_bytes(content)
+    os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
 
 
 def _coordinator(layout, processor=None, publisher=None, lock_factory=None):
@@ -294,18 +330,7 @@ def test_done_manifest_covers_complete_final_tree_with_sizes_and_hashes(layout):
         encoding="utf-8",
     )
 
-    class ProcessorWithSidecar(FakeProcessor):
-        def process(self, **kwargs):
-            result = super().process(**kwargs)
-            for episode in result.episodes:
-                output = Path(kwargs["job_root"]) / episode.provisional_relpath
-                output.with_name(f"{output.stem}.es.forced.srt").write_text(
-                    "1\n00:00:00,000 --> 00:00:01,000\nHola\n",
-                    encoding="utf-8",
-                )
-            return result
-
-    coordinator = _coordinator(layout, processor=ProcessorWithSidecar())
+    coordinator = _coordinator(layout, processor=FakeSidecarProcessor())
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
     published_manifest = result["published_manifest"]
@@ -393,7 +418,7 @@ def test_same_active_job_with_different_payload_is_conflict(layout):
     )
     payload = _payload(layout)
     coordinator.submit(payload)
-    assert entered.wait(timeout=1)
+    assert entered.wait(timeout=3)
     changed = {
         **payload,
         "callback_url": "http://arr-orchestrator:8787/jobs/job-1/events",
@@ -948,6 +973,67 @@ def test_different_or_other_extension_collision_reviews_entire_pack(layout):
     assert existing.read_bytes() == b"existing"
 
 
+def test_range_collision_detects_existing_intermediate_episode(layout):
+    payload = _payload(
+        layout,
+        videos=[("Serie/Season 01/Serie.S01E01-E03E05.mkv", b"range-pack")],
+    )
+    existing = layout["tv"] / "Serie/Season 01/Serie.S01E02.mkv"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"existing-e02")
+    publisher = FakePublisher()
+    coordinator = _coordinator(layout, publisher=publisher)
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    assert result["status"] == "review"
+    assert any(
+        reason.startswith("colision_otro_nombre:")
+        for reason in result["review_reasons"]
+    )
+    assert publisher.calls == []
+    assert existing.read_bytes() == b"existing-e02"
+
+
+@pytest.mark.parametrize("sidecar", [False, True])
+def test_verified_output_substitution_before_copy_reviews_whole_pack(
+    layout,
+    sidecar,
+):
+    payload = _payload(layout)
+
+    class MutatingProcessor(FakeSidecarProcessor if sidecar else FakeProcessor):
+        def process(self, **kwargs):
+            result = super().process(**kwargs)
+            episode = result.episodes[0]
+            if sidecar:
+                relative = episode.subtitle_provisional_relpath
+                assert relative is not None
+            else:
+                relative = episode.provisional_relpath
+            _mutate_same_size_and_mtime(Path(kwargs["job_root"]) / relative)
+            return result
+
+    publisher = FakePublisher()
+    coordinator = _coordinator(
+        layout,
+        processor=MutatingProcessor(),
+        publisher=publisher,
+    )
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    assert result["status"] == "review"
+    assert any(
+        reason.startswith("procesamiento_fallido:")
+        for reason in result["review_reasons"]
+    )
+    assert publisher.calls == []
+    assert not (layout["tv"] / "Serie").exists()
+
+
 def test_unicode_compatibility_collision_in_library_reviews_entire_pack(layout):
     payload = _payload(layout)
     existing = layout["tv"] / "Serie/Ｓｅａｓｏｎ ０１/Serie.Ｓ０１Ｅ０１.mkv"
@@ -1015,7 +1101,7 @@ def test_identical_collision_is_satisfied_without_processing(layout):
     assert result["status"] == "done"
     assert result["satisfied"] == ["Serie/Season 01/Serie.S01E01.mkv"]
     assert publisher.calls[0][3] == ("Season 01/Serie.S01E01.mkv",)
-    assert set(publisher.calls[0][4]) == {"Season 01/Serie.S01E01.mkv"}
+    assert set(publisher.calls[0][5]) == {"Season 01/Serie.S01E01.mkv"}
 
 
 def test_unicode_compatibility_identical_collision_is_reviewed_fail_closed(layout):
@@ -1432,7 +1518,7 @@ def test_identical_video_with_new_sidecar_is_processed_and_published(layout):
     assert result["status"] == "done"
     assert processor.calls == 1
     assert (layout["tv"] / "Serie/Season 01/Serie.S01E01.es.forced.srt").is_file()
-    assert set(coordinator.publisher.calls[0][4]) == {
+    assert set(coordinator.publisher.calls[0][5]) == {
         "Season 01/Serie.S01E01.mkv"
     }
 
@@ -1549,16 +1635,16 @@ def test_partial_prepared_copy_is_removed_before_terminal_review(layout, monkeyp
             ("Serie/Season 01/Serie.S01E02.mkv", b"two"),
         ],
     )
-    original_copy2 = core_module.shutil.copy2
+    original_copy = core_module._copy_verified_file
     calls = []
 
     def fail_second_copy(source, destination, *args, **kwargs):
         calls.append((source, destination))
         if len(calls) == 2:
             raise OSError("fallo controlado en la segunda copia")
-        return original_copy2(source, destination, *args, **kwargs)
+        return original_copy(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(core_module.shutil, "copy2", fail_second_copy)
+    monkeypatch.setattr(core_module, "_copy_verified_file", fail_second_copy)
     publisher = FakePublisher()
     coordinator = _coordinator(layout, publisher=publisher)
 
@@ -1862,9 +1948,13 @@ def test_replay_retries_committed_cleanup_without_tools_or_source(
     restarted.recoverer = recover
     tool_calls = []
     preflight_calls = []
+    lock_calls = []
     restarted.tool_checker = lambda: tool_calls.append(True) or ["ffmpeg"]
     restarted.atomic_preflight = lambda _root: preflight_calls.append(True) or (_ for _ in ()).throw(
         OSError("no debe ejecutarse")
+    )
+    restarted.lock_factory = lambda *_args, **_kwargs: lock_calls.append(True) or (_ for _ in ()).throw(
+        AssertionError("COMMITTED no debe adquirir el bloqueo audiovisual")
     )
 
     if entrypoint == "status":
@@ -1881,3 +1971,4 @@ def test_replay_retries_committed_cleanup_without_tools_or_source(
     assert recovery_calls == [True]
     assert tool_calls == []
     assert preflight_calls == []
+    assert lock_calls == []

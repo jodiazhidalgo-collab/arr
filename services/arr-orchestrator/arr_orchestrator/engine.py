@@ -1623,7 +1623,12 @@ class Engine:
             input_root = extract_archives(job_root, event_callback=record_extract_event)
             clean_junk(input_root)
         except ExtractionError as error:
-            self._finish_extraction_failure(job, job_root, error)
+            self._finish_extraction_failure(
+                job,
+                job_root,
+                error,
+                series_selected=series_selected,
+            )
             return
         except Exception as error:
             self._finish_extraction_failure(
@@ -1632,6 +1637,7 @@ class Engine:
                 ExtractionError(
                     "extract_tool_failed", str(error), output_tail=str(error)[-2000:]
                 ),
+                series_selected=series_selected,
             )
             return
         self.db.transition(
@@ -1647,6 +1653,8 @@ class Engine:
         job: Dict[str, object],
         job_root: Path,
         error: ExtractionError,
+        *,
+        series_selected: bool,
     ) -> None:
         job_id = str(job["job_id"])
         error_details = _sanitize_extraction_details(job_root, error.details)
@@ -1657,6 +1665,15 @@ class Engine:
             f"Extracción fallida: {error.message}",
             error_details,
         )
+        if series_selected:
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                error.code,
+                error.message,
+                phase="extract",
+            )
+            return
         failed, preservation = move_extraction_failure_to_review(
             job_root,
             self.config.review_dir,
@@ -2855,6 +2872,7 @@ class Engine:
                 "reason": error_code,
                 "message": self._safe_worker_error(message),
                 "preserved_files": len(after),
+                "_arr_review_signature": self._series_review_signature_digest(review),
                 "timestamp": time.time(),
             }
             write_reason(
@@ -2892,14 +2910,47 @@ class Engine:
             )
             return False
 
-        self._cleanup_clients(job, strict=False)
+        clients_cleaned = self._cleanup_clients(job, strict=True)
+        reason["clients_cleanup_pending"] = not clients_cleaned
+        try:
+            write_reason(
+                review,
+                reason,
+                "Revision de serie.txt",
+                [
+                    "El pack completo se ha conservado en la revision exclusiva de Series.",
+                    self._safe_worker_error(message),
+                    (
+                        "La limpieza de clientes queda pendiente de reintento automatico."
+                        if not clients_cleaned
+                        else "Las entradas de clientes se han limpiado sin borrar archivos."
+                    ),
+                ],
+            )
+        except Exception as reason_error:
+            self.db.add_event(
+                str(job["job_id"]),
+                phase,
+                "warning",
+                "No se pudo actualizar el motivo con el estado de limpieza",
+                {"error": self._safe_worker_error(reason_error)},
+            )
+        terminal_code = (
+            error_code
+            if clients_cleaned
+            else f"{error_code}_client_cleanup_pending"
+        )
         self.db.transition(
             str(job["job_id"]),
             "manual_review",
             phase,
-            "Pack completo preservado en revision exclusiva de Series",
+            (
+                "Pack preservado; limpieza de clientes pendiente"
+                if not clients_cleaned
+                else "Pack completo preservado en revision exclusiva de Series"
+            ),
             stage_path=str(review),
-            last_error_code=error_code,
+            last_error_code=terminal_code,
             last_error_message=self._safe_worker_error(message),
             result_json=json.dumps(reason, ensure_ascii=False),
         )
@@ -3193,14 +3244,29 @@ class Engine:
 
     @staticmethod
     def _episode_cluster_numbers(value: str) -> List[int]:
-        numbers = [int(item) for item in re.findall(r"\d{1,4}", value)]
-        if (
-            len(numbers) == 2
-            and numbers[1] >= numbers[0]
-            and re.search(r"\d\s*-\s*(?:e\s*)?\d", value, flags=re.IGNORECASE)
-        ):
-            return list(range(numbers[0], numbers[1] + 1))
-        return list(dict.fromkeys(numbers))
+        matches = list(re.finditer(r"\d{1,4}", value))
+        episodes: List[int] = []
+        index = 0
+        while index < len(matches):
+            current = int(matches[index].group(0))
+            if index + 1 < len(matches):
+                following = int(matches[index + 1].group(0))
+                separator = value[matches[index].end() : matches[index + 1].start()]
+                if (
+                    current <= following
+                    and re.fullmatch(
+                        r"[ ._]*-[ ._]*(?:e[ ._]*)?",
+                        separator,
+                        flags=re.IGNORECASE,
+                    )
+                    is not None
+                ):
+                    episodes.extend(range(current, following + 1))
+                    index += 2
+                    continue
+            episodes.append(current)
+            index += 1
+        return list(dict.fromkeys(episodes))
 
     @classmethod
     def _series_episode_groups(
@@ -5080,6 +5146,78 @@ class Engine:
             "bluray_worker_invalid_terminal",
             "bluray_recovery_inconclusive",
         }
+        cleanup_suffix = "_client_cleanup_pending"
+        cleanup_jobs = self.db.jobs_in_state_with_error_suffix(
+            "manual_review",
+            cleanup_suffix,
+            500,
+        )
+        for job in cleanup_jobs:
+            error_code = str(job.get("last_error_code") or "")
+            try:
+                self._load_series_review_cleanup_state(job)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                original_code = error_code.removesuffix(cleanup_suffix)
+                self.db.update_job(
+                    str(job["job_id"]),
+                    last_error_code=f"{original_code}_review_integrity_failed",
+                    last_error_message=self._safe_worker_error(error),
+                )
+                self.db.add_event(
+                    str(job["job_id"]),
+                    "cleanup",
+                    "error",
+                    "La limpieza de clientes se bloqueó porque la revisión ya no es íntegra",
+                    {
+                        "error": self._safe_worker_error(error),
+                        "cleanup_blocked": True,
+                    },
+                )
+                continue
+            if not self._cleanup_clients(job, strict=True):
+                # Rota el lote para que un cliente caído no bloquee otros
+                # reintentos pendientes detrás del límite de esta pasada.
+                self.db.update_job(
+                    str(job["job_id"]),
+                    last_error_code=error_code,
+                )
+                continue
+            try:
+                cleanup_result = self._mark_series_review_cleanup_completed(job)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                self.db.update_job(
+                    str(job["job_id"]),
+                    last_error_code=error_code,
+                )
+                self.db.add_event(
+                    str(job["job_id"]),
+                    "cleanup",
+                    "warning",
+                    "Los clientes se limpiaron, pero el estado de la revisión sigue pendiente",
+                    {"error": self._safe_worker_error(error)},
+                )
+                continue
+            original_code = str(
+                cleanup_result.get("reason")
+                or error_code.removesuffix(cleanup_suffix)
+            )
+            self.db.update_job(
+                str(job["job_id"]),
+                last_error_code=original_code,
+                last_error_message=str(
+                    cleanup_result.get("message")
+                    or job.get("last_error_message")
+                    or ""
+                ),
+                result_json=json.dumps(cleanup_result, ensure_ascii=False),
+            )
+            self.db.add_event(
+                str(job["job_id"]),
+                "cleanup",
+                "decision",
+                "Limpieza pendiente de clientes completada sin borrar archivos",
+            )
+
         for job in self.db.jobs_in_states(["manual_review"], 500):
             error_code = str(job.get("last_error_code") or "")
             if error_code not in recoverable_codes:
@@ -5100,6 +5238,56 @@ class Engine:
             if result is None or str(result.get("status") or "") == "error":
                 continue
             self._apply_worker_result(job, phase, result, recovery=True)
+
+    def _mark_series_review_cleanup_completed(
+        self,
+        job: Dict[str, object],
+    ) -> Dict[str, object]:
+        review, reason = self._load_series_review_cleanup_state(job)
+        reason["clients_cleanup_pending"] = False
+        write_reason(
+            review,
+            reason,
+            "Revision de serie.txt",
+            [
+                "El pack completo se ha conservado en la revision exclusiva de Series.",
+                self._safe_worker_error(reason.get("message") or ""),
+                "Las entradas de clientes se han limpiado sin borrar archivos.",
+            ],
+        )
+        return reason
+
+    def _load_series_review_cleanup_state(
+        self,
+        job: Dict[str, object],
+    ) -> Tuple[Path, Dict[str, object]]:
+        job_id = str(job["job_id"])
+        review_root = self._require_series_physical_path(
+            self.config.series_review_dir,
+            "raíz de revisión de Series",
+        ).resolve(strict=True)
+        review = self._require_series_lexical_path(
+            Path(str(job.get("stage_path") or "")),
+            review_root,
+            "revisión pendiente de limpieza",
+        )
+        if (
+            review.parent != review_root
+            or not review.is_dir()
+            or review.resolve(strict=True) != review
+        ):
+            raise ValueError("La revisión pendiente no es una carpeta canónica de Series")
+        reason_path = review / "reason.json"
+        reason = json.loads(reason_path.read_text(encoding="utf-8"))
+        if not isinstance(reason, dict) or str(reason.get("job_id") or "") != job_id:
+            raise ValueError("El motivo de revisión no pertenece al trabajo de Series")
+        expected_signature = str(reason.get("_arr_review_signature") or "")
+        if (
+            not expected_signature
+            or self._series_review_signature_digest(review) != expected_signature
+        ):
+            raise ValueError("La revisión preservada de Series cambió desde su confirmación")
+        return review, reason
 
     def _filebot_command_preview(
         self,

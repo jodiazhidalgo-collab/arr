@@ -39,6 +39,31 @@ def _write(path, value):
     path.write_text(value, encoding="utf-8")
 
 
+def _eventually_absent(path: Path, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while path.exists() or path.is_symlink():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def _assert_committed_cleanup(
+    journal: DurableJournal,
+    *paths: Path,
+) -> None:
+    snapshot = journal.snapshot()
+    assert snapshot is not None
+    assert snapshot["state"] == "COMMITTED"
+    assert snapshot["details"]["cleanup_complete"] is True
+    for path in paths:
+        # Windows puede conservar durante minutos una entrada de directorio ya
+        # borrada en el NAS. Linux sigue exigiendo aquí la ausencia física.
+        if os.name == "nt" and path.anchor.startswith("\\\\"):
+            continue
+        assert _eventually_absent(path)
+
+
 def _identity(job_id, generation, prepared, final, mode, shadow=None):
     payload = {
         "job_id": job_id,
@@ -122,7 +147,7 @@ def test_new_series_is_renamed_without_overwrite(tmp_path, monkeypatch):
 
     assert result["status"] == "committed"
     assert result["mode"] == "new"
-    assert not prepared.exists()
+    _assert_committed_cleanup(journal, prepared)
     assert (final / "S01E01.mkv").read_text(encoding="utf-8") == "new"
     assert (final / delivery.MARKER_NAME).is_file()
     assert journal.state == "COMMITTED"
@@ -150,6 +175,333 @@ def test_new_series_never_overwrites_a_destination_that_appears(tmp_path, monkey
     assert (prepared / "new.mkv").read_text(encoding="utf-8") == "new"
     assert not (prepared / delivery.MARKER_NAME).exists()
     assert journal.state == "ROLLED_BACK"
+
+
+@pytest.mark.parametrize("existing_series", [False, True])
+@pytest.mark.parametrize("mutation_call", [2, 3])
+def test_content_substitution_inside_publish_lock_never_reaches_library(
+    tmp_path,
+    monkeypatch,
+    existing_series,
+    mutation_call,
+):
+    library = tmp_path / "tv"
+    final = library / "Serie"
+    prepared = tmp_path / "prepared" / "Serie"
+    relative = "Season 01/S01E02.mkv"
+    _write(prepared / relative, "verified-bytes")
+    if existing_series:
+        _write(final / "Season 01/S01E01.mkv", "old-library")
+    else:
+        library.mkdir()
+    expected_digest = delivery._stable_file_sha256(prepared / relative)
+    journal = DurableJournal(tmp_path / "journal")
+    monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
+    monkeypatch.setattr(delivery, "_rename_exchange", _portable_test_exchange)
+    original_verify = delivery._verify_expected_file_digests
+    verification_calls = 0
+
+    def mutate_after_candidate_verification(root, expected, *, recovery, label):
+        nonlocal verification_calls
+        result = original_verify(
+            root,
+            expected,
+            recovery=recovery,
+            label=label,
+        )
+        verification_calls += 1
+        if verification_calls == mutation_call:
+            path = Path(root) / relative
+            previous = path.stat()
+            changed = bytearray(path.read_bytes())
+            changed[0] ^= 1
+            path.write_bytes(changed)
+            os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        return result
+
+    monkeypatch.setattr(
+        delivery,
+        "_verify_expected_file_digests",
+        mutate_after_candidate_verification,
+    )
+
+    def publish():
+        return delivery.publish_series(
+            "job-integrity",
+            prepared,
+            final,
+            journal,
+            expected_files=[relative],
+            expected_file_digests={relative: expected_digest},
+        )
+
+    if mutation_call == 2:
+        with pytest.raises(delivery.DeliveryConflict, match="cambió antes de publicar"):
+            publish()
+    else:
+        assert publish()["status"] == "rolled_back"
+
+    assert journal.state == "ROLLED_BACK"
+    if existing_series:
+        assert (final / "Season 01/S01E01.mkv").read_text("utf-8") == "old-library"
+        assert not (final / relative).exists()
+    else:
+        assert not final.exists()
+
+
+def test_committed_recovery_refuses_cleanup_if_published_bytes_changed(
+    tmp_path,
+    monkeypatch,
+):
+    library = tmp_path / "tv"
+    prepared = library / ".Serie.prepared"
+    final = library / "Serie"
+    relative = "Season 01/S01E01.mkv"
+    library.mkdir()
+    _write(prepared / relative, "verified-bytes")
+    expected_digest = delivery._stable_file_sha256(prepared / relative)
+    journal = DurableJournal(tmp_path / "journal")
+    cleanup_calls = []
+    monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
+    monkeypatch.setattr(
+        delivery,
+        "_cleanup_committed_durable",
+        lambda *_args, **_kwargs: cleanup_calls.append(True) or ["pending-cleanup"],
+    )
+
+    result = delivery.publish_series(
+        "job-committed-integrity",
+        prepared,
+        final,
+        journal,
+        expected_files=[relative],
+        expected_file_digests={relative: expected_digest},
+    )
+    published = final / relative
+    previous = published.stat()
+    changed = bytearray(published.read_bytes())
+    changed[0] ^= 1
+    published.write_bytes(changed)
+    os.utime(published, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+
+    with pytest.raises(delivery.RecoveryAmbiguous, match="COMMITTED"):
+        delivery.recover_delivery(
+            "job-committed-integrity",
+            prepared,
+            final,
+            journal,
+        )
+
+    assert result["cleanup_pending"] == ["pending-cleanup"]
+    assert journal.state == "COMMITTED"
+    assert cleanup_calls == [True]
+    assert (final / delivery.MARKER_NAME).is_file()
+
+
+@pytest.mark.parametrize("existing_series", [False, True])
+def test_cleanup_revalidates_bytes_after_committed_transition(
+    tmp_path,
+    monkeypatch,
+    existing_series,
+):
+    library = tmp_path / "tv"
+    prepared = tmp_path / "prepared" / "Serie"
+    final = library / "Serie"
+    relative = "Season 01/S01E02.mkv"
+    _write(prepared / relative, "verified-bytes")
+    if existing_series:
+        _write(final / "Season 01/S01E01.mkv", "old-library")
+    else:
+        library.mkdir()
+    expected_digest = delivery._stable_file_sha256(prepared / relative)
+    journal = DurableJournal(tmp_path / "journal")
+    monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
+    monkeypatch.setattr(delivery, "_rename_exchange", _portable_test_exchange)
+    original_cleanup = delivery._cleanup_committed_durable
+    cleanup_calls = 0
+
+    def mutate_then_cleanup(*args, **kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        published = Path(kwargs["final"]) / relative
+        previous = published.stat()
+        changed = bytearray(published.read_bytes())
+        changed[0] ^= 1
+        published.write_bytes(changed)
+        os.utime(published, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        return original_cleanup(*args, **kwargs)
+
+    monkeypatch.setattr(delivery, "_cleanup_committed_durable", mutate_then_cleanup)
+
+    with pytest.raises(delivery.RecoveryAmbiguous, match="antes de cleanup"):
+        delivery.publish_series(
+            "job-cleanup-integrity",
+            prepared,
+            final,
+            journal,
+            expected_files=[relative],
+            expected_file_digests={relative: expected_digest},
+        )
+
+    assert journal.state == "COMMITTED"
+    assert cleanup_calls == 1
+    assert (final / delivery.MARKER_NAME).is_file()
+    if existing_series:
+        assert list(library.glob(".Serie.series-worker.*.shadow"))
+
+
+@pytest.mark.parametrize("existing_series", [False, True])
+def test_recovery_uses_durable_content_hashes_before_atomic_commit(
+    tmp_path,
+    monkeypatch,
+    existing_series,
+):
+    library = tmp_path / "tv"
+    prepared = tmp_path / "prepared" / "Serie"
+    final = library / "Serie"
+    relative = "Season 01/S01E02.mkv"
+    _write(prepared / relative, "verified-bytes")
+    if existing_series:
+        _write(final / "Season 01/S01E01.mkv", "old-library")
+    else:
+        library.mkdir()
+    expected_digest = delivery._stable_file_sha256(prepared / relative)
+    journal = DurableJournal(tmp_path / "journal")
+    monkeypatch.setattr(delivery, "preflight_atomic_exchange", _supported_preflight)
+    monkeypatch.setattr(delivery, "_rename_exchange", _portable_test_exchange)
+
+    def crash_before_atomic_commit(*_args, **_kwargs):
+        raise _SimulatedCrash("controlled crash before atomic commit")
+
+    monkeypatch.setattr(
+        delivery,
+        "_commit_exchange" if existing_series else "_commit_new",
+        crash_before_atomic_commit,
+    )
+
+    with pytest.raises(_SimulatedCrash):
+        delivery.publish_series(
+            "job-durable-integrity",
+            prepared,
+            final,
+            journal,
+            expected_files=[relative],
+            expected_file_digests={relative: expected_digest},
+        )
+
+    snapshot = journal.snapshot()
+    assert snapshot is not None and snapshot["state"] == "COMMITTING"
+    candidate = (
+        Path(snapshot["details"]["shadow_root"])
+        if existing_series
+        else prepared
+    )
+    path = candidate / relative
+    previous = path.stat()
+    changed = bytearray(path.read_bytes())
+    changed[0] ^= 1
+    path.write_bytes(changed)
+    os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+
+    with pytest.raises(delivery.RecoveryAmbiguous, match="cambió antes de recuperar"):
+        delivery.recover_delivery(
+            "job-durable-integrity",
+            prepared,
+            final,
+            journal,
+        )
+
+    assert journal.state == "COMMITTING"
+    if existing_series:
+        assert (final / "Season 01/S01E01.mkv").read_text("utf-8") == "old-library"
+        assert not (final / relative).exists()
+    else:
+        assert not final.exists()
+
+
+def test_new_rollback_recovers_crash_after_hiding_invalid_publication(
+    tmp_path,
+    monkeypatch,
+):
+    library = tmp_path / "tv"
+    prepared = library / ".Serie.prepared"
+    final = library / "Serie"
+    library.mkdir()
+    _write(final / "S01E01.mkv", "corrupt")
+    job_id = "job-rollback-new-crash"
+    generation = "1" * 32
+    delivery._write_marker(final, job_id, generation)
+    journal = DurableJournal(tmp_path / "journal")
+    identity = _identity(job_id, generation, prepared, final, "new")
+    identity["expected_file_digests"] = {"S01E01.mkv": "0" * 64}
+    _journal_at_committing(journal, identity)
+    original_rename = delivery._rename_noreplace
+
+    def rename_then_crash(source, destination):
+        original_rename(source, destination)
+        raise _SimulatedCrash("crash after rollback rename")
+
+    monkeypatch.setattr(delivery, "_rename_noreplace", rename_then_crash)
+    with pytest.raises(_SimulatedCrash):
+        delivery.recover_delivery(job_id, prepared, final, journal)
+
+    assert journal.state == "COMMITTING"
+    assert not final.exists()
+    assert delivery._is_generation(delivery._read_marker(prepared), job_id, generation)
+
+    monkeypatch.setattr(delivery, "_rename_noreplace", original_rename)
+    result = delivery.recover_delivery(job_id, prepared, final, journal)
+
+    assert result["status"] == "rolled_back"
+    assert journal.state == "ROLLED_BACK"
+    assert not final.exists()
+    assert prepared.is_dir()
+    assert delivery._read_marker(prepared) is None
+
+
+def test_exchange_rollback_recovers_crash_after_restoring_old_library(
+    tmp_path,
+    monkeypatch,
+):
+    library = tmp_path / "tv"
+    prepared = tmp_path / "prepared" / "Serie"
+    final = library / "Serie"
+    _write(final / "S01E02.mkv", "corrupt")
+    _write(prepared / "source.mkv", "staged")
+    job_id = "job-rollback-exchange-crash"
+    generation = "2" * 32
+    shadow = delivery._shadow_path(final.resolve(), job_id, generation)
+    _write(shadow / "S01E01.mkv", "old-library")
+    delivery._write_marker(final, job_id, generation)
+    journal = DurableJournal(tmp_path / "journal")
+    identity = _identity(job_id, generation, prepared, final, "exchange", shadow)
+    identity["expected_file_digests"] = {"S01E02.mkv": "0" * 64}
+    _journal_at_committing(journal, identity)
+    monkeypatch.setattr(delivery, "_rename_exchange", _portable_test_exchange)
+    original_commit = delivery._commit_exchange
+
+    def exchange_then_crash(left, right):
+        original_commit(left, right)
+        raise _SimulatedCrash("crash after rollback exchange")
+
+    monkeypatch.setattr(delivery, "_commit_exchange", exchange_then_crash)
+    with pytest.raises(_SimulatedCrash):
+        delivery.recover_delivery(job_id, prepared, final, journal)
+
+    assert journal.state == "COMMITTING"
+    assert (final / "S01E01.mkv").read_text("utf-8") == "old-library"
+    assert delivery._is_generation(delivery._read_marker(shadow), job_id, generation)
+
+    monkeypatch.setattr(delivery, "_commit_exchange", original_commit)
+    result = delivery.recover_delivery(job_id, prepared, final, journal)
+
+    assert result["status"] == "rolled_back"
+    assert journal.state == "ROLLED_BACK"
+    assert (final / "S01E01.mkv").read_text("utf-8") == "old-library"
+    replay = delivery.recover_delivery(job_id, prepared, final, journal)
+    assert replay["status"] == "rolled_back"
+    if os.name != "nt" or not shadow.anchor.startswith("\\\\"):
+        assert _eventually_absent(shadow)
 
 
 def test_existing_series_uses_complete_shadow_and_never_edits_old_hardlinks(
@@ -185,7 +537,7 @@ def test_existing_series_uses_complete_shadow_and_never_edits_old_hardlinks(
     assert (final / "Season 01" / "S01E02.mkv").read_text(encoding="utf-8") == "new-2"
     assert (final / "Season 01" / "S01E03.mkv").read_text(encoding="utf-8") == "new-3"
     assert (final / "Season 01" / "S01E01.mkv").stat().st_ino == untouched_inode
-    assert not prepared.exists()
+    _assert_committed_cleanup(journal, prepared)
     assert not list(library.glob(".Serie.series-worker.*.shadow"))
     assert journal.state == "COMMITTED"
 
@@ -354,8 +706,7 @@ def test_recovery_finishes_commit_when_marker_proves_exchange_happened(tmp_path)
     assert result["recovered"] is True
     assert journal.state == "COMMITTED"
     assert (final / "S01E01.mkv").read_text(encoding="utf-8") == "new"
-    assert not shadow.exists()
-    assert not prepared.exists()
+    _assert_committed_cleanup(journal, shadow, prepared)
 
 
 def test_recovery_completes_exchange_after_crash_before_atomic_syscall(
@@ -391,8 +742,7 @@ def test_recovery_completes_exchange_after_crash_before_atomic_syscall(
     assert (final / "S01E01.mkv").read_text(encoding="utf-8") == "old"
     assert (final / "S01E02.mkv").read_text(encoding="utf-8") == "new"
     assert journal.state == "COMMITTED"
-    assert not shadow.exists()
-    assert not prepared.exists()
+    _assert_committed_cleanup(journal, shadow, prepared)
 
 
 def test_tree_signature_ignores_directory_mtime_noise_but_not_inventory(tmp_path):
@@ -673,9 +1023,7 @@ def test_committed_recovery_preserves_later_final_additions_and_finishes_cleanup
     assert result["status"] == "committed"
     assert (final / "Season 01/S01E01.mkv").read_text("utf-8") == "new-1"
     assert (final / "Season 01/S01E02.mkv").read_text("utf-8") == "later"
-    assert not shadow.exists()
-    assert not prepared.exists()
-    assert journal.snapshot()["details"]["cleanup_complete"] is True
+    _assert_committed_cleanup(journal, shadow, prepared)
 
 
 def test_committed_cleanup_uses_root_identity_after_hardlink_metadata_change(
@@ -722,9 +1070,7 @@ def test_committed_cleanup_uses_root_identity_after_hardlink_metadata_change(
     assert inherited.read_text("utf-8") == "old-episode"
     assert inherited.stat().st_mtime_ns == changed
     assert (final / "Season 01/S01E02.mkv").read_text("utf-8") == "new-episode"
-    assert not shadow.exists()
-    assert not prepared.exists()
-    assert journal.snapshot()["details"]["cleanup_complete"] is True
+    _assert_committed_cleanup(journal, shadow, prepared)
 
 
 def test_recovery_completes_new_series_after_crash_before_noreplace(
@@ -751,7 +1097,7 @@ def test_recovery_completes_new_series_after_crash_before_noreplace(
     assert result["recovered"] is True
     assert (final / "S01E01.mkv").read_text(encoding="utf-8") == "new"
     assert journal.state == "COMMITTED"
-    assert not prepared.exists()
+    _assert_committed_cleanup(journal, prepared)
 
 
 def test_new_series_retry_converges_after_marker_is_durable_before_verified(
@@ -797,8 +1143,7 @@ def test_new_series_retry_converges_after_marker_is_durable_before_verified(
 
     assert result["status"] == "committed"
     assert (final / "Season 01/S01E01.mkv").read_text("utf-8") == "new"
-    assert not prepared.exists()
-    assert journal.snapshot()["details"]["cleanup_complete"] is True
+    _assert_committed_cleanup(journal, prepared)
 
 
 def test_new_series_retry_removes_partial_marker_temp_with_exact_manifest(
@@ -830,8 +1175,7 @@ def test_new_series_retry_removes_partial_marker_temp_with_exact_manifest(
     assert result["status"] == "committed"
     assert (final / episode).read_text("utf-8") == "new"
     assert not orphan.exists()
-    assert not prepared.exists()
-    assert journal.snapshot()["details"]["cleanup_complete"] is True
+    _assert_committed_cleanup(journal, prepared)
 
 
 def test_new_series_marker_temp_is_never_published_without_exact_manifest(
@@ -863,8 +1207,7 @@ def test_new_series_marker_temp_is_never_published_without_exact_manifest(
     assert result["status"] == "committed"
     assert (final / episode).read_text("utf-8") == "new"
     assert not (final / orphan.name).exists()
-    assert not prepared.exists()
-    assert journal.snapshot()["details"]["cleanup_complete"] is True
+    _assert_committed_cleanup(journal, prepared)
 
 
 @pytest.mark.parametrize("hostile_kind", ["directory", "symlink"])
@@ -1547,8 +1890,7 @@ def test_recovery_keeps_committing_when_durability_retry_fails(
     assert result["status"] == "committed"
     assert result["recovered"] is True
     assert journal.state == "COMMITTED"
-    assert not shadow.exists()
-    assert not prepared.exists()
+    _assert_committed_cleanup(journal, shadow, prepared)
 
 
 def test_publish_rejects_an_empty_prepared_tree(tmp_path, monkeypatch):

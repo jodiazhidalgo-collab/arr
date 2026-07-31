@@ -16,7 +16,7 @@ from arr_orchestrator.config import Config
 from arr_orchestrator.db import Database
 import arr_orchestrator.engine as engine_module
 from arr_orchestrator.engine import Engine, WORKER_ACTIVE_MAX_SECONDS
-from arr_orchestrator.filesystem import review_content_signature
+from arr_orchestrator.filesystem import ExtractionError, review_content_signature
 from arr_orchestrator.series_worker import (
     SeriesWorkerBusy,
     SeriesWorkerConflict,
@@ -98,6 +98,15 @@ def _wait_state(database: Database, job_id: str, expected: str, timeout: float =
         time.sleep(0.01)
     job = database.get_job(job_id)
     raise AssertionError(f"Estado final {job['state'] if job else None}, esperado {expected}")
+
+
+def _eventually_absent(path: Path, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not path.exists() and not path.is_symlink():
+            return True
+        time.sleep(0.05)
+    return not path.exists() and not path.is_symlink()
 
 
 def _series_job(
@@ -275,12 +284,17 @@ class _CoordinatorProcessor:
             output = output.with_suffix(".mkv")
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(f"processed-{entry.source_relpath}".encode("utf-8"))
+            output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
             completed.append(
                 ProcessedEpisode(
                     source_relpath=entry.source_relpath,
                     target_relpath=entry.target_relpath,
                     provisional_relpath=output.relative_to(job_root).as_posix(),
                     output_size=output.stat().st_size,
+                    output_sha256=output_sha256,
+                    subtitle_provisional_relpath=None,
+                    subtitle_size=None,
+                    subtitle_sha256=None,
                     audio_mode="copy",
                     subtitle_mode="none",
                     verification={"ok": True},
@@ -303,6 +317,7 @@ class _PendingCleanupPublisher:
         journal,
         *,
         expected_files,
+        expected_file_digests,
         allowed_existing_files,
     ):
         prepared = Path(prepared)
@@ -313,6 +328,7 @@ class _PendingCleanupPublisher:
             if path.is_file()
         )
         assert actual == sorted(expected_files)
+        assert set(expected_file_digests) == set(expected_files)
         assert isinstance(allowed_existing_files, dict)
         journal.transition("VERIFIED", preflight={"supported": True})
         journal.transition("COMMITTING")
@@ -388,6 +404,39 @@ def _tree_snapshot(root: Path) -> list[tuple[str, str, object]]:
         elif path.is_file():
             snapshot.append((relative, "file", path.read_bytes()))
     return snapshot
+
+
+def _ready_extract_job(
+    engine: Engine,
+    database: Database,
+    *,
+    category: str,
+    name: str,
+):
+    job = database.create_job(
+        f"extract-failure:{category}:{name}",
+        "fs",
+        category,
+        name,
+        state="ready_extract",
+        source_meta_json=engine._new_job_source_meta_json(
+            category=category,
+            name=name,
+        ),
+    )
+    job_root = engine.config.workshop_root / str(job["job_id"])
+    original = job_root / "original"
+    original.mkdir(parents=True)
+    (original / f"{name}.rar").write_bytes(b"archive")
+    partial = job_root / "extracted" / "layer_01.tmp" / "partial.bin"
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"partial")
+    job = database.update_job(
+        str(job["job_id"]),
+        stage_path=str(job_root),
+        source_path=str(original),
+    )
+    return job, job_root, original, partial
 
 
 @pytest.mark.parametrize(
@@ -695,7 +744,7 @@ def test_verified_worker_review_allows_client_and_workshop_cleanup(tmp_path: Pat
         assert updated["state"] == "manual_review"
         assert Path(updated["stage_path"]) == review
         assert review.is_dir()
-        assert not job_root.exists()
+        assert _eventually_absent(job_root)
         assert not any(engine.config.tv_output.iterdir())
     finally:
         database.close()
@@ -1320,6 +1369,311 @@ def test_series_filebot_rejects_linked_job_before_preparing_or_writing(
         assert updated["last_error_code"].endswith("preservation_unconfirmed")
         assert _tree_snapshot(external) == before
         assert not (external / "series_filebot_output").exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("extraction_error", "expected_code"),
+    [
+        (
+            ExtractionError(
+                "extract_volume_missing",
+                "Falta el siguiente volumen del archivo",
+                output_tail="Cannot find volume part02.rar",
+            ),
+            "extract_volume_missing",
+        ),
+        (RuntimeError("fallo inesperado del extractor"), "extract_tool_failed"),
+    ],
+)
+def test_series_extraction_failure_preserves_whole_pack_before_client_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extraction_error: Exception,
+    expected_code: str,
+) -> None:
+    engine, database = _engine(tmp_path)
+    cleanup_calls: list[tuple[str, bool]] = []
+    try:
+        job, job_root, _original, partial = _ready_extract_job(
+            engine,
+            database,
+            category="tv",
+            name="Mi Serie S01E01",
+        )
+
+        def fail_extract(*_args, **_kwargs):
+            raise extraction_error
+
+        monkeypatch.setattr(engine_module, "extract_archives", fail_extract)
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda cleanup_job, strict: cleanup_calls.append(
+                (str(cleanup_job["job_id"]), strict)
+            )
+            or True,
+        )
+
+        engine._run_extract(job)
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert updated["state"] == "manual_review"
+        assert updated["last_error_code"] == expected_code
+        assert review.parent == engine.config.series_review_dir
+        assert (review / "original" / f"{job['name']}.rar").read_bytes() == b"archive"
+        assert (review / partial.relative_to(job_root)).read_bytes() == b"partial"
+        assert (review / "Revision de serie.txt").is_file()
+        assert reason["reason"] == expected_code
+        assert reason["phase"] == "extract"
+        assert len(str(reason["_arr_review_signature"])) == 64
+        assert cleanup_calls == [(str(job["job_id"]), True)]
+        assert not job_root.exists()
+        assert not any(engine.config.review_dir.iterdir())
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("tamper_mode", ["mutate", "delete"])
+def test_series_extraction_review_blocks_cleanup_if_preserved_pack_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper_mode: str,
+) -> None:
+    engine, database = _engine(tmp_path)
+    cleanup_calls: list[str] = []
+    try:
+        job, _job_root, _original, _partial = _ready_extract_job(
+            engine,
+            database,
+            category="tv",
+            name="Mi Serie S01E04",
+        )
+        monkeypatch.setattr(
+            engine_module,
+            "extract_archives",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ExtractionError("extract_tool_failed", "Fallo controlado")
+            ),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda cleanup_job, strict: cleanup_calls.append(
+                f"{cleanup_job['job_id']}:{strict}"
+            )
+            or False,
+        )
+
+        engine._run_extract(job)
+
+        pending = database.get_job(str(job["job_id"]))
+        review = Path(str(pending["stage_path"]))
+        assert pending["last_error_code"] == "extract_tool_failed_client_cleanup_pending"
+        assert cleanup_calls == [f"{job['job_id']}:True"]
+        if tamper_mode == "delete":
+            shutil.rmtree(review)
+        else:
+            preserved_archive = review / "original" / f"{job['name']}.rar"
+            preserved_archive.write_bytes(b"archive-manipulado")
+
+        engine._reconcile_late_worker_results()
+
+        blocked = database.get_job(str(job["job_id"]))
+        assert blocked["state"] == "manual_review"
+        assert blocked["last_error_code"] == "extract_tool_failed_review_integrity_failed"
+        assert cleanup_calls == [f"{job['job_id']}:True"]
+    finally:
+        database.close()
+
+
+def test_series_extraction_failure_keeps_clients_when_preservation_is_unconfirmed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    cleanup_calls: list[bool] = []
+    signature_calls = 0
+    try:
+        job, job_root, _original, _partial = _ready_extract_job(
+            engine,
+            database,
+            category="tv",
+            name="Mi Serie S01E02",
+        )
+
+        def fail_extract(*_args, **_kwargs):
+            raise ExtractionError(
+                "extract_tool_failed",
+                "La herramienta de extraccion fallo",
+            )
+
+        def mismatched_signature(path: Path, *, whole_tree: bool = False):
+            nonlocal signature_calls
+            signature_calls += 1
+            signature = review_content_signature(path, whole_tree=whole_tree)
+            if signature_calls == 2:
+                return [*signature, ("__mismatch__", 0, "0" * 64)]
+            return signature
+
+        monkeypatch.setattr(engine_module, "extract_archives", fail_extract)
+        monkeypatch.setattr(
+            engine_module,
+            "review_content_signature",
+            mismatched_signature,
+        )
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda *_args, **_kwargs: cleanup_calls.append(True) or True,
+        )
+
+        engine._run_extract(job)
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        assert updated["state"] == "manual_review"
+        assert (
+            updated["last_error_code"]
+            == "extract_tool_failed_preservation_unconfirmed"
+        )
+        assert review.parent == engine.config.series_review_dir
+        assert review.exists()
+        assert cleanup_calls == []
+        assert not job_root.exists()
+        assert not any(engine.config.review_dir.iterdir())
+    finally:
+        database.close()
+
+
+def test_series_extraction_review_retries_failed_client_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    cleanup_outcomes = iter((False, True))
+    cleanup_calls: list[str] = []
+    try:
+        job, _job_root, _original, _partial = _ready_extract_job(
+            engine,
+            database,
+            category="tv",
+            name="Mi Serie S01E03",
+        )
+
+        monkeypatch.setattr(
+            engine_module,
+            "extract_archives",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                ExtractionError("extract_tool_failed", "Fallo controlado")
+            ),
+        )
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda cleanup_job, strict: cleanup_calls.append(
+                f"{cleanup_job['job_id']}:{strict}"
+            )
+            or next(cleanup_outcomes),
+        )
+
+        engine._run_extract(job)
+
+        pending = database.get_job(str(job["job_id"]))
+        pending_result = json.loads(str(pending["result_json"]))
+        assert pending["state"] == "manual_review"
+        assert pending["last_error_code"] == "extract_tool_failed_client_cleanup_pending"
+        assert pending_result["clients_cleanup_pending"] is True
+        assert Path(str(pending["stage_path"])).parent == engine.config.series_review_dir
+
+        now = time.time()
+        database.connect().executemany(
+            """
+            INSERT INTO jobs(
+                job_id, source_uid, origin, category, name, state,
+                created_at, updated_at, last_error_code
+            ) VALUES(?, ?, 'fs', 'movies', ?, 'manual_review', ?, ?, ?)
+            """,
+            [
+                (
+                    f"old-review-{index:03d}",
+                    f"old-review:{index:03d}",
+                    f"Revision antigua {index:03d}",
+                    now - 2000 + index,
+                    now - 2000 + index,
+                    "legacy_manual_review",
+                )
+                for index in range(501)
+            ],
+        )
+        database.connect().commit()
+        first_legacy_page = database.jobs_in_states(["manual_review"], 500)
+        assert str(job["job_id"]) not in {
+            str(candidate["job_id"]) for candidate in first_legacy_page
+        }
+
+        engine._reconcile_late_worker_results()
+
+        recovered = database.get_job(str(job["job_id"]))
+        recovered_result = json.loads(str(recovered["result_json"]))
+        assert recovered["state"] == "manual_review"
+        assert recovered["last_error_code"] == "extract_tool_failed"
+        assert recovered_result["clients_cleanup_pending"] is False
+        review = Path(str(recovered["stage_path"]))
+        durable_reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert durable_reason["clients_cleanup_pending"] is False
+        assert "limpiado sin borrar archivos" in (
+            review / "Revision de serie.txt"
+        ).read_text(encoding="utf-8")
+        assert cleanup_calls == [
+            f"{job['job_id']}:True",
+            f"{job['job_id']}:True",
+        ]
+    finally:
+        database.close()
+
+
+def test_movie_extraction_failure_keeps_legacy_review_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    cleanup_calls: list[bool] = []
+    try:
+        job, job_root, _original, partial = _ready_extract_job(
+            engine,
+            database,
+            category="movies",
+            name="Mi Pelicula (2026)",
+        )
+
+        def fail_extract(*_args, **_kwargs):
+            raise ExtractionError(
+                "extract_volume_missing",
+                "Falta el siguiente volumen del archivo",
+            )
+
+        monkeypatch.setattr(engine_module, "extract_archives", fail_extract)
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda *_args, **_kwargs: cleanup_calls.append(True) or True,
+        )
+
+        engine._run_extract(job)
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        assert updated["state"] == "error_terminal"
+        assert updated["last_error_code"] == "extract_volume_missing"
+        assert review.parent == engine.config.review_dir
+        assert (review / partial.relative_to(job_root)).read_bytes() == b"partial"
+        assert (review / "Error de extraccion.txt").is_file()
+        assert cleanup_calls == []
+        assert not any(engine.config.series_review_dir.iterdir())
     finally:
         database.close()
 
@@ -2084,8 +2438,10 @@ def test_new_profile_snapshot_cannot_fall_back_when_series_route_is_missing(
         (["Mi Serie S01E01.mkv"], {(1, 1)}),
         (["Mi Serie S01E01-E02.mkv"], {(1, 1), (1, 2)}),
         (["Mi Serie S01E01-E03.mkv"], {(1, 1), (1, 2), (1, 3)}),
+        (["Mi Serie S01E01-E03E05.mkv"], {(1, 1), (1, 2), (1, 3), (1, 5)}),
         (["Mi Serie S01E01E02.mkv"], {(1, 1), (1, 2)}),
         (["Mi Serie 1x01-03.mkv"], {(1, 1), (1, 2), (1, 3)}),
+        (["Mi Serie 1x01-03x05.mkv"], {(1, 1), (1, 2), (1, 3), (1, 5)}),
         (["Mi Serie 1x01x02.mkv"], {(1, 1), (1, 2)}),
         (["Mi Serie S00E01.mkv"], {(0, 1)}),
         (

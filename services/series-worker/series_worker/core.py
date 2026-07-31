@@ -13,6 +13,7 @@ import time
 import unicodedata
 import urllib.request
 import uuid
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -41,6 +42,7 @@ from .manifest import (
     ManifestSidecar,
     SeriesManifest,
     discover_manifest,
+    episode_cluster_numbers,
     validate_relative_path,
 )
 from .processing import (
@@ -59,7 +61,6 @@ JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 EPISODE_TOKEN_RE = re.compile(
     r"(?i)(?<![A-Z0-9])S(?P<season>\d{1,3})(?P<body>E\d{1,3}(?:(?:[ ._-]*E|[ ._-]+)\d{1,3})*)"
 )
-EPISODE_NUMBER_RE = re.compile(r"(?i)E?(\d{1,3})")
 PAYLOAD_KEYS = {
     "job_id",
     "job_root",
@@ -625,7 +626,7 @@ def _episode_identity(path: Path) -> tuple[int, frozenset[int]] | None:
     match = EPISODE_TOKEN_RE.search(path.stem)
     if match is None:
         return None
-    episodes = frozenset(int(value) for value in EPISODE_NUMBER_RE.findall(match.group("body")))
+    episodes = frozenset(episode_cluster_numbers(match.group("body")))
     if not episodes:
         return None
     return int(match.group("season")), episodes
@@ -827,10 +828,72 @@ def _cleanup_prepared_staging(prepared: PreparedJob) -> None:
     fsync_directory(staging.parent)
 
 
+def _copy_verified_file(
+    source: Path,
+    destination: Path,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    label: str,
+) -> str:
+    if (
+        not isinstance(expected_size, int)
+        or isinstance(expected_size, bool)
+        or expected_size <= 0
+        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or "") is None
+    ):
+        raise SeriesWorkerError(f"Evidencia verificada inválida: {label}")
+    if source.is_symlink() or not source.is_file():
+        raise SeriesWorkerError(f"Archivo verificado inválido: {label}")
+    if destination.exists() or destination.is_symlink():
+        raise SeriesWorkerError(f"Destino preparado duplicado: {label}")
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.copy")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(source, flags)
+    digest = hashlib.sha256()
+    copied = 0
+    try:
+        path_before = source.lstat()
+        opened_before = os.fstat(descriptor)
+        if stat.S_ISLNK(opened_before.st_mode) or not stat.S_ISREG(opened_before.st_mode):
+            raise SeriesWorkerError(f"Archivo verificado no regular: {label}")
+        with os.fdopen(descriptor, "rb", closefd=False) as source_handle:
+            with temporary.open("xb") as destination_handle:
+                while chunk := source_handle.read(1024 * 1024):
+                    destination_handle.write(chunk)
+                    digest.update(chunk)
+                    copied += len(chunk)
+                destination_handle.flush()
+                os.fsync(destination_handle.fileno())
+        opened_after = os.fstat(descriptor)
+        path_after = source.lstat()
+        identities = {
+            (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+            for item in (path_before, opened_before, opened_after, path_after)
+        }
+        if len(identities) != 1:
+            raise SeriesWorkerError(f"El archivo cambió durante la copia: {label}")
+        if copied != expected_size or digest.hexdigest() != expected_sha256:
+            raise SeriesWorkerError(
+                f"El archivo verificado cambió antes de copiar: {label}"
+            )
+        os.replace(temporary, destination)
+        fsync_directory(destination.parent)
+    finally:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+    destination_size, destination_sha256 = _hash_published_file(destination)
+    if destination_size != expected_size or destination_sha256 != expected_sha256:
+        destination.unlink(missing_ok=True)
+        fsync_directory(destination.parent)
+        raise SeriesWorkerError(f"La copia preparada no coincide: {label}")
+    return expected_sha256
+
+
 def _copy_provisional_to_prepared(
     prepared: PreparedJob,
     processing: ProcessingResult | None,
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], dict[str, str]]:
     destination_root = prepared.prepared_series_root
     if destination_root is None:
         raise SeriesWorkerError("No existe staging de publicación")
@@ -847,6 +910,7 @@ def _copy_provisional_to_prepared(
         prepared.rules_snapshot.rules["subtitulos"]["sufijo_srt_externo"]
     )
     expected_files: list[str] = []
+    expected_file_digests: dict[str, str] = {}
     final_series_root = prepared.collision.final_series_root
     if final_series_root is None:
         raise SeriesWorkerError("No existe raíz final de la serie")
@@ -907,33 +971,90 @@ def _copy_provisional_to_prepared(
             raise ReviewRequiredError(
                 f"La biblioteca cambió: {entry.target_relpath}"
             )
-        expected_files.append(relative.as_posix())
+        relative_text = relative.as_posix()
+        _destination_size, destination_sha256 = _hash_published_file(destination)
+        if destination_sha256 != entry.content_sha256:
+            raise ReviewRequiredError(
+                f"La biblioteca cambió: {entry.target_relpath}"
+            )
+        expected_files.append(relative_text)
+        expected_file_digests[relative_text] = entry.content_sha256
     for entry in prepared.collision.pending:
         episode = by_source.get(entry.source_relpath)
         if episode is None:
             raise SeriesWorkerError(f"Falta salida verificada: {entry.source_relpath}")
+        provisional_relative = validate_relative_path(episode.provisional_relpath)
         provisional = prepared.payload.job_root / Path(
-            *PurePosixPath(episode.provisional_relpath).parts
+            *PurePosixPath(provisional_relative).parts
         )
-        if provisional.is_symlink() or not provisional.is_file():
-            raise SeriesWorkerError(f"Salida provisional inválida: {entry.source_relpath}")
+        expected_provisional = (
+            prepared.payload.job_root
+            / "series_work"
+            / "processed"
+            / Path(*PurePosixPath(entry.target_relpath).parts)
+        ).with_suffix(".mkv")
+        if provisional != expected_provisional:
+            raise SeriesWorkerError(
+                f"Salida provisional fuera de su destino: {entry.source_relpath}"
+            )
         target_parts = PurePosixPath(entry.target_relpath).parts
         relative = Path(*target_parts[1:])
         destination = destination_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(provisional, destination)
-        expected_files.append(relative.as_posix())
-        provisional_srt = provisional.with_name(f"{provisional.stem}{subtitle_suffix}")
-        if provisional_srt.is_file() and not provisional_srt.is_symlink():
+        relative_text = relative.as_posix()
+        expected_file_digests[relative_text] = _copy_verified_file(
+            provisional,
+            destination,
+            expected_size=episode.output_size,
+            expected_sha256=episode.output_sha256,
+            label=entry.source_relpath,
+        )
+        expected_files.append(relative_text)
+        expected_srt = provisional.with_name(f"{provisional.stem}{subtitle_suffix}")
+        subtitle_evidence = (
+            episode.subtitle_provisional_relpath,
+            episode.subtitle_size,
+            episode.subtitle_sha256,
+        )
+        if any(value is not None for value in subtitle_evidence) and not all(
+            value is not None for value in subtitle_evidence
+        ):
+            raise SeriesWorkerError(
+                f"Evidencia de sidecar incompleta: {entry.source_relpath}"
+            )
+        if episode.subtitle_provisional_relpath is not None:
+            subtitle_relative = validate_relative_path(
+                episode.subtitle_provisional_relpath
+            )
+            provisional_srt = prepared.payload.job_root / Path(
+                *PurePosixPath(subtitle_relative).parts
+            )
+            if provisional_srt != expected_srt:
+                raise SeriesWorkerError(
+                    f"Sidecar verificado fuera de su destino: {entry.source_relpath}"
+                )
             subtitle_destination = destination.with_name(
                 f"{destination.stem}{subtitle_suffix}"
             )
-            shutil.copy2(
+            subtitle_text = subtitle_destination.relative_to(
+                destination_root
+            ).as_posix()
+            expected_file_digests[subtitle_text] = _copy_verified_file(
                 provisional_srt,
                 subtitle_destination,
+                expected_size=episode.subtitle_size,
+                expected_sha256=episode.subtitle_sha256 or "",
+                label=f"{entry.source_relpath} (SRT)",
             )
-            expected_files.append(subtitle_destination.relative_to(destination_root).as_posix())
-    return tuple(sorted(expected_files, key=str.casefold))
+            expected_files.append(subtitle_text)
+        elif expected_srt.exists() or expected_srt.is_symlink():
+            raise SeriesWorkerError(
+                f"Apareció un sidecar no verificado: {entry.source_relpath}"
+            )
+    ordered_files = tuple(sorted(expected_files, key=str.casefold))
+    if set(ordered_files) != set(expected_file_digests):
+        raise SeriesWorkerError("La evidencia preparada no cubre todo el pack")
+    return ordered_files, expected_file_digests
 
 
 def _allowed_existing_publication_files(
@@ -2202,14 +2323,22 @@ class SeriesCoordinator:
                 operational_preflight = self._operational_preflight(
                     validated.final_root
                 )
-            lock_context = self.lock_factory(
-                self.lock_path,
-                timeout_sec=0,
-            )
-            try:
+            if committed_recovery_only:
+                lock_context = nullcontext(
+                    {"enabled": False, "reason": "committed_recovery"}
+                )
                 lock_context.__enter__()
-            except HeavyLockTimeout as error:
-                raise SeriesWorkerBusy("El motor audiovisual compartido está ocupado") from error
+            else:
+                lock_context = self.lock_factory(
+                    self.lock_path,
+                    timeout_sec=0,
+                )
+                try:
+                    lock_context.__enter__()
+                except HeavyLockTimeout as error:
+                    raise SeriesWorkerBusy(
+                        "El motor audiovisual compartido está ocupado"
+                    ) from error
             try:
                 active_record = {
                     "job_id": validated.job_id,
@@ -2619,7 +2748,10 @@ class SeriesCoordinator:
                     "Biblioteca cambió; pack enviado a revisión",
                 )
                 return result
-            expected_files = _copy_provisional_to_prepared(prepared, processing)
+            expected_files, expected_file_digests = _copy_provisional_to_prepared(
+                prepared,
+                processing,
+            )
             allowed_existing_files = _allowed_existing_publication_files(
                 prepared,
                 expected_files,
@@ -2632,6 +2764,7 @@ class SeriesCoordinator:
                 prepared.collision.final_series_root,
                 prepared.journal,
                 expected_files=expected_files,
+                expected_file_digests=expected_file_digests,
                 allowed_existing_files=allowed_existing_files,
             )
             if delivery_result.get("status") != "committed":

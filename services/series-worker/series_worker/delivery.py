@@ -337,6 +337,43 @@ def _normalize_allowed_existing_files(
     return normalized
 
 
+def _normalize_expected_file_digests(
+    expected_digests: Mapping[Path | str, str] | None,
+    expected_files: frozenset[str] | None,
+) -> dict[str, str]:
+    if expected_digests is None:
+        return {}
+    if not isinstance(expected_digests, Mapping):
+        raise TypeError("expected_file_digests debe ser un mapa ruta -> sha256")
+    normalized: dict[str, str] = {}
+    for raw_path, raw_digest in expected_digests.items():
+        text = os.fspath(raw_path)
+        if not isinstance(text, str):
+            raise TypeError("expected_file_digests solo admite rutas de texto")
+        relative = PurePosixPath(text.replace("\\", "/"))
+        value = relative.as_posix()
+        digest = str(raw_digest or "")
+        if (
+            relative.is_absolute()
+            or relative == PurePosixPath(".")
+            or ".." in relative.parts
+            or relative.parts == (MARKER_NAME,)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise DeliveryError(f"Huella esperada no segura: {text!r}")
+        if value in normalized:
+            raise DeliveryError(f"Huella esperada duplicada: {value}")
+        normalized[value] = digest
+    if expected_files is not None and frozenset(normalized) != expected_files:
+        missing = sorted(expected_files - frozenset(normalized))[:5]
+        unexpected = sorted(frozenset(normalized) - expected_files)[:5]
+        raise DeliveryError(
+            "expected_file_digests no cubre expected_files "
+            f"(faltan={missing}, sobran={unexpected})"
+        )
+    return normalized
+
+
 def _prepared_file_set(root: Path, *, allow_marker: bool) -> frozenset[str]:
     files: set[str] = set()
     for current, directories, filenames in os.walk(root, followlinks=False):
@@ -600,11 +637,13 @@ def _path_entry_exists(path: Path) -> bool:
 
 
 def _read_marker(root: Path) -> dict[str, Any] | None:
-    if root.is_symlink():
-        _raise_ambiguous(f"la raiz esperada es un enlace simbolico: {root}")
-    if not root.exists():
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError:
         return None
-    if not root.is_dir():
+    if stat.S_ISLNK(root_info.st_mode):
+        _raise_ambiguous(f"la raiz esperada es un enlace simbolico: {root}")
+    if not stat.S_ISDIR(root_info.st_mode):
         _raise_ambiguous(f"la raiz esperada no es un directorio normal: {root}")
     marker_path = root / MARKER_NAME
     if marker_path.is_symlink():
@@ -886,6 +925,19 @@ def _required_allowed_existing_files(details: dict[str, Any]) -> dict[str, str]:
         ) from error
 
 
+def _durable_expected_file_digests(details: dict[str, Any]) -> dict[str, str]:
+    raw = details.get("expected_file_digests")
+    if raw is None:
+        # Compatibilidad exclusiva con journals creados antes de esta huella.
+        return {}
+    try:
+        return _normalize_expected_file_digests(raw, None)
+    except (DeliveryError, TypeError) as error:
+        raise RecoveryAmbiguous(
+            "recovery_ambiguous: huellas durables de publicación inválidas"
+        ) from error
+
+
 def _verify_allowed_existing_files(
     root: Path,
     allowed_existing_files: Mapping[str, str],
@@ -912,6 +964,31 @@ def _verify_allowed_existing_files(
             raise DeliveryConflict(
                 f"La colisión prevista cambió antes de EXCHANGE: {relative}"
             )
+
+
+def _verify_expected_file_digests(
+    root: Path,
+    expected_file_digests: Mapping[str, str],
+    *,
+    recovery: bool,
+    label: str,
+) -> None:
+    for relative, expected_digest in expected_file_digests.items():
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        try:
+            actual_digest = _stable_file_sha256(path)
+        except (DeliveryConflict, OSError) as error:
+            if recovery:
+                raise RecoveryAmbiguous(
+                    f"recovery_ambiguous: {label} ya no es verificable: {relative}"
+                ) from error
+            raise DeliveryConflict(
+                f"{label} cambió antes de publicar: {relative}"
+            ) from error
+        if actual_digest != expected_digest:
+            if recovery:
+                _raise_ambiguous(f"{label} cambió antes de recuperar: {relative}")
+            raise DeliveryConflict(f"{label} cambió antes de publicar: {relative}")
 
 
 def _verify_tree_signature(path: Path, expected: str, label: str) -> None:
@@ -969,18 +1046,23 @@ def _remove_owned_shadow(
     expected = _shadow_path(final, job_id, generation)
     if shadow != expected or shadow.parent != final.parent:
         _raise_ambiguous("el shadow registrado no coincide con el nombre derivado")
-    if shadow.is_symlink():
-        _raise_ambiguous("el shadow no puede ser un enlace simbolico")
-    if not shadow.exists():
+    try:
+        info = shadow.lstat()
+    except FileNotFoundError:
         return
+    if stat.S_ISLNK(info.st_mode):
+        _raise_ambiguous("el shadow no puede ser un enlace simbolico")
+    if not stat.S_ISDIR(info.st_mode):
+        _raise_ambiguous("el shadow no es un directorio normal")
     marker = _read_marker(shadow)
     if marker is not None and not _is_generation(marker, job_id, generation):
         _raise_ambiguous("el shadow pertenece a otra generacion")
     if marker is None and not allow_unmarked:
         _raise_ambiguous("el shadow carece del marcador de propiedad")
-    if shadow.is_symlink() or not shadow.is_dir():
-        _raise_ambiguous("el shadow no es un directorio normal")
-    shutil.rmtree(shadow)
+    try:
+        shutil.rmtree(shadow)
+    except FileNotFoundError:
+        return
     fsync_directory(shadow.parent)
 
 
@@ -1275,6 +1357,14 @@ def _cleanup_committed_durable(
     if snapshot is None or snapshot["state"] != "COMMITTED":
         _raise_ambiguous("cleanup solo puede empezar desde COMMITTED")
     details = snapshot["details"]
+    expected_file_digests = _durable_expected_file_digests(details)
+    if expected_file_digests:
+        _verify_expected_file_digests(
+            final,
+            expected_file_digests,
+            recovery=True,
+            label="La publicación antes de cleanup",
+        )
     durable_identities = _required_cleanup_identities(details, mode)
     started = details.get("cleanup_started")
     complete = details.get("cleanup_complete")
@@ -1375,6 +1465,32 @@ def _commit_exchange(shadow: Path, final: Path) -> None:
     fsync_directory(final.parent)
 
 
+def _record_rollback_intent(
+    journal: DurableJournal,
+    *,
+    mode: str,
+    reason: BaseException,
+) -> str:
+    snapshot = journal.snapshot()
+    if snapshot is None or snapshot["state"] != "COMMITTING":
+        _raise_ambiguous("rollback atómico fuera de COMMITTING")
+    details = snapshot["details"]
+    existing = details.get("rollback_intent")
+    failure_code = str(
+        details.get("rollback_failure_code")
+        or getattr(reason, "code", type(reason).__name__)
+    )
+    if existing is None:
+        journal.transition(
+            "COMMITTING",
+            rollback_intent=mode,
+            rollback_failure_code=failure_code,
+        )
+    elif existing != mode:
+        _raise_ambiguous("el journal contradice la intención de rollback")
+    return failure_code
+
+
 def _rollback_completed_exchange(
     journal: DurableJournal,
     *,
@@ -1384,6 +1500,11 @@ def _rollback_completed_exchange(
     generation: str,
     reason: BaseException,
 ) -> dict[str, Any]:
+    failure_code = _record_rollback_intent(
+        journal,
+        mode="exchange",
+        reason=reason,
+    )
     if not _is_generation(_read_marker(final), job_id, generation):
         _raise_ambiguous("no se puede revertir: la generación nueva no está publicada")
     if not shadow.is_dir() or shadow.is_symlink() or _read_marker(shadow) is not None:
@@ -1395,7 +1516,7 @@ def _rollback_completed_exchange(
         _raise_ambiguous("el rollback no recuperó la generación candidata")
     journal.transition(
         "ROLLED_BACK",
-        failure_code=getattr(reason, "code", type(reason).__name__),
+        failure_code=failure_code,
         rollback_after_exchange=True,
     )
     _remove_owned_shadow(
@@ -1410,6 +1531,57 @@ def _rollback_completed_exchange(
         "job_id": job_id,
         "generation": generation,
         "mode": "exchange",
+        "recovered": True,
+    }
+
+
+def _rollback_completed_new(
+    journal: DurableJournal,
+    *,
+    prepared: Path,
+    final: Path,
+    job_id: str,
+    generation: str,
+    reason: BaseException,
+) -> dict[str, Any]:
+    failure_code = _record_rollback_intent(
+        journal,
+        mode="new",
+        reason=reason,
+    )
+    if not _is_generation(_read_marker(final), job_id, generation):
+        _raise_ambiguous("no se puede revertir: la serie nueva no está publicada")
+    if _path_entry_exists(prepared):
+        _raise_ambiguous("no se puede revertir: reapareció el staging de serie nueva")
+    try:
+        _rename_noreplace(final, prepared)
+    except OSError as error:
+        raise RecoveryAmbiguous(
+            "recovery_ambiguous: no se pudo ocultar la serie nueva inválida"
+        ) from error
+    fsync_directory(final.parent)
+    fsync_directory(prepared.parent)
+    if _path_entry_exists(final) or not _is_generation(
+        _read_marker(prepared),
+        job_id,
+        generation,
+    ):
+        _raise_ambiguous("el rollback de serie nueva no recuperó el candidato")
+    journal.transition(
+        "ROLLED_BACK",
+        failure_code=failure_code,
+        rollback_after_new=True,
+    )
+    _remove_owned_prepared_marker(
+        prepared,
+        job_id=job_id,
+        generation=generation,
+    )
+    return {
+        "status": "rolled_back",
+        "job_id": job_id,
+        "generation": generation,
+        "mode": "new",
         "recovered": True,
     }
 
@@ -1489,14 +1661,85 @@ def _recover_delivery_locked(
     base_signature: str | None = None
     candidate_identity: dict[str, int] | None = None
     allowed_existing_files: dict[str, str] = {}
+    expected_file_digests: dict[str, str] = {}
     if state in {"VERIFIED", "COMMITTING", "COMMITTED"}:
         candidate_signature = _required_signature(details, "candidate_signature")
         prepared_signature = _required_signature(details, "prepared_signature")
         candidate_identity = _required_root_identity(details, "candidate_identity")
         _required_cleanup_identities(details, mode)
+        expected_file_digests = _durable_expected_file_digests(details)
         if mode == "exchange":
             base_signature = _required_signature(details, "base_signature")
             allowed_existing_files = _required_allowed_existing_files(details)
+
+    rollback_intent = details.get("rollback_intent")
+    if state == "COMMITTING" and rollback_intent is not None:
+        failure_code = str(details.get("rollback_failure_code") or "rollback_pending")
+        pending_reason = RecoveryAmbiguous("rollback durable pendiente")
+        if rollback_intent == "new":
+            if final_is_new:
+                return _rollback_completed_new(
+                    journal,
+                    prepared=prepared,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    reason=pending_reason,
+                )
+            if prepared_is_new and not _path_entry_exists(final):
+                journal.transition(
+                    "ROLLED_BACK",
+                    failure_code=failure_code,
+                    rollback_after_new=True,
+                    rollback_recovered=True,
+                )
+                _remove_owned_prepared_marker(
+                    prepared,
+                    job_id=job,
+                    generation=generation,
+                )
+                return {
+                    "status": "rolled_back",
+                    "job_id": job,
+                    "generation": generation,
+                    "mode": "new",
+                    "recovered": True,
+                }
+            _raise_ambiguous("rollback nuevo no puede localizar la generación")
+        if rollback_intent == "exchange":
+            assert shadow is not None
+            if final_is_new and not shadow_is_new:
+                return _rollback_completed_exchange(
+                    journal,
+                    shadow=shadow,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    reason=pending_reason,
+                )
+            if shadow_is_new and not final_is_new:
+                journal.transition(
+                    "ROLLED_BACK",
+                    failure_code=failure_code,
+                    rollback_after_exchange=True,
+                    rollback_recovered=True,
+                )
+                _remove_owned_shadow(
+                    shadow,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    allow_unmarked=False,
+                )
+                return {
+                    "status": "rolled_back",
+                    "job_id": job,
+                    "generation": generation,
+                    "mode": "exchange",
+                    "recovered": True,
+                }
+            _raise_ambiguous("rollback exchange no puede localizar la generación")
+        _raise_ambiguous("intención de rollback no válida")
 
     if state == "COMMITTED":
         if not final_is_new:
@@ -1504,6 +1747,13 @@ def _recover_delivery_locked(
         if prepared_is_new or shadow_is_new:
             _raise_ambiguous("COMMITTED con dos copias de la generacion activa")
         assert candidate_identity is not None
+        if expected_file_digests:
+            _verify_expected_file_digests(
+                final,
+                expected_file_digests,
+                recovery=True,
+                label="La publicación COMMITTED",
+            )
         _verify_root_identity(final, candidate_identity, "biblioteca publicada")
         pending = _cleanup_committed_durable(
             journal,
@@ -1567,10 +1817,34 @@ def _recover_delivery_locked(
         assert candidate_signature is not None
         assert candidate_identity is not None
         if final_is_new:
-            _verify_root_identity(final, candidate_identity, "biblioteca publicada")
+            try:
+                if expected_file_digests:
+                    _verify_expected_file_digests(
+                        final,
+                        expected_file_digests,
+                        recovery=True,
+                        label="La publicación nueva",
+                    )
+                _verify_root_identity(final, candidate_identity, "biblioteca publicada")
+            except RecoveryAmbiguous as error:
+                return _rollback_completed_new(
+                    journal,
+                    prepared=prepared,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    reason=error,
+                )
             if prepared.exists():
                 _raise_ambiguous("la generacion nueva existe en staging y biblioteca")
         elif prepared_is_new and not final.exists():
+            if expected_file_digests:
+                _verify_expected_file_digests(
+                    prepared,
+                    expected_file_digests,
+                    recovery=True,
+                    label="El candidato nuevo",
+                )
             _verify_tree_signature(prepared, candidate_signature, "candidato nuevo")
             _verify_root_identity(prepared, candidate_identity, "candidato nuevo")
             preflight_atomic_exchange(final.parent)
@@ -1586,7 +1860,24 @@ def _recover_delivery_locked(
         if final_is_new:
             if shadow_is_new:
                 _raise_ambiguous("la generacion nueva aparece en ambos lados")
-            _verify_root_identity(final, candidate_identity, "biblioteca publicada")
+            try:
+                if expected_file_digests:
+                    _verify_expected_file_digests(
+                        final,
+                        expected_file_digests,
+                        recovery=True,
+                        label="La publicación intercambiada",
+                    )
+                _verify_root_identity(final, candidate_identity, "biblioteca publicada")
+            except RecoveryAmbiguous as error:
+                return _rollback_completed_exchange(
+                    journal,
+                    shadow=shadow,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    reason=error,
+                )
             assert shadow is not None
             try:
                 _verify_allowed_existing_files(
@@ -1606,6 +1897,13 @@ def _recover_delivery_locked(
         elif shadow_is_new and final.is_dir():
             if not prepared.exists():
                 _raise_ambiguous("falta prepared_series_root antes de EXCHANGE")
+            if expected_file_digests:
+                _verify_expected_file_digests(
+                    shadow,
+                    expected_file_digests,
+                    recovery=True,
+                    label="El candidato shadow",
+                )
             _verify_tree_signature(
                 prepared,
                 prepared_signature,
@@ -1646,6 +1944,34 @@ def _recover_delivery_locked(
     if not _is_generation(final_marker, job, generation):
         _raise_ambiguous("el syscall termino sin el marcador nuevo en biblioteca")
     assert candidate_identity is not None
+    if expected_file_digests:
+        try:
+            _verify_expected_file_digests(
+                final,
+                expected_file_digests,
+                recovery=True,
+                label="La biblioteca publicada",
+            )
+        except RecoveryAmbiguous as error:
+            if mode == "exchange" and shadow is not None:
+                return _rollback_completed_exchange(
+                    journal,
+                    shadow=shadow,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    reason=error,
+                )
+            if mode == "new":
+                return _rollback_completed_new(
+                    journal,
+                    prepared=prepared,
+                    final=final,
+                    job_id=job,
+                    generation=generation,
+                    reason=error,
+                )
+            raise
     _verify_root_identity(final, candidate_identity, "biblioteca publicada")
     _confirm_published_durable(
         mode=mode,
@@ -1697,6 +2023,7 @@ def publish_series(
     journal: DurableJournal,
     *,
     expected_files: Iterable[Path | str] | None = None,
+    expected_file_digests: Mapping[Path | str, str] | None = None,
     allowed_existing_files: Mapping[Path | str, str] | None = None,
 ) -> dict[str, Any]:
     """Publica una raiz no vacia y valida exactamente ``expected_files``."""
@@ -1706,6 +2033,10 @@ def publish_series(
         raise ValueError("job_id no puede estar vacio")
     prepared, final = _canonical_paths(prepared_series_root, final_series_root)
     expected = _normalize_expected_files(expected_files)
+    expected_digests = _normalize_expected_file_digests(
+        expected_file_digests,
+        expected,
+    )
     allowed_existing = _normalize_allowed_existing_files(
         allowed_existing_files,
         expected,
@@ -1723,6 +2054,13 @@ def publish_series(
             expected,
             allow_marker=allow_marker,
         )
+        if expected_digests:
+            _verify_expected_file_digests(
+                prepared,
+                expected_digests,
+                recovery=False,
+                label="El árbol preparado",
+            )
         _validate_logical_tree(prepared)
         return _publish_series_locked(
             job,
@@ -1730,6 +2068,7 @@ def publish_series(
             final,
             journal,
             expected,
+            expected_digests,
             allowed_existing,
         )
 
@@ -1740,6 +2079,7 @@ def _publish_series_locked(
     final: Path,
     journal: DurableJournal,
     expected_files: frozenset[str] | None,
+    expected_file_digests: Mapping[str, str],
     allowed_existing_files: Mapping[str, str],
 ) -> dict[str, Any]:
     try:
@@ -1814,6 +2154,14 @@ def _publish_series_locked(
                 "prepared": _cleanup_root_identity(prepared),
             }
 
+        if expected_file_digests:
+            _verify_expected_file_digests(
+                candidate_root,
+                expected_file_digests,
+                recovery=False,
+                label="El candidato de publicación",
+            )
+
         verification_details = {
             "preflight": preflight,
             "candidate_signature": _signature_digest(candidate_signature),
@@ -1826,11 +2174,22 @@ def _publish_series_locked(
             verification_details["allowed_existing_files"] = dict(
                 sorted(allowed_existing_files.items())
             )
+        if expected_file_digests:
+            verification_details["expected_file_digests"] = dict(
+                sorted(expected_file_digests.items())
+            )
         journal.transition("VERIFIED", **verification_details)
         journal.transition("COMMITTING")
         _validate_prepared_contents(prepared, expected_files, allow_marker=mode == "new")
         if _tree_signature(prepared) != prepared_signature:
             raise DeliveryConflict("El arbol preparado cambio antes de publicar")
+        if expected_file_digests:
+            _verify_expected_file_digests(
+                candidate_root,
+                expected_file_digests,
+                recovery=False,
+                label="El candidato de publicación",
+            )
         if mode == "new":
             if final.exists():
                 raise DeliveryConflict("La serie final aparecio antes de NOREPLACE")
@@ -1857,6 +2216,13 @@ def _publish_series_locked(
 
         if not _is_generation(_read_marker(final), job, generation):
             _raise_ambiguous("la raiz publicada no lleva el marcador esperado")
+        if expected_file_digests:
+            _verify_expected_file_digests(
+                final,
+                expected_file_digests,
+                recovery=False,
+                label="La biblioteca publicada",
+            )
         _verify_root_identity(
             final,
             verification_details["candidate_identity"],

@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 
 import pytest
+import series_worker.processing as processing_module
 
 from series_worker.manifest import discover_manifest
 from series_worker.processing import (
@@ -378,6 +379,60 @@ def test_internal_delay_subtitle_is_prioritized_and_exported(tmp_path: Path) -> 
 
     assert result.episodes[0].subtitle_mode == "internal_delay"
     assert (job / "series_work/processed/Serie/Season 01/Serie.S01E01.es.forced.srt").exists()
+
+
+def test_mkv_substitution_after_full_verification_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relative = "Serie/Season 01/Serie.S01E01.mkv"
+    job, source, manifest = _job(tmp_path, [relative])
+    original_verify = processing_module._verify_output
+
+    def verify_then_mutate(path, plan, runner):
+        result = original_verify(path, plan, runner)
+        previous = path.stat()
+        content = bytearray(path.read_bytes())
+        content[0] ^= 1
+        path.write_bytes(content)
+        os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        return result
+
+    monkeypatch.setattr(processing_module, "_verify_output", verify_then_mutate)
+
+    with pytest.raises(EpisodeProcessingError, match="cambió durante su verificación"):
+        process_manifest(manifest, source, job, _snapshot(tmp_path), FakeRunner())
+
+
+def test_srt_substitution_after_validation_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    relative = "Serie/Season 01/Serie.S01E01.mkv"
+    job, source, manifest = _job(tmp_path, [relative])
+    subtitle = {
+        "index": 2,
+        "codec_type": "subtitle",
+        "codec_name": "subrip",
+        "tags": {"language": "spa", "title": "ESPAÑOL delay audio"},
+        "disposition": {"forced": 0},
+    }
+    runner = FakeRunner({"Serie.S01E01.mkv": _stream_probe(subtitle=subtitle)})
+    original_valid = processing_module._srt_valid
+
+    def validate_then_mutate(path):
+        valid = original_valid(path)
+        previous = path.stat()
+        content = bytearray(path.read_bytes())
+        content[-2] ^= 1
+        path.write_bytes(content)
+        os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        return valid
+
+    monkeypatch.setattr(processing_module, "_srt_valid", validate_then_mutate)
+
+    with pytest.raises(EpisodeProcessingError, match="subtítulo cambió"):
+        process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
 
 
 def test_external_spanish_subtitle_is_embedded(tmp_path: Path) -> None:

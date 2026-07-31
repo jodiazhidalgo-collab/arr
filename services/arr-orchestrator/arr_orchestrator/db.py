@@ -439,6 +439,27 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def jobs_in_state_with_error_suffix(
+        self,
+        state: str,
+        suffix: str,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        if not suffix or limit <= 0:
+            return []
+        rows = self.connect().execute(
+            """
+            SELECT * FROM jobs
+            WHERE state=?
+              AND last_error_code IS NOT NULL
+              AND substr(last_error_code, -length(?))=?
+            ORDER BY updated_at
+            LIMIT ?
+            """,
+            (state, suffix, suffix, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_jobs(self, limit: int = 50) -> List[Dict[str, Any]]:
         rows = self.connect().execute(
             "SELECT * FROM jobs ORDER BY updated_at DESC LIMIT ?", (limit,)

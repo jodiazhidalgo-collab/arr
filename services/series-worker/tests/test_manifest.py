@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from series_worker.manifest import ManifestError, discover_manifest, validate_relative_path
+from series_worker.manifest import (
+    ManifestError,
+    discover_manifest,
+    episode_cluster_numbers,
+    validate_relative_path,
+)
 
 
 def _video(root: Path, relative: str, content: bytes = b"video") -> Path:
@@ -33,13 +38,46 @@ def test_single_episode_builds_relative_mkv_target(tmp_path: Path) -> None:
 
 def test_multiepisode_is_one_physical_entry_with_multiple_ids(tmp_path: Path) -> None:
     source = tmp_path / "series_filebot_output"
-    _video(source, "Serie/Season 02/Serie.S02E04-E05.mkv")
+    _video(source, "Serie/Season 02/Serie.S02E04-E06.mkv")
 
     manifest = discover_manifest(source)
 
     assert manifest.ready
     assert len(manifest.entries) == 1
-    assert manifest.entries[0].episodes == (4, 5)
+    assert manifest.entries[0].episodes == (4, 5, 6)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("S01E01-E03", (1, 2, 3)),
+        ("S01E01-E03E05", (1, 2, 3, 5)),
+        ("S01E01E03-E05", (1, 3, 4, 5)),
+        ("E01-E03", (1, 2, 3)),
+        ("S01E01E02E03", (1, 2, 3)),
+        ("S01E01E02E01", (1, 2)),
+        ("S01E03-E01", (3, 1)),
+    ],
+)
+def test_episode_cluster_numbers_expands_only_safe_ascending_ranges(
+    value: str,
+    expected: tuple[int, ...],
+) -> None:
+    assert episode_cluster_numbers(value) == expected
+
+
+def test_range_claims_intermediate_episodes_for_pack_collision(tmp_path: Path) -> None:
+    source = tmp_path / "series_filebot_output"
+    _video(source, "Serie/Season 01/Serie.S01E01-E03E05.mkv", b"range")
+    _video(source, "Serie/Season 01/Serie.S01E02.1080p.mkv", b"single")
+
+    manifest = discover_manifest(source)
+
+    assert manifest.status == "review"
+    assert any(
+        reason.startswith("episodio_duplicado:S01E02:")
+        for reason in manifest.review_reasons
+    )
 
 
 def test_specials_keep_season_zero_instead_of_treating_it_as_missing(tmp_path: Path) -> None:

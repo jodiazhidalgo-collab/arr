@@ -135,14 +135,38 @@ def _clean_series_name(value: str) -> str:
     return value[:180]
 
 
+def episode_cluster_numbers(value: str) -> tuple[int, ...]:
+    """Lee un bloque de episodios y expande solo rangos ascendentes explícitos."""
+
+    match = EPISODE_RE.search(value)
+    body = match.group("body") if match is not None else value
+    matches = list(EPISODE_NUMBER_RE.finditer(body))
+    episodes: list[int] = []
+    index = 0
+    while index < len(matches):
+        current = int(matches[index].group(1))
+        if index + 1 < len(matches):
+            following = int(matches[index + 1].group(1))
+            separator = body[matches[index].end() : matches[index + 1].start()]
+            if (
+                current <= following
+                and re.fullmatch(r"[ ._]*-[ ._]*", separator) is not None
+            ):
+                episodes.extend(range(current, following + 1))
+                index += 2
+                continue
+        episodes.append(current)
+        index += 1
+    return tuple(dict.fromkeys(episodes))
+
+
 def _episode_data(path: Path, relative: Path) -> tuple[str, str, int, tuple[int, ...]] | None:
     match = EPISODE_RE.search(path.stem)
     if match is None:
         return None
     season = int(match.group("season"))
     body = match.group("body")
-    numbers = tuple(int(item) for item in EPISODE_NUMBER_RE.findall(body))
-    episodes = tuple(dict.fromkeys(numbers))
+    episodes = episode_cluster_numbers(body)
     if not episodes:
         return None
 
@@ -347,5 +371,6 @@ __all__ = [
     "SeriesManifest",
     "SUBTITLE_SIDECAR_EXTENSIONS",
     "discover_manifest",
+    "episode_cluster_numbers",
     "validate_relative_path",
 ]

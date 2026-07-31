@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import unicodedata
 import uuid
@@ -135,6 +136,10 @@ class ProcessedEpisode:
     target_relpath: str
     provisional_relpath: str
     output_size: int
+    output_sha256: str
+    subtitle_provisional_relpath: str | None
+    subtitle_size: int | None
+    subtitle_sha256: str | None
     audio_mode: str
     subtitle_mode: str
     verification: dict[str, Any]
@@ -668,6 +673,33 @@ def _content_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _stable_file_evidence(path: Path) -> tuple[int, str]:
+    """Obtiene tamaño y SHA del mismo archivo regular abierto, sin carreras de ruta."""
+
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ProcessingError("La salida verificada no es un archivo regular.")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    digest = hashlib.sha256()
+    try:
+        opened_before = os.fstat(descriptor)
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        opened_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after = path.lstat()
+    identities = {
+        (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+        for item in (before, opened_before, opened_after, after)
+    }
+    if len(identities) != 1:
+        raise ProcessingError("La salida cambió mientras se calculaba su huella.")
+    return int(after.st_size), digest.hexdigest()
+
+
 def _validated_sidecars(
     source_root: Path,
     sidecars: Sequence[ManifestSidecar],
@@ -894,7 +926,7 @@ def _export_subtitle(
     output: Path,
     rules: dict[str, Any],
     runner: Runner,
-) -> Path | None:
+) -> tuple[Path, int, str] | None:
     if plan.subtitle is None or not rules["limpieza"]["exportar_srt_externo"]:
         return None
     suffix = str(rules["subtitulos"]["sufijo_srt_externo"])
@@ -920,12 +952,18 @@ def _export_subtitle(
                 timeout=900,
                 label="exportación de subtítulo interno",
             )
+        evidence_before = _stable_file_evidence(temporary)
         if not _srt_valid(temporary):
             raise ProcessingError("El subtítulo externo provisional no es válido.")
+        evidence_after = _stable_file_evidence(temporary)
+        if evidence_after != evidence_before:
+            raise ProcessingError("El subtítulo cambió durante su verificación.")
         _fsync_file(temporary)
         os.replace(temporary, destination)
         _fsync_parent(destination)
-        return destination
+        if _stable_file_evidence(destination) != evidence_before:
+            raise ProcessingError("El subtítulo verificado cambió antes de congelarlo.")
+        return destination, evidence_before[0], evidence_before[1]
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -934,7 +972,11 @@ def _execute_plan(
     plan: EpisodePlan,
     rules_snapshot: RulesSnapshot,
     runner: Runner,
-) -> dict[str, Any]:
+) -> tuple[
+    dict[str, Any],
+    tuple[Path, int, str] | None,
+    tuple[int, str],
+]:
     output = plan.output
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.processing.mkv")
@@ -969,13 +1011,18 @@ def _execute_plan(
                     timeout=900,
                     label="capítulos MKV",
                 )
+        verified_evidence = _stable_file_evidence(temporary)
         verification = _verify_output(temporary, plan, runner)
+        if _stable_file_evidence(temporary) != verified_evidence:
+            raise ProcessingError("El MKV cambió durante su verificación completa.")
         verification["chapters"] = chapters
-        _export_subtitle(plan, output, rules_snapshot.rules, runner)
+        exported_subtitle = _export_subtitle(plan, output, rules_snapshot.rules, runner)
         _fsync_file(temporary)
         os.replace(temporary, output)
         _fsync_parent(output)
-        return verification
+        if _stable_file_evidence(output) != verified_evidence:
+            raise ProcessingError("El MKV verificado cambió antes de congelarlo.")
+        return verification, exported_subtitle, verified_evidence
     finally:
         temporary.unlink(missing_ok=True)
         chapter_file.unlink(missing_ok=True)
@@ -1048,13 +1095,28 @@ class SeriesProcessor:
                     ocr_workspace=ocr_workspace,
                     external_subtitles=frozen_sidecars,
                 )
-                verification = _execute_plan(plan, rules_snapshot, self.runner)
+                verification, exported_subtitle, output_evidence = _execute_plan(
+                    plan,
+                    rules_snapshot,
+                    self.runner,
+                )
+                output_size, output_sha256 = output_evidence
+                subtitle_relpath: str | None = None
+                subtitle_size: int | None = None
+                subtitle_sha256: str | None = None
+                if exported_subtitle is not None:
+                    exported_path, subtitle_size, subtitle_sha256 = exported_subtitle
+                    subtitle_relpath = exported_path.relative_to(job).as_posix()
                 completed.append(
                     ProcessedEpisode(
                         source_relpath=entry.source_relpath,
                         target_relpath=entry.target_relpath,
                         provisional_relpath=output.relative_to(job).as_posix(),
-                        output_size=output.stat().st_size,
+                        output_size=output_size,
+                        output_sha256=output_sha256,
+                        subtitle_provisional_relpath=subtitle_relpath,
+                        subtitle_size=subtitle_size,
+                        subtitle_sha256=subtitle_sha256,
                         audio_mode=plan.audio_mode,
                         subtitle_mode=plan.subtitle.mode if plan.subtitle else "none",
                         verification=verification,
