@@ -1,14 +1,22 @@
+import hashlib
 import json
 import shutil
 import tempfile
+import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from arr_orchestrator.config import Config
 from arr_orchestrator.db import Database
-from arr_orchestrator.engine import Engine, WORKER_ACTIVE_MAX_SECONDS
+from arr_orchestrator.engine import (
+    Engine,
+    TV_WATCHER_RULES_SETTING_KEY,
+    WATCHER_RULES_SETTING_KEY,
+    WORKER_ACTIVE_MAX_SECONDS,
+)
 from arr_orchestrator.filebot import MOVE_PATTERN, is_duplicate_output
 from arr_orchestrator.identity.fingerprint import identity_fingerprint
 from arr_orchestrator.filesystem import (
@@ -2276,6 +2284,225 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(empty_restarted.watcher_rules()["rules"]["ignored_suffixes"], [])
             self.assertFalse(empty_restarted._ignored_movies_item(item))
             database.close()
+
+    def test_watcher_profile_cas_uses_exact_sqlite_value_under_real_concurrency(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        first_database = None
+        second_database = None
+        try:
+            root = Path(temporary.name)
+            config = test_config(root)
+            config.ensure_directories()
+            first_database = Database(root / "test.db")
+            first_database.initialize()
+            second_database = Database(root / "test.db")
+            second_database.initialize()
+            first = Engine(config, first_database)
+            second = Engine(config, second_database)
+
+            def raw_fingerprint(setting_key, raw_value):
+                comparison_document = json.dumps(
+                    {"setting_key": setting_key, "value": raw_value},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                return hashlib.sha256(comparison_document.encode("utf-8")).hexdigest()
+
+            self.assertIsNone(first_database.get_setting(WATCHER_RULES_SETTING_KEY))
+            movies_missing = first.watcher_rules("movies")
+            self.assertEqual(
+                movies_missing["fingerprint"],
+                raw_fingerprint(WATCHER_RULES_SETTING_KEY, None),
+            )
+            movies_created = first.update_watcher_rules(
+                {
+                    "rules": {"ignored_suffixes": [".movie-part"]},
+                    "expected_fingerprint": movies_missing["fingerprint"],
+                },
+                "movies",
+                require_expected_fingerprint=True,
+            )
+            self.assertTrue(movies_created["ok"])
+            movies_raw_before = first_database.get_setting(WATCHER_RULES_SETTING_KEY)
+
+            raw_seed = (
+                '{ "history" : [{"ignored_suffixes":[".series-part"],'
+                '"effective_at":7}], "effective_at" : 7, '
+                '"ignored_suffixes" : [".series-part"] }'
+            )
+            first_database.set_setting(TV_WATCHER_RULES_SETTING_KEY, raw_seed)
+            expected = raw_fingerprint(TV_WATCHER_RULES_SETTING_KEY, raw_seed)
+            self.assertNotEqual(
+                raw_seed,
+                json.dumps(
+                    json.loads(raw_seed),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            self.assertEqual(first.watcher_rules("tv")["fingerprint"], expected)
+            self.assertEqual(second.watcher_rules("tv")["fingerprint"], expected)
+            self.assertNotEqual(
+                first.watcher_rules("movies")["fingerprint"],
+                first.watcher_rules("tv")["fingerprint"],
+            )
+
+            missing = first.update_watcher_rules(
+                {"rules": {"ignored_suffixes": [".missing"]}},
+                "tv",
+                require_expected_fingerprint=True,
+            )
+            self.assertFalse(missing["ok"])
+            self.assertEqual(missing["error"], "expected_fingerprint_required")
+
+            barrier = threading.Barrier(2)
+
+            def concurrent_save(engine, suffix):
+                try:
+                    barrier.wait(timeout=5)
+                    return engine.update_watcher_rules(
+                        {
+                            "rules": {"ignored_suffixes": [suffix]},
+                            "expected_fingerprint": expected,
+                        },
+                        "tv",
+                        require_expected_fingerprint=True,
+                    )
+                finally:
+                    engine.db.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = (
+                    executor.submit(concurrent_save, first, ".client-one"),
+                    executor.submit(concurrent_save, second, ".client-two"),
+                )
+                results = [future.result(timeout=10) for future in futures]
+
+            successful = [result for result in results if result.get("ok")]
+            conflicts = [result for result in results if not result.get("ok")]
+            self.assertEqual(len(successful), 1)
+            self.assertEqual(len(conflicts), 1)
+            self.assertTrue(successful[0]["saved"])
+            self.assertEqual(conflicts[0]["error"], "watcher_rules_conflict")
+            self.assertEqual(
+                conflicts[0]["current"]["fingerprint"],
+                successful[0]["fingerprint"],
+            )
+
+            raw_final = first_database.get_setting(TV_WATCHER_RULES_SETTING_KEY)
+            self.assertEqual(
+                raw_final,
+                json.dumps(
+                    json.loads(raw_final),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            self.assertEqual(
+                successful[0]["fingerprint"],
+                raw_fingerprint(TV_WATCHER_RULES_SETTING_KEY, raw_final),
+            )
+            self.assertEqual(
+                json.loads(raw_final)["ignored_suffixes"],
+                successful[0]["rules"]["ignored_suffixes"],
+            )
+            self.assertEqual(
+                first_database.get_setting(WATCHER_RULES_SETTING_KEY),
+                movies_raw_before,
+            )
+            self.assertEqual(
+                list(first._watcher_snapshot("tv")[0]),
+                json.loads(raw_final)["ignored_suffixes"],
+            )
+            self.assertEqual(
+                list(second._watcher_snapshot("tv")[0]),
+                json.loads(raw_final)["ignored_suffixes"],
+            )
+        finally:
+            if first_database is not None:
+                first_database.close()
+            if second_database is not None:
+                second_database.close()
+            temporary.cleanup()
+
+    def test_watcher_get_cannot_reinstall_stale_snapshot_after_profile_save(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        database = None
+        try:
+            root = Path(temporary.name)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            seeded = engine.update_watcher_rules(
+                {"rules": {"ignored_suffixes": [".old"]}},
+                "tv",
+            )
+            expected = seeded["fingerprint"]
+            original_get_setting = database.get_setting
+            read_barrier = threading.Barrier(2)
+            release_get = threading.Event()
+            save_reached_database = threading.Event()
+            save_finished = threading.Event()
+            thread_role = threading.local()
+
+            def controlled_get_setting(key):
+                stored = original_get_setting(key)
+                if key != TV_WATCHER_RULES_SETTING_KEY:
+                    return stored
+                if getattr(thread_role, "value", "") == "get":
+                    read_barrier.wait(timeout=5)
+                    self.assertTrue(release_get.wait(timeout=5))
+                elif getattr(thread_role, "value", "") == "save":
+                    save_reached_database.set()
+                return stored
+
+            def stale_get():
+                thread_role.value = "get"
+                try:
+                    return engine.watcher_rules("tv")
+                finally:
+                    database.close()
+
+            def save_new_rules():
+                thread_role.value = "save"
+                try:
+                    result = engine.update_watcher_rules(
+                        {
+                            "rules": {"ignored_suffixes": [".new"]},
+                            "expected_fingerprint": expected,
+                        },
+                        "tv",
+                        require_expected_fingerprint=True,
+                    )
+                    save_finished.set()
+                    return result
+                finally:
+                    database.close()
+
+            with patch.object(database, "get_setting", side_effect=controlled_get_setting):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    get_future = executor.submit(stale_get)
+                    read_barrier.wait(timeout=5)
+                    save_future = executor.submit(save_new_rules)
+                    if save_reached_database.wait(timeout=0.5):
+                        self.assertTrue(save_finished.wait(timeout=5))
+                    release_get.set()
+                    get_future.result(timeout=10)
+                    saved = save_future.result(timeout=10)
+
+            self.assertTrue(saved["ok"])
+            raw_final = database.get_setting(TV_WATCHER_RULES_SETTING_KEY)
+            self.assertEqual(json.loads(raw_final)["ignored_suffixes"], [".new"])
+            self.assertEqual(engine._watcher_snapshot("tv")[0], (".new",))
+        finally:
+            if database is not None:
+                database.close()
+            temporary.cleanup()
 
     def test_watcher_rule_scope_is_only_complete_movies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

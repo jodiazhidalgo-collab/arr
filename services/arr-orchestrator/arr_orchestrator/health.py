@@ -89,15 +89,32 @@ def start_health_server(
             path = self.path.split("?", 1)[0]
             if path == "/settings/watcher" and watcher_rules_updater:
                 result = watcher_rules_updater(self._read_json())
-                self._json(200 if result.get("ok") else 400, result)
+                status = (
+                    200
+                    if result.get("ok")
+                    else 409
+                    if result.get("error") == "watcher_rules_conflict"
+                    else 400
+                )
+                self._json(status, result)
                 return
             if path.startswith("/settings/watcher/") and watcher_rules_updater:
                 profile = path.removeprefix("/settings/watcher/").strip("/")
                 if profile not in WATCHER_PROFILES:
                     self._json(404, {"error": "not_found"})
                     return
-                result = watcher_rules_updater(self._read_json(), profile)
-                self._json(200 if result.get("ok") else 400, result)
+                result = watcher_rules_updater(
+                    self._read_json(),
+                    profile,
+                    require_expected_fingerprint=True,
+                )
+                if result.get("ok"):
+                    status = 200
+                elif result.get("error") == "watcher_rules_conflict":
+                    status = 409
+                else:
+                    status = 400
+                self._json(status, result)
                 return
             identity_handlers = {
                 "/settings/identity": identity_rules_updater,

@@ -66,6 +66,7 @@ class WatcherRulesProxyTests(unittest.TestCase):
         current = {
             "ok": True,
             "rules": {"ignored_suffixes": [".delay-audio-part"]},
+            "fingerprint": "a" * 64,
         }
         with patch.object(
             server,
@@ -80,13 +81,14 @@ class WatcherRulesProxyTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(result["rules"], current["rules"])
+        self.assertEqual(result["fingerprint"], current["fingerprint"])
         self.assertEqual(result["profile"], "movies")
         self.assertTrue(result["connected"])
         self.assertTrue(result["editable"])
 
     def test_movies_profile_preserves_upstream_conflicts_and_failures(self) -> None:
         cases = (
-            (409, "revision_conflict"),
+            (409, "watcher_rules_conflict"),
             (503, "orchestrator_unavailable"),
             (500, "internal_error"),
         )
@@ -98,7 +100,10 @@ class WatcherRulesProxyTests(unittest.TestCase):
             ):
                 actual_status, result = server._save_watcher_rules_profile(
                     "movies",
-                    {"rules": {"ignored_suffixes": []}},
+                    {
+                        "rules": {"ignored_suffixes": []},
+                        "expected_fingerprint": "a" * 64,
+                    },
                 )
 
             self.assertEqual(actual_status, status)
@@ -138,7 +143,7 @@ class WatcherRulesProxyTests(unittest.TestCase):
         self.assertEqual(profile_handler.response, (503, expected_profile))
 
     def test_legacy_watcher_route_also_preserves_upstream_status(self) -> None:
-        conflict = {"ok": False, "error": "revision_conflict"}
+        conflict = {"ok": False, "error": "watcher_rules_conflict"}
         handler = _CapturedHandler(
             "/api/watcher-rules",
             {"rules": {"ignored_suffixes": []}},
@@ -157,8 +162,13 @@ class WatcherRulesProxyTests(unittest.TestCase):
             "ok": True,
             "profile": "tv",
             "rules": {"ignored_suffixes": [".part"]},
+            "fingerprint": "b" * 64,
         }
-        saved = {**loaded, "saved": True}
+        saved = {**loaded, "saved": True, "fingerprint": "c" * 64}
+        save_payload = {
+            "rules": {"ignored_suffixes": [".part"]},
+            "expected_fingerprint": loaded["fingerprint"],
+        }
         with patch.object(
             server,
             "_proxy_upstream_json",
@@ -167,14 +177,16 @@ class WatcherRulesProxyTests(unittest.TestCase):
             get_status, get_result = server._watcher_rules_profile_payload("tv")
             post_status, post_result = server._save_watcher_rules_profile(
                 "tv",
-                {"rules": {"ignored_suffixes": [".part"]}},
+                save_payload,
             )
 
         self.assertEqual(get_status, 200)
         self.assertTrue(get_result["connected"])
         self.assertTrue(get_result["editable"])
+        self.assertEqual(get_result["fingerprint"], loaded["fingerprint"])
         self.assertEqual(post_status, 200)
         self.assertTrue(post_result["saved"])
+        self.assertEqual(post_result["fingerprint"], saved["fingerprint"])
         self.assertEqual(
             upstream.call_args_list[0].args,
             (f"{server.ORCH_URL}/settings/watcher/tv",),
@@ -184,7 +196,7 @@ class WatcherRulesProxyTests(unittest.TestCase):
             upstream.call_args_list[1].args,
             (
                 f"{server.ORCH_URL}/settings/watcher/tv",
-                {"rules": {"ignored_suffixes": [".part"]}},
+                save_payload,
             ),
         )
         self.assertEqual(upstream.call_args_list[1].kwargs, {"timeout": 20})
@@ -201,7 +213,11 @@ class WatcherRulesProxyTests(unittest.TestCase):
         profile_get.assert_called_once_with("movies")
         self.assertEqual(get_handler.response, (200, expected))
 
-        post_handler = _CapturedHandler("/api/watcher-rules/tv", {"rules": {}})
+        post_payload = {
+            "rules": {},
+            "expected_fingerprint": "b" * 64,
+        }
+        post_handler = _CapturedHandler("/api/watcher-rules/tv", post_payload)
         saved = {"ok": True, "profile": "tv", "saved": True}
         with patch.object(
             server,
@@ -209,8 +225,29 @@ class WatcherRulesProxyTests(unittest.TestCase):
             return_value=(200, saved),
         ) as profile_save:
             server.Handler.do_POST(post_handler)
-        profile_save.assert_called_once_with("tv", {"rules": {}})
+        profile_save.assert_called_once_with("tv", post_payload)
         self.assertEqual(post_handler.response, (200, saved))
+
+    def test_profile_route_preserves_watcher_cas_conflict(self) -> None:
+        payload = {
+            "rules": {"ignored_suffixes": [".stale"]},
+            "expected_fingerprint": "a" * 64,
+        }
+        conflict = {
+            "ok": False,
+            "error": "watcher_rules_conflict",
+            "current": {"fingerprint": "b" * 64},
+        }
+        handler = _CapturedHandler("/api/watcher-rules/movies", payload)
+        with patch.object(
+            server,
+            "_save_watcher_rules_profile",
+            return_value=(409, conflict),
+        ) as profile_save:
+            server.Handler.do_POST(handler)
+
+        profile_save.assert_called_once_with("movies", payload)
+        self.assertEqual(handler.response, (409, conflict))
 
     def test_missing_profile_endpoint_is_not_reported_as_editable(self) -> None:
         with patch.object(

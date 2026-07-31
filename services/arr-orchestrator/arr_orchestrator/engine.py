@@ -160,6 +160,10 @@ class Engine:
         self._series_dependency_refreshing = False
         self.running = True
         self.dependencies: Dict[str, str] = {}
+        self._watcher_rules_locks = {
+            "movies": threading.RLock(),
+            "tv": threading.RLock(),
+        }
         self._watcher_rules_snapshot = self._load_ignored_movies_suffixes()
         self._tv_watcher_rules_snapshot = self._load_watcher_suffixes("tv")
 
@@ -208,11 +212,12 @@ class Engine:
         Tuple[Tuple[float, Tuple[str, ...]], ...],
     ]:
         normalized = self._watcher_profile(profile)
-        return (
-            self._watcher_rules_snapshot
-            if normalized == "movies"
-            else self._tv_watcher_rules_snapshot
-        )
+        with self._watcher_rules_locks[normalized]:
+            return (
+                self._watcher_rules_snapshot
+                if normalized == "movies"
+                else self._tv_watcher_rules_snapshot
+            )
 
     def _load_watcher_suffixes(
         self, profile: str
@@ -222,17 +227,35 @@ class Engine:
         Tuple[Tuple[float, Tuple[str, ...]], ...],
     ]:
         normalized = self._watcher_profile(profile)
-        setting_key = (
+        stored = self.db.get_setting(self._watcher_setting_key(normalized))
+        return self._decode_watcher_suffixes(normalized, stored)
+
+    @staticmethod
+    def _watcher_setting_key(profile: str) -> str:
+        return (
             WATCHER_RULES_SETTING_KEY
-            if normalized == "movies"
+            if profile == "movies"
             else TV_WATCHER_RULES_SETTING_KEY
         )
-        defaults = (
+
+    @staticmethod
+    def _watcher_defaults(profile: str) -> Tuple[str, ...]:
+        return (
             DEFAULT_IGNORED_MOVIES_SUFFIXES
-            if normalized == "movies"
+            if profile == "movies"
             else DEFAULT_IGNORED_TV_SUFFIXES
         )
-        stored = self.db.get_setting(setting_key)
+
+    def _decode_watcher_suffixes(
+        self,
+        profile: str,
+        stored: Optional[str],
+    ) -> Tuple[
+        Tuple[str, ...],
+        float,
+        Tuple[Tuple[float, Tuple[str, ...]], ...],
+    ]:
+        defaults = self._watcher_defaults(profile)
         if stored is None:
             return (
                 defaults,
@@ -278,24 +301,95 @@ class Engine:
                 ((0.0, defaults),),
             )
 
-    def watcher_rules(self, profile: str = "movies") -> Dict[str, object]:
-        normalized = self._watcher_profile(profile)
-        suffixes, _effective_at, _history = self._watcher_snapshot(normalized)
-        setting_key = (
-            WATCHER_RULES_SETTING_KEY
-            if normalized == "movies"
-            else TV_WATCHER_RULES_SETTING_KEY
+    def _set_watcher_snapshot(
+        self,
+        profile: str,
+        snapshot: Tuple[
+            Tuple[str, ...],
+            float,
+            Tuple[Tuple[float, Tuple[str, ...]], ...],
+        ],
+    ) -> None:
+        with self._watcher_rules_locks[profile]:
+            if profile == "movies":
+                self._watcher_rules_snapshot = snapshot
+            else:
+                self._tv_watcher_rules_snapshot = snapshot
+
+    @staticmethod
+    def _watcher_fingerprint(setting_key: str, stored: Optional[str]) -> str:
+        comparison_document = json.dumps(
+            {"setting_key": setting_key, "value": stored},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
         )
+        return hashlib.sha256(comparison_document.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _serialize_watcher_rules(
+        suffixes: Tuple[str, ...],
+        effective_at: float,
+        history: Tuple[Tuple[float, Tuple[str, ...]], ...],
+    ) -> str:
+        return json.dumps(
+            {
+                "ignored_suffixes": list(suffixes),
+                "effective_at": effective_at,
+                "history": [
+                    {
+                        "effective_at": entry_at,
+                        "ignored_suffixes": list(entry_suffixes),
+                    }
+                    for entry_at, entry_suffixes in history
+                ],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _watcher_rules_payload(
+        self,
+        profile: str,
+        setting_key: str,
+        stored: Optional[str],
+        snapshot: Tuple[
+            Tuple[str, ...],
+            float,
+            Tuple[Tuple[float, Tuple[str, ...]], ...],
+        ],
+    ) -> Dict[str, object]:
+        suffixes, _effective_at, _history = snapshot
         return {
             "ok": True,
-            "profile": normalized,
+            "profile": profile,
             "rules": {"ignored_suffixes": list(suffixes)},
+            "fingerprint": self._watcher_fingerprint(setting_key, stored),
             "rules_path": f"{self.db.path}:settings/{setting_key}",
-            "scope": str(self.config.complete_root / normalized),
+            "scope": str(self.config.complete_root / profile),
         }
 
+    def watcher_rules(self, profile: str = "movies") -> Dict[str, object]:
+        normalized = self._watcher_profile(profile)
+        with self._watcher_rules_locks[normalized]:
+            setting_key = self._watcher_setting_key(normalized)
+            stored = self.db.get_setting(setting_key)
+            snapshot = self._decode_watcher_suffixes(normalized, stored)
+            self._set_watcher_snapshot(normalized, snapshot)
+            return self._watcher_rules_payload(
+                normalized,
+                setting_key,
+                stored,
+                snapshot,
+            )
+
     def update_watcher_rules(
-        self, payload: Dict[str, object], profile: str = "movies"
+        self,
+        payload: Dict[str, object],
+        profile: str = "movies",
+        *,
+        require_expected_fingerprint: bool = False,
     ) -> Dict[str, object]:
         try:
             normalized = self._watcher_profile(profile)
@@ -308,40 +402,95 @@ class Engine:
             suffixes = self._normalize_ignored_movies_suffixes(rules["ignored_suffixes"])
         except ValueError as error:
             return {"ok": False, "error": str(error)}
-        effective_at = time.time()
-        _current_suffixes, _current_effective_at, current_history = self._watcher_snapshot(
-            normalized
-        )
-        history = current_history + ((effective_at, suffixes),)
-        setting_key = (
-            WATCHER_RULES_SETTING_KEY
-            if normalized == "movies"
-            else TV_WATCHER_RULES_SETTING_KEY
-        )
-        self.db.set_setting(
-            setting_key,
-            json.dumps(
-                {
-                    "ignored_suffixes": list(suffixes),
-                    "effective_at": effective_at,
-                    "history": [
-                        {
-                            "effective_at": entry_at,
-                            "ignored_suffixes": list(entry_suffixes),
-                        }
-                        for entry_at, entry_suffixes in history
-                    ],
-                },
-                ensure_ascii=False,
-            ),
-        )
-        if normalized == "movies":
-            self._watcher_rules_snapshot = (suffixes, effective_at, history)
+        raw_expected = payload.get("expected_fingerprint")
+        expected_fingerprint: Optional[str]
+        if raw_expected is None:
+            if require_expected_fingerprint:
+                return {
+                    "ok": False,
+                    "error": "expected_fingerprint_required",
+                    "message": "Falta expected_fingerprint para guardar este perfil.",
+                }
+            expected_fingerprint = None
+        elif not isinstance(raw_expected, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}", raw_expected.strip()
+        ):
+            return {
+                "ok": False,
+                "error": "expected_fingerprint_invalid",
+                "message": "expected_fingerprint no es valido.",
+            }
         else:
-            self._tv_watcher_rules_snapshot = (suffixes, effective_at, history)
-        result = self.watcher_rules(normalized)
-        result["saved"] = True
-        return result
+            expected_fingerprint = raw_expected.strip().lower()
+
+        with self._watcher_rules_locks[normalized]:
+            return self._update_watcher_rules_locked(
+                normalized,
+                suffixes,
+                expected_fingerprint,
+            )
+
+    def _update_watcher_rules_locked(
+        self,
+        normalized: str,
+        suffixes: Tuple[str, ...],
+        expected_fingerprint: Optional[str],
+    ) -> Dict[str, object]:
+        setting_key = self._watcher_setting_key(normalized)
+        attempts = 1 if expected_fingerprint is not None else 4
+        for _attempt in range(attempts):
+            stored = self.db.get_setting(setting_key)
+            current_snapshot = self._decode_watcher_suffixes(normalized, stored)
+            current_fingerprint = self._watcher_fingerprint(setting_key, stored)
+            if (
+                expected_fingerprint is not None
+                and expected_fingerprint != current_fingerprint
+            ):
+                self._set_watcher_snapshot(normalized, current_snapshot)
+                return {
+                    "ok": False,
+                    "error": "watcher_rules_conflict",
+                    "message": "Las reglas cambiaron desde la ultima lectura.",
+                    "current": self._watcher_rules_payload(
+                        normalized,
+                        setting_key,
+                        stored,
+                        current_snapshot,
+                    ),
+                }
+
+            effective_at = time.time()
+            current_history = current_snapshot[2]
+            history = current_history + ((effective_at, suffixes),)
+            serialized = self._serialize_watcher_rules(
+                suffixes,
+                effective_at,
+                history,
+            )
+            if self.db.compare_and_set_setting_value(
+                setting_key,
+                stored,
+                serialized,
+            ):
+                saved_snapshot = (suffixes, effective_at, history)
+                self._set_watcher_snapshot(normalized, saved_snapshot)
+                result = self._watcher_rules_payload(
+                    normalized,
+                    setting_key,
+                    serialized,
+                    saved_snapshot,
+                )
+                result["saved"] = True
+                return result
+            if expected_fingerprint is not None:
+                break
+
+        return {
+            "ok": False,
+            "error": "watcher_rules_conflict",
+            "message": "Las reglas cambiaron durante el guardado.",
+            "current": self.watcher_rules(normalized),
+        }
 
     def identity_rules(self, profile: str = "common") -> Dict[str, object]:
         return self.identity.payload(profile)

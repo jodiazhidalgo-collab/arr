@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -187,19 +188,34 @@ class ArrFollowTests(unittest.TestCase):
 
     def test_health_server_profiles_watchers_and_keeps_legacy_as_movies(self) -> None:
         state = {
-            "movies": [".movie-part"],
-            "tv": [".series-part"],
+            "movies": {"suffixes": [".movie-part"], "fingerprint": "a" * 64},
+            "tv": {"suffixes": [".series-part"], "fingerprint": "b" * 64},
         }
 
         def watcher_provider(profile="movies"):
             return {
                 "ok": True,
                 "profile": profile,
-                "rules": {"ignored_suffixes": list(state[profile])},
+                "rules": {"ignored_suffixes": list(state[profile]["suffixes"])},
+                "fingerprint": state[profile]["fingerprint"],
             }
 
-        def watcher_updater(payload, profile="movies"):
-            state[profile] = list(payload["rules"]["ignored_suffixes"])
+        def watcher_updater(
+            payload,
+            profile="movies",
+            require_expected_fingerprint=False,
+        ):
+            expected = payload.get("expected_fingerprint")
+            if require_expected_fingerprint and not expected:
+                return {"ok": False, "error": "expected_fingerprint_required"}
+            if expected is not None and expected != state[profile]["fingerprint"]:
+                return {
+                    "ok": False,
+                    "error": "watcher_rules_conflict",
+                    "current": watcher_provider(profile),
+                }
+            state[profile]["suffixes"] = list(payload["rules"]["ignored_suffixes"])
+            state[profile]["fingerprint"] = "c" * 64
             return {**watcher_provider(profile), "saved": True}
 
         server = start_health_server(
@@ -216,20 +232,79 @@ class ArrFollowTests(unittest.TestCase):
                 legacy = json.loads(response.read().decode("utf-8"))
             with urllib.request.urlopen(base + "/tv", timeout=5) as response:
                 tv = json.loads(response.read().decode("utf-8"))
+
+            missing_cas = urllib.request.Request(
+                base + "/tv",
+                data=b'{"rules":{"ignored_suffixes":[".missing"]}}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as missing_error:
+                urllib.request.urlopen(missing_cas, timeout=5)
+            self.assertEqual(missing_error.exception.code, 400)
+
             request = urllib.request.Request(
                 base + "/tv",
-                data=b'{"rules":{"ignored_suffixes":[".tv-new"]}}',
+                data=json.dumps(
+                    {
+                        "rules": {"ignored_suffixes": [".tv-new"]},
+                        "expected_fingerprint": tv["fingerprint"],
+                    }
+                ).encode("utf-8"),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=5) as response:
                 updated = json.loads(response.read().decode("utf-8"))
 
+            stale = urllib.request.Request(
+                base + "/tv",
+                data=json.dumps(
+                    {
+                        "rules": {"ignored_suffixes": [".stale"]},
+                        "expected_fingerprint": tv["fingerprint"],
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as stale_error:
+                urllib.request.urlopen(stale, timeout=5)
+            self.assertEqual(stale_error.exception.code, 409)
+            stale_payload = json.loads(stale_error.exception.read().decode("utf-8"))
+
+            legacy_update = urllib.request.Request(
+                base,
+                data=b'{"rules":{"ignored_suffixes":[".legacy"]}}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(legacy_update, timeout=5) as response:
+                legacy_saved = json.loads(response.read().decode("utf-8"))
+
+            legacy_stale = urllib.request.Request(
+                base,
+                data=json.dumps(
+                    {
+                        "rules": {"ignored_suffixes": [".legacy-stale"]},
+                        "expected_fingerprint": legacy["fingerprint"],
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as legacy_stale_error:
+                urllib.request.urlopen(legacy_stale, timeout=5)
+            self.assertEqual(legacy_stale_error.exception.code, 409)
+
             self.assertEqual(legacy["profile"], "movies")
             self.assertEqual(legacy["rules"]["ignored_suffixes"], [".movie-part"])
             self.assertEqual(tv["rules"]["ignored_suffixes"], [".series-part"])
             self.assertEqual(updated["rules"]["ignored_suffixes"], [".tv-new"])
-            self.assertEqual(state["movies"], [".movie-part"])
+            self.assertEqual(stale_payload["error"], "watcher_rules_conflict")
+            self.assertEqual(stale_payload["current"]["fingerprint"], "c" * 64)
+            self.assertEqual(legacy_saved["rules"]["ignored_suffixes"], [".legacy"])
+            self.assertEqual(state["tv"]["suffixes"], [".tv-new"])
         finally:
             server.shutdown()
             server.server_close()
