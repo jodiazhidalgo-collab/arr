@@ -3,6 +3,7 @@
   [int]$TimeoutMs = 10000,
   [ValidateSet("auto", "chrome", "msedge")]
   [string]$Browser = "auto",
+  [switch]$ReadOnly,
   [switch]$KeepBrowserOpen
 )
 
@@ -60,11 +61,13 @@ const artifactDir = process.argv[3];
 const timeoutMs = Number(process.argv[4] || "10000");
 const keepBrowserOpen = process.argv[5] === "1";
 const browserMode = process.argv[6] || "auto";
+const readOnly = process.argv[7] === "1";
 const startedAt = new Date().toISOString();
 const baseUrl = new URL(panelUrl);
 baseUrl.hash = "";
 const globalTimeoutMs = Math.max(120000, timeoutMs * 18);
 let globalTimeoutReached = false;
+const readOnlyMutationAttempts = [];
 const globalWatchdog = setTimeout(() => {
   globalTimeoutReached = true;
   console.error("ARR_UI_CHECK_GLOBAL_TIMEOUT_REACHED");
@@ -116,6 +119,52 @@ function pathOf(rawUrl) {
   }
 }
 
+function sanitizedRequestTarget(rawUrl) {
+  try {
+    return new URL(rawUrl).pathname || "/";
+  } catch (_error) {
+    return "<invalid-url>";
+  }
+}
+
+async function checkedBrowserContext(browser, options, label) {
+  const context = await browser.newContext({
+    ...options,
+    acceptDownloads: false,
+    ...(readOnly ? { serviceWorkers: "block" } : {}),
+  });
+  if (!readOnly) return context;
+  await context.route("**/*", route => handleReadOnlyRoute(route, label));
+  return context;
+}
+
+async function handleReadOnlyRoute(route, label) {
+  const request = route.request();
+  const method = request.method().toUpperCase();
+  const pathname = pathOf(request.url());
+  if (pathname === "/api/codex-diagnostic") {
+    readOnlyMutationAttempts.push({
+      kind: "forbidden_endpoint",
+      label,
+      method,
+      path: sanitizedRequestTarget(request.url()),
+    });
+    await route.abort("blockedbyclient");
+    return;
+  }
+  if (["GET", "HEAD", "OPTIONS"].includes(method)) {
+    await route.fallback();
+    return;
+  }
+  readOnlyMutationAttempts.push({
+    kind: "browser_request",
+    label,
+    method,
+    path: sanitizedRequestTarget(request.url()),
+  });
+  await route.abort("blockedbyclient");
+}
+
 function createObservationBucket(label) {
   return {
     label,
@@ -125,22 +174,37 @@ function createObservationBucket(label) {
     downloads: [],
     forbidden_actions: [],
     expected_cas_conflict: false,
+    expected_report_error: false,
   };
 }
 
 function attachObservers(page, bucket) {
   page.on("console", message => {
     const text = textPreview(message.text(), 1600);
+    const rawLocation = message.location();
+    const location = {
+      path: sanitizedRequestTarget(rawLocation && rawLocation.url),
+      lineNumber: rawLocation && Number.isFinite(rawLocation.lineNumber) ? rawLocation.lineNumber : 0,
+      columnNumber: rawLocation && Number.isFinite(rawLocation.columnNumber) ? rawLocation.columnNumber : 0,
+    };
     bucket.console_events.push({
       profile: bucket.label,
       type: message.type(),
       text,
       expected: Boolean(
-        bucket.expected_cas_conflict
-        && message.type() === "error"
-        && /(?:409|series-rules|conflict)/i.test(text)
+        message.type() === "error"
+        && (
+          (
+            bucket.expected_cas_conflict
+            && /\b409\b/.test(text)
+          )
+          || (
+            bucket.expected_report_error
+            && /\b503\b/.test(text)
+          )
+        )
       ),
-      location: message.location(),
+      location,
     });
   });
   page.on("pageerror", error => {
@@ -161,7 +225,7 @@ function attachObservers(page, bucket) {
         profile: bucket.label,
         kind: "codex_diagnostic_action",
         method,
-        url: request.url(),
+        path: sanitizedRequestTarget(request.url()),
       });
     }
   });
@@ -174,7 +238,7 @@ function attachObservers(page, bucket) {
       kind: "requestfailed",
       method: request.method(),
       resourceType: request.resourceType(),
-      url: request.url(),
+      path: sanitizedRequestTarget(request.url()),
       failure: failure ? failure.errorText : "",
       expected: false,
     });
@@ -186,10 +250,18 @@ function attachObservers(page, bucket) {
     const pathname = pathOf(response.url());
     if (pathname === "/favicon.ico") return;
     const expected = Boolean(
-      bucket.expected_cas_conflict
-      && pathname === "/api/series-rules"
-      && request.method() === "POST"
-      && status === 409
+      (
+        bucket.expected_cas_conflict
+        && pathname === "/api/series-rules"
+        && request.method() === "POST"
+        && status === 409
+      )
+      || (
+        bucket.expected_report_error
+        && pathname === "/api/report"
+        && request.method() === "GET"
+        && status === 503
+      )
     );
     bucket.network.push({
       profile: bucket.label,
@@ -197,7 +269,7 @@ function attachObservers(page, bucket) {
       status,
       method: request.method(),
       resourceType: request.resourceType(),
-      url: response.url(),
+      path: sanitizedRequestTarget(response.url()),
       expected,
     });
   });
@@ -205,7 +277,7 @@ function attachObservers(page, bucket) {
     bucket.downloads.push({
       profile: bucket.label,
       suggested_filename: download.suggestedFilename(),
-      url: download.url(),
+      path: sanitizedRequestTarget(download.url()),
     });
   });
 }
@@ -521,6 +593,26 @@ async function captureCapabilities(page, expected) {
 }
 
 async function jsonRequest(request, method, pathname, payload = undefined) {
+  const normalizedMethod = String(method || "GET").toUpperCase();
+  const resolvedUrl = new URL(pathname, baseUrl).href;
+  if (readOnly && pathOf(resolvedUrl) === "/api/codex-diagnostic") {
+    readOnlyMutationAttempts.push({
+      kind: "forbidden_endpoint",
+      label: "jsonRequest",
+      method: normalizedMethod,
+      path: sanitizedRequestTarget(resolvedUrl),
+    });
+    fail("ARR_UI_READ_ONLY_FORBIDDEN_ENDPOINT", normalizedMethod + " " + sanitizedRequestTarget(resolvedUrl));
+  }
+  if (readOnly && !["GET", "HEAD", "OPTIONS"].includes(normalizedMethod)) {
+    readOnlyMutationAttempts.push({
+      kind: "api_request",
+      label: "jsonRequest",
+      method: normalizedMethod,
+      path: sanitizedRequestTarget(resolvedUrl),
+    });
+    fail("ARR_UI_READ_ONLY_API_MUTATION", normalizedMethod + " " + sanitizedRequestTarget(resolvedUrl));
+  }
   const options = { timeout: timeoutMs, failOnStatusCode: false };
   if (payload !== undefined) options.data = payload;
   const response = method === "POST"
@@ -534,6 +626,138 @@ async function jsonRequest(request, method, pathname, payload = undefined) {
     fail("ARR_UI_INVALID_JSON", pathname + " status=" + response.status());
   }
   return { status: response.status(), ok: response.ok(), body };
+}
+
+async function runReadOnlyGuardSelfTest() {
+  if (!readOnly) {
+    return { ok: true, skipped: true, reason: "read_only_disabled", attempts: [] };
+  }
+  const result = {
+    ok: false,
+    skipped: false,
+    browser_post_blocked: false,
+    api_post_blocked: false,
+    api_forbidden_get_blocked: false,
+    forbidden_get_blocked: false,
+    safe_get_allowed: false,
+    fake_network_reached: false,
+    context_wiring: false,
+    attempts: [],
+    error: null,
+  };
+  const firstAttempt = readOnlyMutationAttempts.length;
+  let registeredPattern = null;
+  let registeredHandler = null;
+  let contextOptions = null;
+  const fakeContext = {
+    route: async (pattern, handler) => {
+      registeredPattern = pattern;
+      registeredHandler = handler;
+    },
+  };
+  const fakeBrowser = {
+    newContext: async options => {
+      contextOptions = options;
+      return fakeContext;
+    },
+  };
+  const fakeRoute = (method, url) => {
+    const actions = [];
+    return {
+      actions,
+      request: () => ({ method: () => method, url: () => url }),
+      abort: async reason => { actions.push("abort:" + reason); },
+      fallback: async () => { actions.push("fallback"); },
+    };
+  };
+  try {
+    const wiredContext = await checkedBrowserContext(
+      fakeBrowser,
+      { viewport: { width: 1, height: 1 } },
+      "read-only-guard-self-test"
+    );
+    result.context_wiring = wiredContext === fakeContext
+      && registeredPattern === "**/*"
+      && typeof registeredHandler === "function"
+      && contextOptions.acceptDownloads === false
+      && contextOptions.serviceWorkers === "block";
+
+    const browserPost = fakeRoute(
+      "POST",
+      "http://arr.invalid/api/__codex_read_only_guard_probe?token=must_not_escape"
+    );
+    await registeredHandler(browserPost);
+    result.browser_post_blocked = isDeepStrictEqual(
+      browserPost.actions,
+      ["abort:blockedbyclient"]
+    );
+
+    const forbiddenGet = fakeRoute(
+      "GET",
+      "http://arr.invalid/api/codex-diagnostic?token=must_not_escape"
+    );
+    await registeredHandler(forbiddenGet);
+    result.forbidden_get_blocked = isDeepStrictEqual(
+      forbiddenGet.actions,
+      ["abort:blockedbyclient"]
+    );
+
+    const safeGet = fakeRoute("GET", "http://arr.invalid/api/status");
+    await registeredHandler(safeGet);
+    result.safe_get_allowed = isDeepStrictEqual(safeGet.actions, ["fallback"]);
+
+    const fakeRequest = {
+      post: async () => {
+        result.fake_network_reached = true;
+        fail("ARR_UI_READ_ONLY_SELF_TEST_NETWORK_REACHED");
+      },
+      get: async () => {
+        result.fake_network_reached = true;
+        fail("ARR_UI_READ_ONLY_SELF_TEST_NETWORK_REACHED");
+      },
+    };
+    try {
+      await jsonRequest(
+        fakeRequest,
+        "POST",
+        "/api/__codex_read_only_guard_probe?token=must_not_escape",
+        {}
+      );
+    } catch (error) {
+      result.api_post_blocked = error && error.code === "ARR_UI_READ_ONLY_API_MUTATION";
+    }
+    try {
+      await jsonRequest(
+        fakeRequest,
+        "GET",
+        "/api/codex-diagnostic?token=must_not_escape"
+      );
+    } catch (error) {
+      result.api_forbidden_get_blocked = error
+        && error.code === "ARR_UI_READ_ONLY_FORBIDDEN_ENDPOINT";
+    }
+  } catch (error) {
+    result.error = errorPayload(error);
+  } finally {
+    result.attempts = readOnlyMutationAttempts.splice(firstAttempt);
+  }
+  const serializedAttempts = JSON.stringify(result.attempts);
+  result.ok = result.error === null
+    && result.browser_post_blocked
+    && result.api_post_blocked
+    && result.api_forbidden_get_blocked
+    && result.forbidden_get_blocked
+    && result.safe_get_allowed
+    && !result.fake_network_reached
+    && result.context_wiring
+    && result.attempts.length === 4
+    && !serializedAttempts.includes("must_not_escape")
+    && result.attempts.every(attempt => (
+      typeof attempt.path === "string"
+      && !attempt.path.includes("?")
+      && !("url" in attempt)
+    ));
+  return result;
 }
 
 async function endpointChecks(request) {
@@ -911,7 +1135,7 @@ async function runProfile(browser, profile) {
   let fatalError = null;
 
   try {
-    context = await browser.newContext(profile.context);
+    context = await checkedBrowserContext(browser, profile.context, profile.name);
     page = await context.newPage();
     attachObservers(page, bucket);
 
@@ -1024,7 +1248,11 @@ async function runDraftIsolation(browser) {
   let context = null;
   let error = null;
   try {
-    context = await browser.newContext(profileDefinitions()[0].context);
+    context = await checkedBrowserContext(
+      browser,
+      profileDefinitions()[0].context,
+      "draft-isolation"
+    );
     const page = await context.newPage();
     attachObservers(page, bucket);
     const seriesBefore = await jsonRequest(context.request, "GET", "/api/series-rules");
@@ -1170,7 +1398,13 @@ async function runCasConflict(browser) {
     ok: false,
     attempted: false,
     precondition_active_equals_rules: false,
-    mutation_kind: "swap_first_two_series_video_extensions",
+    mutation_kind: readOnly
+      ? "simulated_swap_without_server_write"
+      : "swap_first_two_series_video_extensions",
+    read_only: readOnly,
+    first_expected_fingerprint_ok: false,
+    second_expected_fingerprint_ok: false,
+    reload_disabled_while_saving: false,
     original_series_fingerprint: null,
     mutation_fingerprint: null,
     conflict_status: null,
@@ -1189,9 +1423,15 @@ async function runCasConflict(browser) {
   let originalMovies = null;
   let mutationRules = null;
   let operationalError = null;
+  let releaseSimulatedSave = null;
+  let simulatedSaveGate = Promise.resolve();
 
   try {
-    context = await browser.newContext(profileDefinitions()[0].context);
+    context = await checkedBrowserContext(
+      browser,
+      profileDefinitions()[0].context,
+      "cas-series"
+    );
     const seriesResponse = await jsonRequest(context.request, "GET", "/api/series-rules");
     const moviesResponse = await jsonRequest(context.request, "GET", "/api/movie-rules");
     check(seriesResponse.ok && moviesResponse.ok, "ARR_UI_CAS_BASELINE_HTTP");
@@ -1209,6 +1449,53 @@ async function runCasConflict(browser) {
     const pageB = await context.newPage();
     attachObservers(pageA, bucketA);
     attachObservers(pageB, bucketB);
+    if (readOnly) {
+      simulatedSaveGate = new Promise(resolve => {
+        releaseSimulatedSave = resolve;
+      });
+      const simulatedFingerprint = originalSeries.fingerprint === "c".repeat(64)
+        ? "d".repeat(64)
+        : "c".repeat(64);
+      await pageA.route("**/api/series-rules", async route => {
+        const request = route.request();
+        if (request.method() !== "POST") {
+          await route.fallback();
+          return;
+        }
+        const payload = request.postDataJSON();
+        result.first_expected_fingerprint_ok = payload.expected_fingerprint === originalSeries.fingerprint;
+        await simulatedSaveGate;
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ...originalSeries,
+            ok: true,
+            rules: mutationRules,
+            active: mutationRules,
+            fingerprint: simulatedFingerprint,
+          }),
+        });
+      });
+      await pageB.route("**/api/series-rules", async route => {
+        const request = route.request();
+        if (request.method() !== "POST") {
+          await route.fallback();
+          return;
+        }
+        const payload = request.postDataJSON();
+        result.second_expected_fingerprint_ok = payload.expected_fingerprint === originalSeries.fingerprint;
+        await route.fulfill({
+          status: 409,
+          contentType: "application/json",
+          body: JSON.stringify({
+            ok: false,
+            error: "fingerprint_conflict",
+            message: "Conflicto CAS simulado en lectura pura",
+          }),
+        });
+      });
+    }
     const seriesRoute = canonicalByHash.get("#limpieza-series/entrada");
     await Promise.all([
       directOpen(pageA, seriesRoute.hash, seriesRoute),
@@ -1229,6 +1516,15 @@ async function runCasConflict(browser) {
       && response.request().method() === "POST"
     ), { timeout: timeoutMs });
     await pageA.locator("#save-rules-profile").click();
+    if (readOnly) {
+      try {
+        result.reload_disabled_while_saving = await pageA.locator("#reload-rules-profile").isDisabled();
+        check(result.reload_disabled_while_saving, "ARR_UI_CAS_RELOAD_ENABLED_DURING_SAVE");
+      } finally {
+        if (releaseSimulatedSave) releaseSimulatedSave();
+        releaseSimulatedSave = null;
+      }
+    }
     const savedResponse = await saveAResponse;
     const savedBody = await savedResponse.json();
     check(savedResponse.status() === 200, "ARR_UI_CAS_FIRST_SAVE_STATUS", String(savedResponse.status()));
@@ -1268,14 +1564,43 @@ async function runCasConflict(browser) {
   } catch (error) {
     operationalError = errorPayload(error);
   } finally {
+    if (releaseSimulatedSave) releaseSimulatedSave();
+    releaseSimulatedSave = null;
     bucketB.expected_cas_conflict = false;
     if (context && originalSeries && mutationRules) {
-      result.restoration = await restoreSeriesExactly(
-        context.request,
-        originalSeries,
-        mutationRules,
-        result.mutation_fingerprint
-      );
+      if (readOnly) {
+        try {
+          const current = await jsonRequest(context.request, "GET", "/api/series-rules");
+          const unchanged = current.ok
+            && current.body.fingerprint === originalSeries.fingerprint
+            && isDeepStrictEqual(current.body.rules, originalSeries.rules);
+          result.restoration = {
+            ok: unchanged,
+            attempted: false,
+            exact_rules_restored: unchanged,
+            exact_fingerprint_restored: unchanged,
+            final_fingerprint: current.body.fingerprint || null,
+            read_only_verified: true,
+            error: unchanged ? null : { message: "La configuración cambió durante la prueba de lectura pura" },
+          };
+        } catch (error) {
+          result.restoration = {
+            ok: false,
+            attempted: false,
+            exact_rules_restored: false,
+            exact_fingerprint_restored: false,
+            read_only_verified: false,
+            error: errorPayload(error),
+          };
+        }
+      } else {
+        result.restoration = await restoreSeriesExactly(
+          context.request,
+          originalSeries,
+          mutationRules,
+          result.mutation_fingerprint
+        );
+      }
       try {
         const moviesAfter = await jsonRequest(context.request, "GET", "/api/movie-rules");
         result.movie_fingerprint_after = moviesAfter.body.fingerprint || null;
@@ -1303,9 +1628,108 @@ async function runCasConflict(browser) {
     && result.stale_draft_preserved
     && result.restoration.ok === true
     && result.movie_unchanged
+    && (!readOnly || (
+      result.first_expected_fingerprint_ok
+      && result.second_expected_fingerprint_ok
+      && result.reload_disabled_while_saving
+    ))
     && bucketOk(bucketA)
     && bucketOk(bucketB);
   result.events = { tab_a: bucketA, tab_b: bucketB };
+  return result;
+}
+
+async function runReportFailure(browser) {
+  const result = {
+    ok: false,
+    attempted: false,
+    status: null,
+    visible_error: "",
+    error_class: false,
+    error: null,
+  };
+  const bucket = createObservationBucket("report-http-error");
+  let context = null;
+  try {
+    context = await checkedBrowserContext(
+      browser,
+      profileDefinitions()[0].context,
+      "report-http-error"
+    );
+    const page = await context.newPage();
+    attachObservers(page, bucket);
+    await page.addInitScript(() => {
+      try {
+        localStorage.setItem("arr-media-panel-informes-profile", "series");
+      } catch {
+        // El documento inicial about:blank no siempre permite localStorage.
+      }
+    });
+    await page.route("**/api/reports?profile=series", route => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        connected: true,
+        profile: "series",
+        report_root: "<SERIES_REPORTS>",
+        files: [{
+          name: "controlled-report.txt",
+          relative: "controlled-report.txt",
+          size: 32,
+          kind: "txt",
+          profile: "series",
+        }],
+      }),
+    }));
+    await page.route("**/api/codex-diagnostics?profile=series", route => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ok: true, root: "<CODEX_DIAGS>", files: [] }),
+    }));
+    await page.route("**/api/report?profile=series&file=controlled-report.txt", async route => {
+      bucket.expected_report_error = true;
+      result.attempted = true;
+      await route.fulfill({
+        status: 503,
+        contentType: "text/plain; charset=utf-8",
+        body: "controlled report failure",
+      });
+    });
+    const informesRoute = canonicalByHash.get("#informes");
+    await directOpen(page, informesRoute.hash, informesRoute);
+    await page.locator("details.worker-group > summary").click();
+    const responsePromise = page.waitForResponse(response => (
+      pathOf(response.url()) === "/api/report"
+      && response.request().method() === "GET"
+    ), { timeout: timeoutMs });
+    await page.locator("[data-report=\"controlled-report.txt\"]").click();
+    const response = await responsePromise;
+    result.status = response.status();
+    await page.locator("#report-view.report-view-error").waitFor({ state: "visible", timeout: timeoutMs });
+    result.visible_error = textPreview(await page.locator("#report-view pre").innerText(), 500);
+    result.error_class = await page.locator("#report-view").evaluate(element => element.classList.contains("report-view-error"));
+    bucket.expected_report_error = false;
+    check(result.status === 503, "ARR_UI_REPORT_ERROR_STATUS", String(result.status));
+    check(/No se pudo abrir el informe:\s*HTTP 503/i.test(result.visible_error), "ARR_UI_REPORT_ERROR_HIDDEN", result.visible_error);
+    check(result.error_class, "ARR_UI_REPORT_ERROR_CLASS_MISSING");
+    await page.screenshot({ path: path.join(artifactDir, "report_http_error.png"), fullPage: true });
+  } catch (error) {
+    bucket.expected_report_error = false;
+    result.error = errorPayload(error);
+  } finally {
+    if (context && !keepBrowserOpen) {
+      await context.close().catch(() => {});
+    }
+  }
+  result.observation = bucketSummary(bucket);
+  result.ok = result.error === null
+    && result.attempted
+    && result.status === 503
+    && result.error_class
+    && /No se pudo abrir el informe:\s*HTTP 503/i.test(result.visible_error)
+    && bucketOk(bucket);
+  result.events = bucket;
   return result;
 }
 
@@ -1333,8 +1757,12 @@ async function launchBrowser() {
   const profiles = [];
   let draftIsolation = { ok: false, skipped: true, reason: "profiles_not_green" };
   let casSeries = { ok: false, skipped: true, reason: "profiles_not_green" };
+  let reportFailure = { ok: false, skipped: true, reason: "profiles_not_green" };
+  let readOnlyGuard = { ok: !readOnly, skipped: true, reason: "profiles_not_green" };
 
   try {
+    readOnlyGuard = await runReadOnlyGuardSelfTest();
+    check(readOnlyGuard.ok === true, "ARR_UI_READ_ONLY_GUARD_SELF_TEST_FAILED");
     const launched = await launchBrowser();
     browser = launched.browser;
     browserUsed = launched.mode;
@@ -1345,8 +1773,14 @@ async function launchBrowser() {
       draftIsolation = await runDraftIsolation(browser);
       if (draftIsolation.ok === true) {
         casSeries = await runCasConflict(browser);
+        if (casSeries.ok === true) {
+          reportFailure = await runReportFailure(browser);
+        } else {
+          reportFailure = { ok: false, skipped: true, reason: "cas_not_green" };
+        }
       } else {
         casSeries = { ok: false, skipped: true, reason: "draft_isolation_not_green" };
+        reportFailure = { ok: false, skipped: true, reason: "draft_isolation_not_green" };
       }
     }
   } catch (error) {
@@ -1366,6 +1800,7 @@ async function launchBrowser() {
     buckets.push(casSeries.events.tab_a);
     buckets.push(casSeries.events.tab_b);
   }
+  if (reportFailure.events) buckets.push(reportFailure.events);
   const consoleEvents = buckets.flatMap(bucket => bucket.console_events || []);
   const pageErrors = buckets.flatMap(bucket => bucket.page_errors || []);
   const network = buckets.flatMap(bucket => bucket.network || []);
@@ -1380,13 +1815,16 @@ async function launchBrowser() {
   const ok = launchError === null
     && summaryProfiles.length === 2
     && summaryProfiles.every(profile => profile.ok === true)
+    && readOnlyGuard.ok === true
     && draftIsolation.ok === true
     && casSeries.ok === true
+    && reportFailure.ok === true
     && consoleErrors.length === 0
     && pageErrors.length === 0
     && blockingNetwork.length === 0
     && downloads.length === 0
-    && forbiddenActions.length === 0;
+    && forbiddenActions.length === 0
+    && readOnlyMutationAttempts.length === 0;
 
   const summary = {
     ok,
@@ -1395,7 +1833,11 @@ async function launchBrowser() {
     duration_ms: Date.now() - Date.parse(startedAt),
     global_timeout_ms: globalTimeoutMs,
     global_timeout_reached: globalTimeoutReached,
-    panel_url: panelUrl,
+    panel_url: baseUrl.origin,
+    read_only: readOnly,
+    read_only_scope: readOnly
+      ? "no_config_or_action_requests; health_atomic_preflight_allowed"
+      : "disabled",
     browser_mode: browserUsed,
     profile_count: summaryProfiles.length,
     profiles: summaryProfiles,
@@ -1409,10 +1851,28 @@ async function launchBrowser() {
       error: draftIsolation.error || null,
       reason: draftIsolation.reason || null,
     },
+    read_only_guard: {
+      ok: readOnlyGuard.ok === true,
+      skipped: readOnlyGuard.skipped === true,
+      browser_post_blocked: readOnlyGuard.browser_post_blocked === true,
+      api_post_blocked: readOnlyGuard.api_post_blocked === true,
+      api_forbidden_get_blocked: readOnlyGuard.api_forbidden_get_blocked === true,
+      forbidden_get_blocked: readOnlyGuard.forbidden_get_blocked === true,
+      safe_get_allowed: readOnlyGuard.safe_get_allowed === true,
+      fake_network_reached: readOnlyGuard.fake_network_reached === true,
+      context_wiring: readOnlyGuard.context_wiring === true,
+      attempt_count: Array.isArray(readOnlyGuard.attempts) ? readOnlyGuard.attempts.length : 0,
+      error: readOnlyGuard.error || null,
+      reason: readOnlyGuard.reason || null,
+    },
     cas_series: {
       ok: casSeries.ok === true,
       skipped: casSeries.skipped === true,
       mutation_kind: casSeries.mutation_kind || null,
+      read_only: casSeries.read_only === true,
+      first_expected_fingerprint_ok: casSeries.first_expected_fingerprint_ok === true,
+      second_expected_fingerprint_ok: casSeries.second_expected_fingerprint_ok === true,
+      reload_disabled_while_saving: casSeries.reload_disabled_while_saving === true,
       original_series_fingerprint: casSeries.original_series_fingerprint || null,
       mutation_fingerprint: casSeries.mutation_fingerprint || null,
       conflict_status: casSeries.conflict_status || null,
@@ -1425,12 +1885,22 @@ async function launchBrowser() {
       error: casSeries.error || null,
       reason: casSeries.reason || null,
     },
+    report_http_error: {
+      ok: reportFailure.ok === true,
+      skipped: reportFailure.skipped === true,
+      status: reportFailure.status || null,
+      visible_error: reportFailure.visible_error || "",
+      error_class: reportFailure.error_class === true,
+      error: reportFailure.error || null,
+      reason: reportFailure.reason || null,
+    },
     console_error_count: consoleErrors.length,
     page_error_count: pageErrors.length,
     blocking_network_count: blockingNetwork.length,
     expected_network_count: network.filter(event => event.expected === true).length,
     download_count: downloads.length,
     forbidden_action_count: forbiddenActions.length,
+    read_only_mutation_attempt_count: readOnlyMutationAttempts.length,
     screenshots: summaryProfiles.map(profile => profile.screenshot),
     launch_error: launchError,
   };
@@ -1453,12 +1923,15 @@ async function launchBrowser() {
     profile.details ? profile.details.layouts : [],
   ])));
   writeJson("draft_isolation.json", draftIsolation);
+  writeJson("read_only_guard.json", readOnlyGuard);
   writeJson("cas_series.json", casSeries);
+  writeJson("report_http_error.json", reportFailure);
   writeJson("console.json", consoleEvents);
   writeJson("page_errors.json", pageErrors);
   writeJson("network.json", network);
   writeJson("downloads.json", downloads);
   writeJson("forbidden_actions.json", forbiddenActions);
+  writeJson("read_only_mutation_attempts.json", readOnlyMutationAttempts);
   clearTimeout(globalWatchdog);
 
   console.log("ARR_UI_CHECK_JSON_START");
@@ -1479,8 +1952,9 @@ $previousErrorAction = $ErrorActionPreference
 Push-Location $runtimeDir
 try {
   $keep = if ($KeepBrowserOpen) { "1" } else { "0" }
+  $readOnlyArg = if ($ReadOnly) { "1" } else { "0" }
   $ErrorActionPreference = "Continue"
-  $output = & $node.Source $runner $PanelUrl $artifactDir $TimeoutMs $keep $Browser 2>&1
+  $output = & $node.Source $runner $PanelUrl $artifactDir $TimeoutMs $keep $Browser $readOnlyArg 2>&1
   $exitCode = $LASTEXITCODE
 } finally {
   $ErrorActionPreference = $previousErrorAction

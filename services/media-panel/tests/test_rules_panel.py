@@ -1,10 +1,28 @@
 import io
 from pathlib import Path
+import shutil
+import subprocess
+import textwrap
 import unittest
 import urllib.error
 from unittest.mock import patch
 
 from media_panel import server
+
+
+def run_node_contract(script: str, *paths: Path) -> None:
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("Node.js no está disponible")
+    result = subprocess.run(
+        [node, "-e", textwrap.dedent(script), *(str(path) for path in paths)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr or result.stdout)
 
 
 class _CapturedHandler:
@@ -113,6 +131,136 @@ class RulesPanelContractTests(unittest.TestCase):
             self.panel_js,
         )
 
+    def test_rule_load_and_save_share_one_document_generation(self) -> None:
+        self.assertIn(
+            "function nextRuleDocumentEpoch(state, source)", self.panel_js
+        )
+        self.assertGreaterEqual(
+            self.panel_js.count(
+                "const documentEpoch = nextRuleDocumentEpoch(state, source);"
+            ),
+            2,
+        )
+        self.assertGreaterEqual(
+            self.panel_js.count(
+                "if (!isCurrentRuleDocumentEpoch(state, source, documentEpoch)) return;"
+            ),
+            4,
+        )
+        self.assertIn(
+            'id="reload-rules-profile" ${saving ? "disabled" : ""}',
+            self.panel_js,
+        )
+        self.assertIn("if (state.saving[source]) return;", self.panel_js)
+
+    def test_stale_rule_responses_cannot_replace_a_newer_generation(self) -> None:
+        panel = (
+            Path(server.__file__).resolve().parent
+            / "web"
+            / "static"
+            / "js"
+            / "panel.js"
+        )
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const fakeApp = { innerHTML: "" };
+            const fakeTitle = { textContent: "" };
+            const tabButtons = ["identidad", "limpieza-peliculas", "limpieza-series", "ajustes", "motor", "historial", "revision", "informes"].map(view => ({
+              dataset: { view },
+              classList: { toggle: () => {} },
+              addEventListener: () => {}
+            }));
+            const response = payload => ({ ok: true, status: 200, text: async () => JSON.stringify(payload) });
+            global.location = { hash: "#motor", href: "" };
+            global.history = { replaceState: () => {} };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            global.document = {
+              getElementById: id => id === "app" ? fakeApp : id === "title" ? fakeTitle : null,
+              querySelectorAll: selector => selector === ".tabs button" ? tabButtons : [],
+              addEventListener: () => {}
+            };
+            global.window = {
+              ArrIdentityUI: { show: async () => {} },
+              confirm: () => true,
+              addEventListener: () => {}
+            };
+            global.fetch = path => {
+              if (path === "/api/status") return Promise.resolve(response({ orchestrator: {}, media_worker: {}, paths: {} }));
+              if (path === "/api/jobs") return Promise.resolve(response({ jobs: [] }));
+              throw new Error(`Fetch inicial inesperado: ${path}`);
+            };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+
+            (async () => {
+              const view = "limpieza-peliculas";
+              const source = "rules";
+              const state = ruleViewStates[view];
+              const original = { ok: true, connected: true, editable: true, fingerprint: "a".repeat(64), rules: { entrada: { extensiones_video: [".mkv"] } } };
+              state.documents[source] = original;
+              state.drafts[source] = { entrada: { extensiones_video: [".mp4"] } };
+              state.dirty[source] = true;
+
+              let resolveSave;
+              let reloadCalls = 0;
+              const saveResponse = new Promise(resolve => { resolveSave = resolve; });
+              global.fetch = (path, options = {}) => {
+                if (options.method === "POST") return saveResponse;
+                reloadCalls += 1;
+                return Promise.resolve(response(original));
+              };
+              const pendingSave = saveRuleSource(view, source);
+              if (!state.saving[source]) throw new Error("Guardar no quedó marcado como activo");
+              if (reloadRuleSource(view, source) !== undefined || reloadCalls !== 0) {
+                throw new Error("Recargar se ejecutó mientras Guardar estaba activo");
+              }
+
+              const newerAfterSave = { ...original, fingerprint: "b".repeat(64), rules: { entrada: { extensiones_video: [".avi"] } } };
+              nextRuleDocumentEpoch(state, source);
+              state.documents[source] = newerAfterSave;
+              state.drafts[source] = clone(newerAfterSave.rules);
+              state.dirty[source] = false;
+              state.saving[source] = false;
+              resolveSave(response({ ...original, fingerprint: "c".repeat(64) }));
+              await pendingSave;
+              if (state.documents[source].fingerprint !== newerAfterSave.fingerprint) {
+                throw new Error("Una respuesta tardía de Guardar pisó la generación nueva");
+              }
+
+              let resolveLoad;
+              const loadResponse = new Promise(resolve => { resolveLoad = resolve; });
+              global.fetch = () => loadResponse;
+              const pendingLoad = loadRuleSource(view, source, { replace: true });
+              const newerAfterLoad = { ...original, fingerprint: "d".repeat(64), rules: { entrada: { extensiones_video: [".mov"] } } };
+              nextRuleDocumentEpoch(state, source);
+              state.documents[source] = newerAfterLoad;
+              state.drafts[source] = clone(newerAfterLoad.rules);
+              state.loading[source] = false;
+              resolveLoad(response({ ...original, fingerprint: "e".repeat(64) }));
+              await pendingLoad;
+              if (state.documents[source].fingerprint !== newerAfterLoad.fingerprint) {
+                throw new Error("Una respuesta tardía de Recargar pisó la generación nueva");
+              }
+            })().catch(error => {
+              console.error(error.stack || error);
+              process.exitCode = 1;
+            });
+            """,
+            panel,
+        )
+
+    def test_every_editable_rule_document_requires_a_cas_fingerprint(self) -> None:
+        self.assertIn(
+            'typeof documentState.fingerprint === "string"', self.panel_js
+        )
+        self.assertIn(
+            'typeof payload.fingerprint === "string"', self.panel_js
+        )
+        self.assertIn("una huella CAS válida", self.panel_js)
+        self.assertIn("error.status === 409", self.panel_js)
+        self.assertIn("Conflicto al guardar", self.panel_js)
+
     def test_hash_priority_persistence_and_legacy_aliases_are_explicit(self) -> None:
         self.assertIn("const PANEL_ROUTE_STORAGE_KEY", self.panel_js)
         self.assertIn("function exactCanonicalRoute(hash)", self.panel_js)
@@ -153,6 +301,12 @@ class RulesPanelContractTests(unittest.TestCase):
         self.assertIn("arr-media-panel-historial-profile", self.panel_js)
         self.assertIn("arr-media-panel-revision-profile", self.panel_js)
         self.assertIn("arr-media-panel-informes-profile", self.panel_js)
+
+    def test_report_open_checks_http_status_and_renders_a_visible_error(self) -> None:
+        self.assertIn("const response = await fetch(", self.panel_js)
+        self.assertIn("if (!response.ok)", self.panel_js)
+        self.assertIn("No se pudo abrir el informe", self.panel_js)
+        self.assertIn("report-view-error", self.panel_js)
 
     def test_series_status_distinguishes_legacy_canary_and_active(self) -> None:
         self.assertIn("modo legacy · no enruta trabajos nuevos", self.panel_js)

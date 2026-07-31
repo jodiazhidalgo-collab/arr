@@ -586,12 +586,24 @@ async function showInformes(context) {
   }));
   document.querySelectorAll("[data-report]").forEach(btn => btn.addEventListener("click", async () => {
     const file = btn.dataset.report;
-    const text = await fetch(`/api/report?profile=${encodeURIComponent(profile)}&file=${encodeURIComponent(file)}`, { cache: "no-store" }).then(r => r.text());
-    if (!isCurrentViewContext(context)) return;
-    const box = document.getElementById("report-view");
-    if (!box) return;
-    box.style.display = "block";
-    box.querySelector("pre").textContent = text;
+    try {
+      const response = await fetch(`/api/report?profile=${encodeURIComponent(profile)}&file=${encodeURIComponent(file)}`, { cache: "no-store" });
+      const text = await response.text();
+      if (!isCurrentViewContext(context)) return;
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const box = document.getElementById("report-view");
+      if (!box) return;
+      box.classList.remove("report-view-error");
+      box.style.display = "block";
+      box.querySelector("pre").textContent = text;
+    } catch (error) {
+      if (!isCurrentViewContext(context)) return;
+      const box = document.getElementById("report-view");
+      if (!box) return;
+      box.classList.add("report-view-error");
+      box.style.display = "block";
+      box.querySelector("pre").textContent = `No se pudo abrir el informe: ${error.message}`;
+    }
   }));
   bindAuxiliaryProfileSelector("informes", showInformes);
 }
@@ -610,11 +622,34 @@ function isRuleSourceActive(view, source) {
   return routeKeyFromHash() === view && ruleSourceKey(view) === source;
 }
 
+function nextRuleDocumentEpoch(state, source) {
+  const documentEpoch = Number(state.requestEpoch[source] || 0) + 1;
+  state.requestEpoch[source] = documentEpoch;
+  return documentEpoch;
+}
+
+function isCurrentRuleDocumentEpoch(state, source, documentEpoch) {
+  return Number(state.requestEpoch[source] || 0) === documentEpoch;
+}
+
+function validRuleDocumentPayload(payload) {
+  return Boolean(payload)
+    && typeof payload === "object"
+    && !Array.isArray(payload)
+    && typeof payload.rules === "object"
+    && payload.rules !== null
+    && !Array.isArray(payload.rules)
+    && typeof payload.fingerprint === "string"
+    && Boolean(payload.fingerprint.trim());
+}
+
 function ruleDocumentEditable(documentState) {
   return Boolean(documentState)
     && documentState.ok !== false
     && documentState.connected !== false
-    && documentState.editable !== false;
+    && documentState.editable !== false
+    && typeof documentState.fingerprint === "string"
+    && Boolean(documentState.fingerprint.trim());
 }
 
 function ruleDocumentStatus(documentState, sourceConfig) {
@@ -681,7 +716,7 @@ function renderRuleProfile(view) {
           <div class="muted">${esc(section.help)}</div>
         </div>
         <div class="toolbar-actions">
-          <button class="btn ghost" id="reload-rules-profile">Recargar</button>
+          <button class="btn ghost" id="reload-rules-profile" ${saving ? "disabled" : ""}>Recargar</button>
           <button class="btn primary" id="save-rules-profile" data-tooltip="${esc(sourceConfig.endpoint)}" ${!editable || !dirty || saving ? "disabled" : ""}>${saving ? "Guardando…" : "Guardar reglas"}</button>
         </div>
       </div>
@@ -792,13 +827,12 @@ function updateRuleDraftFromInput(view, source, input) {
 async function loadRuleSource(view, source, { replace = false } = {}) {
   const state = ruleViewStates[view];
   const sourceConfig = ruleSourceConfig(view, source);
-  if (!state || !sourceConfig || state.loading[source]) return;
+  if (!state || !sourceConfig || state.loading[source] || state.saving[source]) return;
   if (state.documents[source] && !replace) {
     if (isRuleSourceActive(view, source)) renderRuleProfile(view);
     return;
   }
-  const requestEpoch = Number(state.requestEpoch[source] || 0) + 1;
-  state.requestEpoch[source] = requestEpoch;
+  const documentEpoch = nextRuleDocumentEpoch(state, source);
   state.loading[source] = true;
   if (isRuleSourceActive(view, source)) {
     app.innerHTML = `<section class="panel">Cargando ${esc(sourceConfig.label.toLowerCase())}...</section>`;
@@ -815,9 +849,9 @@ async function loadRuleSource(view, source, { replace = false } = {}) {
         payload.series_mode = "unknown";
       }
     }
-    if (state.requestEpoch[source] !== requestEpoch) return;
-    if (!payload || typeof payload !== "object" || Array.isArray(payload) || typeof payload.rules !== "object") {
-      throw new Error("El servidor no devolvió el contrato completo de reglas.");
+    if (!isCurrentRuleDocumentEpoch(state, source, documentEpoch)) return;
+    if (!validRuleDocumentPayload(payload)) {
+      throw new Error("El servidor no devolvió reglas con una huella CAS válida.");
     }
     state.documents[source] = payload;
     state.drafts[source] = clone(payload.rules);
@@ -829,19 +863,21 @@ async function loadRuleSource(view, source, { replace = false } = {}) {
       : "";
     if (isRuleSourceActive(view, source)) renderRuleProfile(view);
   } catch (error) {
-    if (state.requestEpoch[source] !== requestEpoch) return;
+    if (!isCurrentRuleDocumentEpoch(state, source, documentEpoch)) return;
     state.notice[source] = `Error cargando: ${error.message}`;
     if (isRuleSourceActive(view, source)) {
       app.innerHTML = `<section class="panel identity-load-error"><span class="pill bad">No disponible</span><div><h2>No se pudo cargar ${esc(sourceConfig.label.toLowerCase())}</h2><p>${esc(error.message)}</p></div><button type="button" class="btn primary" id="rules-load-retry">Reintentar</button></section>`;
       document.getElementById("rules-load-retry")?.addEventListener("click", () => loadRuleSource(view, source, { replace: true }));
     }
   } finally {
-    if (state.requestEpoch[source] === requestEpoch) state.loading[source] = false;
+    if (!isCurrentRuleDocumentEpoch(state, source, documentEpoch)) return;
+    state.loading[source] = false;
   }
 }
 
 function reloadRuleSource(view, source) {
   const state = ruleViewStates[view];
+  if (state.saving[source]) return;
   if (state.dirty[source] && !window.confirm("Recargar descartará los cambios sin guardar. ¿Continuar?")) return;
   return loadRuleSource(view, source, { replace: true });
 }
@@ -850,8 +886,9 @@ async function saveRuleSource(view, source) {
   const state = ruleViewStates[view];
   const documentState = state.documents[source];
   const sourceConfig = ruleSourceConfig(view, source);
-  if (!ruleDocumentEditable(documentState) || !state.dirty[source] || state.saving[source]) return;
+  if (!ruleDocumentEditable(documentState) || !state.dirty[source] || state.loading[source] || state.saving[source]) return;
   const submittedDraft = clone(state.drafts[source]);
+  const documentEpoch = nextRuleDocumentEpoch(state, source);
   state.saving[source] = true;
   if (isRuleSourceActive(view, source)) renderRuleProfile(view);
   try {
@@ -859,7 +896,8 @@ async function saveRuleSource(view, source) {
       method: "POST",
       body: JSON.stringify({ rules: submittedDraft, expected_fingerprint: documentState.fingerprint ?? null })
     });
-    if (!savedState || savedState.ok === false || typeof savedState.rules !== "object") {
+    if (!isCurrentRuleDocumentEpoch(state, source, documentEpoch)) return;
+    if (!validRuleDocumentPayload(savedState) || savedState.ok === false) {
       throw new Error(savedState?.message || savedState?.error || "El motor no confirmó las reglas guardadas.");
     }
     if (sourceConfig.endpoint === "/api/series-rules") {
@@ -877,10 +915,13 @@ async function saveRuleSource(view, source) {
         ? `Reglas guardadas. ${ruleDocumentStatus(savedState, sourceConfig)}`
         : "Reglas guardadas y activas para trabajos nuevos.";
   } catch (error) {
-    state.notice[source] = error.status === 409
-      ? `Conflicto al guardar: ${error.message} Recarga y vuelve a intentarlo.`
+    if (!isCurrentRuleDocumentEpoch(state, source, documentEpoch)) return;
+    const conflict = error.status === 409 || error.payload?.error === "fingerprint_conflict";
+    state.notice[source] = conflict
+      ? `Conflicto al guardar ${sourceConfig.label.toLowerCase()}: ${error.message} Recarga y vuelve a intentarlo.`
       : `Error guardando: ${error.message}`;
   } finally {
+    if (!isCurrentRuleDocumentEpoch(state, source, documentEpoch)) return;
     state.saving[source] = false;
     if (isRuleSourceActive(view, source)) renderRuleProfile(view);
   }

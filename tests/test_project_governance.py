@@ -111,3 +111,69 @@ def test_review_docs_match_the_validation_contract():
         assert "node --check services/media-panel/media_panel/web/static/js/panel.js" in text
         assert "arr-pytest-evidence-windows-latest" in text
         assert "arr-pytest-evidence-ubuntu-latest" in text
+
+
+def test_ui_checker_supports_a_non_mutating_cas_and_report_error_pass():
+    script = read(".agents/skills/playwright-ui-check-arr/scripts/ui_check.ps1")
+
+    for expected in (
+        "[switch]$ReadOnly",
+        'const readOnly = process.argv[7] === "1";',
+        "simulated_swap_without_server_write",
+        "ARR_UI_CAS_RELOAD_ENABLED_DURING_SAVE",
+        "runReportFailure(browser)",
+        "runReadOnlyGuardSelfTest()",
+        "handleReadOnlyRoute(route, label)",
+        "result.context_wiring",
+        "ARR_UI_REPORT_ERROR_HIDDEN",
+        'read_only_verified: true',
+        'context.route("**/*"',
+        "ARR_UI_READ_ONLY_API_MUTATION",
+        'serviceWorkers: "block"',
+        "acceptDownloads: false",
+        "ARR_UI_READ_ONLY_FORBIDDEN_ENDPOINT",
+        "sanitizedRequestTarget",
+        "bucket.expected_report_error",
+        "read_only_mutation_attempt_count",
+        "health_atomic_preflight_allowed",
+    ):
+        assert expected in script
+    assert "route.continue()" not in script
+    assert script.count("route.fallback()") >= 3
+    assert "reportFailure = await runReportFailure(browser);" in script
+    assert (
+        "$runner $PanelUrl $artifactDir $TimeoutMs $keep $Browser $readOnlyArg 2>&1"
+        in script
+    )
+    assert '$readOnlyArg = if ($ReadOnly) { "1" } else { "0" }' in script
+    assert "$readOnly = if ($ReadOnly)" not in script
+    main = script.split('(async () => {', 1)[1]
+    assert main.index("readOnlyGuard = await runReadOnlyGuardSelfTest();") < main.index(
+        "const launched = await launchBrowser();"
+    )
+    read_only_guard = script.split("async function checkedBrowserContext", 1)[1].split(
+        "function createObservationBucket", 1
+    )[0]
+    assert "url: request.url()" not in read_only_guard
+    observer = script.split("function attachObservers", 1)[1].split(
+        "function blockingNetworkEvents", 1
+    )[0]
+    assert "url:" not in observer
+    assert "/\\b409\\b/.test(text)" in observer
+    assert "/\\b503\\b/.test(text)" in observer
+    assert "path: sanitizedRequestTarget(rawLocation && rawLocation.url)" in observer
+    assert "must_not_escape" in script
+    assert "result.attempts.length === 4" in script
+    guard_self_test = script.split("async function runReadOnlyGuardSelfTest", 1)[1].split(
+        "async function endpointChecks", 1
+    )[0]
+    assert "page." not in guard_self_test
+    report_failure = script.split("async function runReportFailure", 1)[1].split(
+        "async function launchBrowser", 1
+    )[0]
+    init_script = report_failure.split("await page.addInitScript(() => {", 1)[1].split(
+        "});", 1
+    )[0]
+    assert "try {" in init_script
+    assert 'localStorage.setItem("arr-media-panel-informes-profile", "series");' in init_script
+    assert "} catch {" in init_script
