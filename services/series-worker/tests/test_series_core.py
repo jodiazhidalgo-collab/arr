@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from contextlib import nullcontext
@@ -1736,7 +1737,7 @@ def test_review_copy_must_match_source_before_becoming_review(
     assert not any(layout["review"].iterdir())
 
 
-def test_health_is_read_only_until_submit_caches_atomic_preflight(layout):
+def test_health_runs_atomic_preflight_once_and_reuses_device_cache(layout):
     calls = []
     coordinator = SeriesCoordinator(
         rules_store=RulesStore(config_path=layout["root"] / "health-rules.json"),
@@ -1752,17 +1753,117 @@ def test_health_is_read_only_until_submit_caches_atomic_preflight(layout):
 
     first = coordinator.health()
     second = coordinator.health()
-    accepted = coordinator.submit(_payload(layout))
-    terminal = coordinator.wait("job-1")
-    after_submit = coordinator.health()
+    assert first.http_status == second.http_status == 200
+    assert first.payload["checks"]["atomicity"]["verified"] is True
+    assert second.payload["checks"]["atomicity"]["verified"] is True
+    assert len(calls) == 1
+
+
+def test_health_atomicity_cache_expires_and_same_device_failure_turns_503(layout):
+    now = [0.0]
+    outcomes = [
+        {"supported": True, "st_dev": layout["tv"].stat().st_dev},
+        OSError(errno.EROFS, "controlled read-only remount"),
+    ]
+
+    def preflight(_root):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    coordinator = SeriesCoordinator(
+        rules_store=RulesStore(config_path=layout["root"] / "health-ttl-rules.json"),
+        tool_checker=lambda: [],
+        atomic_preflight=preflight,
+        health_clock=lambda: now[0],
+        health_atomicity_cache_ttl_sec=300.0,
+    )
+
+    first = coordinator.health()
+    now[0] = 299.0
+    cached = coordinator.health()
+    now[0] = 300.0
+    expired = coordinator.health()
+
+    assert first.http_status == cached.http_status == 200
+    assert first.payload["checks"]["atomicity"]["verified_age_sec"] == 0.0
+    assert cached.payload["checks"]["atomicity"]["verified_age_sec"] == 299.0
+    assert expired.http_status == 503
+    assert expired.payload["checks"]["atomicity"] == {
+        "ok": False,
+        "verified": False,
+    }
+    assert outcomes == []
+    assert coordinator._health_atomicity_cache is None
+
+
+def test_concurrent_health_after_cache_expiry_runs_one_atomic_preflight(layout):
+    now = [0.0]
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def preflight(root):
+        calls.append(now[0])
+        if len(calls) == 2:
+            entered.set()
+            assert release.wait(timeout=5)
+        return {"supported": True, "st_dev": root.stat().st_dev}
+
+    coordinator = SeriesCoordinator(
+        rules_store=RulesStore(
+            config_path=layout["root"] / "health-concurrent-ttl-rules.json"
+        ),
+        tool_checker=lambda: [],
+        atomic_preflight=preflight,
+        health_clock=lambda: now[0],
+        health_atomicity_cache_ttl_sec=300.0,
+    )
+    assert coordinator.health().http_status == 200
+    now[0] = 300.0
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(coordinator.health())) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    assert entered.wait(timeout=5)
+    release.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert len(calls) == 2
+    assert [result.http_status for result in results] == [200, 200]
+    assert all(
+        result.payload["checks"]["atomicity"]["verified_age_sec"] == 0.0
+        for result in results
+    )
+
+
+def test_health_rechecks_atomicity_when_device_cache_changes(layout):
+    calls = []
+
+    def preflight(root):
+        calls.append(root.stat().st_dev)
+        return {"supported": True, "st_dev": root.stat().st_dev}
+
+    coordinator = SeriesCoordinator(
+        rules_store=RulesStore(config_path=layout["root"] / "health-device-rules.json"),
+        tool_checker=lambda: [],
+        atomic_preflight=preflight,
+    )
+
+    first = coordinator.health()
+    coordinator._health_atomicity_cache = {
+        "supported": True,
+        "st_dev": layout["tv"].stat().st_dev + 1,
+    }
+    second = coordinator.health()
 
     assert first.http_status == second.http_status == 200
-    assert first.payload["checks"]["atomicity"]["verified"] is False
-    assert second.payload["checks"]["atomicity"]["verified"] is False
-    assert accepted.http_status == 202
-    assert terminal.payload["result"]["status"] == "done"
-    assert len(calls) == 1
-    assert after_submit.payload["checks"]["atomicity"]["verified"] is True
+    assert first.payload["checks"]["atomicity"]["verified"] is True
+    assert second.payload["checks"]["atomicity"]["verified"] is True
+    assert calls == [layout["tv"].stat().st_dev] * 2
 
 
 @pytest.mark.parametrize("journal_state", ["PREPARED", "PROCESSING"])
@@ -1791,7 +1892,10 @@ def test_health_keeps_missing_contract_for_injected_operational_checker(layout):
     coordinator = SeriesCoordinator(
         rules_store=RulesStore(config_path=layout["root"] / "health-rules.json"),
         tool_checker=lambda: calls.append(True) or ["vobsubocr"],
-        atomic_preflight=lambda root: {"supported": True},
+        atomic_preflight=lambda root: {
+            "supported": True,
+            "st_dev": root.stat().st_dev,
+        },
     )
 
     response = coordinator.health()
@@ -1815,7 +1919,11 @@ def test_default_tool_checker_uses_bounded_parallel_smoke(layout, monkeypatch):
 
     monkeypatch.setattr(core_module, "unavailable_tools", checker)
     coordinator = SeriesCoordinator(
-        rules_store=RulesStore(config_path=layout["root"] / "default-health-rules.json")
+        rules_store=RulesStore(config_path=layout["root"] / "default-health-rules.json"),
+        atomic_preflight=lambda root: {
+            "supported": True,
+            "st_dev": root.stat().st_dev,
+        },
     )
 
     response = coordinator.health()
@@ -1828,6 +1936,7 @@ def test_failed_or_stale_preflight_invalidates_health_cache(layout):
     outcomes = [
         {"supported": True, "st_dev": layout["tv"].stat().st_dev},
         OSError(errno.EIO, "controlled preflight failure"),
+        OSError(errno.EIO, "controlled health preflight failure"),
     ]
 
     def preflight(_root):
@@ -1858,21 +1967,32 @@ def test_failed_or_stale_preflight_invalidates_health_cache(layout):
     assert failed.value.http_status == 503
     assert not (layout["reports"] / "job-cache-2").exists()
     assert list(layout["review"].iterdir()) == []
-    assert coordinator.health().payload["checks"]["atomicity"]["verified"] is False
+    unhealthy = coordinator.health()
+    assert unhealthy.http_status == 503
+    assert unhealthy.payload["checks"]["atomicity"] == {
+        "ok": False,
+        "verified": False,
+    }
+    assert coordinator._health_atomicity_cache is None
 
+    outcomes.append(
+        {"supported": True, "st_dev": layout["tv"].stat().st_dev}
+    )
     coordinator._health_atomicity_cache = {
         "supported": True,
         "st_dev": layout["tv"].stat().st_dev + 1,
     }
     stale = coordinator.health()
-    assert stale.payload["checks"]["atomicity"]["verified"] is False
-    assert coordinator._health_atomicity_cache is None
+    assert stale.http_status == 200
+    assert stale.payload["checks"]["atomicity"]["verified"] is True
+    assert coordinator._health_atomicity_cache["st_dev"] == layout["tv"].stat().st_dev
 
 
 def test_unexpected_preflight_failure_invalidates_health_cache(layout):
     outcomes = [
         {"supported": True, "st_dev": layout["tv"].stat().st_dev},
         ValueError("controlled unexpected preflight failure"),
+        ValueError("controlled unexpected health preflight failure"),
     ]
 
     def preflight(_root):
@@ -1904,7 +2024,61 @@ def test_unexpected_preflight_failure_invalidates_health_cache(layout):
     assert not (layout["reports"] / "job-unexpected-cache-2").exists()
     assert list(layout["review"].iterdir()) == []
 
-    assert coordinator.health().payload["checks"]["atomicity"]["verified"] is False
+    unhealthy = coordinator.health()
+    assert unhealthy.http_status == 503
+    assert unhealthy.payload["checks"]["atomicity"] == {
+        "ok": False,
+        "verified": False,
+    }
+    assert coordinator._health_atomicity_cache is None
+
+
+def test_health_rejects_unsupported_atomicity_without_caching(layout):
+    calls = []
+    coordinator = SeriesCoordinator(
+        rules_store=RulesStore(config_path=layout["root"] / "unsupported-health-rules.json"),
+        tool_checker=lambda: [],
+        atomic_preflight=lambda root: calls.append(root) or {
+            "supported": False,
+            "st_dev": root.stat().st_dev,
+        },
+    )
+
+    first = coordinator.health()
+    second = coordinator.health()
+
+    assert first.http_status == second.http_status == 503
+    assert first.payload["checks"]["atomicity"] == {
+        "ok": False,
+        "verified": False,
+    }
+    assert second.payload["checks"]["atomicity"] == {
+        "ok": False,
+        "verified": False,
+    }
+    assert len(calls) == 2
+    assert coordinator._health_atomicity_cache is None
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="renameat2 requiere Linux")
+def test_health_real_preflight_leaves_no_probe_residue(layout, monkeypatch):
+    monkeypatch.setenv(
+        "SERIES_ATOMIC_PREFLIGHT_LOCK_PATH",
+        str(layout["root"] / "locks/series-atomic-preflight.lock"),
+    )
+    coordinator = SeriesCoordinator(
+        rules_store=RulesStore(config_path=layout["root"] / "real-health-rules.json"),
+        tool_checker=lambda: [],
+        atomic_preflight=delivery_module.preflight_atomic_exchange,
+    )
+
+    first = coordinator.health()
+    second = coordinator.health()
+
+    assert first.http_status == second.http_status == 200
+    assert first.payload["checks"]["atomicity"]["verified"] is True
+    assert second.payload["checks"]["atomicity"]["verified"] is True
+    assert list(layout["tv"].iterdir()) == []
 
 
 @pytest.mark.parametrize("entrypoint", ["status", "submit"])

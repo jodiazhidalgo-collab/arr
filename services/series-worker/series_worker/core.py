@@ -78,6 +78,7 @@ DEFAULT_ALLOWED_ROOT = "/data/downloads/torrents/complete/taller"
 DEFAULT_FINAL_ROOT = "/data/media/tv"
 DEFAULT_REVIEW_ROOT = "/data/media/repetidas_vs_error_series"
 DEFAULT_REPORT_ROOT = "/config/series-worker"
+DEFAULT_HEALTH_ATOMICITY_CACHE_TTL_SEC = 300.0
 DEFAULT_CALLBACK_ORIGIN = "http://arr-orchestrator:8787"
 DEFAULT_LOCK_PATH = "/config/worker-locks/media-heavy.lock"
 
@@ -1501,6 +1502,8 @@ class SeriesCoordinator:
         atomic_preflight: Callable[[Path], dict[str, Any]] = preflight_atomic_exchange,
         tool_checker: Callable[[], list[str]] | None = None,
         lock_factory: Callable[..., ContextManager[Any]] = series_heavy_lock,
+        health_clock: Callable[[], float] = time.monotonic,
+        health_atomicity_cache_ttl_sec: float = DEFAULT_HEALTH_ATOMICITY_CACHE_TTL_SEC,
     ) -> None:
         self._rules_error: BaseException | None = None
         if rules_store is None:
@@ -1521,6 +1524,11 @@ class SeriesCoordinator:
             )
         )
         self.lock_factory = lock_factory
+        self.health_clock = health_clock
+        self.health_atomicity_cache_ttl_sec = max(
+            0.0,
+            float(health_atomicity_cache_ttl_sec),
+        )
         self.lock_path = Path(
             str(
                 os.environ.get("SERIES_WORKER_LOCK_PATH")
@@ -1533,6 +1541,7 @@ class SeriesCoordinator:
         self._threads: dict[str, threading.Thread] = {}
         self._last_errors: dict[str, str] = {}
         self._health_atomicity_cache: dict[str, Any] | None = None
+        self._health_atomicity_cached_at: float | None = None
         self._health_atomicity_lock = threading.Lock()
 
     def rules_payload(self) -> dict[str, Any]:
@@ -1556,7 +1565,7 @@ class SeriesCoordinator:
         checks: dict[str, Any] = {
             "rules": {"ok": False},
             "tools": {"ok": False},
-            "atomicity": {"ok": False},
+            "atomicity": {"ok": False, "verified": False},
         }
         errors: list[str] = []
         try:
@@ -1577,27 +1586,55 @@ class SeriesCoordinator:
             if not final_root.is_dir():
                 raise NotADirectoryError(str(final_root))
             with self._health_atomicity_lock:
+                now = float(self.health_clock())
                 cached = (
                     dict(self._health_atomicity_cache)
                     if self._health_atomicity_cache is not None
                     else None
                 )
-                if cached is not None and int(cached.get("st_dev", -1)) != int(
-                    final_stat.st_dev
+                cached_at = self._health_atomicity_cached_at
+                current_device = int(final_stat.st_dev)
+                if cached is not None and (
+                    cached.get("supported") is not True
+                    or int(cached.get("st_dev", -1)) != current_device
+                    or cached_at is None
+                    or now - cached_at >= self.health_atomicity_cache_ttl_sec
                 ):
                     self._health_atomicity_cache = None
+                    self._health_atomicity_cached_at = None
                     cached = None
-            checks["atomicity"] = (
-                {"ok": True, "verified": True, **cached}
-                if cached is not None
-                else {
-                    "ok": True,
-                    "verified": False,
-                    "status": "preflight_on_submit",
-                    "st_dev": int(final_stat.st_dev),
-                }
-            )
+                    cached_at = None
+                if cached is None:
+                    try:
+                        atomic_result = self.atomic_preflight(final_root)
+                        after_device = int(final_root.stat().st_dev)
+                        if (
+                            not isinstance(atomic_result, dict)
+                            or atomic_result.get("supported") is not True
+                            or int(atomic_result.get("st_dev", -1)) != current_device
+                            or after_device != current_device
+                        ):
+                            raise AtomicDeliveryUnsupported(
+                                "El preflight no verificó el dispositivo actual"
+                            )
+                    except Exception:
+                        self._health_atomicity_cache = None
+                        self._health_atomicity_cached_at = None
+                        raise
+                    cached = dict(atomic_result)
+                    self._health_atomicity_cache = dict(cached)
+                    cached_at = float(self.health_clock())
+                    self._health_atomicity_cached_at = cached_at
+            checks["atomicity"] = {
+                **cached,
+                "ok": True,
+                "verified": True,
+                "verified_age_sec": max(0.0, now - float(cached_at)),
+            }
         except Exception as error:
+            with self._health_atomicity_lock:
+                self._health_atomicity_cache = None
+                self._health_atomicity_cached_at = None
             errors.append("atomicity:" + _safe_error(error))
         ok = not errors
         return Submission(
@@ -1848,11 +1885,13 @@ class SeriesCoordinator:
         except Exception as error:
             with self._health_atomicity_lock:
                 self._health_atomicity_cache = None
+                self._health_atomicity_cached_at = None
             raise ServiceUnavailable(
                 "Publicación atómica no disponible: " + _safe_error(error)
             ) from error
         with self._health_atomicity_lock:
             self._health_atomicity_cache = dict(atomic_result)
+            self._health_atomicity_cached_at = float(self.health_clock())
         return dict(atomic_result)
 
     def _preflight_prepared(

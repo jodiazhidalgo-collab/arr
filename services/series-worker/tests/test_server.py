@@ -35,7 +35,7 @@ class StubCoordinator:
                 "checks": {
                     "rules": {"ok": True},
                     "tools": {"ok": True},
-                    "atomicity": {"ok": True},
+                    "atomicity": {"ok": True, "verified": True},
                 },
             },
         )
@@ -184,6 +184,7 @@ def test_health_and_rules_endpoints(api):
     )
 
     assert status == 200 and health["status"] == "ok"
+    assert health["checks"]["atomicity"]["verified"] is True
     assert rules_status == 200 and current["applies_to"] == "new_jobs"
     assert save_status == 200 and saved["fingerprint"] != current["fingerprint"]
     assert conflict_status == 409 and conflict["error"] == "fingerprint_conflict"
