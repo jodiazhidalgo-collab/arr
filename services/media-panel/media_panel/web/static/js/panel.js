@@ -2,13 +2,13 @@ const app = document.getElementById("app");
 const title = document.getElementById("title");
 const tabs = [...document.querySelectorAll(".tabs button")];
 
-const rulesStates = {
-  media: null,
-  watcher: null
-};
-const RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
-let currentRuleSection = readStoredRuleSection();
+const PANEL_ROUTE_STORAGE_KEY = "arr-media-panel-route";
+const LEGACY_RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
 let viewEpoch = 0;
+const auxiliaryProfiles = {
+  revision: storageGet("arr-media-panel-revision-profile", "movies") === "series" ? "series" : "movies",
+  informes: storageGet("arr-media-panel-informes-profile", "movies") === "series" ? "series" : "movies"
+};
 
 function currentViewContext(view) {
   return Object.freeze({ view, epoch: viewEpoch, hash: location.hash });
@@ -31,19 +31,6 @@ function isCurrentViewContext(context) {
     && context.hash === location.hash
     && context.view === routeKeyFromHash();
 }
-
-const RULE_SOURCES = {
-  media: {
-    endpoint: "/api/rules",
-    label: "reglas multimedia",
-    fallbackRules: {}
-  },
-  watcher: {
-    endpoint: "/api/watcher-rules",
-    label: "Vigilante ARR",
-    fallbackRules: { ignored_suffixes: [] }
-  }
-};
 
 const RULE_SECTIONS = {
   entrada: {
@@ -222,12 +209,11 @@ const RULE_SECTIONS = {
     ]
   },
   vigilante: {
-    title: "Vigilante ARR",
-    help: "Finales de nombre que ARR ignora en la carpeta complete/movies.",
-    source: "watcher",
+    title: "Vigilantes",
+    help: "Finales de nombre que ARR ignora antes de crear un trabajo.",
     groups: [
       {
-        title: "Carpeta movies",
+        title: "Archivos ignorados",
         note: "Si un archivo, incluso dentro de una carpeta, termina así, ARR ignora la carpeta completa.",
         controls: [
           { type: "list", path: "ignored_suffixes", label: "Extensiones o finales ignorados" }
@@ -237,26 +223,79 @@ const RULE_SECTIONS = {
   }
 };
 
-if (!RULE_SECTIONS[currentRuleSection]) {
-  currentRuleSection = "entrada";
-  storeRuleSection(currentRuleSection);
-}
+const CLEANING_SECTIONS = Object.freeze(["entrada", "video", "audio", "subtitulos", "limpieza"]);
+const SETTINGS_SECTIONS = Object.freeze(["trailers", "vigilantes"]);
+const RULE_VIEW_CONFIG = Object.freeze({
+  "limpieza-peliculas": Object.freeze({
+    profile: "movies",
+    label: "Limpieza películas",
+    sections: CLEANING_SECTIONS,
+    defaultSection: "entrada",
+    sources: Object.freeze({
+      rules: Object.freeze({ endpoint: "/api/movie-rules", label: "Motor de películas" })
+    })
+  }),
+  "limpieza-series": Object.freeze({
+    profile: "series",
+    label: "Limpieza series",
+    sections: CLEANING_SECTIONS,
+    defaultSection: "entrada",
+    sources: Object.freeze({
+      rules: Object.freeze({ endpoint: "/api/series-rules", label: "Motor de series" })
+    })
+  }),
+  ajustes: Object.freeze({
+    profile: "settings",
+    label: "Ajustes",
+    sections: SETTINGS_SECTIONS,
+    defaultSection: "trailers",
+    sources: Object.freeze({
+      trailers: Object.freeze({ endpoint: "/api/trailer-rules", label: "Trailers" }),
+      watcherMovies: Object.freeze({ endpoint: "/api/watcher-rules/movies", label: "Vigilante de películas" }),
+      watcherTv: Object.freeze({ endpoint: "/api/watcher-rules/tv", label: "Vigilante de series" })
+    })
+  })
+});
 
-function readStoredRuleSection() {
+function storageGet(key, fallback = null) {
   try {
-    return localStorage.getItem(RULE_SECTION_STORAGE_KEY) || "entrada";
+    const value = localStorage.getItem(key);
+    return value === null ? fallback : value;
   } catch (_error) {
-    return "entrada";
+    return fallback;
   }
 }
 
-function storeRuleSection(section) {
-  try {
-    localStorage.setItem(RULE_SECTION_STORAGE_KEY, section);
-  } catch (_error) {
-    return;
-  }
+function storageSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (_error) { return; }
 }
+
+function ruleSectionStorageKey(view) {
+  return `arr-media-panel-section-${RULE_VIEW_CONFIG[view].profile}`;
+}
+
+function readStoredRuleSection(view) {
+  const config = RULE_VIEW_CONFIG[view];
+  const stored = storageGet(ruleSectionStorageKey(view), config.defaultSection);
+  return config.sections.includes(stored) ? stored : config.defaultSection;
+}
+
+function createRuleViewState(view) {
+  return {
+    view,
+    section: readStoredRuleSection(view),
+    watcherProfile: storageGet("arr-media-panel-ajustes-vigilante", "movies") === "tv" ? "tv" : "movies",
+    documents: {},
+    drafts: {},
+    dirty: {},
+    loading: {},
+    saving: {},
+    requestEpoch: {},
+    notice: {}
+  };
+}
+
+const ruleViewStates = Object.fromEntries(Object.keys(RULE_VIEW_CONFIG).map(view => [view, createRuleViewState(view)]));
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -328,11 +367,14 @@ async function showMotor(context) {
   const orchOk = status.orchestrator?.status === "ok";
   const workerOk = status.media_worker?.status === "ok";
   const deps = status.orchestrator?.dependencies || {};
+  const services = status.services || {};
   const latest = (jobs.jobs || []).slice(0, 8);
   app.innerHTML = `
     <section class="grid">
-      <div class="card"><small>Orquestador</small><span class="metric">${orchOk ? "OK" : "Error"}</span>${pill(orchOk ? "activo" : "fallo", orchOk ? "ok" : "bad")}</div>
-      <div class="card"><small>Media Worker</small><span class="metric">${workerOk ? "OK" : "Error"}</span>${pill(workerOk ? "activo" : "fallo", workerOk ? "ok" : "bad")}</div>
+      ${serviceStatusCard("Orquestador", services.orchestrator, orchOk)}
+      ${serviceStatusCard("Películas", services.movies, workerOk)}
+      ${serviceStatusCard("Series", services.series, false)}
+      ${serviceStatusCard("Trailers", services.trailers, workerOk)}
       <div class="card"><small>qBittorrent</small><span class="metric">${esc(deps.qbittorrent || "-")}</span></div>
       <div class="card"><small>RDT-Client</small><span class="metric">${esc(deps.rdtclient || "-")}</span></div>
     </section>
@@ -348,6 +390,12 @@ async function showMotor(context) {
       <h2>Ultimos trabajos</h2>
       ${jobsTable(latest)}
     </section>`;
+}
+
+function serviceStatusCard(label, service, legacyOk = false) {
+  const connected = typeof service?.connected === "boolean" ? service.connected : legacyOk;
+  const message = service?.message || service?.status || (connected ? "activo" : "no conectado");
+  return `<div class="card"><small>${esc(label)}</small><span class="metric">${connected ? "OK" : "—"}</span>${pill(message, connected ? "ok" : "warn")}</div>`;
 }
 
 function jobsTable(jobs, options = {}) {
@@ -390,15 +438,34 @@ async function showHistorial(context) {
   app.innerHTML = `<section class="panel"><h2>Trabajos recientes</h2>${jobsTable(jobs)}</section>`;
 }
 
+function renderAuxiliaryProfileSelector(view, profile) {
+  return `<div class="segmented-tabs auxiliary-profile-tabs" role="group" aria-label="Perfil de ${view === "revision" ? "revisión" : "informes"}">
+    <button type="button" class="${profile === "movies" ? "active" : ""}" data-aux-profile="movies">Películas</button>
+    <button type="button" class="${profile === "series" ? "active" : ""}" data-aux-profile="series">Series</button>
+  </div>`;
+}
+
+function bindAuxiliaryProfileSelector(view, renderer) {
+  document.querySelectorAll("[data-aux-profile]").forEach(button => button.addEventListener("click", () => {
+    const profile = button.dataset.auxProfile === "series" ? "series" : "movies";
+    if (profile === auxiliaryProfiles[view]) return;
+    auxiliaryProfiles[view] = profile;
+    storageSet(`arr-media-panel-${view}-profile`, profile);
+    renderer();
+  }));
+}
+
 async function showRevision(context) {
   context = ensureViewContext("revision", context);
   setActive("revision");
-  title.textContent = "Revision";
-  app.innerHTML = `<section class="panel">Cargando revision...</section>`;
-  const data = await api("/api/review");
+  title.textContent = "Revisión";
+  const profile = auxiliaryProfiles.revision;
+  app.innerHTML = `<section class="panel">Cargando revisión de ${profile === "series" ? "series" : "películas"}...</section>`;
+  const data = await api(`/api/review?profile=${encodeURIComponent(profile)}`);
   if (!isCurrentViewContext(context)) return;
   const items = data.items || [];
   app.innerHTML = `<section class="panel">
+    ${renderAuxiliaryProfileSelector("revision", profile)}
     <h2>repetidas_vs_error</h2>
     <div class="muted">${esc(data.review_dir)}</div>
     <div class="review-list" style="margin-top:12px">
@@ -413,14 +480,19 @@ async function showRevision(context) {
       `).join("") : `<div class="empty">No hay elementos en revision.</div>`}
     </div>
   </section>`;
+  bindAuxiliaryProfileSelector("revision", showRevision);
 }
 
 async function showInformes(context) {
   context = ensureViewContext("informes", context);
   setActive("informes");
   title.textContent = "Informes";
-  app.innerHTML = `<section class="panel">Cargando informes...</section>`;
-  const [data, codex] = await Promise.all([api("/api/reports"), api("/api/codex-diagnostics")]);
+  const profile = auxiliaryProfiles.informes;
+  app.innerHTML = `<section class="panel">Cargando informes de ${profile === "series" ? "series" : "películas"}...</section>`;
+  const [data, codex] = await Promise.all([
+    api(`/api/reports?profile=${encodeURIComponent(profile)}`),
+    api("/api/codex-diagnostics")
+  ]);
   if (!isCurrentViewContext(context)) return;
   const files = data.files || [];
   const codexFiles = codex.files || [];
@@ -462,6 +534,7 @@ async function showInformes(context) {
     .join("");
   app.innerHTML = `
   <section class="panel">
+    ${renderAuxiliaryProfileSelector("informes", profile)}
     <h2>Informes Codex</h2>
     <div class="muted">${esc(codex.root || "")}</div>
     ${codexFiles.length ? codexBlocks : `<div class="empty" style="margin-top:12px">Aun no hay informes Codex.</div>`}
@@ -497,202 +570,282 @@ async function showInformes(context) {
     box.style.display = "block";
     box.querySelector("pre").textContent = text;
   }));
+  bindAuxiliaryProfileSelector("informes", showInformes);
 }
 
-async function showReglas(context) {
-  context = ensureViewContext("reglas", context);
-  setActive("reglas");
-  title.textContent = "Motor de reglas";
-  app.innerHTML = `<section class="panel">Cargando reglas...</section>`;
-  const loadedSources = await Promise.all(Object.entries(RULE_SOURCES).map(async ([source, config]) => {
-    try {
-      return [source, await api(config.endpoint)];
-    } catch (error) {
-      return [source, {
-        ok: false,
-        rules: clone(config.fallbackRules),
-        rules_path: config.label,
-        error: error.message || `No se pudo cargar ${config.label}.`
-      }];
-    }
-  }));
-  if (!isCurrentViewContext(context)) return;
-  loadedSources.forEach(([source, documentState]) => {
-    rulesStates[source] = documentState;
-  });
-  renderRules();
+function ruleSourceKey(view, state = ruleViewStates[view]) {
+  if (view !== "ajustes") return "rules";
+  if (state.section === "trailers") return "trailers";
+  return state.watcherProfile === "tv" ? "watcherTv" : "watcherMovies";
 }
 
-function currentRulesSource(sectionKey = currentRuleSection) {
-  return RULE_SECTIONS[sectionKey]?.source || "media";
+function ruleSourceConfig(view, source = ruleSourceKey(view)) {
+  return RULE_VIEW_CONFIG[view].sources[source];
 }
 
-function currentRulesDocument() {
-  return rulesStates[currentRulesSource()];
+function isRuleSourceActive(view, source) {
+  return routeKeyFromHash() === view && ruleSourceKey(view) === source;
 }
 
-function rulesStatusText(documentState, source) {
-  if (documentState?.ok === false) {
-    return `Error cargando: ${documentState.error || "orquestador no disponible"}`;
+function ruleDocumentEditable(documentState) {
+  return Boolean(documentState)
+    && documentState.ok !== false
+    && documentState.connected !== false
+    && documentState.editable !== false;
+}
+
+function ruleDocumentStatus(documentState, sourceConfig) {
+  if (!documentState) return `Cargando ${sourceConfig.label.toLowerCase()}…`;
+  if (documentState.connected === false || documentState.editable === false) {
+    return documentState.message || `${sourceConfig.label} no conectado`;
   }
-  if (source === "media") {
-    const fingerprint = String(documentState?.fingerprint || "").slice(0, 12);
-    return `Reglas multimedia activas para trabajos nuevos${fingerprint ? ` · Huella ${fingerprint}` : ""}`;
+  if (documentState.ok === false) {
+    return documentState.message || documentState.error || `No se pudo cargar ${sourceConfig.label.toLowerCase()}.`;
   }
-  if (source === "watcher") {
-    return "Reglas del Vigilante ARR activas para nuevas detecciones.";
-  }
-  return `Archivo: ${documentState?.rules_path || "-"}`;
+  const fingerprint = String(documentState.fingerprint || "").slice(0, 12);
+  return `${sourceConfig.label} activo para trabajos nuevos${fingerprint ? ` · Huella ${fingerprint}` : ""}`;
 }
 
-function savedRulesMessage(source, savedState) {
-  if (source === "watcher") {
-    return "Reglas guardadas y activas para nuevas detecciones. Los trabajos ya creados mantienen sus reglas.";
+function renderRuleProfile(view) {
+  if (routeKeyFromHash() !== view) return;
+  const config = RULE_VIEW_CONFIG[view];
+  const state = ruleViewStates[view];
+  const source = ruleSourceKey(view, state);
+  const sourceConfig = ruleSourceConfig(view, source);
+  const documentState = state.documents[source];
+  const draft = state.drafts[source];
+  if (!documentState || !draft) {
+    app.innerHTML = `<section class="panel">Cargando ${esc(sourceConfig.label.toLowerCase())}...</section>`;
+    return;
   }
-  const fingerprint = String(savedState?.fingerprint || "").slice(0, 12);
-  return `Reglas guardadas y activas para trabajos nuevos.${fingerprint ? ` · Huella ${fingerprint}.` : ""}`;
-}
-
-function saveRulesTooltip(source) {
-  if (source === "watcher") return "Orquestador /api/watcher-rules";
-  if (source === "media") return "Media Worker /api/rules";
-  return "";
-}
-
-function renderRules(statusMessage = "") {
-  const section = RULE_SECTIONS[currentRuleSection];
-  const source = currentRulesSource();
-  const documentState = currentRulesDocument();
-  const statusText = statusMessage || rulesStatusText(documentState, source);
-  const saveTooltip = saveRulesTooltip(source);
-  const sectionButtons = Object.entries(RULE_SECTIONS).map(([key, value]) =>
-    `<button class="${key === currentRuleSection ? "active" : ""}" data-rule-section="${key}">${esc(value.title)}</button>`
+  const editable = ruleDocumentEditable(documentState);
+  const sectionKey = state.section === "vigilantes" ? "vigilante" : state.section;
+  const section = RULE_SECTIONS[sectionKey];
+  const dirty = Boolean(state.dirty[source]);
+  const saving = Boolean(state.saving[source]);
+  const statusText = state.notice[source] || ruleDocumentStatus(documentState, sourceConfig);
+  const sectionButtons = config.sections.map(key =>
+    `<button class="${key === state.section ? "active" : ""}" data-rule-section="${esc(key)}">${esc(RULE_SECTIONS[key === "vigilantes" ? "vigilante" : key].title)}</button>`
   ).join("");
-  app.innerHTML = `
-    <section class="split">
-      <aside class="side">${sectionButtons}</aside>
-      <div class="rules-work panel">
-        <div class="toolbar">
-          <div>
-            <h2>${esc(section.title)}</h2>
-            <div class="muted">${esc(section.help)}</div>
-          </div>
-          <div class="toolbar-actions">
-            <button class="btn ghost" id="reload-rules">Recargar</button>
-            <button class="btn primary" id="save-rules" ${saveTooltip ? `data-tooltip="${esc(saveTooltip)}"` : ""} ${documentState?.ok === false ? "disabled" : ""}>Guardar reglas</button>
-          </div>
-        </div>
-        <div id="rules-status" class="status">${esc(statusText)}</div>
-        <div id="rules-editor">${section.groups.map(renderGroup).join("")}</div>
-      </div>
-    </section>`;
+  const watcherSelector = view === "ajustes" && state.section === "vigilantes"
+    ? `<div class="segmented-tabs rule-profile-tabs" role="group" aria-label="Perfil del Vigilante ARR">
+        <button type="button" class="${state.watcherProfile === "movies" ? "active" : ""}" data-watcher-profile="movies">Películas</button>
+        <button type="button" class="${state.watcherProfile === "tv" ? "active" : ""}" data-watcher-profile="tv">Series</button>
+      </div>`
+    : "";
+  const lockedNotice = editable ? "" : `<div class="locked-notice" role="status">
+    <span class="pill warn">Solo lectura</span>
+    <strong>${esc(documentState.message || `${sourceConfig.label} no conectado`)}</strong>
+    <span>La configuración se muestra completa, pero no se enviará ningún cambio.</span>
+  </div>`;
 
-  document.querySelectorAll("[data-rule-section]").forEach(btn => btn.addEventListener("click", () => {
-    currentRuleSection = btn.dataset.ruleSection;
-    storeRuleSection(currentRuleSection);
-    renderRules();
+  app.innerHTML = `<section class="split rule-profile-shell" data-rule-view="${esc(view)}" data-rule-source="${esc(source)}">
+    <aside class="side">${sectionButtons}</aside>
+    <div class="rules-work panel">
+      <div class="toolbar">
+        <div>
+          <span class="identity-kicker">${esc(config.label)}</span>
+          <h2>${esc(section.title)}</h2>
+          <div class="muted">${esc(section.help)}</div>
+        </div>
+        <div class="toolbar-actions">
+          <button class="btn ghost" id="reload-rules-profile">Recargar</button>
+          <button class="btn primary" id="save-rules-profile" data-tooltip="${esc(sourceConfig.endpoint)}" ${!editable || !dirty || saving ? "disabled" : ""}>${saving ? "Guardando…" : "Guardar reglas"}</button>
+        </div>
+      </div>
+      ${watcherSelector}
+      <div id="rules-status" class="status ${editable ? "" : "warn"}" role="status" aria-live="polite">${esc(statusText)}</div>
+      ${lockedNotice}
+      <div id="rules-editor" ${editable ? "" : 'class="rules-editor-locked" aria-disabled="true"'}>
+        ${section.groups.map(group => renderRuleProfileGroup(group, draft, editable)).join("")}
+      </div>
+    </div>
+  </section>`;
+
+  document.querySelectorAll("[data-rule-section]").forEach(button => button.addEventListener("click", () => {
+    const sectionTarget = button.dataset.ruleSection;
+    state.section = sectionTarget;
+    storageSet(ruleSectionStorageKey(view), sectionTarget);
+    const targetHash = `#${view}/${sectionTarget}`;
+    if (location.hash === targetHash) renderRuleProfile(view);
+    else location.hash = targetHash;
   }));
-  document.getElementById("reload-rules").addEventListener("click", () => showReglas());
-  document.getElementById("save-rules").addEventListener("click", saveRules);
+  document.querySelectorAll("[data-watcher-profile]").forEach(button => button.addEventListener("click", () => {
+    state.watcherProfile = button.dataset.watcherProfile === "tv" ? "tv" : "movies";
+    storageSet("arr-media-panel-ajustes-vigilante", state.watcherProfile);
+    const nextSource = ruleSourceKey(view, state);
+    if (state.documents[nextSource]) renderRuleProfile(view);
+    else loadRuleSource(view, nextSource);
+  }));
+  document.querySelectorAll("[data-rule-path]").forEach(input => {
+    const update = () => updateRuleDraftFromInput(view, source, input);
+    input.addEventListener("input", update);
+    input.addEventListener("change", update);
+  });
+  document.getElementById("reload-rules-profile")?.addEventListener("click", () => reloadRuleSource(view, source));
+  document.getElementById("save-rules-profile")?.addEventListener("click", () => saveRuleSource(view, source));
 }
 
-function renderGroup(group) {
+function renderRuleProfileGroup(group, draft, editable) {
   return `<div class="rule-group">
     <h3>${esc(group.title)}</h3>
     <p>${esc(group.note || "")}</p>
-    ${group.controls.map(renderControl).join("")}
+    ${group.controls.map(control => renderRuleProfileControl(control, draft, editable)).join("")}
   </div>`;
 }
 
-function renderControl(control) {
-  const value = getPath(currentRulesDocument()?.rules || {}, control.path);
+function renderRuleProfileControl(control, draft, editable) {
+  const value = getPath(draft, control.path);
   const id = `field-${control.path.replace(/[^a-z0-9]+/gi, "-")}`;
+  const disabled = editable ? "" : "disabled";
   const hint = control.suffix ? `<span class="hint">${esc(control.suffix)}</span>` : "";
   const formatHint = control.format ? `<span class="hint">${esc(control.format)}</span>` : "";
   let input = "";
   if (control.type === "boolean") {
-    input = `<label class="toggle"><input id="${id}" data-path="${esc(control.path)}" data-type="boolean" type="checkbox" ${value ? "checked" : ""}> Activo</label>`;
+    input = `<label class="toggle"><input id="${id}" data-rule-path="${esc(control.path)}" data-rule-type="boolean" type="checkbox" ${value ? "checked" : ""} ${disabled}> Activo</label>`;
   } else if (control.type === "number") {
-    input = `<input id="${id}" data-path="${esc(control.path)}" data-type="number" type="number" value="${esc(value ?? "")}" min="${esc(control.min ?? "")}" max="${esc(control.max ?? "")}" step="${esc(control.step ?? 1)}">${hint}`;
+    input = `<input id="${id}" data-rule-path="${esc(control.path)}" data-rule-type="number" type="number" value="${esc(value ?? "")}" min="${esc(control.min ?? "")}" max="${esc(control.max ?? "")}" step="${esc(control.step ?? 1)}" ${disabled}>${hint}`;
   } else if (control.type === "list") {
-    input = `<textarea id="${id}" data-path="${esc(control.path)}" data-type="list">${esc((value || []).join("\n"))}</textarea><span class="hint">Una entrada por linea.</span>${formatHint}`;
+    input = `<textarea id="${id}" data-rule-path="${esc(control.path)}" data-rule-type="list" ${disabled}>${esc((value || []).join("\n"))}</textarea><span class="hint">Una entrada por línea.</span>${formatHint}`;
   } else if (control.type === "kv-number" || control.type === "kv-text") {
-    input = `<textarea id="${id}" data-path="${esc(control.path)}" data-type="${control.type}">${esc(Object.entries(value || {}).map(([k, v]) => `${k}: ${v}`).join("\n"))}</textarea><span class="hint">Formato: clave: valor</span>`;
+    input = `<textarea id="${id}" data-rule-path="${esc(control.path)}" data-rule-type="${control.type}" ${disabled}>${esc(Object.entries(value || {}).map(([key, item]) => `${key}: ${item}`).join("\n"))}</textarea><span class="hint">Formato: clave: valor</span>`;
   } else if (control.type === "select") {
-    input = `<select id="${id}" data-path="${esc(control.path)}" data-type="text">
-      ${(control.options || []).map(opt => `<option value="${esc(opt.value)}" ${opt.value === value ? "selected" : ""}>${esc(opt.label)}</option>`).join("")}
+    input = `<select id="${id}" data-rule-path="${esc(control.path)}" data-rule-type="text" ${disabled}>
+      ${(control.options || []).map(option => `<option value="${esc(option.value)}" ${option.value === value ? "selected" : ""}>${esc(option.label)}</option>`).join("")}
     </select>`;
   } else {
-    input = `<input id="${id}" data-path="${esc(control.path)}" data-type="text" type="text" value="${esc(value ?? "")}">`;
+    input = `<input id="${id}" data-rule-path="${esc(control.path)}" data-rule-type="text" type="text" value="${esc(value ?? "")}" ${disabled}>`;
   }
   return `<div class="field"><label for="${id}">${esc(control.label)}</label><div>${input}</div></div>`;
 }
 
-function collectRules() {
-  const rules = clone(currentRulesDocument().rules);
-  document.querySelectorAll("[data-path]").forEach(input => {
-    const path = input.dataset.path;
-    const type = input.dataset.type;
-    let value;
-    if (type === "boolean") {
-      value = input.checked;
-    } else if (type === "number") {
-      value = Number(input.value);
-    } else if (type === "list") {
-      value = input.value.split(/\r?\n/).map(x => x.trim()).filter((item, index) =>
-        Boolean(item) || (path === "video.idiomas_indeterminados_como_es" && index === 0)
-      );
-    } else if (type === "kv-number" || type === "kv-text") {
-      value = {};
-      input.value.split(/\r?\n/).forEach(line => {
-        const idx = line.indexOf(":");
-        if (idx <= 0) return;
-        const key = line.slice(0, idx).trim();
-        const raw = line.slice(idx + 1).trim();
-        if (!key) return;
-        value[key] = type === "kv-number" ? Number(raw) : raw;
-      });
-    } else {
-      value = input.value;
-    }
-    setPath(rules, path, value);
-  });
-  return rules;
+function inputRuleValue(input) {
+  const type = input.dataset.ruleType;
+  if (type === "boolean") return input.checked;
+  if (type === "number") return Number(input.value);
+  if (type === "list") {
+    return input.value.split(/\r?\n/).map(item => item.trim()).filter((item, index) =>
+      Boolean(item) || (input.dataset.rulePath === "video.idiomas_indeterminados_como_es" && index === 0)
+    );
+  }
+  if (type === "kv-number" || type === "kv-text") {
+    const value = {};
+    input.value.split(/\r?\n/).forEach(line => {
+      const separator = line.indexOf(":");
+      if (separator <= 0) return;
+      const key = line.slice(0, separator).trim();
+      const raw = line.slice(separator + 1).trim();
+      if (key) value[key] = type === "kv-number" ? Number(raw) : raw;
+    });
+    return value;
+  }
+  return input.value;
 }
 
-async function saveRules() {
-  const context = currentViewContext("reglas");
-  const btn = document.getElementById("save-rules");
+function updateRuleDraftFromInput(view, source, input) {
+  const state = ruleViewStates[view];
+  const documentState = state.documents[source];
+  if (!ruleDocumentEditable(documentState) || !state.drafts[source]) return;
+  setPath(state.drafts[source], input.dataset.rulePath, inputRuleValue(input));
+  state.dirty[source] = JSON.stringify(state.drafts[source]) !== JSON.stringify(documentState.rules);
+  state.notice[source] = state.dirty[source] ? "Cambios sin guardar." : "Sin cambios pendientes.";
   const status = document.getElementById("rules-status");
-  btn.disabled = true;
-  status.textContent = "Guardando...";
+  if (status && isRuleSourceActive(view, source)) status.textContent = state.notice[source];
+  const save = document.getElementById("save-rules-profile");
+  if (save && isRuleSourceActive(view, source)) save.disabled = !state.dirty[source];
+}
+
+async function loadRuleSource(view, source, { replace = false } = {}) {
+  const state = ruleViewStates[view];
+  const sourceConfig = ruleSourceConfig(view, source);
+  if (!state || !sourceConfig || state.loading[source]) return;
+  if (state.documents[source] && !replace) {
+    if (isRuleSourceActive(view, source)) renderRuleProfile(view);
+    return;
+  }
+  const requestEpoch = Number(state.requestEpoch[source] || 0) + 1;
+  state.requestEpoch[source] = requestEpoch;
+  state.loading[source] = true;
+  if (isRuleSourceActive(view, source)) {
+    app.innerHTML = `<section class="panel">Cargando ${esc(sourceConfig.label.toLowerCase())}...</section>`;
+  }
   try {
-    const savingSection = currentRuleSection;
-    const savingSource = currentRulesSource(savingSection);
-    const savingEndpoint = RULE_SOURCES[savingSource].endpoint;
-    const rules = collectRules();
-    const payload = { rules };
-    if (savingSource === "media") {
-      payload.expected_fingerprint = rulesStates[savingSource]?.fingerprint;
+    const payload = await api(sourceConfig.endpoint);
+    if (state.requestEpoch[source] !== requestEpoch) return;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload) || typeof payload.rules !== "object") {
+      throw new Error("El servidor no devolvió el contrato completo de reglas.");
     }
-    const savedState = await api(savingEndpoint, {
-      method: "POST",
-      body: JSON.stringify(payload)
-    });
-    if (savingSource === "media" && savedState.applied !== true) {
-      throw new Error("El motor no confirmó la activación de las reglas.");
-    }
-    rulesStates[savingSource] = savedState;
-    if (isCurrentViewContext(context) && currentRuleSection === savingSection) {
-      renderRules(savedRulesMessage(savingSource, savedState));
-    }
+    state.documents[source] = payload;
+    state.drafts[source] = clone(payload.rules);
+    state.dirty[source] = false;
+    state.notice[source] = replace ? "Configuración recargada desde el motor." : "";
+    if (isRuleSourceActive(view, source)) renderRuleProfile(view);
   } catch (error) {
-    status.textContent = error.status === 409
-      ? `Conflicto al guardar: ${error.message} Recarga las reglas y vuelve a intentarlo.`
+    if (state.requestEpoch[source] !== requestEpoch) return;
+    state.notice[source] = `Error cargando: ${error.message}`;
+    if (isRuleSourceActive(view, source)) {
+      app.innerHTML = `<section class="panel identity-load-error"><span class="pill bad">No disponible</span><div><h2>No se pudo cargar ${esc(sourceConfig.label.toLowerCase())}</h2><p>${esc(error.message)}</p></div><button type="button" class="btn primary" id="rules-load-retry">Reintentar</button></section>`;
+      document.getElementById("rules-load-retry")?.addEventListener("click", () => loadRuleSource(view, source, { replace: true }));
+    }
+  } finally {
+    if (state.requestEpoch[source] === requestEpoch) state.loading[source] = false;
+  }
+}
+
+function reloadRuleSource(view, source) {
+  const state = ruleViewStates[view];
+  if (state.dirty[source] && !window.confirm("Recargar descartará los cambios sin guardar. ¿Continuar?")) return;
+  return loadRuleSource(view, source, { replace: true });
+}
+
+async function saveRuleSource(view, source) {
+  const state = ruleViewStates[view];
+  const documentState = state.documents[source];
+  const sourceConfig = ruleSourceConfig(view, source);
+  if (!ruleDocumentEditable(documentState) || !state.dirty[source] || state.saving[source]) return;
+  const submittedDraft = clone(state.drafts[source]);
+  state.saving[source] = true;
+  if (isRuleSourceActive(view, source)) renderRuleProfile(view);
+  try {
+    const savedState = await api(sourceConfig.endpoint, {
+      method: "POST",
+      body: JSON.stringify({ rules: submittedDraft, expected_fingerprint: documentState.fingerprint ?? null })
+    });
+    if (!savedState || savedState.ok === false || typeof savedState.rules !== "object") {
+      throw new Error(savedState?.message || savedState?.error || "El motor no confirmó las reglas guardadas.");
+    }
+    const changedWhileSaving = JSON.stringify(state.drafts[source]) !== JSON.stringify(submittedDraft);
+    const currentDraft = state.drafts[source];
+    state.documents[source] = savedState;
+    state.drafts[source] = changedWhileSaving ? currentDraft : clone(savedState.rules);
+    state.dirty[source] = changedWhileSaving
+      && JSON.stringify(currentDraft) !== JSON.stringify(savedState.rules);
+    state.notice[source] = changedWhileSaving
+      ? "La revisión enviada se guardó; los cambios posteriores siguen en el borrador."
+      : "Reglas guardadas y activas para trabajos nuevos.";
+  } catch (error) {
+    state.notice[source] = error.status === 409
+      ? `Conflicto al guardar: ${error.message} Recarga y vuelve a intentarlo.`
       : `Error guardando: ${error.message}`;
   } finally {
-    btn.disabled = false;
+    state.saving[source] = false;
+    if (isRuleSourceActive(view, source)) renderRuleProfile(view);
   }
+}
+
+async function showRuleProfile(view, context) {
+  context = ensureViewContext(view, context);
+  const state = ruleViewStates[view];
+  const config = RULE_VIEW_CONFIG[view];
+  setActive(view);
+  title.textContent = config.label;
+  const route = canonicalRouteFromHash(location.hash);
+  if (route?.view === view && config.sections.includes(route.section)) state.section = route.section;
+  storageSet(ruleSectionStorageKey(view), state.section);
+  const source = ruleSourceKey(view, state);
+  if (state.documents[source]) renderRuleProfile(view);
+  else await loadRuleSource(view, source);
+  if (!isCurrentViewContext(context)) return;
 }
 
 async function createCodexDiagnostic(jobId, button) {
@@ -731,32 +884,95 @@ document.addEventListener("click", event => {
 });
 
 const routes = {
-  "limpieza-arr": context => window.ArrIdentityUI.show(context),
-  reglas: showReglas,
+  identidad: context => window.ArrIdentityUI.show(context),
+  "limpieza-peliculas": context => showRuleProfile("limpieza-peliculas", context),
+  "limpieza-series": context => showRuleProfile("limpieza-series", context),
+  ajustes: context => showRuleProfile("ajustes", context),
   motor: showMotor,
   historial: showHistorial,
   revision: showRevision,
   informes: showInformes
 };
 
-tabs.forEach(btn => btn.addEventListener("click", () => {
-  const view = btn.dataset.view;
-  const target = view === "limpieza-arr" ? "limpieza-arr/parser" : view;
-  if (location.hash === `#${target}`) dispatchRoute(view);
-  else location.hash = target;
-}));
+function exactCanonicalRoute(hash) {
+  const identity = typeof window.ArrIdentityUI?.identityRouteFromHash === "function"
+    ? window.ArrIdentityUI.identityRouteFromHash(hash)
+    : null;
+  if (identity) return { ...identity, view: "identidad" };
+  const cleaning = String(hash || "").match(/^#(limpieza-peliculas|limpieza-series)\/(entrada|video|audio|subtitulos|limpieza)$/);
+  if (cleaning) return { view: cleaning[1], section: cleaning[2], hash: `#${cleaning[1]}/${cleaning[2]}` };
+  const settings = String(hash || "").match(/^#ajustes\/(trailers|vigilantes)$/);
+  if (settings) return { view: "ajustes", section: settings[1], hash: `#ajustes/${settings[1]}` };
+  const simple = String(hash || "").match(/^#(motor|historial|revision|informes)$/);
+  if (simple) return { view: simple[1], hash: `#${simple[1]}` };
+  return null;
+}
+
+function canonicalRouteFromHash(hash = location.hash) {
+  const exact = exactCanonicalRoute(hash);
+  if (exact) return exact;
+
+  const identityTarget = typeof window.ArrIdentityUI?.resolveTarget === "function"
+    ? window.ArrIdentityUI.resolveTarget(hash)
+    : null;
+  if (identityTarget) return { ...identityTarget, view: "identidad" };
+
+  const legacyRules = String(hash || "").match(/^#reglas(?:\/(entrada|video|audio|subtitulos|limpieza|trailers|vigilante|vigilantes))?$/);
+  if (legacyRules) {
+    const legacySection = legacyRules[1] || storageGet(LEGACY_RULE_SECTION_STORAGE_KEY, "entrada");
+    if (legacySection === "trailers") return { view: "ajustes", section: "trailers", hash: "#ajustes/trailers", legacy: true };
+    if (["vigilante", "vigilantes"].includes(legacySection)) return { view: "ajustes", section: "vigilantes", hash: "#ajustes/vigilantes", legacy: true };
+    const section = CLEANING_SECTIONS.includes(legacySection) ? legacySection : "entrada";
+    return { view: "limpieza-peliculas", section, hash: `#limpieza-peliculas/${section}`, legacy: true };
+  }
+
+  const partialRules = String(hash || "").match(/^#(limpieza-peliculas|limpieza-series|ajustes)$/);
+  if (partialRules) {
+    const view = partialRules[1];
+    const section = readStoredRuleSection(view);
+    return { view, section, hash: `#${view}/${section}`, partial: true };
+  }
+
+  const stored = exactCanonicalRoute(storageGet(PANEL_ROUTE_STORAGE_KEY, ""));
+  if (stored) return stored;
+  return { view: "identidad", profile: "common", section: "parser", hash: "#identidad/comun/parser", fallback: true };
+}
+
+function normalizeLocationRoute() {
+  const route = canonicalRouteFromHash(location.hash);
+  if (location.hash !== route.hash) history.replaceState(null, "", route.hash);
+  storageSet(PANEL_ROUTE_STORAGE_KEY, route.hash);
+  return route;
+}
 
 function routeFromHash() {
-  return (location.hash.replace("#", "") || "reglas").split("/", 1)[0];
+  return exactCanonicalRoute(location.hash)?.view || canonicalRouteFromHash(location.hash).view;
 }
 
 function routeKeyFromHash() {
-  const view = routeFromHash();
-  return routes[view] ? view : "reglas";
+  return routeFromHash();
 }
 
-function dispatchRoute(view = routeFromHash()) {
-  const routeKey = routes[view] ? view : "reglas";
+function tabTarget(view) {
+  if (routeKeyFromHash() === view) return location.hash;
+  if (view === "identidad" && typeof window.ArrIdentityUI?.resolveTarget === "function") {
+    return window.ArrIdentityUI.resolveTarget("#identidad").hash;
+  }
+  if (view === "identidad") return "#identidad/comun/parser";
+  if (RULE_VIEW_CONFIG[view]) return `#${view}/${readStoredRuleSection(view)}`;
+  return `#${view}`;
+}
+
+tabs.forEach(button => button.addEventListener("click", () => {
+  const view = button.dataset.view;
+  const target = tabTarget(view);
+  if (location.hash === target) dispatchRoute();
+  else location.hash = target;
+}));
+
+function dispatchRoute() {
+  const route = normalizeLocationRoute();
+  const routeKey = route.view;
   const context = beginViewContext(routeKey);
   return Promise.resolve(routes[routeKey](context)).catch(error => {
     if (!isCurrentViewContext(context)) return;
@@ -766,6 +982,13 @@ function dispatchRoute(view = routeFromHash()) {
 
 window.addEventListener("hashchange", () => {
   dispatchRoute();
+});
+
+window.addEventListener("beforeunload", event => {
+  const dirty = Object.values(ruleViewStates).some(state => Object.values(state.dirty).some(Boolean));
+  if (!dirty) return;
+  event.preventDefault();
+  event.returnValue = "";
 });
 
 dispatchRoute();

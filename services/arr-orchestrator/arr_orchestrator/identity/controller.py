@@ -12,6 +12,12 @@ from typing import Dict, Iterable, Optional
 
 from ..name_parser import MediaDecision, decide_media, test_parser_title
 from ..name_resolver import NameResolver
+from .defaults import (
+    IDENTITY_PROFILES,
+    IDENTITY_SETTING_KEY,
+    factory_identity_rules,
+    identity_profile_setting_key,
+)
 from .settings import (
     IdentityRulesValidationError,
     IdentitySettingsStore,
@@ -35,21 +41,41 @@ class IdentityController:
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self.log = logger or logging.getLogger("arr-orchestrator.identity")
-        self.store = IdentitySettingsStore(
-            database,
-            default_language=str(getattr(config, "resolver_language", "es-ES")),
-            default_region=str(getattr(config, "resolver_region", "ES")),
-            logger=self.log,
-            resolver_http_timeout_ms=int(
-                getattr(config, "resolver_http_timeout_ms", 2500)
-            ),
-            resolver_total_budget_ms=int(
-                getattr(config, "resolver_total_budget_ms", 5000)
-            ),
-            resolver_retry_seconds=int(
-                getattr(config, "resolver_retry_seconds", 60)
-            ),
+        default_language = str(getattr(config, "resolver_language", "es-ES"))
+        default_region = str(getattr(config, "resolver_region", "ES"))
+        resolver_http_timeout_ms = int(
+            getattr(config, "resolver_http_timeout_ms", 2500)
         )
+        resolver_total_budget_ms = int(
+            getattr(config, "resolver_total_budget_ms", 5000)
+        )
+        resolver_retry_seconds = int(
+            getattr(config, "resolver_retry_seconds", 60)
+        )
+        defaults = factory_identity_rules(
+            default_language,
+            default_region,
+            resolver_http_timeout_ms,
+            resolver_total_budget_ms,
+            resolver_retry_seconds,
+        )
+        _seed_profile_settings(database, defaults)
+        self.stores = {
+            profile: IdentitySettingsStore(
+                database,
+                default_language=default_language,
+                default_region=default_region,
+                logger=self.log,
+                resolver_http_timeout_ms=resolver_http_timeout_ms,
+                resolver_total_budget_ms=resolver_total_budget_ms,
+                resolver_retry_seconds=resolver_retry_seconds,
+                profile=profile,
+                setting_key=identity_profile_setting_key(profile),
+            )
+            for profile in IDENTITY_PROFILES
+        }
+        # Alias conservado para consumidores antiguos: siempre representa common.
+        self.store = self.stores["common"]
         self.resolver = NameResolver(
             str(getattr(config, "tmdb_api_token", "")),
             str(getattr(config, "resolver_language", "es-ES")),
@@ -64,20 +90,41 @@ class IdentityController:
     def enabled(self) -> bool:
         return self.resolver.enabled
 
-    def payload(self) -> Dict[str, object]:
-        return self.store.payload()
+    def payload(self, profile: str = "common") -> Dict[str, object]:
+        return self._store(profile).payload()
 
-    def update(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return self.store.update(payload)
+    def update(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        return self._store(profile).update(payload)
 
-    def reset(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return self.store.reset(payload)
+    def reset(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        return self._store(profile).reset(payload)
 
-    def clear_cache(self) -> Dict[str, object]:
-        return self.store.clear_cache()
+    def clear_cache(self, profile: str = "common") -> Dict[str, object]:
+        normalized_profile = _identity_profile(profile)
+        result = self.stores[normalized_profile].clear_cache()
+        result["profile"] = normalized_profile
+        return result
 
-    def job_snapshot(self) -> Dict[str, object]:
-        return self.store.job_snapshot()
+    def job_snapshot(self, profile: str = "common") -> Dict[str, object]:
+        normalized_profile = _identity_profile(profile)
+        result = self.stores[normalized_profile].job_snapshot()
+        result["profile"] = normalized_profile
+        return result
+
+    def classification_snapshot(self) -> Dict[str, object]:
+        """Snapshot common usado exclusivamente antes de conocer la categoria."""
+
+        return self.job_snapshot("common")
+
+    def job_snapshot_for_category(self, category: object) -> Dict[str, object]:
+        return self.job_snapshot(_profile_for_category(category))
+
+    def _store(self, profile: str) -> IdentitySettingsStore:
+        return self.stores[_identity_profile(profile)]
 
     def rules_for_job(self, job: Dict[str, object]) -> Dict[str, object]:
         meta = _source_meta(job.get("source_meta_json"))
@@ -90,6 +137,7 @@ class IdentityController:
                     "revision": int(stored.get("revision") or 0),
                     "saved_at": stored.get("saved_at"),
                     "fingerprint": identity_fingerprint(rules),
+                    "profile": _snapshot_profile(stored, job),
                     "source": "job_snapshot",
                 }
             except (IdentityRulesValidationError, TypeError, ValueError):
@@ -105,10 +153,11 @@ class IdentityController:
                 "revision": int(legacy.get("revision") or 0),
                 "saved_at": legacy.get("saved_at"),
                 "fingerprint": identity_fingerprint(migrated),
+                "profile": _profile_for_category(job.get("category")),
                 "source": "legacy_filebot_snapshot",
             }
 
-        current = self.store.job_snapshot()
+        current = self.job_snapshot_for_category(job.get("category"))
         current["source"] = "current_fallback"
         return current
 
@@ -123,7 +172,11 @@ class IdentityController:
         category: str,
         rules: Optional[Dict[str, object]] = None,
     ) -> MediaDecision:
-        active_rules = rules if isinstance(rules, dict) else self.store.snapshot()
+        active_rules = (
+            rules
+            if isinstance(rules, dict)
+            else self.stores[_profile_for_category(category)].snapshot()
+        )
         parser_rules = active_rules.get("parser") if isinstance(active_rules.get("parser"), dict) else None
         decisions = [
             decide_media(source, category, rules=parser_rules)
@@ -143,28 +196,50 @@ class IdentityController:
                 return decision
         return decisions[0]
 
-    def test_parser(self, payload: Dict[str, object]) -> Dict[str, object]:
+    def test_parser(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        normalized_profile = _identity_profile(profile)
         try:
-            name, category, rules = self._test_request(payload, allow_auto=True)
+            name, category, rules = self._test_request(
+                payload, allow_auto=True, profile=normalized_profile
+            )
         except IdentityRulesValidationError as error:
-            return {"ok": False, "error": "invalid_rules", "message": str(error)}
+            return {
+                "ok": False,
+                "profile": normalized_profile,
+                "error": "invalid_rules",
+                "message": str(error),
+            }
         try:
             result = test_parser_title(name, category, rules=rules.get("parser"))
         except (IndexError, TypeError, ValueError, re.error):
             self.log.exception("Las reglas del parser fallaron durante la prueba")
             return {
                 "ok": False,
+                "profile": normalized_profile,
                 "error": "parser_execution_failed",
                 "message": "Las reglas del parser no pudieron aplicarse.",
             }
-        return {"ok": True, "status": _parser_status(result), "result": result}
+        return {
+            "ok": True,
+            "profile": normalized_profile,
+            "status": _parser_status(result),
+            "result": result,
+        }
 
-    def test_resolver(self, payload: Dict[str, object]) -> Dict[str, object]:
+    def test_resolver(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        normalized_profile = _identity_profile(profile)
         try:
-            name, category, rules = self._test_request(payload, allow_auto=False)
+            name, category, rules = self._test_request(
+                payload, allow_auto=False, profile=normalized_profile
+            )
         except IdentityRulesValidationError as error:
             return {
                 "ok": False,
+                "profile": normalized_profile,
                 "status": "INVALID_RULES",
                 "error": "invalid_rules",
                 "message": str(error),
@@ -176,12 +251,14 @@ class IdentityController:
             self.log.exception("Las reglas del parser fallaron durante la prueba del resolver")
             return {
                 "ok": False,
+                "profile": normalized_profile,
                 "status": "PARSER_ERROR",
                 "error": "parser_execution_failed",
                 "message": "Las reglas del parser no pudieron aplicarse.",
                 "decision": _test_decision("PARSER_ERROR"),
             }
         result = self.resolver.preview(name, category, rules)
+        result["profile"] = normalized_profile
         result["parser_test"] = parser
         return result
 
@@ -196,12 +273,21 @@ class IdentityController:
         return min(maximum, base * (multiplier**exponent))
 
     def _test_request(
-        self, payload: Dict[str, object], *, allow_auto: bool
+        self,
+        payload: Dict[str, object],
+        *,
+        allow_auto: bool,
+        profile: str = "common",
     ) -> tuple[str, str, Dict[str, object]]:
         name = str(payload.get("name") or "").strip()
         if not name or len(name) > 2_000 or "\x00" in name:
             raise IdentityRulesValidationError("name debe contener un titulo valido.")
-        category = str(payload.get("category") or ("auto" if allow_auto else "movies")).strip().lower()
+        default_category = (
+            "auto"
+            if allow_auto
+            else (profile if profile in {"movies", "tv"} else "movies")
+        )
+        category = str(payload.get("category") or default_category).strip().lower()
         aliases = {"movie": "movies", "pelicula": "movies", "series": "tv", "serie": "tv"}
         category = aliases.get(category, category)
         allowed = {"movies", "tv", "auto"} if allow_auto else {"movies", "tv"}
@@ -209,8 +295,63 @@ class IdentityController:
             raise IdentityRulesValidationError("category debe ser movies, tv o auto.")
         explicit_category = "" if category == "auto" else category
         supplied = payload.get("rules")
-        rules = normalize_identity_rules(supplied) if supplied is not None else self.store.snapshot()
+        rules = (
+            normalize_identity_rules(supplied)
+            if supplied is not None
+            else self.stores[profile].snapshot()
+        )
         return name, explicit_category, rules
+
+
+def _identity_profile(value: object) -> str:
+    profile = str(value or "").strip().lower()
+    if profile not in IDENTITY_PROFILES:
+        raise ValueError("profile debe ser common, movies o tv")
+    return profile
+
+
+def _profile_for_category(value: object) -> str:
+    category = str(value or "").strip().lower()
+    return category if category in {"movies", "tv"} else "common"
+
+
+def _snapshot_profile(
+    snapshot: Dict[str, object], job: Dict[str, object]
+) -> str:
+    profile = str(snapshot.get("profile") or "").strip().lower()
+    if profile in IDENTITY_PROFILES:
+        return profile
+    return _profile_for_category(job.get("category"))
+
+
+def _seed_profile_settings(database: object, defaults: Dict[str, object]) -> None:
+    """Clona una sola vez legacy/defaults sin tocar nunca ``identity.pipeline``."""
+
+    reader = getattr(database, "get_setting")
+    legacy_raw = reader(IDENTITY_SETTING_KEY)
+    seed_raw = legacy_raw
+    if seed_raw is None:
+        seed_raw = json.dumps(
+            {
+                "rules": defaults,
+                "revision": 0,
+                "saved_at": None,
+                "history": [],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    exact_writer = getattr(database, "compare_and_set_setting_value", None)
+    writer = getattr(database, "set_setting")
+    for profile in IDENTITY_PROFILES:
+        setting_key = identity_profile_setting_key(profile)
+        if reader(setting_key) is not None:
+            continue
+        if callable(exact_writer):
+            exact_writer(setting_key, None, seed_raw)
+        elif reader(setting_key) is None:
+            writer(setting_key, seed_raw)
 
 def _merge_legacy_filebot(
     identity_rules: Dict[str, object], legacy_rules: Dict[str, object]

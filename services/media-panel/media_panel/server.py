@@ -1,5 +1,7 @@
+import copy
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -27,6 +29,24 @@ WORKER_URL = os.environ.get("MEDIA_WORKER_URL", "http://media-worker:8790").rstr
 CODEX_DIAG_ROOT = Path(os.environ.get("CODEX_DIAG_ROOT", "/diagnosticos_codex"))
 IDENTITY_PROXY = IdentityProxy(ORCH_URL)
 MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+IDENTITY_PROFILES = frozenset({"common", "movies", "tv"})
+MOVIE_RULE_BLOCKS = ("entrada", "video", "audio", "subtitulos", "limpieza")
+TRAILER_RULE_BLOCKS = ("trailers",)
+SERIES_NOT_CONNECTED_MESSAGE = "Motor de series no conectado"
+JOB_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+SERIES_EVIDENCE_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:s\d{1,2}e\d{1,3}|season\s*\d+|temporada\s*\d+|series?)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+MOVIE_EVIDENCE_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:pel[ií]cula|movies?|trailers?|(?:19|20)\d{2})(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+MAX_PROFILE_EVIDENCE_PATHS = 200
+MAX_REPORT_METADATA_BYTES = 512 * 1024
 
 
 class PayloadTooLargeError(ValueError):
@@ -73,6 +93,45 @@ def _same_origin_request(headers: object) -> bool:
         and parsed.scheme.lower() in {"http", "https"}
         and parsed.netloc.lower() == host
     )
+
+
+def _read_protected_json_object(handler: object) -> Optional[Dict[str, Any]]:
+    """Aplica a los POST nuevos el mismo contrato seguro de Identidad."""
+
+    headers = getattr(handler, "headers", {})
+    send_json = getattr(handler, "_json")
+    if not _same_origin_request(headers):
+        send_json(
+            403,
+            {
+                "ok": False,
+                "error": "cross_origin_request",
+                "message": "La petición debe proceder del panel ARR.",
+            },
+        )
+        return None
+    if not _is_application_json(headers):
+        send_json(
+            415,
+            {
+                "ok": False,
+                "error": "unsupported_media_type",
+                "message": "Content-Type debe ser application/json.",
+            },
+        )
+        return None
+    try:
+        return getattr(handler, "_read_payload")(strict=True)
+    except InvalidJsonPayloadError:
+        send_json(
+            400,
+            {
+                "ok": False,
+                "error": "invalid_json",
+                "message": "El cuerpo debe ser un objeto JSON válido.",
+            },
+        )
+        return None
 
 CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -275,21 +334,291 @@ def _save_media_rules(payload: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     )
 
 
-def _watcher_rules_payload() -> Dict[str, Any]:
-    return _upstream_json(f"{ORCH_URL}/settings/watcher")
+def _rules_block_view(
+    rules: object,
+    blocks: Tuple[str, ...],
+    *,
+    fill_missing: bool = False,
+) -> Dict[str, Any]:
+    source = rules if isinstance(rules, dict) else {}
+    return {
+        block: copy.deepcopy(source.get(block, {}))
+        for block in blocks
+        if fill_missing or block in source
+    }
 
 
-def _save_watcher_rules(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _upstream_post_json(f"{ORCH_URL}/settings/watcher", payload)
+def _scoped_media_rules_payload(
+    payload: Dict[str, Any],
+    profile: str,
+    blocks: Tuple[str, ...],
+    *,
+    connected: bool = True,
+    editable: bool = True,
+) -> Dict[str, Any]:
+    result = copy.deepcopy(payload) if isinstance(payload, dict) else {}
+    for field in ("rules", "active", "defaults"):
+        if field in result:
+            result[field] = _rules_block_view(result.get(field), blocks)
+    result.update(
+        {
+            "profile": profile,
+            "connected": connected,
+            "editable": editable,
+        }
+    )
+    return result
+
+
+def _media_rules_profile_payload(
+    profile: str,
+    blocks: Tuple[str, ...],
+) -> Tuple[int, Dict[str, Any]]:
+    status, payload = _media_rules_payload()
+    return status, _scoped_media_rules_payload(
+        payload,
+        profile,
+        blocks,
+        connected=status < 500,
+        editable=status < 400,
+    )
+
+
+def _invalid_scoped_rules(profile: str, message: str) -> Tuple[int, Dict[str, Any]]:
+    return 400, {
+        "ok": False,
+        "error": "invalid_rules",
+        "message": message,
+        "profile": profile,
+    }
+
+
+def _save_media_rules_profile(
+    payload: Dict[str, Any],
+    profile: str,
+    blocks: Tuple[str, ...],
+) -> Tuple[int, Dict[str, Any]]:
+    unexpected_payload = (
+        sorted(set(payload) - {"rules", "expected_fingerprint"})
+        if isinstance(payload, dict)
+        else []
+    )
+    if unexpected_payload:
+        return _invalid_scoped_rules(
+            profile,
+            "Campos fuera del contrato: " + ", ".join(unexpected_payload),
+        )
+    requested_rules = payload.get("rules") if isinstance(payload, dict) else None
+    expected = payload.get("expected_fingerprint") if isinstance(payload, dict) else None
+    if not isinstance(requested_rules, dict):
+        return _invalid_scoped_rules(profile, "rules debe ser un objeto.")
+    unexpected = sorted(set(requested_rules) - set(blocks))
+    if unexpected:
+        return _invalid_scoped_rules(
+            profile,
+            "Bloques fuera del perfil: " + ", ".join(unexpected),
+        )
+    if not isinstance(expected, str) or not expected:
+        return _invalid_scoped_rules(
+            profile,
+            "expected_fingerprint es obligatorio.",
+        )
+
+    current_status, current = _media_rules_payload()
+    if current_status >= 400:
+        return current_status, _scoped_media_rules_payload(
+            current,
+            profile,
+            blocks,
+            connected=current_status < 500,
+            editable=False,
+        )
+    current_rules = current.get("rules") if isinstance(current, dict) else None
+    current_fingerprint = current.get("fingerprint") if isinstance(current, dict) else None
+    if not isinstance(current_rules, dict) or not isinstance(current_fingerprint, str):
+        return 502, {
+            "ok": False,
+            "error": "invalid_upstream_response",
+            "message": "Media Worker no devolvio reglas completas con huella.",
+            "profile": profile,
+            "connected": False,
+            "editable": False,
+        }
+    if expected != current_fingerprint:
+        conflict = _scoped_media_rules_payload(
+            current,
+            profile,
+            blocks,
+            connected=True,
+            editable=True,
+        )
+        conflict.update(
+            {
+                "ok": False,
+                "error": "fingerprint_conflict",
+                "message": "Las reglas cambiaron; recarga antes de guardar.",
+                "expected_fingerprint": expected,
+                "current_fingerprint": current_fingerprint,
+            }
+        )
+        return 409, conflict
+
+    merged_rules = copy.deepcopy(current_rules)
+    for block, value in requested_rules.items():
+        merged_rules[block] = copy.deepcopy(value)
+    saved_status, saved = _save_media_rules(
+        {
+            "rules": merged_rules,
+            "expected_fingerprint": expected,
+        }
+    )
+    return saved_status, _scoped_media_rules_payload(
+        saved,
+        profile,
+        blocks,
+        connected=saved_status < 500,
+        editable=saved_status < 500,
+    )
+
+
+def _series_rules_payload() -> Dict[str, Any]:
+    defaults = _rules_block_view(
+        _read_json(DEFAULT_RULES_PATH),
+        MOVIE_RULE_BLOCKS,
+        fill_missing=True,
+    )
+    return {
+        "ok": True,
+        "profile": "series",
+        "connected": False,
+        "editable": False,
+        "message": SERIES_NOT_CONNECTED_MESSAGE,
+        "rules": copy.deepcopy(defaults),
+        "active": {},
+        "defaults": defaults,
+        "rules_path": None,
+        "defaults_path": str(DEFAULT_RULES_PATH),
+        "fingerprint": None,
+        "saved_at": None,
+        "applied": False,
+        "applies_to": "none",
+    }
+
+
+def _series_rules_unavailable() -> Tuple[int, Dict[str, Any]]:
+    return 503, {
+        "ok": False,
+        "error": "series_engine_not_connected",
+        "message": SERIES_NOT_CONNECTED_MESSAGE,
+        "profile": "series",
+        "connected": False,
+        "editable": False,
+        "applied": False,
+    }
+
+
+def _watcher_rules_payload() -> Tuple[int, Dict[str, Any]]:
+    return _proxy_upstream_json(f"{ORCH_URL}/settings/watcher", timeout=8)
+
+
+def _save_watcher_rules(
+    payload: Dict[str, Any],
+) -> Tuple[int, Dict[str, Any]]:
+    return _proxy_upstream_json(
+        f"{ORCH_URL}/settings/watcher",
+        payload,
+        timeout=20,
+    )
+
+
+def _watcher_rules_profile_payload(profile: str) -> Tuple[int, Dict[str, Any]]:
+    if profile == "movies":
+        status, upstream = _watcher_rules_payload()
+        result = copy.deepcopy(upstream)
+        result.update(
+            {
+                "profile": "movies",
+                "connected": status < 500,
+                "editable": status < 500,
+            }
+        )
+        return status, result
+    return 200, {
+        "ok": True,
+        "profile": "tv",
+        "connected": False,
+        "editable": False,
+        "message": "Vigilante de series no conectado",
+        "rules": {"ignored_suffixes": []},
+        "scope": str(COMPLETE_ROOT / "tv"),
+    }
+
+
+def _save_watcher_rules_profile(
+    profile: str,
+    payload: Dict[str, Any],
+) -> Tuple[int, Dict[str, Any]]:
+    if profile == "movies":
+        status, upstream = _save_watcher_rules(payload)
+        result = copy.deepcopy(upstream)
+        result.update(
+            {
+                "profile": "movies",
+                "connected": status < 500,
+                "editable": status < 500,
+            }
+        )
+        return status, result
+    return 503, {
+        "ok": False,
+        "error": "series_watcher_not_connected",
+        "message": "Vigilante de series no conectado",
+        "profile": "tv",
+        "connected": False,
+        "editable": False,
+    }
 
 
 def _status_payload() -> Dict[str, Any]:
     orch = _upstream_json(f"{ORCH_URL}/health")
     worker = _upstream_json(f"{WORKER_URL}/health")
+    orchestrator_connected = bool(
+        isinstance(orch, dict)
+        and not orch.get("error")
+        and (orch.get("ok") is True or orch.get("status") == "ok")
+    )
+    worker_connected = bool(
+        isinstance(worker, dict)
+        and not worker.get("error")
+        and (worker.get("ok") is True or worker.get("status") == "ok")
+    )
+    orchestrator_service = copy.deepcopy(orch)
+    orchestrator_service.update(
+        {"connected": orchestrator_connected, "editable": False}
+    )
+    movies_service = copy.deepcopy(worker)
+    movies_service.update(
+        {"connected": worker_connected, "editable": worker_connected}
+    )
+    trailers_service = copy.deepcopy(worker)
+    trailers_service.update(
+        {"connected": worker_connected, "editable": worker_connected}
+    )
     return {
         "ok": True,
         "orchestrator": orch,
         "media_worker": worker,
+        "services": {
+            "orchestrator": orchestrator_service,
+            "movies": movies_service,
+            "series": {
+                "status": "not_connected",
+                "connected": False,
+                "editable": False,
+                "message": SERIES_NOT_CONNECTED_MESSAGE,
+            },
+            "trailers": trailers_service,
+        },
         "paths": {
             "rules": {"path": str(RULES_PATH), "exists": RULES_PATH.exists()},
             "defaults": {"path": str(DEFAULT_RULES_PATH), "exists": DEFAULT_RULES_PATH.exists()},
@@ -339,39 +668,192 @@ def _job_follow_payload(job_id: str) -> Dict[str, Any]:
     return {"ok": False, "error": "No se pudo leer seguimiento del job."}
 
 
-def _review_payload(limit: int = 80) -> Dict[str, Any]:
-    items: List[Dict[str, Any]] = []
+def _normalized_profile(value: object) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    if text in {"tv", "series", "serie", "show", "shows"}:
+        return "series"
+    if text in {"movie", "movies", "pelicula", "película"} or text.startswith(
+        "trailer"
+    ):
+        return "movies"
+    return None
+
+
+def _profile_from_metadata(value: object) -> Optional[str]:
+    if not isinstance(value, dict):
+        return None
+    queue: List[Tuple[Dict[str, Any], int]] = [(value, 0)]
+    seen = set()
+    while queue:
+        current, depth = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        for key in ("profile", "category", "media_type"):
+            profile = _normalized_profile(current.get(key))
+            if profile:
+                return profile
+        if depth >= 3:
+            continue
+        for key in (
+            "source_meta",
+            "source_meta_json",
+            "media_decision",
+            "resolved_identity",
+            "identity",
+            "details",
+            "job",
+        ):
+            nested = current.get(key)
+            if isinstance(nested, str) and nested.lstrip().startswith("{"):
+                try:
+                    nested = json.loads(nested)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    nested = None
+            if isinstance(nested, dict):
+                queue.append((nested, depth + 1))
+    return None
+
+
+def _profile_from_text_evidence(text: str) -> Optional[str]:
+    if SERIES_EVIDENCE_RE.search(text):
+        return "series"
+    if MOVIE_EVIDENCE_RE.search(text):
+        return "movies"
+    return None
+
+
+def _review_structure_profile(folder: Path, reason_file: str) -> Optional[str]:
+    evidence = [folder.name, reason_file]
+    try:
+        for index, child in enumerate(folder.rglob("*")):
+            if index >= MAX_PROFILE_EVIDENCE_PATHS:
+                break
+            evidence.append(str(child.relative_to(folder)))
+    except OSError:
+        pass
+    return _profile_from_text_evidence("\n".join(evidence))
+
+
+def _review_item_profile(
+    payload: Dict[str, Any],
+    reason_file: str,
+    *,
+    folder: Optional[Path] = None,
+    job: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    return (
+        _profile_from_metadata(payload)
+        or _profile_from_metadata(job)
+        or (_review_structure_profile(folder, reason_file) if folder else None)
+    )
+
+
+def _job_contexts(job_ids: set[str]) -> Dict[str, Dict[str, Any]]:
+    if not job_ids:
+        return {}
+    jobs = _jobs_payload().get("jobs", [])
+    if not isinstance(jobs, list):
+        return {}
+    return {
+        str(job.get("job_id")): job
+        for job in jobs
+        if isinstance(job, dict) and str(job.get("job_id") or "") in job_ids
+    }
+
+
+def _job_id_from_path(path: Path) -> str:
+    for part in path.parts:
+        if JOB_ID_RE.fullmatch(part):
+            return part
+    return ""
+
+
+def _review_payload(
+    limit: int = 80,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
     if REVIEW_DIR.is_dir():
-        for folder in sorted(REVIEW_DIR.iterdir(), key=_mtime, reverse=True)[:limit]:
+        for folder in sorted(REVIEW_DIR.iterdir(), key=_mtime, reverse=True):
             if not folder.is_dir():
                 continue
             txts = sorted(folder.glob("*.txt"))
             reason_json = folder / "reason.json"
             payload = _read_json(reason_json)
-            items.append(
+            reason_file = txts[0].name if txts else ""
+            item_profile = _review_item_profile(
+                payload,
+                reason_file,
+                folder=folder,
+            )
+            records.append(
                 {
-                    "name": folder.name,
-                    "path": str(folder),
-                    "mtime": _mtime(folder),
-                    "reason_file": txts[0].name if txts else "",
-                    "reason_text": _short_text(txts[0], 2000) if txts else "",
-                    "phase": payload.get("phase", ""),
-                    "job_id": payload.get("job_id", ""),
-                    "file_count": _count_children(folder),
+                    "folder": folder,
+                    "payload": payload,
+                    "reason_file": reason_file,
+                    "reason_path": txts[0] if txts else None,
+                    "profile": item_profile,
                 }
             )
-    return {"ok": True, "review_dir": str(REVIEW_DIR), "items": items}
+    unresolved_job_ids = {
+        str(record["payload"].get("job_id") or "")
+        for record in records
+        if record["profile"] is None
+        and JOB_ID_RE.fullmatch(str(record["payload"].get("job_id") or ""))
+    }
+    contexts = _job_contexts(unresolved_job_ids) if profile is not None else {}
+    items: List[Dict[str, Any]] = []
+    for record in records:
+        if len(items) >= limit:
+            break
+        folder = record["folder"]
+        payload = record["payload"]
+        job_id = str(payload.get("job_id") or "")
+        item_profile = record["profile"] or _profile_from_metadata(
+            contexts.get(job_id)
+        )
+        if profile is not None and item_profile not in {None, profile}:
+            continue
+        reason_path = record["reason_path"]
+        items.append(
+            {
+                "name": folder.name,
+                "path": str(folder),
+                "mtime": _mtime(folder),
+                "reason_file": record["reason_file"],
+                "reason_text": _short_text(reason_path, 2000) if reason_path else "",
+                "phase": payload.get("phase", ""),
+                "job_id": job_id,
+                "file_count": _count_children(folder),
+                "profile": item_profile,
+                "classification": item_profile or "unclassified",
+            }
+        )
+    result: Dict[str, Any] = {
+        "ok": True,
+        "review_dir": str(REVIEW_DIR),
+        "items": items,
+    }
+    if profile is not None:
+        result["profile"] = profile
+    return result
 
 
-def _reports_payload(limit: int = 120) -> Dict[str, Any]:
-    files: List[Dict[str, Any]] = []
+def _reports_payload(
+    limit: int = 120,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    records: List[Dict[str, Any]] = []
     roots = [REPORT_ROOT / "runtime", REPORT_ROOT / "logs", REPORT_ROOT]
     seen = set()
+    scan_limit = max(limit, limit * 10 if profile is not None else limit)
     for root in roots:
         if not root.is_dir():
             continue
         for path in sorted(root.rglob("*"), key=_mtime, reverse=True):
-            if len(files) >= limit:
+            if len(records) >= scan_limit:
                 break
             if not path.is_file():
                 continue
@@ -381,16 +863,65 @@ def _reports_payload(limit: int = 120) -> Dict[str, Any]:
             if rel in seen:
                 continue
             seen.add(rel)
-            files.append(
+            metadata: Dict[str, Any] = {}
+            size = path.stat().st_size
+            if path.suffix.lower() == ".json" and size <= MAX_REPORT_METADATA_BYTES:
+                metadata = _read_json(path)
+            item_profile = _profile_from_metadata(metadata)
+            if item_profile is None:
+                item_profile = _profile_from_text_evidence(rel)
+            job_id = str(metadata.get("job_id") or "") or _job_id_from_path(
+                path.relative_to(REPORT_ROOT)
+            )
+            records.append(
                 {
                     "name": path.name,
                     "relative": rel,
-                    "size": path.stat().st_size,
+                    "size": size,
                     "mtime": _mtime(path),
                     "kind": path.suffix.lower().lstrip(".") or "file",
+                    "profile": item_profile,
+                    "job_id": job_id,
                 }
             )
-    return {"ok": True, "report_root": str(REPORT_ROOT), "files": files}
+    unresolved_job_ids = {
+        str(record.get("job_id") or "")
+        for record in records
+        if record.get("profile") is None
+        and JOB_ID_RE.fullmatch(str(record.get("job_id") or ""))
+    }
+    contexts = _job_contexts(unresolved_job_ids) if profile is not None else {}
+    files: List[Dict[str, Any]] = []
+    for record in records:
+        if len(files) >= limit:
+            break
+        item_profile = record.get("profile") or _profile_from_metadata(
+            contexts.get(str(record.get("job_id") or ""))
+        )
+        if item_profile is None:
+            # Este root pertenece al Media Worker de peliculas/trailers.
+            item_profile = "movies"
+        if profile is not None and item_profile != profile:
+            continue
+        item = dict(record)
+        item["profile"] = item_profile
+        item.pop("job_id", None)
+        files.append(item)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "report_root": str(REPORT_ROOT),
+        "files": files,
+    }
+    if profile is not None:
+        result.update(
+            {
+                "profile": profile,
+                "connected": profile == "movies" and REPORT_ROOT.is_dir(),
+            }
+        )
+        if profile == "series":
+            result["message"] = SERIES_NOT_CONNECTED_MESSAGE
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -493,19 +1024,69 @@ class Handler(BaseHTTPRequestHandler):
             status, result = _media_rules_payload()
             self._json(status, result)
             return
+        if path == "/api/movie-rules":
+            status, result = _media_rules_profile_payload(
+                "movies",
+                MOVIE_RULE_BLOCKS,
+            )
+            self._json(status, result)
+            return
+        if path == "/api/trailer-rules":
+            status, result = _media_rules_profile_payload(
+                "trailers",
+                TRAILER_RULE_BLOCKS,
+            )
+            self._json(status, result)
+            return
+        if path == "/api/series-rules":
+            self._json(200, _series_rules_payload())
+            return
         if path == "/api/watcher-rules":
-            result = _watcher_rules_payload()
-            self._json(200 if result.get("ok") else 502, result)
+            status, result = _watcher_rules_payload()
+            self._json(status, result)
+            return
+        if path in {"/api/watcher-rules/movies", "/api/watcher-rules/tv"}:
+            profile = path.rsplit("/", 1)[-1]
+            status, result = _watcher_rules_profile_payload(profile)
+            self._json(status, result)
             return
         if path == "/api/identity-rules":
             status, result = IDENTITY_PROXY.get_rules()
             self._json(status, result)
             return
+        if path.startswith("/api/identity-rules/"):
+            profile = path.removeprefix("/api/identity-rules/").strip("/")
+            if profile in IDENTITY_PROFILES:
+                status, result = IDENTITY_PROXY.get_rules(profile)
+                self._json(status, result)
+                return
         if path == "/api/review":
-            self._json(200, _review_payload())
+            profile = query.get("profile", [None])[0]
+            if profile not in {None, "movies", "series"}:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_profile",
+                        "message": "profile debe ser movies o series.",
+                    },
+                )
+                return
+            self._json(200, _review_payload(profile=profile))
             return
         if path == "/api/reports":
-            self._json(200, _reports_payload())
+            profile = query.get("profile", [None])[0]
+            if profile not in {None, "movies", "series"}:
+                self._json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "invalid_profile",
+                        "message": "profile debe ser movies o series.",
+                    },
+                )
+                return
+            self._json(200, _reports_payload(profile=profile))
             return
         if path == "/api/codex-diagnostics":
             self._json(200, _codex_diagnostics_payload())
@@ -565,12 +1146,52 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as error:
                 self._json(500, {"ok": False, "error": str(error)})
             return
+        media_profile_actions = {
+            "/api/movie-rules": ("movies", MOVIE_RULE_BLOCKS),
+            "/api/trailer-rules": ("trailers", TRAILER_RULE_BLOCKS),
+        }
+        media_profile_action = media_profile_actions.get(parsed.path)
+        if media_profile_action:
+            profile, blocks = media_profile_action
+            payload = _read_protected_json_object(self)
+            if payload is None:
+                return
+            try:
+                status, result = _save_media_rules_profile(
+                    payload,
+                    profile,
+                    blocks,
+                )
+                self._json(status, result)
+            except Exception as error:
+                self._json(500, {"ok": False, "error": type(error).__name__})
+            return
+        if parsed.path == "/api/series-rules":
+            if _read_protected_json_object(self) is None:
+                return
+            status, result = _series_rules_unavailable()
+            self._json(status, result)
+            return
         if parsed.path == "/api/watcher-rules":
             try:
-                result = _save_watcher_rules(self._read_payload())
-                self._json(200 if result.get("ok") else 400, result)
+                status, result = _save_watcher_rules(self._read_payload())
+                self._json(status, result)
             except Exception as error:
                 self._json(500, {"ok": False, "error": str(error)})
+            return
+        if parsed.path in {"/api/watcher-rules/movies", "/api/watcher-rules/tv"}:
+            profile = parsed.path.rsplit("/", 1)[-1]
+            payload = _read_protected_json_object(self)
+            if payload is None:
+                return
+            try:
+                status, result = _save_watcher_rules_profile(
+                    profile,
+                    payload,
+                )
+                self._json(status, result)
+            except Exception as error:
+                self._json(500, {"ok": False, "error": type(error).__name__})
             return
         identity_actions = {
             "/api/identity-rules": IDENTITY_PROXY.save_rules,
@@ -580,6 +1201,22 @@ class Handler(BaseHTTPRequestHandler):
             "/api/identity-rules/test-resolver": IDENTITY_PROXY.test_resolver,
         }
         identity_action = identity_actions.get(parsed.path)
+        if identity_action is None and parsed.path.startswith("/api/identity-rules/"):
+            suffix = parsed.path.removeprefix("/api/identity-rules/").strip("/")
+            profile, separator, action_name = suffix.partition("/")
+            profile_actions = {
+                "": IDENTITY_PROXY.save_rules,
+                "reset": IDENTITY_PROXY.reset_rules,
+                "cache/clear": IDENTITY_PROXY.clear_cache,
+                "test-parser": IDENTITY_PROXY.test_parser,
+                "test-resolver": IDENTITY_PROXY.test_resolver,
+            }
+            profile_action = profile_actions.get(action_name if separator else "")
+            if profile in IDENTITY_PROFILES and profile_action is not None:
+                identity_action = lambda payload, method=profile_action, selected=profile: method(
+                    payload,
+                    selected,
+                )
         if identity_action:
             if not _same_origin_request(self.headers):
                 self._json(

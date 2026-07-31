@@ -4,11 +4,19 @@
   const ui = window.ArrIdentityUI;
 
   ui.renderTester = function (section) {
+    const state = ui.state;
     const parser = section === "parser";
-    const category = ui.state.testCategories[section];
-    const activeTest = ui.state.activeTest;
+    const category = state.testCategories[section];
+    const activeTest = state.activeTest;
     const testing = Boolean(activeTest);
     const testingHere = activeTest?.section === section;
+    const categoryOptions = state.profile === "common"
+      ? `${parser ? `<option value="auto" ${category === "auto" ? "selected" : ""}>Automática</option>` : ""}
+          <option value="movies" ${category === "movies" ? "selected" : ""}>Película</option>
+          <option value="tv" ${category === "tv" ? "selected" : ""}>Serie</option>`
+      : state.profile === "movies"
+        ? `<option value="movies" selected>Película</option>`
+        : `<option value="tv" selected>Serie</option>`;
     return `<section class="identity-tester rule-group" aria-labelledby="identity-tester-title">
       <div class="identity-tester-heading">
         <div><h3 id="identity-tester-title">Probar título</h3><p>Usa los valores que ves ahora, incluso antes de guardarlos.</p></div>
@@ -16,16 +24,12 @@
       </div>
       <div class="identity-test-form">
         <label class="identity-sr-only" for="identity-test-name">Nombre a probar</label>
-        <input id="identity-test-name" type="text" value="${ui.esc(ui.state.testNames[section])}" placeholder="Escribe aquí el nombre sucio completo" autocomplete="off" spellcheck="false">
+        <input id="identity-test-name" type="text" value="${ui.esc(state.testNames[section])}" placeholder="Escribe aquí el nombre sucio completo" autocomplete="off" spellcheck="false">
         <label class="identity-sr-only" for="identity-test-category">Categoría</label>
-        <select id="identity-test-category">
-          ${parser ? `<option value="auto" ${category === "auto" ? "selected" : ""}>Automática</option>` : ""}
-          <option value="movies" ${category === "movies" ? "selected" : ""}>Película</option>
-          <option value="tv" ${category === "tv" ? "selected" : ""}>Serie</option>
-        </select>
+        <select id="identity-test-category">${categoryOptions}</select>
         <button type="button" class="btn primary" id="identity-test-button" ${testing ? "disabled" : ""}>${testingHere ? "Probando…" : testing ? "Prueba en curso…" : "Probar título"}</button>
       </div>
-      <div id="identity-test-result">${testingHere ? `<div class="identity-test-loading">Analizando el título…</div>` : ui.renderTestResult(section, ui.state.lastResult[section], ui.state.testContext[section])}</div>
+      <div id="identity-test-result">${testingHere ? `<div class="identity-test-loading">Analizando el título…</div>` : ui.renderTestResult(section, state.lastResult[section], state.testContext[section])}</div>
     </section>`;
   };
 
@@ -34,10 +38,12 @@
     const category = document.getElementById("identity-test-category");
     const button = document.getElementById("identity-test-button");
     if (!name || !category || !button) return;
-    const section = ui.state.section;
+    const state = ui.state;
+    const profile = state.profile;
+    const section = state.section;
     name.addEventListener("input", () => {
-      ui.state.testNames[section] = name.value;
-      ui.invalidateTestResult(section);
+      state.testNames[section] = name.value;
+      ui.invalidateTestResult(section, { profile });
     });
     name.addEventListener("keydown", event => {
       if (event.key !== "Enter") return;
@@ -45,8 +51,8 @@
       button.click();
     });
     category.addEventListener("change", () => {
-      ui.state.testCategories[section] = category.value;
-      ui.invalidateTestResult(section);
+      state.testCategories[section] = category.value;
+      ui.invalidateTestResult(section, { profile });
     });
     button.addEventListener("click", ui.runTitleTest);
     ui.bindCandidateActions();
@@ -59,8 +65,10 @@
   };
 
   ui.runTitleTest = async function () {
-    if (ui.state.activeTest) {
-      ui.status("Ya hay una prueba de título en curso. Espera a que termine.", "info");
+    const state = ui.state;
+    const profile = state.profile;
+    if (state.activeTest) {
+      ui.status("Ya hay una prueba de título en curso. Espera a que termine.", "info", profile);
       const activeButton = document.getElementById("identity-test-button");
       if (activeButton) {
         activeButton.disabled = true;
@@ -68,30 +76,30 @@
       }
       return;
     }
-    const section = ui.state.section;
+    const section = state.section;
     const name = document.getElementById("identity-test-name")?.value.trim() || "";
-    const category = document.getElementById("identity-test-category")?.value || (section === "parser" ? "auto" : "movies");
-    ui.state.testNames[section] = name;
-    ui.state.testCategories[section] = category;
+    const category = document.getElementById("identity-test-category")?.value || state.testCategories[section];
+    state.testNames[section] = name;
+    state.testCategories[section] = category;
     if (!name) {
-      ui.status("Escribe un nombre antes de probar.", "warn");
+      ui.status("Escribe un nombre antes de probar.", "warn", profile);
       document.getElementById("identity-test-name")?.focus();
       return;
     }
     const button = document.getElementById("identity-test-button");
     const resultBox = document.getElementById("identity-test-result");
     if (!button || !resultBox) return;
-    const request = ui.beginTestRequest(section);
+    const request = ui.beginTestRequest(section, profile);
     if (!request) return;
     const { requestId } = request;
-    const submittedRules = ui.clone(ui.state.draft);
+    const submittedRules = ui.clone(state.draft);
     button.disabled = true;
     button.textContent = "Probando…";
     resultBox.innerHTML = `<div class="identity-test-loading">Analizando el título…</div>`;
     try {
       let result;
       try {
-        result = await ui.api(`/api/identity-rules/test-${section}`, {
+        result = await ui.api(`${ui.identityApiRoot(profile)}/test-${section}`, {
           method: "POST",
           body: JSON.stringify({ name, category, rules: submittedRules })
         });
@@ -100,7 +108,7 @@
         if (section !== "resolver" || !errorPayload || typeof errorPayload !== "object" || Array.isArray(errorPayload)) throw error;
         result = errorPayload;
       }
-      if (!ui.isCurrentTestRequest(section, requestId)) return;
+      if (!ui.isCurrentTestRequest(request)) return;
       const parserResult = section === "parser"
         ? (result.result || result)
         : (result.parser_test?.result || result.parser_test || {});
@@ -115,9 +123,9 @@
           ? ""
           : String(parserResult.year).trim()
       });
-      ui.state.lastResult[section] = result;
-      ui.state.testContext[section] = context;
-      if (ui.isActiveView() && ui.state.section === section) {
+      state.lastResult[section] = result;
+      state.testContext[section] = context;
+      if (ui.isProfileActive(profile, section)) {
         const currentBox = document.getElementById("identity-test-result");
         if (currentBox) currentBox.innerHTML = ui.renderTestResult(section, result, context);
         ui.bindCandidateActions();
@@ -128,11 +136,12 @@
           `${resolverAnnouncement ? `${resolverAnnouncement}. ` : ""}${result.ok === false
             ? "Prueba terminada con una incidencia. No se ha guardado ni movido ningún archivo."
             : "Prueba terminada. No se ha guardado ni movido ningún archivo."}`,
-          result.ok === false ? "warn" : "ok"
+          result.ok === false ? "warn" : "ok",
+          profile
         );
       }
     } catch (error) {
-      if (!ui.isCurrentTestRequest(section, requestId)) return;
+      if (!ui.isCurrentTestRequest(request)) return;
       const resolverFailure = section === "resolver" ? {
         ok: false,
         status: "REQUEST_ERROR",
@@ -151,9 +160,9 @@
         parserTitle: "",
         parserYear: ""
       }) : null;
-      ui.state.lastResult[section] = resolverFailure;
-      ui.state.testContext[section] = failureContext;
-      if (ui.isActiveView() && ui.state.section === section) {
+      state.lastResult[section] = resolverFailure;
+      state.testContext[section] = failureContext;
+      if (ui.isProfileActive(profile, section)) {
         const currentBox = document.getElementById("identity-test-result");
         if (currentBox) currentBox.innerHTML = resolverFailure
           ? ui.renderResolverResult(resolverFailure, failureContext)
@@ -162,12 +171,13 @@
           resolverFailure
             ? "PRUEBA NO COMPLETADA. No se ha guardado ni movido ningún archivo."
             : `Error probando: ${error.message}`,
-          "bad"
+          "bad",
+          profile
         );
       }
     } finally {
       const released = ui.finishTestRequest(request);
-      if (released && ui.isActiveView()) {
+      if (released && ui.isProfileActive(profile)) {
         const currentButton = document.getElementById("identity-test-button");
         if (currentButton) {
           currentButton.disabled = false;
@@ -205,7 +215,8 @@
   };
 
   ui.addCandidateRule = function (dataset) {
-    const context = ui.state.testContext.resolver;
+    const state = ui.state;
+    const context = state.testContext.resolver;
     if (!context || Number(dataset.testRequestId) !== Number(context.requestId)) {
       ui.status("Esta prueba ya no es válida. Vuelve a pulsar Probar título.", "warn");
       return;
@@ -230,7 +241,7 @@
     const path = dataset.candidateAction === "alias"
       ? `resolver.aliases.${category}`
       : `resolver.forced_matches.${category}`;
-    const list = ui.getPath(ui.state.draft, path) || [];
+    const list = ui.getPath(state.draft, path) || [];
     const value = dataset.candidateAction === "alias"
       ? `${parserTitle} | ${candidateTitle}`
       : category === "tv" && !parserYear

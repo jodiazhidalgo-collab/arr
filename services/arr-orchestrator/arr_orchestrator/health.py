@@ -6,6 +6,7 @@ from urllib.parse import unquote
 
 
 MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024
+IDENTITY_PROFILES = ("common", "movies", "tv")
 
 
 def start_health_server(
@@ -18,12 +19,12 @@ def start_health_server(
     diagnostic_creator: Optional[Callable[[str, bool], Dict[str, object]]] = None,
     watcher_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
     watcher_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
-    identity_rules_provider: Optional[Callable[[], Dict[str, object]]] = None,
-    identity_rules_updater: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
-    identity_rules_resetter: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
-    identity_cache_clearer: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
-    identity_parser_tester: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
-    identity_resolver_tester: Optional[Callable[[Dict[str, object]], Dict[str, object]]] = None,
+    identity_rules_provider: Optional[Callable[..., Dict[str, object]]] = None,
+    identity_rules_updater: Optional[Callable[..., Dict[str, object]]] = None,
+    identity_rules_resetter: Optional[Callable[..., Dict[str, object]]] = None,
+    identity_cache_clearer: Optional[Callable[..., Dict[str, object]]] = None,
+    identity_parser_tester: Optional[Callable[..., Dict[str, object]]] = None,
+    identity_resolver_tester: Optional[Callable[..., Dict[str, object]]] = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -34,6 +35,12 @@ def start_health_server(
                 self._json(200, watcher_rules_provider())
             elif path == "/settings/identity" and identity_rules_provider:
                 self._json(200, identity_rules_provider())
+            elif path.startswith("/settings/identity/") and identity_rules_provider:
+                profile = path.removeprefix("/settings/identity/").strip("/")
+                if profile in IDENTITY_PROFILES:
+                    self._json(200, identity_rules_provider(profile))
+                else:
+                    self._json(404, {"error": "not_found"})
             elif path == "/jobs":
                 self._json(200, jobs_provider())
             elif path.startswith("/jobs/") and path.endswith("/follow") and follow_provider:
@@ -85,8 +92,27 @@ def start_health_server(
                 "/settings/identity/test-resolver": identity_resolver_tester,
             }
             identity_handler = identity_handlers.get(path)
+            identity_profile = None
+            if not identity_handler and path.startswith("/settings/identity/"):
+                relative = path.removeprefix("/settings/identity/").strip("/")
+                parts = relative.split("/") if relative else []
+                if parts and parts[0] in IDENTITY_PROFILES:
+                    identity_profile = parts[0]
+                    action = "/".join(parts[1:])
+                    identity_handler = {
+                        "": identity_rules_updater,
+                        "reset": identity_rules_resetter,
+                        "cache/clear": identity_cache_clearer,
+                        "test-parser": identity_parser_tester,
+                        "test-resolver": identity_resolver_tester,
+                    }.get(action)
             if identity_handler:
-                result = identity_handler(self._read_json())
+                request = self._read_json()
+                result = (
+                    identity_handler(request, identity_profile)
+                    if identity_profile
+                    else identity_handler(request)
+                )
                 if result.get("ok"):
                     status = 200
                 elif result.get("error") == "revision_conflict":

@@ -17,8 +17,22 @@ from .resolver_defaults import DEFAULT_SERIES_CANDIDATES, DEFAULT_TITLE_MATCHING
 
 IDENTITY_SETTING_KEY = "identity.pipeline"
 IDENTITY_RULES_PATH = f"settings/{IDENTITY_SETTING_KEY}"
+IDENTITY_PROFILES = ("common", "movies", "tv")
+IDENTITY_PROFILE_SETTING_KEYS = {
+    profile: f"{IDENTITY_SETTING_KEY}.{profile}" for profile in IDENTITY_PROFILES
+}
 IDENTITY_SCHEMA_VERSION = 1
 IDENTITY_HISTORY_LIMIT = 12
+
+
+def identity_profile_setting_key(profile: str) -> str:
+    """Devuelve la clave persistida de un perfil valido."""
+
+    normalized = str(profile or "").strip().lower()
+    try:
+        return IDENTITY_PROFILE_SETTING_KEYS[normalized]
+    except KeyError as error:
+        raise ValueError("profile debe ser common, movies o tv") from error
 
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2})?$")
 _REGION_RE = re.compile(r"^[A-Za-z]{2}$")

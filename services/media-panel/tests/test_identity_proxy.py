@@ -90,6 +90,49 @@ class IdentityProxyTests(unittest.TestCase):
         self.assertEqual(json.loads(request.data.decode("utf-8")), draft)
         self.assertEqual(upstream.call_args.kwargs["timeout"], 25)
 
+    def test_profile_endpoints_keep_each_identity_document_isolated(self) -> None:
+        payload = {"rules": {"schema_version": 1}, "expected_revision": 2}
+        cases = (
+            ("common", "save_rules", "", "/settings/identity/common"),
+            ("movies", "reset_rules", "reset", "/settings/identity/movies/reset"),
+            ("tv", "clear_cache", "cache", "/settings/identity/tv/cache/clear"),
+            ("movies", "test_parser", "parser", "/settings/identity/movies/test-parser"),
+            ("tv", "test_resolver", "resolver", "/settings/identity/tv/test-resolver"),
+        )
+        for profile, method_name, _label, expected_path in cases:
+            with self.subTest(profile=profile, method=method_name), patch.object(
+                identity_proxy.urllib.request,
+                "urlopen",
+                return_value=_Response(200, {"ok": True, "profile": profile}),
+            ) as upstream:
+                method = getattr(self.proxy, method_name)
+                result = method(payload, profile)
+
+            self.assertEqual(result[1]["profile"], profile)
+            request = upstream.call_args.args[0]
+            self.assertEqual(request.full_url, f"http://arr-orchestrator:8787{expected_path}")
+            self.assertEqual(request.get_method(), "POST")
+
+    def test_profile_get_uses_scoped_upstream_path(self) -> None:
+        with patch.object(
+            identity_proxy.urllib.request,
+            "urlopen",
+            return_value=_Response(200, {"ok": True, "profile": "tv"}),
+        ) as upstream:
+            result = self.proxy.get_rules("tv")
+
+        self.assertEqual(result, (200, {"ok": True, "profile": "tv"}))
+        self.assertEqual(
+            upstream.call_args.args[0].full_url,
+            "http://arr-orchestrator:8787/settings/identity/tv",
+        )
+
+    def test_unknown_profile_is_rejected_before_network(self) -> None:
+        with patch.object(identity_proxy.urllib.request, "urlopen") as upstream:
+            with self.assertRaises(ValueError):
+                self.proxy.get_rules("other")
+        upstream.assert_not_called()
+
     def test_http_conflict_preserves_status_and_body(self) -> None:
         body = b'{"ok":false,"error":"revision_conflict","current_revision":5}'
         conflict = urllib.error.HTTPError(
@@ -161,6 +204,58 @@ class IdentityPanelHandlerTests(unittest.TestCase):
             server.Handler.do_GET(handler)
 
         self.assertEqual(handler.response, (502, expected))
+
+    def test_profile_get_forwards_profile_and_exact_status(self) -> None:
+        for profile in ("common", "movies", "tv"):
+            with self.subTest(profile=profile):
+                handler = _CapturedHandler(f"/api/identity-rules/{profile}")
+                expected = {"ok": True, "profile": profile, "revision": 1}
+                with patch.object(
+                    server.IDENTITY_PROXY,
+                    "get_rules",
+                    return_value=(200, expected),
+                ) as get_rules:
+                    server.Handler.do_GET(handler)
+
+                get_rules.assert_called_once_with(profile)
+                self.assertEqual(handler.response, (200, expected))
+
+    def test_profile_save_and_reset_forward_profile(self) -> None:
+        payload = {"expected_revision": 1}
+        for suffix, method_name in (("", "save_rules"), ("/reset", "reset_rules")):
+            with self.subTest(suffix=suffix):
+                handler = _CapturedHandler(f"/api/identity-rules/movies{suffix}", payload)
+                expected = {"ok": True, "profile": "movies", "revision": 2}
+                with patch.object(
+                    server.IDENTITY_PROXY,
+                    method_name,
+                    return_value=(200, expected),
+                ) as action:
+                    server.Handler.do_POST(handler)
+
+                action.assert_called_once_with(payload, "movies")
+                self.assertEqual(handler.response, (200, expected))
+
+    def test_profile_cache_and_test_actions_forward_profile(self) -> None:
+        payload = {"name": "Dark.S01E01", "category": "tv"}
+        actions = (
+            ("/cache/clear", "clear_cache"),
+            ("/test-parser", "test_parser"),
+            ("/test-resolver", "test_resolver"),
+        )
+        for suffix, method_name in actions:
+            with self.subTest(suffix=suffix):
+                handler = _CapturedHandler(f"/api/identity-rules/tv{suffix}", payload)
+                expected = {"ok": True, "profile": "tv"}
+                with patch.object(
+                    server.IDENTITY_PROXY,
+                    method_name,
+                    return_value=(200, expected),
+                ) as action:
+                    server.Handler.do_POST(handler)
+
+                action.assert_called_once_with(payload, "tv")
+                self.assertEqual(handler.response, (200, expected))
 
     def test_all_identity_post_actions_forward_payload_and_status(self) -> None:
         payload = {"name": "Blade.Runner.1982.1080p", "category": "movies"}

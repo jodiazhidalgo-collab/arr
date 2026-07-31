@@ -82,49 +82,64 @@ class RulesPanelContractTests(unittest.TestCase):
         )
         cls.server_py = Path(server.__file__).read_text(encoding="utf-8")
 
-    def test_sources_use_a_map_and_load_in_parallel(self) -> None:
-        self.assertIn("const RULE_SOURCES = {", self.panel_js)
-        self.assertIn('endpoint: "/api/rules"', self.panel_js)
-        self.assertIn('endpoint: "/api/watcher-rules"', self.panel_js)
+    def test_profile_sources_use_only_the_scoped_endpoints(self) -> None:
+        self.assertIn("const RULE_VIEW_CONFIG = Object.freeze({", self.panel_js)
+        for endpoint in (
+            "/api/movie-rules",
+            "/api/series-rules",
+            "/api/trailer-rules",
+            "/api/watcher-rules/movies",
+            "/api/watcher-rules/tv",
+        ):
+            self.assertIn(f'endpoint: "{endpoint}"', self.panel_js)
+        self.assertNotIn('endpoint: "/api/rules"', self.panel_js)
         self.assertIn(
-            "Promise.all(Object.entries(RULE_SOURCES)", self.panel_js
+            'const CLEANING_SECTIONS = Object.freeze(["entrada", "video", '
+            '"audio", "subtitulos", "limpieza"]);',
+            self.panel_js,
         )
-        self.assertIn("rulesStates[currentRulesSource()]", self.panel_js)
-        self.assertNotIn('savingSource === "watcher"', self.panel_js)
+        self.assertIn(
+            'const SETTINGS_SECTIONS = Object.freeze(["trailers", "vigilantes"]);',
+            self.panel_js,
+        )
 
     def test_save_updates_only_the_selected_source(self) -> None:
+        self.assertIn("state.documents[source] = savedState;", self.panel_js)
+        self.assertIn("state.drafts[source]", self.panel_js)
+        self.assertIn("state.dirty[source]", self.panel_js)
+        self.assertIn("state.requestEpoch[source]", self.panel_js)
         self.assertIn(
-            "rulesStates[savingSource] = savedState;", self.panel_js
-        )
-        self.assertIn(
-            "payload.expected_fingerprint = "
-            "rulesStates[savingSource]?.fingerprint;",
+            "expected_fingerprint: documentState.fingerprint ?? null",
             self.panel_js,
         )
 
-    def test_panel_keeps_view_and_persists_invalid_section_as_entrada(self) -> None:
-        self.assertIn(
-            "localStorage.getItem(RULE_SECTION_STORAGE_KEY)", self.panel_js
-        )
-        self.assertIn(
-            "localStorage.setItem(RULE_SECTION_STORAGE_KEY, section)",
-            self.panel_js,
-        )
-        self.assertIn(
-            'const target = view === "limpieza-arr" '
-            '? "limpieza-arr/parser" : view;',
-            self.panel_js,
-        )
-        self.assertIn("else location.hash = target;", self.panel_js)
-        self.assertIn("function routeFromHash()", self.panel_js)
-        self.assertIn('window.addEventListener("hashchange"', self.panel_js)
-        self.assertIn(
-            'if (!RULE_SECTIONS[currentRuleSection]) {\n'
-            '  currentRuleSection = "entrada";\n'
-            "  storeRuleSection(currentRuleSection);\n"
-            "}",
-            self.panel_js,
-        )
+    def test_hash_priority_persistence_and_legacy_aliases_are_explicit(self) -> None:
+        self.assertIn("const PANEL_ROUTE_STORAGE_KEY", self.panel_js)
+        self.assertIn("function exactCanonicalRoute(hash)", self.panel_js)
+        self.assertIn("function canonicalRouteFromHash", self.panel_js)
+        self.assertIn("const exact = exactCanonicalRoute(hash);", self.panel_js)
+        self.assertIn("const stored = exactCanonicalRoute(storageGet(", self.panel_js)
+        self.assertIn('history.replaceState(null, "", route.hash)', self.panel_js)
+        self.assertIn("#identidad/comun/parser", self.panel_js)
+        self.assertIn("#limpieza-peliculas/${section}", self.panel_js)
+        self.assertIn("#ajustes/trailers", self.panel_js)
+        self.assertIn("#ajustes/vigilantes", self.panel_js)
+        self.assertIn("/^#reglas", self.panel_js)
+        self.assertIn("window.ArrIdentityUI.resolveTarget(hash)", self.panel_js)
+
+    def test_series_is_complete_but_locked_to_its_own_contract(self) -> None:
+        self.assertIn('endpoint: "/api/series-rules"', self.panel_js)
+        self.assertIn("documentState.connected !== false", self.panel_js)
+        self.assertIn("documentState.editable !== false", self.panel_js)
+        self.assertIn('class="rules-editor-locked"', self.panel_js)
+        self.assertIn("La configuración se muestra completa", self.panel_js)
+        self.assertIn("config.sections.map", self.panel_js)
+
+    def test_review_and_reports_are_profile_scoped(self) -> None:
+        self.assertIn("/api/review?profile=${encodeURIComponent(profile)}", self.panel_js)
+        self.assertIn("/api/reports?profile=${encodeURIComponent(profile)}", self.panel_js)
+        self.assertIn("arr-media-panel-revision-profile", self.panel_js)
+        self.assertIn("arr-media-panel-informes-profile", self.panel_js)
 
     def test_removed_filebot_editor_and_proxy_are_not_exposed(self) -> None:
         for text in (
@@ -144,7 +159,7 @@ class RulesPanelContractTests(unittest.TestCase):
         self.assertNotIn(".readonly-value", self.panel_css)
 
     def test_list_controls_use_textarea_without_trash_icons(self) -> None:
-        self.assertIn("Una entrada por linea.", self.panel_js)
+        self.assertIn("Una entrada por línea.", self.panel_js)
         self.assertNotIn("Papelera", self.panel_js)
         self.assertNotIn("trash", self.panel_js.lower())
 

@@ -93,6 +93,34 @@ h3 {
   border-color: var(--button);
 }
 
+.segmented-tabs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 5px;
+  margin-bottom: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #0b1220;
+}
+
+.segmented-tabs button {
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.segmented-tabs button.active {
+  border-color: var(--button);
+  background: var(--button);
+  color: #fff;
+  font-weight: 750;
+}
+
 .btn.primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -254,6 +282,40 @@ h3 {
   color: var(--muted);
   margin-bottom: 12px;
   overflow-wrap: anywhere;
+}
+
+.status.warn {
+  color: #fde68a;
+}
+
+.locked-notice {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  padding: 12px;
+  margin: 0 0 12px;
+  border: 1px solid #92400e;
+  border-radius: 8px;
+  background: rgba(120, 53, 15, .28);
+  color: #fde68a;
+}
+
+.locked-notice span:last-child {
+  color: var(--muted);
+}
+
+.rules-editor-locked {
+  opacity: .76;
+}
+
+.rules-editor-locked :disabled {
+  cursor: not-allowed;
+}
+
+.rule-profile-tabs,
+.auxiliary-profile-tabs {
+  margin-bottom: 12px;
 }
 
 .rule-group {
@@ -517,5 +579,13 @@ textarea {
   }
   .tabs button {
     flex: 1 1 44%;
+  }
+  .segmented-tabs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+  .identity-profile-tabs {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }

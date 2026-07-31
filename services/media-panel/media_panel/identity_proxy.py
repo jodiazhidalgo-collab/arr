@@ -14,6 +14,7 @@ MIN_RESOLVER_PROXY_TIMEOUT_SECONDS = 10.0
 MAX_RESOLVER_PROXY_TIMEOUT_SECONDS = (
     MAX_RESOLVER_BUDGET_MS / 1_000 + RESOLVER_PROXY_MARGIN_SECONDS
 )
+IDENTITY_PROFILES = frozenset({"common", "movies", "tv"})
 
 
 def _resolver_proxy_timeout(payload: Dict[str, object]) -> float:
@@ -50,24 +51,58 @@ class IdentityProxy:
     def __init__(self, orchestrator_url: str) -> None:
         self.base_url = str(orchestrator_url or "").rstrip("/")
 
-    def get_rules(self) -> Tuple[int, Dict[str, object]]:
-        return self._request("/settings/identity", None, 10)
+    @staticmethod
+    def _settings_path(profile: Optional[str] = None, action: str = "") -> str:
+        path = "/settings/identity"
+        if profile is not None:
+            normalized = str(profile or "").strip().lower()
+            if normalized not in IDENTITY_PROFILES:
+                raise ValueError("Perfil de identidad no valido.")
+            path = f"{path}/{normalized}"
+        if action:
+            path = f"{path}/{str(action).strip('/')}"
+        return path
 
-    def save_rules(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, object]]:
-        return self._request("/settings/identity", payload, 25)
+    def get_rules(
+        self, profile: Optional[str] = None
+    ) -> Tuple[int, Dict[str, object]]:
+        return self._request(self._settings_path(profile), None, 10)
 
-    def reset_rules(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, object]]:
-        return self._request("/settings/identity/reset", payload, 25)
+    def save_rules(
+        self,
+        payload: Dict[str, object],
+        profile: Optional[str] = None,
+    ) -> Tuple[int, Dict[str, object]]:
+        return self._request(self._settings_path(profile), payload, 25)
 
-    def clear_cache(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, object]]:
-        return self._request("/settings/identity/cache/clear", payload, 25)
+    def reset_rules(
+        self,
+        payload: Dict[str, object],
+        profile: Optional[str] = None,
+    ) -> Tuple[int, Dict[str, object]]:
+        return self._request(self._settings_path(profile, "reset"), payload, 25)
 
-    def test_parser(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, object]]:
-        return self._request("/settings/identity/test-parser", payload, 25)
+    def clear_cache(
+        self,
+        payload: Dict[str, object],
+        profile: Optional[str] = None,
+    ) -> Tuple[int, Dict[str, object]]:
+        return self._request(self._settings_path(profile, "cache/clear"), payload, 25)
 
-    def test_resolver(self, payload: Dict[str, object]) -> Tuple[int, Dict[str, object]]:
+    def test_parser(
+        self,
+        payload: Dict[str, object],
+        profile: Optional[str] = None,
+    ) -> Tuple[int, Dict[str, object]]:
+        return self._request(self._settings_path(profile, "test-parser"), payload, 25)
+
+    def test_resolver(
+        self,
+        payload: Dict[str, object],
+        profile: Optional[str] = None,
+    ) -> Tuple[int, Dict[str, object]]:
         return self._request(
-            "/settings/identity/test-resolver",
+            self._settings_path(profile, "test-resolver"),
             payload,
             _resolver_proxy_timeout(payload),
         )

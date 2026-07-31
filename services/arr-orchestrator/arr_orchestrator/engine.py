@@ -244,35 +244,46 @@ class Engine:
         result["saved"] = True
         return result
 
-    def identity_rules(self) -> Dict[str, object]:
-        return self.identity.payload()
+    def identity_rules(self, profile: str = "common") -> Dict[str, object]:
+        return self.identity.payload(profile)
 
-    def update_identity_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return self.identity.update(payload)
+    def update_identity_rules(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        return self.identity.update(payload, profile)
 
-    def reset_identity_rules(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return self.identity.reset(payload)
+    def reset_identity_rules(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        return self.identity.reset(payload, profile)
 
-    def clear_identity_cache(self, _payload: Dict[str, object]) -> Dict[str, object]:
-        return self.identity.clear_cache()
+    def clear_identity_cache(
+        self, _payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        return self.identity.clear_cache(profile)
 
-    def test_identity_parser(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return self.identity.test_parser(payload)
+    def test_identity_parser(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        return self.identity.test_parser(payload, profile)
 
-    def test_identity_resolver(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return self.identity.test_resolver(payload)
+    def test_identity_resolver(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        return self.identity.test_resolver(payload, profile)
 
     def _new_job_source_meta_json(
         self,
         *,
         identity_context: Optional[Dict[str, object]] = None,
+        category: Optional[str] = None,
     ) -> str:
         return json.dumps(
             {
                 "identity_rules": (
                     identity_context
                     if isinstance(identity_context, dict)
-                    else self.identity.job_snapshot()
+                    else self.identity.job_snapshot_for_category(category)
                 ),
             },
             ensure_ascii=False,
@@ -338,7 +349,11 @@ class Engine:
         self.observer.join(timeout=10)
 
     def status(self) -> Dict[str, object]:
-        identity_rules = self.identity.payload()
+        identity_profiles = {
+            profile: self.identity.payload(profile)
+            for profile in ("common", "movies", "tv")
+        }
+        identity_rules = identity_profiles["common"]
         return {
             "status": "ok",
             "mode": self.config.mode,
@@ -347,6 +362,13 @@ class Engine:
             "identity_rules": {
                 "revision": identity_rules.get("revision"),
                 "fingerprint": identity_rules.get("fingerprint"),
+                "profiles": {
+                    profile: {
+                        "revision": payload.get("revision"),
+                        "fingerprint": payload.get("fingerprint"),
+                    }
+                    for profile, payload in identity_profiles.items()
+                },
             },
             "queue_size": self.events.qsize(),
         }
@@ -484,12 +506,13 @@ class Engine:
             if not source_path:
                 continue
             job = self._job_for_qbt_content(infohash, source_path, content_path)
-            identity_context = (
-                self.identity.rules_for_job(job)
-                if job
-                else self.identity.job_snapshot()
+            identity_context = self.identity.rules_for_job(job) if job else None
+            classification_context = (
+                identity_context
+                if identity_context is not None
+                else self.identity.classification_snapshot()
             )
-            identity_rules = dict(identity_context.get("rules") or {})
+            identity_rules = dict(classification_context.get("rules") or {})
             category = self._category(
                 str(torrent.get("category") or ""),
                 str(torrent.get("name") or ""),
@@ -498,6 +521,7 @@ class Engine:
             if not job and self._ignored_movies_item(source_path):
                 continue
             if not job:
+                identity_context = self.identity.job_snapshot_for_category(category)
                 job = self.db.create_job(
                     self._new_source_uid("qbt", infohash),
                     "qbt",
@@ -584,9 +608,10 @@ class Engine:
             return
         job = self.db.get_active_job_by_infohash(infohash)
         if not job:
-            identity_context = self.identity.job_snapshot()
-            identity_rules = dict(identity_context.get("rules") or {})
+            classification_context = self.identity.classification_snapshot()
+            identity_rules = dict(classification_context.get("rules") or {})
             category = self._watch_category(path, name, identity_rules)
+            identity_context = self.identity.job_snapshot_for_category(category)
             job = self.db.create_job(
                 self._new_source_uid("torrent", infohash),
                 "watch",
@@ -700,12 +725,13 @@ class Engine:
             )
             return
         job = self._job_for_qbt_content(infohash, source_path, content_path)
-        identity_context = (
-            self.identity.rules_for_job(job)
-            if job
-            else self.identity.job_snapshot()
+        identity_context = self.identity.rules_for_job(job) if job else None
+        classification_context = (
+            identity_context
+            if identity_context is not None
+            else self.identity.classification_snapshot()
         )
-        identity_rules = dict(identity_context.get("rules") or {})
+        identity_rules = dict(classification_context.get("rules") or {})
         category = self._category(
             str(torrent.get("category") or ""),
             str(torrent.get("name") or ""),
@@ -715,6 +741,7 @@ class Engine:
             path.unlink(missing_ok=True)
             return
         if not job:
+            identity_context = self.identity.job_snapshot_for_category(category)
             job = self.db.create_job(
                 self._new_source_uid("qbt", infohash),
                 "qbt",
@@ -771,10 +798,11 @@ class Engine:
                 item.name,
                 state="waiting_stable",
                 source_path=str(item),
-                source_meta_json=self._new_job_source_meta_json(),
+                source_meta_json=self._new_job_source_meta_json(category=category),
             )
         elif job["state"] not in TERMINAL_STATES:
-            self.db.update_job(
+            job = self._freeze_category_identity_snapshot(job, category)
+            job = self.db.update_job(
                 job["job_id"],
                 category=category,
                 source_path=str(item),
@@ -829,6 +857,7 @@ class Engine:
         submitted_at: float,
         message: str,
     ) -> Dict[str, object]:
+        job = self._freeze_category_identity_snapshot(job, category)
         job_id = str(job["job_id"])
         current_state = str(job.get("state") or "")
         materializing_states = {
@@ -872,6 +901,55 @@ class Engine:
             self.db.add_event(job_id, "qbt", "decision", message, structured)
             return updated
         return job
+
+    def _freeze_category_identity_snapshot(
+        self, job: Dict[str, object], category: str
+    ) -> Dict[str, object]:
+        """Sustituye common solo al resolver por primera vez movies/tv.
+
+        Los snapshots historicos no incluian ``profile`` y se dejan intactos.
+        El marcador explicito permite completar de forma segura trabajos nuevos
+        que nacieron como manual y obtuvieron su categoria mas tarde.
+        """
+
+        if category not in {"movies", "tv"}:
+            return job
+        raw_source_meta = job.get("source_meta_json")
+        if isinstance(raw_source_meta, dict):
+            source_meta = dict(raw_source_meta)
+        else:
+            try:
+                source_meta = json.loads(str(raw_source_meta or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return job
+        if not isinstance(source_meta, dict):
+            return job
+        stored = source_meta.get("identity_rules")
+        if not isinstance(stored, dict) or stored.get("profile") != "common":
+            return job
+        snapshot = self.identity.job_snapshot_for_category(category)
+        source_meta["identity_rules"] = snapshot
+        updated = self.db.update_job(
+            str(job["job_id"]),
+            source_meta_json=json.dumps(
+                source_meta,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        self.db.add_event(
+            str(job["job_id"]),
+            "settings",
+            "decision",
+            f"Perfil de identidad {category} congelado tras clasificacion",
+            {
+                "category": category,
+                "identity_profile": category,
+                "identity_revision": int(snapshot.get("revision") or 0),
+                "identity_fingerprint": str(snapshot.get("fingerprint") or ""),
+            },
+        )
+        return updated
 
     def _adopt_qbt_for_materialized_job(
         self,
@@ -953,7 +1031,11 @@ class Engine:
             )
 
     def _diagnostic_status(self) -> Dict[str, object]:
-        identity_rules = self.identity.payload()
+        identity_profiles = {
+            profile: self.identity.payload(profile)
+            for profile in ("common", "movies", "tv")
+        }
+        identity_rules = identity_profiles["common"]
         return {
             "orchestrator": {
                 "status": "ok",
@@ -962,6 +1044,13 @@ class Engine:
                 "identity_rules": {
                     "revision": identity_rules.get("revision"),
                     "fingerprint": identity_rules.get("fingerprint"),
+                    "profiles": {
+                        profile: {
+                            "revision": payload.get("revision"),
+                            "fingerprint": payload.get("fingerprint"),
+                        }
+                        for profile, payload in identity_profiles.items()
+                    },
                 },
             },
             "media_worker": {
@@ -3059,7 +3148,7 @@ class Engine:
         rules = (
             identity_rules
             if isinstance(identity_rules, dict)
-            else self.identity.store.snapshot()
+            else self.identity.stores["common"].snapshot()
         )
         return self._category("", name, rules)
 

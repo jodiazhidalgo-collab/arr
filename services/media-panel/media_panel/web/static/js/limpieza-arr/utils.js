@@ -2,19 +2,46 @@
   "use strict";
 
   const ui = window.ArrIdentityUI = window.ArrIdentityUI || {};
-  ui.state = {
-    document: null,
-    draft: null,
-    dirty: false,
-    loading: false,
-    section: "parser",
-    lastResult: { parser: null, resolver: null },
-    testContext: { parser: null, resolver: null },
-    testRequestIds: { parser: 0, resolver: 0 },
-    activeTest: null,
-    testNames: { parser: "", resolver: "" },
-    testCategories: { parser: "auto", resolver: "movies" }
-  };
+  const PROFILE_CONFIG = Object.freeze({
+    common: Object.freeze({ slug: "comun", label: "Común", defaultCategory: "auto" }),
+    movies: Object.freeze({ slug: "peliculas", label: "Películas", defaultCategory: "movies" }),
+    tv: Object.freeze({ slug: "series", label: "Series", defaultCategory: "tv" })
+  });
+
+  function createProfileState(profile) {
+    const category = PROFILE_CONFIG[profile].defaultCategory;
+    return {
+      profile,
+      document: null,
+      draft: null,
+      dirty: false,
+      loading: false,
+      saving: false,
+      cacheClearing: false,
+      requestEpoch: 0,
+      saveEpoch: 0,
+      section: "parser",
+      lastResult: { parser: null, resolver: null },
+      testContext: { parser: null, resolver: null },
+      testRequestIds: { parser: 0, resolver: 0 },
+      activeTest: null,
+      testNames: { parser: "", resolver: "" },
+      testCategories: { parser: category, resolver: category === "auto" ? "movies" : category },
+      notice: null
+    };
+  }
+
+  ui.profileConfig = PROFILE_CONFIG;
+  ui.states = Object.fromEntries(Object.keys(PROFILE_CONFIG).map(profile => [
+    profile,
+    createProfileState(profile)
+  ]));
+  ui.activeProfile = "common";
+  Object.defineProperty(ui, "state", {
+    configurable: true,
+    enumerable: true,
+    get() { return ui.states[ui.activeProfile]; }
+  });
 
   ui.clone = value => JSON.parse(JSON.stringify(value));
   ui.esc = value => String(value ?? "").replace(/[&<>"']/g, ch => ({
@@ -38,8 +65,46 @@
     cursor[parts.at(-1)] = value;
   };
 
+  ui.profileFromSlug = function (slug) {
+    return Object.keys(PROFILE_CONFIG).find(profile => PROFILE_CONFIG[profile].slug === slug) || null;
+  };
+
+  ui.profileSlug = function (profile = ui.activeProfile) {
+    return PROFILE_CONFIG[profile]?.slug || PROFILE_CONFIG.common.slug;
+  };
+
+  ui.profileLabel = function (profile = ui.activeProfile) {
+    return PROFILE_CONFIG[profile]?.label || PROFILE_CONFIG.common.label;
+  };
+
+  ui.setActiveProfile = function (profile) {
+    if (PROFILE_CONFIG[profile]) ui.activeProfile = profile;
+    return ui.state;
+  };
+
+  ui.identityApiRoot = function (profile = ui.activeProfile) {
+    return `/api/identity-rules/${profile}`;
+  };
+
+  ui.identityRouteFromHash = function (hash = location.hash) {
+    const match = String(hash || "").match(/^#identidad\/(comun|peliculas|series)\/(parser|resolver)$/);
+    if (!match) return null;
+    return Object.freeze({
+      profile: ui.profileFromSlug(match[1]),
+      section: match[2],
+      hash: `#identidad/${match[1]}/${match[2]}`
+    });
+  };
+
   ui.isActiveView = function () {
-    return location.hash === "#limpieza-arr" || location.hash.startsWith("#limpieza-arr/");
+    return Boolean(ui.identityRouteFromHash());
+  };
+
+  ui.isProfileActive = function (profile, section = null) {
+    const route = ui.identityRouteFromHash();
+    return Boolean(route)
+      && route.profile === profile
+      && (section === null || route.section === section);
   };
 
   ui.storageGet = function (key, fallback = null) {
@@ -100,72 +165,82 @@
   };
 
   ui.sectionFromHash = function () {
-    const section = location.hash.replace(/^#limpieza-arr\/?/, "").split("/")[0];
-    return section === "resolver" ? "resolver" : "parser";
+    return ui.identityRouteFromHash()?.section || "parser";
   };
 
-  ui.status = function (message, tone = "info") {
-    ui.state.notice = { message, tone };
-    if (!ui.isActiveView()) return;
+  ui.status = function (message, tone = "info", profile = ui.activeProfile) {
+    const state = ui.states[profile];
+    if (!state) return;
+    state.notice = { message, tone };
+    if (!ui.isProfileActive(profile)) return;
     const box = document.getElementById("identity-status");
     if (!box) return;
     box.className = `status identity-status ${tone}`;
     box.textContent = message;
   };
 
-  ui.invalidateTestResult = function (section, { updateDom = true } = {}) {
-    if (!Object.prototype.hasOwnProperty.call(ui.state.lastResult, section)) return;
-    ui.state.testRequestIds[section] = Number(ui.state.testRequestIds[section] || 0) + 1;
-    ui.state.lastResult[section] = null;
-    ui.state.testContext[section] = null;
-    if (!updateDom || !ui.isActiveView() || ui.state.section !== section) return;
+  ui.invalidateTestResult = function (section, { updateDom = true, profile = ui.activeProfile } = {}) {
+    const state = ui.states[profile];
+    if (!state || !Object.prototype.hasOwnProperty.call(state.lastResult, section)) return;
+    state.testRequestIds[section] = Number(state.testRequestIds[section] || 0) + 1;
+    state.lastResult[section] = null;
+    state.testContext[section] = null;
+    if (!updateDom || !ui.isProfileActive(profile, section)) return;
     const box = document.getElementById("identity-test-result");
     if (box && typeof ui.renderTestResult === "function") {
       box.innerHTML = ui.renderTestResult(section, null);
     }
     const button = document.getElementById("identity-test-button");
     if (button) {
-      button.disabled = Boolean(ui.state.activeTest);
-      button.textContent = ui.state.activeTest ? "Prueba en curso…" : "Probar título";
+      button.disabled = Boolean(state.activeTest);
+      button.textContent = state.activeTest ? "Prueba en curso…" : "Probar título";
     }
   };
 
-  ui.invalidateAllTestResults = function ({ updateDom = true } = {}) {
-    ui.invalidateTestResult("parser", { updateDom });
-    ui.invalidateTestResult("resolver", { updateDom });
+  ui.invalidateAllTestResults = function ({ updateDom = true, profile = ui.activeProfile } = {}) {
+    ui.invalidateTestResult("parser", { updateDom, profile });
+    ui.invalidateTestResult("resolver", { updateDom, profile });
   };
 
-  ui.beginTestRequest = function (section) {
-    if (ui.state.activeTest) return null;
-    ui.invalidateTestResult(section, { updateDom: false });
+  ui.beginTestRequest = function (section, profile = ui.activeProfile) {
+    const state = ui.states[profile];
+    if (!state || state.activeTest) return null;
+    ui.invalidateTestResult(section, { updateDom: false, profile });
     const request = Object.freeze({
+      profile,
       section,
-      requestId: ui.state.testRequestIds[section],
+      requestId: state.testRequestIds[section],
+      epoch: state.requestEpoch
     });
-    ui.state.activeTest = request;
+    state.activeTest = request;
     return request;
   };
 
-  ui.isCurrentTestRequest = function (section, requestId) {
-    return Number(ui.state.testRequestIds[section]) === Number(requestId);
+  ui.isCurrentTestRequest = function (request) {
+    const state = ui.states[request?.profile];
+    return Boolean(state)
+      && state.activeTest === request
+      && Number(state.testRequestIds[request.section]) === Number(request.requestId);
   };
 
   ui.finishTestRequest = function (request) {
-    if (ui.state.activeTest !== request) return false;
-    ui.state.activeTest = null;
+    const state = ui.states[request?.profile];
+    if (!state || state.activeTest !== request) return false;
+    state.activeTest = null;
     return true;
   };
 
   ui.markDirty = function () {
-    ui.state.dirty = true;
-    ui.invalidateAllTestResults();
-    ui.status("Cambios sin guardar.", "warn");
+    const state = ui.state;
+    state.dirty = true;
+    ui.invalidateAllTestResults({ profile: state.profile });
+    ui.status("Cambios sin guardar.", "warn", state.profile);
     const save = document.getElementById("identity-save");
     if (save) save.disabled = false;
   };
 
-  ui.activeMetadata = function () {
-    const documentState = ui.state.document || {};
+  ui.activeMetadata = function (profile = ui.activeProfile) {
+    const documentState = ui.states[profile]?.document || {};
     const fingerprint = String(documentState.fingerprint || "");
     return `Revisión ${documentState.revision ?? 0} · ${ui.formatDate(documentState.saved_at)}`
       + (fingerprint ? ` · ${fingerprint.slice(0, 18)}…` : "");

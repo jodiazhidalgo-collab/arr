@@ -53,10 +53,22 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         )
 
     def test_top_tab_and_modular_assets_are_loaded_in_order(self) -> None:
-        self.assertLess(
-            self.index.index('data-view="limpieza-arr"'),
-            self.index.index('data-view="reglas"'),
+        navigation = (
+            ('data-view="identidad"', "Identidad ARR"),
+            ('data-view="limpieza-peliculas"', "Limpieza películas"),
+            ('data-view="limpieza-series"', "Limpieza series"),
+            ('data-view="ajustes"', "Ajustes"),
+            ('data-view="motor"', "Motor"),
+            ('data-view="historial"', "Historial"),
+            ('data-view="revision"', "Revisión"),
+            ('data-view="informes"', "Informes"),
         )
+        positions = []
+        for marker, label in navigation:
+            self.assertIn(marker, self.index)
+            self.assertIn(label, self.index)
+            positions.append(self.index.index(marker))
+        self.assertEqual(positions, sorted(positions))
         for asset in (
             "/static/css/limpieza-arr/layout.css",
             "/static/css/limpieza-arr/controls.css",
@@ -79,40 +91,98 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         )
 
     def test_hash_and_dirty_draft_survive_subtab_navigation(self) -> None:
-        self.assertIn('`#limpieza-arr/${section}`', self.view)
-        self.assertIn("arr-identity-section", self.view)
-        self.assertIn("ui.state.section = section;", self.view)
+        self.assertIn('`#identidad/${ui.profileSlug(state.profile)}/${section}`', self.view)
+        self.assertIn("arr-identity-section-${profile}", self.view)
+        self.assertIn("state.section = section;", self.view)
         self.assertNotIn("ui.state.draft = ui.clone(ui.state.document.rules);\n    rememberSection", self.view)
         self.assertIn('window.addEventListener("beforeunload"', self.view)
         self.assertIn("confirmDraftLoss", self.view)
-        self.assertIn("arr-identity-open-", self.controls)
+        self.assertIn("arr-identity-open-${ui.activeProfile}-${section}", self.controls)
+        self.assertIn("ui.states", self.utils)
+        self.assertIn("requestEpoch", self.utils)
         self.assertIn("ui.storageGet", self.controls)
         self.assertIn("ui.storageSet", self.controls)
         self.assertNotIn("localStorage.setItem", self.controls)
 
+    def test_late_identity_response_cannot_paint_or_replace_another_profile(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const app = { innerHTML: "" };
+            global.location = { hash: "#identidad/comun/parser" };
+            global.history = { replaceState: () => {} };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            global.document = { getElementById: id => id === "app" ? app : null, querySelectorAll: () => [] };
+            global.window = { addEventListener: () => {}, confirm: () => true };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            const resolvers = {};
+            const calls = [];
+            ui.api = path => {
+              calls.push(path);
+              return new Promise(resolve => { resolvers[path] = resolve; });
+            };
+            const payload = (profile, marker) => ({
+              ok: true,
+              profile,
+              revision: 1,
+              rules: { parser: { marker }, resolver: {} },
+              defaults: { parser: {}, resolver: {} },
+              schema: { parser: { groups: [] }, resolver: { groups: [] } }
+            });
+            const renders = [];
+            ui.render = () => { renders.push(ui.activeProfile); };
+
+            (async () => {
+              ui.setActiveProfile("common");
+              const commonRequest = ui.loadRules({ profile: "common" });
+              location.hash = "#identidad/peliculas/parser";
+              ui.setActiveProfile("movies");
+              const moviesRequest = ui.loadRules({ profile: "movies" });
+              resolvers["/api/identity-rules/movies"](payload("movies", "MOVIES"));
+              await moviesRequest;
+              resolvers["/api/identity-rules/common"](payload("common", "COMMON"));
+              await commonRequest;
+              if (calls.join("|") !== "/api/identity-rules/common|/api/identity-rules/movies") throw new Error(`Rutas mezcladas: ${calls}`);
+              if (ui.states.common.draft.parser.marker !== "COMMON") throw new Error("Common perdió su documento");
+              if (ui.states.movies.draft.parser.marker !== "MOVIES") throw new Error("Movies perdió su documento");
+              if (ui.activeProfile !== "movies") throw new Error("La respuesta tardía cambió el perfil");
+              if (renders.join("|") !== "movies") throw new Error(`La respuesta tardía repintó: ${renders}`);
+            })().catch(error => {
+              console.error(error.stack || error);
+              process.exitCode = 1;
+            });
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "view.js",
+        )
+
     def test_save_reset_import_and_cache_contracts_are_explicit(self) -> None:
         self.assertIn('const API_ROOT = "/api/identity-rules";', self.view)
-        self.assertIn("expected_revision: Number(ui.state.document.revision || 0)", self.view)
-        self.assertIn("ui.state.draft = ui.clone(ui.state.document.defaults);", self.view)
+        self.assertIn('`${API_ROOT}/${profile}`', self.view)
+        self.assertIn("expected_revision: Number(state.document.revision || 0)", self.view)
+        self.assertIn("state.draft = ui.clone(state.document.defaults);", self.view)
         self.assertIn("Pulsa Guardar para aplicarlos", self.view)
         self.assertIn("const MAX_IMPORT_BYTES = 4 * 1024 * 1024;", self.view)
         self.assertIn("El JSON supera el límite de 4 MB", self.view)
-        self.assertIn("`${API_ROOT}/cache/clear`", self.view)
+        self.assertIn("`${API_ROOT}/${profile}/cache/clear`", self.view)
         self.assertIn("Tu borrador se conserva", self.view)
         self.assertIn("payload.repair_required", self.view)
-        self.assertIn("Boolean(ui.state.document.repair_required)", self.view)
-        self.assertIn("validRulesDocument(payload)", self.view)
+        self.assertIn("Boolean(state.document.repair_required)", self.view)
+        self.assertIn("validRulesDocument(payload, profile)", self.view)
         self.assertIn("validCachePayload(payload)", self.view)
-        self.assertIn("if (!ui.isActiveView()) return;", self.view)
+        self.assertIn("ui.isProfileActive(profile)", self.view)
         self.assertIn('body: "{}"', self.view)
 
     def test_save_cursor_waits_only_during_a_real_save(self) -> None:
         self.assertIn(
-            '!ui.state.dirty && !saving ? \'data-idle-disabled="true"\'',
+            '!state.dirty && !saving ? \'data-idle-disabled="true"\'',
             self.view,
         )
         self.assertIn(
-            'save.toggleAttribute("data-idle-disabled", !ui.state.dirty);',
+            'save.toggleAttribute("data-idle-disabled", !state.dirty);',
             self.view,
         )
         self.assertIn(
@@ -126,9 +196,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
     def test_save_tooltip_remains_visible_when_button_is_disabled(self) -> None:
         self.assertIn(".btn[data-tooltip]:hover::after", self.panel_styles)
         self.assertIn("content: attr(data-tooltip);", self.panel_styles)
-        self.assertIn(
-            'data-tooltip="Orquestador /api/identity-rules"', self.view
-        )
+        self.assertIn('data-tooltip="Orquestador ${ui.esc(API_ROOT)}/${ui.esc(state.profile)}"', self.view)
 
     def test_schema_controls_are_dynamic_and_fully_editable(self) -> None:
         for marker in (
@@ -146,9 +214,9 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             self.assertIn(marker, self.controls)
 
     def test_title_testers_use_unsaved_draft_and_human_resolver_contract(self) -> None:
-        self.assertIn("const submittedRules = ui.clone(ui.state.draft);", self.testers)
+        self.assertIn("const submittedRules = ui.clone(state.draft);", self.testers)
         self.assertIn("rules: submittedRules", self.testers)
-        self.assertIn("/api/identity-rules/test-${section}", self.testers)
+        self.assertIn("${ui.identityApiRoot(profile)}/test-${section}", self.testers)
         self.assertIn("Probar título", self.testers)
         self.assertIn("error?.payload", self.testers)
         self.assertNotIn("% del umbral", self.testers)
@@ -163,7 +231,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("Ventaja sobre el segundo", self.resolver_result)
         self.assertIn("Diagnóstico técnico", self.resolver_result)
         self.assertIn("ui.bindCandidateActions();", self.testers)
-        self.assertIn("if (ui.state.activeTest)", self.testers)
+        self.assertIn("if (state.activeTest)", self.testers)
         self.assertNotIn('id="identity-test-result" aria-live', self.testers)
         self.assertIn('role="status" aria-live="polite"', self.view)
 
@@ -173,7 +241,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             const fs = require("fs");
             const vm = require("vm");
             global.window = {};
-            global.location = { hash: "#limpieza-arr/resolver" };
+            global.location = { hash: "#identidad/comun/resolver" };
             global.localStorage = { getItem: () => null, setItem: () => {} };
             vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
             vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
@@ -364,9 +432,9 @@ class IdentityUiStaticContractTests(unittest.TestCase):
     def test_tester_actions_are_bound_to_immutable_parser_context(self) -> None:
         self.assertIn("const context = Object.freeze({", self.testers)
         self.assertIn("result.parser_test?.result || result.parser_test", self.testers)
-        self.assertIn("ui.beginTestRequest(section)", self.testers)
-        self.assertIn("ui.isCurrentTestRequest(section, requestId)", self.testers)
-        self.assertIn("ui.invalidateTestResult(section)", self.testers)
+        self.assertIn("ui.beginTestRequest(section, profile)", self.testers)
+        self.assertIn("ui.isCurrentTestRequest(request)", self.testers)
+        self.assertIn("ui.invalidateTestResult(section, { profile })", self.testers)
         self.assertIn("`${parserTitle} | ${candidateTitle}`", self.testers)
         self.assertIn("`${parserTitle} | ${parserYear} | ${tmdbId}`", self.testers)
         self.assertIn("`${parserTitle} | ${tmdbId}`", self.testers)
@@ -380,7 +448,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             const fs = require("fs");
             const vm = require("vm");
             global.window = {};
-            global.location = { hash: "#limpieza-arr/resolver" };
+            global.location = { hash: "#identidad/comun/resolver" };
             global.localStorage = { getItem: () => null, setItem: () => {} };
             const name = { value: "Titulo.2024.mkv", focus: () => {} };
             const category = { value: "movies" };
@@ -460,7 +528,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             const fs = require("fs");
             const vm = require("vm");
             global.window = {};
-            global.location = { hash: "#limpieza-arr/parser" };
+            global.location = { hash: "#identidad/comun/parser" };
             global.localStorage = { getItem: () => null, setItem: () => {} };
             const name = { value: "Blade.Runner.1982.1080p", focus: () => {} };
             const category = { value: "movies" };
@@ -493,7 +561,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
               const first = ui.runTitleTest();
               await Promise.resolve();
               ui.state.section = "resolver";
-              location.hash = "#limpieza-arr/resolver";
+              location.hash = "#identidad/comun/resolver";
               await ui.runTitleTest();
               ui.invalidateTestResult("parser", { updateDom: false });
               await ui.runTitleTest();
@@ -522,7 +590,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             const listeners = {};
             const fakeApp = { innerHTML: "" };
             const fakeTitle = { textContent: "" };
-            const tabButtons = ["limpieza-arr", "reglas", "motor", "historial", "revision", "informes"].map(view => ({
+            const tabButtons = ["identidad", "limpieza-peliculas", "limpieza-series", "ajustes", "motor", "historial", "revision", "informes"].map(view => ({
               dataset: { view },
               classList: { toggle: () => {} },
               addEventListener: () => {}
@@ -546,7 +614,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             global.fetch = path => {
               if (path === "/api/status") return statusPending.then(response);
               if (path === "/api/jobs") return jobsPending.then(response);
-              if (path === "/api/review") return Promise.resolve(response({ items: [], review_dir: "<REVIEW>" }));
+              if (path === "/api/review?profile=movies") return Promise.resolve(response({ items: [], review_dir: "<REVIEW>" }));
               throw new Error(`Fetch inesperado: ${path}`);
             };
 
@@ -559,7 +627,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
               resolveJobs({ jobs: [] });
               await new Promise(resolve => setImmediate(resolve));
               await new Promise(resolve => setImmediate(resolve));
-              if (fakeTitle.textContent !== "Revision") throw new Error(`Título obsoleto: ${fakeTitle.textContent}`);
+              if (fakeTitle.textContent !== "Revisión") throw new Error(`Título obsoleto: ${fakeTitle.textContent}`);
               if (!fakeApp.innerHTML.includes("repetidas_vs_error")) throw new Error("La vista Revision no quedó visible");
               if (fakeApp.innerHTML.includes("Rutas vivas")) throw new Error("Motor sobrescribió la ruta actual");
             })().catch(error => {

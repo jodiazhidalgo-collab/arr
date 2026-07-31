@@ -8,6 +8,12 @@ from types import SimpleNamespace
 
 from arr_orchestrator.db import Database
 from arr_orchestrator.identity.controller import IdentityController
+from arr_orchestrator.identity.defaults import (
+    IDENTITY_PROFILES,
+    IDENTITY_SETTING_KEY,
+    factory_identity_rules,
+    identity_profile_setting_key,
+)
 from arr_orchestrator.identity.fingerprint import identity_fingerprint
 
 
@@ -164,6 +170,104 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(
             json.loads(self.database.get_setting("filebot.rules"))["revision"], 7
         )
+
+    def test_legacy_pipeline_is_cloned_once_and_profiles_are_independent(self) -> None:
+        legacy_rules = factory_identity_rules()
+        legacy_raw = json.dumps(
+            {
+                "rules": legacy_rules,
+                "revision": 4,
+                "saved_at": "2026-07-30T12:00:00Z",
+                "history": [
+                    {
+                        "revision": 4,
+                        "saved_at": "2026-07-30T12:00:00Z",
+                        "fingerprint": identity_fingerprint(legacy_rules),
+                        "action": "save",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        self.database.set_setting(IDENTITY_SETTING_KEY, legacy_raw)
+
+        controller = IdentityController(_config(), self.database)
+
+        self.assertEqual(self.database.get_setting(IDENTITY_SETTING_KEY), legacy_raw)
+        for profile in IDENTITY_PROFILES:
+            self.assertEqual(
+                self.database.get_setting(identity_profile_setting_key(profile)),
+                legacy_raw,
+            )
+            payload = controller.payload(profile)
+            self.assertEqual(payload["profile"], profile)
+            self.assertEqual(payload["revision"], 4)
+
+        movie_rules = controller.payload("movies")["rules"]
+        movie_rules["resolver"]["acceptance"]["min_score"] = 61
+        saved = controller.update(
+            {"rules": movie_rules, "expected_revision": 4}, "movies"
+        )
+
+        self.assertTrue(saved["ok"])
+        self.assertEqual(saved["revision"], 5)
+        self.assertEqual(saved["profile"], "movies")
+        self.assertEqual(controller.payload("common")["revision"], 4)
+        self.assertEqual(controller.payload("tv")["revision"], 4)
+        self.assertEqual(
+            controller.payload("tv")["rules"]["resolver"]["acceptance"][
+                "min_score"
+            ],
+            75,
+        )
+        self.assertNotEqual(
+            controller.payload("movies")["fingerprint"],
+            controller.payload("tv")["fingerprint"],
+        )
+        tv_rules = controller.payload("tv")["rules"]
+        tv_rules["resolver"]["acceptance"]["min_margin"] = 13
+        tv_saved = controller.update(
+            {"rules": tv_rules, "expected_revision": 4}, "tv"
+        )
+        self.assertTrue(tv_saved["ok"])
+        self.assertEqual(tv_saved["revision"], 5)
+        self.assertEqual(controller.payload("common")["revision"], 4)
+        self.assertEqual(
+            [entry["revision"] for entry in controller.payload("movies")["history"]],
+            [4, 5],
+        )
+        self.assertEqual(
+            [entry["revision"] for entry in controller.payload("tv")["history"]],
+            [4, 5],
+        )
+        self.assertEqual(self.database.get_setting(IDENTITY_SETTING_KEY), legacy_raw)
+
+    def test_category_snapshot_selects_profile_and_old_job_keeps_snapshot(self) -> None:
+        controller = IdentityController(_config(), self.database)
+        old_snapshot = controller.job_snapshot("movies")
+        old_job = {
+            "category": "movies",
+            "source_meta_json": json.dumps({"identity_rules": old_snapshot}),
+        }
+        movie_rules = controller.payload("movies")["rules"]
+        movie_rules["resolver"]["acceptance"]["min_score"] = 62
+        saved = controller.update(
+            {"rules": movie_rules, "expected_revision": 0}, "movies"
+        )
+
+        restored = controller.rules_for_job(old_job)
+        new_movie = controller.job_snapshot_for_category("movies")
+        new_tv = controller.job_snapshot_for_category("tv")
+
+        self.assertEqual(restored["source"], "job_snapshot")
+        self.assertEqual(restored["profile"], "movies")
+        self.assertEqual(
+            restored["rules"]["resolver"]["acceptance"]["min_score"], 75
+        )
+        self.assertEqual(new_movie["revision"], saved["revision"])
+        self.assertEqual(new_movie["profile"], "movies")
+        self.assertEqual(new_tv["revision"], 0)
+        self.assertEqual(new_tv["profile"], "tv")
 
     def test_job_snapshot_is_stable_after_later_save(self) -> None:
         controller = IdentityController(_config(), self.database)

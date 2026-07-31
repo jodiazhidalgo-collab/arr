@@ -168,6 +168,69 @@ class IdentityHealthTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_profiled_identity_endpoints_and_legacy_alias_dispatch(self) -> None:
+        calls = []
+
+        def provider(profile="common"):
+            calls.append(("get", profile))
+            return {"ok": True, "profile": profile, "revision": 3}
+
+        def action(name):
+            def handler(payload, profile="common"):
+                calls.append((name, profile, payload))
+                return {"ok": True, "profile": profile}
+
+            return handler
+
+        server = start_health_server(
+            0,
+            lambda: {"status": "ok"},
+            lambda: [],
+            identity_rules_provider=provider,
+            identity_rules_updater=action("save"),
+            identity_rules_resetter=action("reset"),
+            identity_cache_clearer=action("cache"),
+            identity_parser_tester=action("parser"),
+            identity_resolver_tester=action("resolver"),
+        )
+        try:
+            port = server.server_address[1]
+            base = f"http://127.0.0.1:{port}/settings/identity"
+            with urllib.request.urlopen(f"{base}/movies", timeout=5) as response:
+                fetched = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(fetched["profile"], "movies")
+            self.assertEqual(_post(f"{base}/tv", {"expected_revision": 3})[0], 200)
+            self.assertEqual(
+                _post(f"{base}/tv/reset", {"expected_revision": 3})[0], 200
+            )
+            self.assertEqual(_post(f"{base}/movies/cache/clear", {})[0], 200)
+            self.assertEqual(
+                _post(f"{base}/common/test-parser", {"name": "Alien"})[0],
+                200,
+            )
+            self.assertEqual(
+                _post(f"{base}/movies/test-resolver", {"name": "Alien"})[0],
+                200,
+            )
+            self.assertEqual(_post(base, {"expected_revision": 3})[0], 200)
+            self.assertEqual(_post(f"{base}/unknown", {})[0], 404)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(calls[0], ("get", "movies"))
+        self.assertEqual(
+            [(call[0], call[1]) for call in calls[1:]],
+            [
+                ("save", "tv"),
+                ("reset", "tv"),
+                ("cache", "movies"),
+                ("parser", "common"),
+                ("resolver", "movies"),
+                ("save", "common"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

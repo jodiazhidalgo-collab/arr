@@ -1,4 +1,4 @@
-"""Almacen CAS de ``identity.pipeline`` con snapshot coherente e historial."""
+"""Almacen CAS de un perfil de identidad con snapshot coherente e historial."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Protocol
 
 from .defaults import (
     IDENTITY_HISTORY_LIMIT,
-    IDENTITY_RULES_PATH,
     IDENTITY_SCHEMA_VERSION,
     IDENTITY_SETTING_KEY,
     factory_identity_rules,
@@ -115,6 +114,8 @@ class IdentitySettingsStore:
         resolver_http_timeout_ms: int = 2500,
         resolver_total_budget_ms: int = 5000,
         resolver_retry_seconds: int = 60,
+        profile: str = "common",
+        setting_key: str = IDENTITY_SETTING_KEY,
     ) -> None:
         if (
             isinstance(history_limit, bool)
@@ -126,6 +127,8 @@ class IdentitySettingsStore:
         self._logger = logger or logging.getLogger("arr-orchestrator.identity-settings")
         self._lock = threading.RLock()
         self._history_limit = history_limit
+        self._profile = str(profile or "common")
+        self._setting_key = str(setting_key or IDENTITY_SETTING_KEY)
         self._defaults = normalize_identity_rules(
             factory_identity_rules(
                 default_language,
@@ -141,7 +144,7 @@ class IdentitySettingsStore:
         self._history: List[Dict[str, object]] = []
         self._stored_raw: Optional[str] = None
         self._stored_is_canonical = True
-        self._load_locked(self._database.get_setting(IDENTITY_SETTING_KEY))
+        self._load_locked(self._database.get_setting(self._setting_key))
 
     def _load_locked(self, raw: Optional[str]) -> None:
         self._stored_raw = raw
@@ -202,7 +205,7 @@ class IdentitySettingsStore:
             self._stored_is_canonical = False
 
     def _refresh_locked(self, *, force: bool = False) -> None:
-        raw = self._database.get_setting(IDENTITY_SETTING_KEY)
+        raw = self._database.get_setting(self._setting_key)
         if force or raw != self._stored_raw:
             self._load_locked(raw)
 
@@ -231,7 +234,9 @@ class IdentitySettingsStore:
             "history": copy.deepcopy(self._history),
             "history_limit": self._history_limit,
             "cache_status": self._cache_status(),
-            "rules_path": IDENTITY_RULES_PATH,
+            "rules_path": f"settings/{self._setting_key}",
+            "setting_key": self._setting_key,
+            "profile": self._profile,
             "repair_required": not self._stored_is_canonical,
         }
 
@@ -274,16 +279,16 @@ class IdentitySettingsStore:
         exact_writer = getattr(self._database, "compare_and_set_setting_value", None)
         if callable(exact_writer):
             return bool(
-                exact_writer(IDENTITY_SETTING_KEY, self._stored_raw, serialized)
+                exact_writer(self._setting_key, self._stored_raw, serialized)
             )
         writer = getattr(self._database, "compare_and_set_setting", None)
         if callable(writer):
-            return bool(writer(IDENTITY_SETTING_KEY, expected_revision, serialized))
+            return bool(writer(self._setting_key, expected_revision, serialized))
         # Compatibilidad para dobles antiguos. Database usa el CAS real.
-        current = self._database.get_setting(IDENTITY_SETTING_KEY)
+        current = self._database.get_setting(self._setting_key)
         if _stored_revision(current) != expected_revision:
             return False
-        self._database.set_setting(IDENTITY_SETTING_KEY, serialized)
+        self._database.set_setting(self._setting_key, serialized)
         return True
 
     def _write_locked(
@@ -326,7 +331,7 @@ class IdentitySettingsStore:
         try:
             saved = self._compare_and_set(expected_revision, serialized)
         except Exception:
-            self._logger.exception("No se pudo guardar identity.pipeline")
+            self._logger.exception("No se pudo guardar %s", self._setting_key)
             result = self._response_locked(ok=False)
             result.update(
                 {

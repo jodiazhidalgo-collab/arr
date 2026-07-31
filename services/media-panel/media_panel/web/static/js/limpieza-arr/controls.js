@@ -200,13 +200,13 @@
 
   ui.groupIsOpen = function (section, id, fallback) {
     try {
-      const stored = JSON.parse(ui.storageGet(`arr-identity-open-${section}`, "null"));
+      const stored = JSON.parse(ui.storageGet(`arr-identity-open-${ui.activeProfile}-${section}`, "null"));
       return Array.isArray(stored) ? stored.includes(id) : fallback;
     } catch (_error) { return fallback; }
   };
 
   ui.storeOpenGroups = function () {
     const open = [...document.querySelectorAll(".identity-group[open]")].map(group => group.dataset.groupId);
-    ui.storageSet(`arr-identity-open-${ui.state.section}`, JSON.stringify(open));
+    ui.storageSet(`arr-identity-open-${ui.activeProfile}-${ui.state.section}`, JSON.stringify(open));
   };
 })();
