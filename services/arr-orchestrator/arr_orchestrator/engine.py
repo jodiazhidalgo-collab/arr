@@ -43,6 +43,7 @@ from .filesystem import (
     write_reason,
 )
 from .media_worker import (
+    MediaWorkerBusy,
     MediaWorkerClient,
     MediaWorkerError,
     MediaWorkerJobActive,
@@ -2424,6 +2425,9 @@ class Engine:
                 input_root,
                 self.config.media_reports_root,
             )
+        except MediaWorkerBusy as error:
+            self._defer_media_worker_busy(current, "bluray", "ready_filebot", error)
+            return None
         except (MediaWorkerJobActive, MediaWorkerTransportError) as error:
             return self._reconcile_bluray_running(current, call_error=error)
         except MediaWorkerError as error:
@@ -4681,6 +4685,13 @@ class Engine:
                 self.config.media_reports_root,
             )
             self._apply_worker_result(job, "media", result, recovery=False)
+        except MediaWorkerBusy as error:
+            self._defer_media_worker_busy(
+                job,
+                "media",
+                "media_postprocess_ready",
+                error,
+            )
         except MediaWorkerJobActive as error:
             self._record_worker_wait(job, "media", "active", error)
         except MediaWorkerTransportError as error:
@@ -4717,6 +4728,8 @@ class Engine:
                 self.config.media_reports_root,
             )
             self._apply_worker_result(job, "trailer", result, recovery=False)
+        except MediaWorkerBusy as error:
+            self._defer_media_worker_busy(job, "trailer", "trailer_ready", error)
         except MediaWorkerJobActive as error:
             self._record_worker_wait(job, "trailer", "active", error)
         except MediaWorkerTransportError as error:
@@ -4899,6 +4912,37 @@ class Engine:
                 )
         elif status != "error":
             raise ValueError("El resultado terminal tiene un estado inesperado")
+
+    def _defer_media_worker_busy(
+        self,
+        job: Dict[str, object],
+        phase: str,
+        ready_state: str,
+        error: MediaWorkerBusy,
+    ) -> None:
+        job_id = str(job["job_id"])
+        message = self._safe_worker_error(error)
+        self._worker_status_checked_at.pop(job_id, None)
+        self._worker_started_at.pop(job_id, None)
+        self.db.update_job(
+            job_id,
+            state=ready_state,
+            last_error_code=error.error_code,
+            last_error_message=message,
+        )
+        self.db.add_event(
+            job_id,
+            phase,
+            "retry",
+            "Media Worker ocupado; reintento seguro pendiente",
+            {
+                "state": ready_state,
+                "error_code": error.error_code,
+                "error": message,
+                "source_exists": Path(str(job.get("source_path") or "")).exists(),
+                "stage_exists": Path(str(job.get("stage_path") or "")).exists(),
+            },
+        )
 
     def _record_worker_wait(
         self,

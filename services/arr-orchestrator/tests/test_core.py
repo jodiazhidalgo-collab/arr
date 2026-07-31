@@ -1,9 +1,10 @@
 import json
+import shutil
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from arr_orchestrator.config import Config
 from arr_orchestrator.db import Database
@@ -27,6 +28,7 @@ from arr_orchestrator.filesystem import (
     write_reason,
 )
 from arr_orchestrator.media_worker import (
+    MediaWorkerBusy,
     MediaWorkerClient,
     MediaWorkerError,
     MediaWorkerTransportError,
@@ -822,6 +824,158 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(command_events[0]["structured"]["command_preview"]["endpoint"], "/process-movie")
             self.assertEqual(database.get_job(job["job_id"])["state"], "ready_cleanup")
             database.close()
+
+    def test_media_heavy_lock_busy_retries_then_succeeds_without_early_cleanup(self) -> None:
+        scenarios = (
+            ("media", "movies", "media_postprocess_ready", "ready_cleanup"),
+            ("trailer", "trailers_automatizacion", "trailer_ready", "ready_cleanup"),
+            ("bluray", "movies", "ready_filebot", "bluray_running"),
+        )
+        for phase, category, ready_state, final_state in scenarios:
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = test_config(root)
+                config.ensure_directories()
+                database = Database(root / "test.db")
+                database.initialize()
+                engine = Engine(config, database)
+                stage = config.workshop_root / f"job-{phase}-busy"
+                source = stage / "original"
+                source.mkdir(parents=True)
+                if phase == "bluray":
+                    stream = source / "BDMV" / "STREAM"
+                    stream.mkdir(parents=True)
+                    (stream / "00001.m2ts").write_bytes(b"bluray")
+                    (source / "CERTIFICATE").mkdir()
+                else:
+                    (source / "material.mkv").write_bytes(b"media")
+                job = database.create_job(
+                    f"fs:{phase}:heavy-lock-busy",
+                    "fs",
+                    category,
+                    f"Worker busy {phase}",
+                    state=ready_state,
+                    source_path=str(source),
+                    stage_path=str(stage),
+                )
+
+                busy = MediaWorkerBusy(
+                    "El motor audiovisual compartido esta ocupado",
+                    endpoint=f"/{phase}",
+                    status_code=409,
+                    error_code="media_worker_busy",
+                    retryable=True,
+                )
+
+                class BusyThenSuccessfulWorker:
+                    def __init__(self):
+                        self.calls = 0
+                        self.status_calls = 0
+
+                    def _begin(self):
+                        self.calls += 1
+                        if self.calls == 1:
+                            raise busy
+
+                    def process_movie(self, *_args):
+                        self._begin()
+                        final_video = config.movies_final / "Worker busy media.mkv"
+                        final_video.parent.mkdir(parents=True, exist_ok=True)
+                        final_video.write_bytes(b"movie")
+                        return {
+                            "status": "done",
+                            "job_id": job["job_id"],
+                            "kind": "movie",
+                            "final": {"final_video": str(final_video)},
+                        }
+
+                    def process_trailer(self, *_args):
+                        self._begin()
+                        destination = config.movies_final / "Worker busy trailer.mkv"
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(b"trailer")
+                        return {
+                            "status": "done",
+                            "job_id": job["job_id"],
+                            "kind": "trailer",
+                            "destination": str(destination),
+                        }
+
+                    def normalize_bluray(self, *_args):
+                        self._begin()
+                        shutil.rmtree(source / "BDMV")
+                        shutil.rmtree(source / "CERTIFICATE")
+                        normalized = source / "Worker busy bluray.mkv"
+                        normalized.write_bytes(b"bluray normalized")
+                        return {
+                            "status": "normalized",
+                            "job_id": job["job_id"],
+                            "kind": "bluray",
+                            "result_file": str(normalized),
+                        }
+
+                    def job_status(self, *_args):
+                        self.status_calls += 1
+                        raise AssertionError("media_worker_busy no debe consultar un job inexistente")
+
+                worker = BusyThenSuccessfulWorker()
+                engine.media_worker = worker
+                engine._cleanup_clients = Mock(
+                    side_effect=AssertionError("media_worker_busy no debe limpiar clientes")
+                )
+
+                if phase == "media":
+                    engine._run_media_postprocess(job)
+                elif phase == "trailer":
+                    engine._run_trailer(job)
+                else:
+                    self.assertIsNone(
+                        engine._normalize_bluray_before_filebot(job, stage, source)
+                    )
+
+                updated = database.get_job(job["job_id"])
+                self.assertEqual(updated["state"], ready_state)
+                self.assertEqual(updated["last_error_code"], "media_worker_busy")
+                self.assertTrue(source.exists())
+                self.assertTrue(stage.exists())
+                self.assertEqual(worker.calls, 1)
+                self.assertEqual(worker.status_calls, 0)
+                engine._cleanup_clients.assert_not_called()
+                events = database.job_detail(job["job_id"])["timeline"]
+                self.assertTrue(
+                    any(
+                        event["phase"] == phase
+                        and event["event_type"] == "retry"
+                        and "reintento" in event["message"].casefold()
+                        for event in events
+                    )
+                )
+
+                retry_job = database.get_job(job["job_id"])
+                if phase == "media":
+                    engine._run_media_postprocess(retry_job)
+                    advanced_input = None
+                elif phase == "trailer":
+                    engine._run_trailer(retry_job)
+                    advanced_input = None
+                else:
+                    advanced_input = engine._normalize_bluray_before_filebot(
+                        retry_job,
+                        stage,
+                        source,
+                    )
+
+                completed = database.get_job(job["job_id"])
+                self.assertEqual(completed["state"], final_state)
+                self.assertEqual(worker.calls, 2)
+                self.assertEqual(worker.status_calls, 0)
+                self.assertNotEqual(completed["state"], "manual_review")
+                engine._cleanup_clients.assert_not_called()
+                if phase == "bluray":
+                    self.assertIsNotNone(advanced_input)
+                    self.assertEqual(len(media_files(advanced_input)), 1)
+                    self.assertEqual(media_files(advanced_input)[0].suffix.lower(), ".mkv")
+                database.close()
 
     def test_worker_http_failure_finishes_movie_and_trailer_in_manual_review(self) -> None:
         for phase in ("media", "trailer"):

@@ -28,6 +28,10 @@ class MediaWorkerJobActive(MediaWorkerError):
     pass
 
 
+class MediaWorkerBusy(MediaWorkerError):
+    pass
+
+
 class MediaWorkerTransportError(MediaWorkerError):
     pass
 
@@ -252,7 +256,12 @@ class MediaWorkerClient:
     ) -> MediaWorkerError:
         error_code = str(result.get("error_code") or "media_worker_error")
         message = str(result.get("error") or error_code)
-        error_type = MediaWorkerJobActive if status_code == 409 else MediaWorkerError
+        if status_code == 409 and error_code == "media_job_active":
+            error_type = MediaWorkerJobActive
+        elif status_code == 409 and error_code == "media_worker_busy":
+            error_type = MediaWorkerBusy
+        else:
+            error_type = MediaWorkerError
         return error_type(
             message,
             endpoint=endpoint,

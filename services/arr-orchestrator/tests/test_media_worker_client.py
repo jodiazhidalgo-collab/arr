@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from arr_orchestrator.media_worker import (
+    MediaWorkerBusy,
     MediaWorkerClient,
     MediaWorkerError,
     MediaWorkerJobActive,
@@ -73,6 +74,31 @@ class MediaWorkerClientTests(unittest.TestCase):
         self.assertIs(error.result, payload)
         self.assertTrue(error.retryable)
         post.assert_called_once()
+
+    @patch("arr_orchestrator.media_worker.requests.post")
+    def test_heavy_lock_busy_409_is_not_the_same_as_active_job(self, post: Mock) -> None:
+        payload = {
+            "status": "error",
+            "error_code": "media_worker_busy",
+            "retryable": True,
+            "job_id": "job-1",
+        }
+        post.return_value = response(409, payload)
+
+        with self.assertRaises(MediaWorkerBusy) as caught:
+            self.client.process_movie(
+                "job-1",
+                Path("/data/source"),
+                Path("/data/final"),
+                Path("/data/review"),
+                Path("/data/reports"),
+            )
+
+        error = caught.exception
+        self.assertNotIsInstance(error, MediaWorkerJobActive)
+        self.assertEqual(error.error_code, "media_worker_busy")
+        self.assertTrue(error.retryable)
+        self.assertIs(error.result, payload)
 
     @patch("arr_orchestrator.media_worker.requests.post")
     def test_server_500_raises_typed_error_and_keeps_json(self, post: Mock) -> None:
