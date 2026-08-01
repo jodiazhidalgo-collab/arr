@@ -119,6 +119,21 @@ SERIES_CANARY_PREFIX = "codex_live_flow_probe_"
 SERIES_PUBLISHED_MANIFEST_SCHEMA = "series-published-manifest-v1"
 SERIES_GENERATION_MARKER = ".series-worker-generation.json"
 SERIES_VERIFY_MAX_CONCURRENCY = 2
+SERIES_OUTPUT_SIDECAR_SUFFIXES = {".srt", ".ass", ".ssa", ".sub", ".idx"}
+SERIES_FULL_PIPELINE_STATES = {
+    "ready_stage",
+    "staging",
+    "ready_extract",
+    "extracting",
+    "ready_filebot",
+    "identity_retry",
+    "filebot_running",
+    "series_postprocess_ready",
+    "series_postprocess_running",
+    "series_review_cleanup",
+    "verifying_output",
+    "ready_cleanup",
+}
 
 
 class Engine:
@@ -661,6 +676,66 @@ class Engine:
             str(job.get("category") or "") == "tv"
             and self._series_pipeline_for_job(job).get("route") == "series-worker"
         )
+
+    def _series_full_pipeline_owner(self) -> Optional[str]:
+        """Devuelve el unico trabajo autorizado a avanzar por el flujo TV.
+
+        La cola se decide con estado persistido, no con un lock en memoria, para
+        conservar el mismo propietario despues de reiniciar el orquestador.
+        """
+
+        candidates: List[Dict[str, object]] = []
+        for candidate in self.db.jobs_in_states(SERIES_FULL_PIPELINE_STATES, 500):
+            try:
+                if self._series_selected_for_job(candidate):
+                    candidates.append(candidate)
+            except ValueError:
+                # Un snapshot corrupto debe llegar a su manejo de error sin
+                # secuestrar la cola de trabajos validos.
+                continue
+        if not candidates:
+            return None
+
+        def order(candidate: Dict[str, object]) -> Tuple[int, float, str]:
+            state = str(candidate.get("state") or "")
+            # Un trabajo que ya salio de ready_stage conserva la propiedad
+            # aunque exista otro mas antiguo que aun no haya creado taller.
+            active_rank = 1 if state == "ready_stage" else 0
+            return (
+                active_rank,
+                float(candidate.get("created_at") or 0.0),
+                str(candidate.get("job_id") or ""),
+            )
+
+        return str(min(candidates, key=order).get("job_id") or "") or None
+
+    def _series_waits_for_full_pipeline(self, job: Dict[str, object]) -> bool:
+        if (
+            not self.config.active
+            or str(job.get("state") or "") not in SERIES_FULL_PIPELINE_STATES
+        ):
+            return False
+        try:
+            if not self._series_selected_for_job(job):
+                return False
+        except ValueError:
+            return False
+        job_id = str(job["job_id"])
+        owner = self._series_full_pipeline_owner()
+        if owner in {None, job_id}:
+            if str(job.get("last_error_code") or "") == "series_worker_pipeline_queued":
+                self.db.update_job(
+                    job_id,
+                    last_error_code=None,
+                    last_error_message=None,
+                )
+            return False
+        self._record_series_wait(
+            job,
+            "pipeline_queued",
+            "Otro episodio de Series conserva la cola completa hasta terminar",
+        )
+        return True
 
     def _ignored_movies_item(
         self,
@@ -1536,6 +1611,8 @@ class Engine:
         if job["state"] == "bluray_running":
             self._reconcile_bluray_running(job)
             return
+        if job["state"] != "waiting_stable" and self._series_waits_for_full_pipeline(job):
+            return
         if job["state"] == "identity_retry":
             retry_at = float(job.get("identity_retry_at") or 0)
             if time.time() < retry_at:
@@ -1614,6 +1691,8 @@ class Engine:
                 result_json=json.dumps({"input_manifest": entries}, ensure_ascii=False),
             )
             job = self.db.get_job(str(job["job_id"]))
+        if self._series_waits_for_full_pipeline(job):
+            return
         if not self.config.active:
             if job["state"] == "ready_stage":
                 self.db.transition(
@@ -3968,7 +4047,7 @@ class Engine:
     ) -> None:
         payload = result.get("published_manifest")
         if not isinstance(payload, dict) or set(payload) != {"schema", "digest", "entries"}:
-            raise ValueError("Series Worker no conserva el manifiesto final completo")
+            raise ValueError("Series Worker no conserva el manifiesto final del pack")
         if payload.get("schema") != SERIES_PUBLISHED_MANIFEST_SCHEMA:
             raise ValueError("El manifiesto final de Series usa un esquema desconocido")
         digest = str(payload.get("digest") or "")
@@ -4020,18 +4099,33 @@ class Engine:
             raise ValueError("La huella del manifiesto final de Series no coincide")
         final_series = self.config.tv_output.joinpath(*series_root.parts)
         actual_inside = self._series_regular_file_inventory(final_series)
-        actual = {
-            PurePosixPath(series_root.name, *PurePosixPath(path).parts).as_posix(): size
-            for path, size in actual_inside.items()
-            if not (
-                len(PurePosixPath(path).parts) == 1
-                and PurePosixPath(path).name == SERIES_GENERATION_MARKER
-            )
-        }
-        if actual != declared:
-            raise ValueError("La biblioteca no coincide con el manifiesto final completo")
+        if SERIES_GENERATION_MARKER in actual_inside:
+            raise ValueError("La biblioteca conserva el marcador interno de Series")
+        for path, size in declared.items():
+            relative = PurePosixPath(path)
+            inside = PurePosixPath(*relative.parts[1:]).as_posix()
+            if actual_inside.get(inside) != size:
+                raise ValueError("La biblioteca no coincide con el manifiesto final del pack")
         if any(path.as_posix() not in declared for path in published_paths):
             raise ValueError("Falta un episodio del pack en el manifiesto final")
+        for published in published_paths:
+            inside = PurePosixPath(*published.parts[1:])
+            prefix = f"{inside.stem}.".casefold()
+            for actual_path in actual_inside:
+                candidate = PurePosixPath(actual_path)
+                if (
+                    candidate.parent == inside.parent
+                    and candidate.name.casefold().startswith(prefix)
+                    and candidate.suffix.casefold() in SERIES_OUTPUT_SIDECAR_SUFFIXES
+                ):
+                    declared_path = PurePosixPath(
+                        series_root.name,
+                        *candidate.parts,
+                    ).as_posix()
+                    if declared_path not in declared:
+                        raise ValueError(
+                            "La biblioteca no coincide con los subtitulos del pack"
+                        )
 
     def _validate_series_worker_result(
         self,
@@ -4590,8 +4684,6 @@ class Engine:
         job_id = str(job["job_id"])
         other_running = any(
             str(candidate.get("job_id") or "") != job_id
-            and str(candidate.get("last_error_code") or "")
-            != "series_worker_active_timeout"
             for candidate in self.db.jobs_in_states(
                 {"series_postprocess_running"},
                 100,

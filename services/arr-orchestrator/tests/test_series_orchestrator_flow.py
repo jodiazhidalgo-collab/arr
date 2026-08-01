@@ -330,7 +330,11 @@ class _PendingCleanupPublisher:
         assert actual == sorted(expected_files)
         assert set(expected_file_digests) == set(expected_files)
         assert isinstance(allowed_existing_files, dict)
-        journal.transition("VERIFIED", preflight={"supported": True})
+        journal.transition(
+            "VERIFIED",
+            preflight={"supported": True},
+            expected_file_digests=dict(expected_file_digests),
+        )
         journal.transition("COMMITTING")
         final.mkdir(parents=True, exist_ok=True)
         for path in prepared.rglob("*"):
@@ -1998,7 +2002,7 @@ def test_second_series_job_waits_until_first_verification_finishes(
         database.close()
 
 
-def test_timed_out_unknown_job_does_not_permanently_block_worker_arbitration(
+def test_timed_out_unknown_job_keeps_worker_arbitration_closed_for_safety(
     tmp_path: Path,
 ) -> None:
     engine, database = _engine(tmp_path)
@@ -2032,13 +2036,79 @@ def test_timed_out_unknown_job_does_not_permanently_block_worker_arbitration(
 
         engine._run_series_postprocess(second)
 
-        assert len(worker.process_calls) == 1
+        assert worker.process_calls == []
         assert database.get_job(str(second["job_id"]))["state"] == (
-            "series_postprocess_running"
+            "series_postprocess_ready"
+        )
+        assert database.get_job(str(second["job_id"]))["last_error_code"] == (
+            "series_worker_pipeline_busy"
         )
         assert database.get_job(str(first["job_id"]))["state"] == (
             "series_postprocess_running"
         )
+    finally:
+        database.close()
+
+
+def test_full_series_queue_stages_only_one_of_twenty_jobs(tmp_path: Path) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        jobs = []
+        for index in range(1, 21):
+            name = f"Serie Cola S01E{index:02d}.mkv"
+            source = engine.config.complete_root / "tv" / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(f"episode-{index}".encode("ascii"))
+            jobs.append(
+                database.create_job(
+                    f"queue:{index}",
+                    "fs",
+                    "tv",
+                    name,
+                    state="ready_stage",
+                    source_path=str(source),
+                    source_meta_json=engine._new_job_source_meta_json(
+                        category="tv",
+                        name=name,
+                    ),
+                )
+            )
+
+        staged: list[str] = []
+
+        def stage_once(job):
+            job_id = str(job["job_id"])
+            staged.append(job_id)
+            job_root = engine.config.workshop_root / job_id
+            job_root.mkdir(parents=True)
+            database.transition(
+                job_id,
+                "series_postprocess_running",
+                "test",
+                "Trabajo de prueba ocupa la cola completa",
+                stage_path=str(job_root),
+            )
+
+        engine._run_stage = stage_once  # type: ignore[method-assign]
+        engine.process_jobs()
+
+        assert len(staged) == 1
+        first = staged[0]
+        for job in jobs:
+            current = database.get_job(str(job["job_id"]))
+            if str(job["job_id"]) == first:
+                assert current["state"] == "series_postprocess_running"
+                assert (engine.config.workshop_root / first).is_dir()
+            else:
+                assert current["state"] == "ready_stage"
+                assert current["last_error_code"] == "series_worker_pipeline_queued"
+                assert not (engine.config.workshop_root / str(job["job_id"])).exists()
+
+        database.transition(first, "done", "test", "Primero terminado")
+        engine.process_jobs()
+
+        assert len(staged) == 2
+        assert staged[1] != first
     finally:
         database.close()
 
