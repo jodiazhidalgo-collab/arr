@@ -609,17 +609,39 @@ def verify_owned_series_root(path, job_id):
     if not isinstance(contract, dict) or contract.get("job_id") != job_id:
         return False, "missing_series_cleanup_contract"
     marker_path = path / ".series-worker-generation.json"
+    if marker_path.exists() or marker_path.is_symlink():
+        return False, "series_marker_leaked"
+    journal_path = SERIES_REPORT_ROOT / job_id / "journal.json"
     try:
-        marker_info = marker_path.lstat()
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        journal_info = journal_path.lstat()
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return False, "series_marker_unreadable"
-    if not stat.S_ISREG(marker_info.st_mode) or marker != {
-        "schema_version": 1,
-        "job_id": job_id,
-        "generation": contract.get("generation"),
-    }:
-        return False, "series_marker_mismatch"
+        return False, "series_journal_unreadable"
+    if not stat.S_ISREG(journal_info.st_mode) or journal_path.is_symlink():
+        return False, "series_journal_unsafe"
+    if not isinstance(journal, dict) or not isinstance(journal.get("details"), dict):
+        return False, "series_journal_mismatch"
+    details = journal["details"]
+    published_manifest = contract["published_manifest"]
+    try:
+        final_series_root = Path(str(details.get("final_series_root") or ""))
+        final_matches = (
+            final_series_root.is_absolute()
+            and final_series_root.resolve(strict=False) == path.resolve(strict=False)
+        )
+    except (OSError, RuntimeError):
+        final_matches = False
+    if (
+        journal.get("state") != "COMMITTED"
+        or details.get("job_id") != job_id
+        or details.get("generation") != contract.get("generation")
+        or details.get("cleanup_complete") is not True
+        or details.get("marker_retired") is not True
+        or details.get("published_manifest_digest") != published_manifest.get("digest")
+        or details.get("published_manifest_entries") != len(published_manifest.get("entries", []))
+        or not final_matches
+    ):
+        return False, "series_journal_mismatch"
     actual_entries = []
     actual_directories = []
     try:
@@ -633,8 +655,6 @@ def verify_owned_series_root(path, job_id):
                 actual_directories.append(directory.relative_to(TV_FINAL_ROOT).as_posix())
             for name in filenames:
                 file_path = current_path / name
-                if file_path == marker_path:
-                    continue
                 info = file_path.lstat()
                 if not stat.S_ISREG(info.st_mode) or file_path.is_symlink():
                     return False, "series_tree_has_unsafe_file"
