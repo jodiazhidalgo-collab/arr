@@ -147,10 +147,28 @@ def test_new_series_is_renamed_without_overwrite(tmp_path, monkeypatch):
 
     assert result["status"] == "committed"
     assert result["mode"] == "new"
+    assert result["marker_retired"] is True
     _assert_committed_cleanup(journal, prepared)
     assert (final / "S01E01.mkv").read_text(encoding="utf-8") == "new"
-    assert (final / delivery.MARKER_NAME).is_file()
+    assert not (final / delivery.MARKER_NAME).exists()
     assert journal.state == "COMMITTED"
+    assert journal.snapshot()["details"]["marker_retired"] is True
+
+
+def test_series_delivery_lock_is_kept_outside_media_library(tmp_path, monkeypatch):
+    final = tmp_path / "media" / "tv" / "Serie"
+    lock_root = tmp_path / "config" / "worker-locks"
+    monkeypatch.setenv(
+        "SERIES_ATOMIC_PREFLIGHT_LOCK_PATH",
+        str(lock_root / "series-atomic-preflight.lock"),
+    )
+
+    lock_path = delivery._series_lock_path(final)
+
+    assert lock_path.parent == lock_root
+    assert lock_path.name.startswith("series-worker-publish-")
+    assert lock_path.suffix == ".lock"
+    assert final.parent not in lock_path.parents
 
 
 def test_new_series_never_overwrites_a_destination_that_appears(tmp_path, monkeypatch):
@@ -706,6 +724,7 @@ def test_recovery_finishes_commit_when_marker_proves_exchange_happened(tmp_path)
     assert result["recovered"] is True
     assert journal.state == "COMMITTED"
     assert (final / "S01E01.mkv").read_text(encoding="utf-8") == "new"
+    assert not (final / delivery.MARKER_NAME).exists()
     _assert_committed_cleanup(journal, shadow, prepared)
 
 
@@ -2147,11 +2166,12 @@ def test_linux_observer_sees_only_old_or_new_complete_root(tmp_path):
         observer.join(timeout=2)
 
     old_pack = frozenset({"S01E01.mkv", "S01E02.mkv"})
-    new_pack = frozenset(
+    transactional_pack = frozenset(
         {"S01E01.mkv", "S01E02.mkv", "S01E03.mkv", delivery.MARKER_NAME}
     )
+    clean_pack = frozenset({"S01E01.mkv", "S01E02.mkv", "S01E03.mkv"})
     assert observations
-    assert set(observations) <= {old_pack, new_pack}
-    assert new_pack in observations
+    assert set(observations) <= {old_pack, transactional_pack, clean_pack}
+    assert clean_pack in observations
     assert (final / "S01E01.mkv").stat().st_ino == old_inode
     assert (final / "S01E02.mkv").read_text(encoding="utf-8") == "old-2"

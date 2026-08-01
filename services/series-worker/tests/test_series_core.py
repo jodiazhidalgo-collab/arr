@@ -151,7 +151,11 @@ class FakePublisher:
         assert actual == sorted(expected_files)
         for relative, digest in expected_file_digests.items():
             assert hashlib.sha256((prepared / relative).read_bytes()).hexdigest() == digest
-        journal.transition("VERIFIED", preflight={"supported": True})
+        journal.transition(
+            "VERIFIED",
+            preflight={"supported": True},
+            expected_file_digests=dict(expected_file_digests),
+        )
         journal.transition("COMMITTING")
         final.mkdir(parents=True, exist_ok=True)
         for path in prepared.rglob("*"):
@@ -316,7 +320,7 @@ def test_success_persists_full_journal_and_terminal_replays(layout):
     ]
 
 
-def test_done_manifest_covers_complete_final_tree_with_sizes_and_hashes(layout):
+def test_done_manifest_hashes_only_the_new_pack_not_the_existing_series(layout):
     payload = _payload(
         layout,
         videos=[("Serie/Season 01/Serie.S01E02.mkv", b"new-source")],
@@ -326,11 +330,6 @@ def test_done_manifest_covers_complete_final_tree_with_sizes_and_hashes(layout):
     existing_video.write_bytes(b"existing-video")
     poster = layout["tv"] / "Serie/poster.jpg"
     poster.write_bytes(b"poster")
-    (layout["tv"] / "Serie" / core_module.MARKER_NAME).write_text(
-        "internal marker",
-        encoding="utf-8",
-    )
-
     coordinator = _coordinator(layout, processor=FakeSidecarProcessor())
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
@@ -339,8 +338,6 @@ def test_done_manifest_covers_complete_final_tree_with_sizes_and_hashes(layout):
 
     assert published_manifest["schema"] == "series-published-manifest-v1"
     assert [entry["path"] for entry in entries] == [
-        "Serie/poster.jpg",
-        "Serie/Season 01/Serie.S01E01.mkv",
         "Serie/Season 01/Serie.S01E02.es.forced.srt",
         "Serie/Season 01/Serie.S01E02.mkv",
     ]
@@ -357,6 +354,9 @@ def test_done_manifest_covers_complete_final_tree_with_sizes_and_hashes(layout):
     ).encode("utf-8")
     assert published_manifest["digest"] == hashlib.sha256(encoded_entries).hexdigest()
     assert all(entry["path"].split("/")[-1] != core_module.MARKER_NAME for entry in entries)
+    assert existing_video.is_file()
+    assert poster.is_file()
+    assert not (layout["tv"] / "Serie" / core_module.MARKER_NAME).exists()
 
 
 def test_tampered_terminal_manifest_cannot_replace_journal_bound_digest(layout):

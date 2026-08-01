@@ -90,7 +90,23 @@ def _path_key(path: Path) -> str:
 
 def _series_lock_path(final: Path) -> Path:
     digest = hashlib.sha256(os.fsencode(_path_key(final))).hexdigest()[:32]
-    return final.parent / f".series-worker-publish-{digest}.lock"
+    configured_root = str(os.environ.get("SERIES_DELIVERY_LOCK_ROOT") or "").strip()
+    if configured_root:
+        lock_root = Path(configured_root)
+    else:
+        preflight_lock = str(
+            os.environ.get("SERIES_ATOMIC_PREFLIGHT_LOCK_PATH") or ""
+        ).strip()
+        lock_root = (
+            Path(preflight_lock).parent
+            if preflight_lock
+            else Path(tempfile.gettempdir()) / "series-worker-delivery-locks"
+        )
+    lock_root = Path(os.path.abspath(os.path.normpath(os.fspath(lock_root))))
+    lock_root.mkdir(parents=True, exist_ok=True)
+    if lock_root.is_symlink() or not lock_root.is_dir():
+        raise DeliveryError("La raiz de locks de Series no es un directorio seguro")
+    return lock_root / f"series-worker-publish-{digest}.lock"
 
 
 @contextmanager
@@ -1433,10 +1449,34 @@ def _result(
         "generation": generation,
         "mode": mode,
         "final_series_root": str(final),
-        "marker": str(final / MARKER_NAME),
+        "marker_retired": not _path_entry_exists(final / MARKER_NAME),
         "recovered": recovered,
         "cleanup_pending": list(cleanup_pending),
     }
+
+
+def _retire_published_marker(
+    journal: DurableJournal,
+    *,
+    final: Path,
+    job_id: str,
+    generation: str,
+) -> None:
+    """Retira el marcador tecnico una vez que COMMITTED ya es recuperable."""
+
+    snapshot = journal.snapshot()
+    if snapshot is None or snapshot["state"] != "COMMITTED":
+        _raise_ambiguous("el marcador solo puede retirarse desde COMMITTED")
+    details = snapshot["details"]
+    if details.get("cleanup_complete") is not True:
+        _raise_ambiguous("el marcador no puede retirarse antes de terminar cleanup")
+    marker = _read_marker(final)
+    if marker is not None:
+        if not _is_generation(marker, job_id, generation):
+            _raise_ambiguous("la biblioteca conserva un marcador ajeno")
+        (final / MARKER_NAME).unlink()
+        fsync_directory(final)
+    journal.transition("COMMITTED", marker_retired=True)
 
 
 def _commit_new(prepared: Path, final: Path) -> None:
@@ -1656,6 +1696,9 @@ def _recover_delivery_locked(
     prepared_is_new = _is_generation(prepared_marker, job, generation)
     shadow_is_new = _is_generation(shadow_marker, job, generation)
     state = snapshot["state"]
+    marker_retired = details.get("marker_retired")
+    if marker_retired not in {None, True}:
+        _raise_ambiguous("estado durable del marcador invalido")
     candidate_signature: str | None = None
     prepared_signature: str | None = None
     base_signature: str | None = None
@@ -1742,8 +1785,10 @@ def _recover_delivery_locked(
         _raise_ambiguous("intención de rollback no válida")
 
     if state == "COMMITTED":
-        if not final_is_new:
-            _raise_ambiguous("COMMITTED sin la generacion esperada en biblioteca")
+        if marker_retired is True and final_marker is not None:
+            _raise_ambiguous("COMMITTED retirado conserva un marcador inesperado")
+        if not final_is_new and not final.is_dir():
+            _raise_ambiguous("COMMITTED sin la raiz esperada en biblioteca")
         if prepared_is_new or shadow_is_new:
             _raise_ambiguous("COMMITTED con dos copias de la generacion activa")
         assert candidate_identity is not None
@@ -1764,6 +1809,13 @@ def _recover_delivery_locked(
             job_id=job,
             generation=generation,
         )
+        if not pending:
+            _retire_published_marker(
+                journal,
+                final=final,
+                job_id=job,
+                generation=generation,
+            )
         return _result(
             job_id=job,
             generation=generation,
@@ -1989,6 +2041,13 @@ def _recover_delivery_locked(
         job_id=job,
         generation=generation,
     )
+    if not pending:
+        _retire_published_marker(
+            journal,
+            final=final,
+            job_id=job,
+            generation=generation,
+        )
     return _result(
         job_id=job,
         generation=generation,
@@ -2256,6 +2315,13 @@ def _publish_series_locked(
         job_id=job,
         generation=generation,
     )
+    if not pending:
+        _retire_published_marker(
+            journal,
+            final=final,
+            job_id=job,
+            generation=generation,
+        )
     return _result(
         job_id=job,
         generation=generation,

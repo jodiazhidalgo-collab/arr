@@ -1345,33 +1345,51 @@ def _published_manifest(prepared: PreparedJob) -> dict[str, Any]:
         or not series_root.is_dir()
     ):
         raise SeriesWorkerError("La raíz publicada de la serie no es segura")
+    snapshot = prepared.journal.snapshot()
+    details = snapshot.get("details", {}) if isinstance(snapshot, dict) else {}
+    expected = details.get("expected_file_digests")
+    if not isinstance(expected, dict) or not expected:
+        raise SeriesWorkerError("La publicación no conserva las huellas del pack")
+    pack_digests = dict(expected)
+    sidecar_suffixes = {".srt", ".ass", ".ssa", ".sub", ".idx"}
+    for manifest_entry in prepared.manifest.entries:
+        target_parts = PurePosixPath(manifest_entry.target_relpath).parts
+        if len(target_parts) < 2:
+            raise SeriesWorkerError("El pack publicado contiene un destino inválido")
+        relative_video = PurePosixPath(*target_parts[1:])
+        parent = series_root.joinpath(*relative_video.parent.parts)
+        if not parent.is_dir() or parent.is_symlink():
+            raise SeriesWorkerError("La carpeta final del episodio no es segura")
+        prefix = f"{relative_video.stem}.".casefold()
+        for sibling in parent.iterdir():
+            if (
+                sibling.name.casefold().startswith(prefix)
+                and sibling.suffix.casefold() in sidecar_suffixes
+            ):
+                sidecar_relative = sibling.relative_to(series_root).as_posix()
+                if sidecar_relative not in pack_digests:
+                    _sidecar_size, sidecar_digest = _hash_published_file(sibling)
+                    pack_digests[sidecar_relative] = sidecar_digest
+
     entries: list[dict[str, Any]] = []
-    for current, directories, filenames in os.walk(series_root, followlinks=False):
-        current_path = Path(current)
-        for name in directories:
-            directory = current_path / name
-            info = directory.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise SeriesWorkerError(
-                    "La biblioteca publicada contiene una carpeta no regular"
-                )
-        for name in filenames:
-            path = current_path / name
-            relative = path.relative_to(prepared.payload.final_root).as_posix()
-            if path.parent == series_root and name == MARKER_NAME:
-                continue
-            relative = validate_relative_path(relative)
-            size, content_sha256 = _hash_published_file(path)
-            entries.append(
-                {
-                    "path": relative,
-                    "size": size,
-                    "content_sha256": content_sha256,
-                }
-            )
+    for raw_relative, expected_digest in pack_digests.items():
+        relative = validate_relative_path(raw_relative)
+        if not _is_sha256(expected_digest):
+            raise SeriesWorkerError("La publicación conserva una huella inválida")
+        path = series_root.joinpath(*PurePosixPath(relative).parts)
+        size, content_sha256 = _hash_published_file(path)
+        if content_sha256 != expected_digest:
+            raise SeriesWorkerError("La huella final del pack no coincide")
+        entries.append(
+            {
+                "path": PurePosixPath(series_root.name, *PurePosixPath(relative).parts).as_posix(),
+                "size": size,
+                "content_sha256": content_sha256,
+            }
+        )
     entries.sort(key=lambda item: (_path_key(item["path"]), item["path"]))
     if not entries:
-        raise SeriesWorkerError("La serie publicada no contiene archivos")
+        raise SeriesWorkerError("El pack publicado no contiene archivos")
     folded = [_path_key(item["path"]) for item in entries]
     if len(set(folded)) != len(folded):
         raise SeriesWorkerError("La serie publicada contiene rutas equivalentes")
