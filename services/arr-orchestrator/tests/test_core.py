@@ -2530,6 +2530,93 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(jobs[0]["source_path"], str(tv_item))
             database.close()
 
+    def test_missing_waiting_source_is_discarded_only_after_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            try:
+                engine = Engine(config, database)
+                source = config.complete_root / "movies" / "Ausente"
+                job = database.create_job(
+                    "fs:movies:ausente",
+                    "fs",
+                    "movies",
+                    source.name,
+                    state="waiting_stable",
+                    source_path=str(source),
+                )
+
+                with patch("arr_orchestrator.engine.time.time", return_value=100.0):
+                    engine._process_job(job)
+                with patch("arr_orchestrator.engine.time.time", return_value=200.0):
+                    engine._process_job(database.get_job(job["job_id"]))
+
+                events = database.events_for_job(job["job_id"])
+                missing_events = [
+                    event
+                    for event in events
+                    if "margen antes de descartar" in event["message"]
+                ]
+                self.assertEqual(len(missing_events), 1)
+                self.assertEqual(
+                    database.get_job(job["job_id"])["state"],
+                    "waiting_stable",
+                )
+
+                with patch("arr_orchestrator.engine.time.time", return_value=401.0):
+                    engine._process_job(database.get_job(job["job_id"]))
+
+                discarded = database.get_job(job["job_id"])
+                self.assertEqual(discarded["state"], "discarded")
+                self.assertEqual(
+                    discarded["last_error_code"],
+                    "source_missing_after_grace",
+                )
+            finally:
+                database.close()
+
+    def test_missing_waiting_source_can_return_during_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            try:
+                engine = Engine(config, database)
+                source = config.complete_root / "movies" / "Reaparece"
+                job = database.create_job(
+                    "fs:movies:reaparece",
+                    "fs",
+                    "movies",
+                    source.name,
+                    state="waiting_stable",
+                    source_path=str(source),
+                )
+
+                with patch("arr_orchestrator.engine.time.time", return_value=100.0):
+                    engine._process_job(job)
+                source.mkdir(parents=True)
+                (source / "pelicula.mkv").write_bytes(b"video")
+                with patch("arr_orchestrator.engine.time.time", return_value=120.0):
+                    engine._process_job(database.get_job(job["job_id"]))
+
+                current = database.get_job(job["job_id"])
+                self.assertEqual(current["state"], "waiting_stable")
+                self.assertIn(str(job["job_id"]), engine._stable)
+                self.assertNotIn(str(job["job_id"]), engine._missing_source_since)
+                self.assertTrue(
+                    any(
+                        "origen ha reaparecido" in event["message"]
+                        for event in database.events_for_job(job["job_id"])
+                    )
+                )
+            finally:
+                database.close()
+
     def test_late_nested_ignored_file_pauses_only_jobs_under_effective_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

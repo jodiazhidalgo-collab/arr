@@ -101,6 +101,7 @@ class ArrBlackboxTests(unittest.TestCase):
             "ARR_MODE": "active",
             "ARR_SERIES_MODE": "active",
             "ARR_STABLE_SECONDS": "8",
+            "ARR_MISSING_SOURCE_GRACE_SECONDS": "300",
             "ARR_WORKSHOP_ROOT": "/data/downloads/torrents/complete/taller",
             "ARR_REVIEW_DIR": "/data/media/repetidas_vs_error",
             "ARR_SERIES_REVIEW_DIR": "/volume1/UGREEN/data/media/repetidas_vs_error_series",
@@ -138,6 +139,10 @@ class ArrBlackboxTests(unittest.TestCase):
                 self.assertEqual(meta["series_mode"], "active")
                 self.assertEqual(summary["series_mode"], "active")
                 self.assertEqual(meta["config_snapshot"]["timing"]["stable_seconds"], "8")
+                self.assertEqual(
+                    meta["config_snapshot"]["timing"]["missing_source_grace_seconds"],
+                    "300",
+                )
                 self.assertEqual(
                     meta["config_snapshot"]["paths"]["workshop"],
                     "<DATA_DOWNLOADS>/torrents/complete/taller",

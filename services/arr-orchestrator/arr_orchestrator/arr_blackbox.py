@@ -31,6 +31,7 @@ CONFIG_SNAPSHOT_KEYS = {
     "series_mode": "ARR_SERIES_MODE",
     "timing": {
         "stable_seconds": "ARR_STABLE_SECONDS",
+        "missing_source_grace_seconds": "ARR_MISSING_SOURCE_GRACE_SECONDS",
         "reconcile_seconds": "ARR_RECONCILE_SECONDS",
         "rdt_fallback_seconds": "ARR_RDT_FALLBACK_SECONDS",
         "resolver_http_timeout_ms": "ARR_RESOLVER_HTTP_TIMEOUT_MS",

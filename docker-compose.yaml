@@ -275,6 +275,7 @@ services:
       TZ: Europe/Madrid
       ARR_MODE: "active"
       ARR_STABLE_SECONDS: "8"
+      ARR_MISSING_SOURCE_GRACE_SECONDS: "300"
       ARR_RECONCILE_SECONDS: "30"
       ARR_WORKSHOP_ROOT: "/data/downloads/torrents/complete/taller"
       ARR_RDT_FALLBACK_SECONDS: "5400"
@@ -467,6 +468,7 @@ services:
       LOG_DIR: "/app/logs"
       DATA_DIR: "/app/data"
       ARR_DIAGNOSTICS_ROOT: "/diagnostics/arr"
+      ARR_ORCHESTRATOR_URL: "http://arr-orchestrator:8787"
       ARR_HOST_ROOT: "${ARR_ROOT}"
       ARR_HOST_DATA_ROOT: "${ARR_DATA_ROOT}"
       ARR_ROOT_UNC: "${ARR_ROOT_UNC:-}"

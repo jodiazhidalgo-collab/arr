@@ -3,7 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import app as app_module
 from modulos.arr_trace import ArrTrace
@@ -217,6 +217,11 @@ class DeliveryTracingTests(unittest.TestCase):
         summary = self.trace_summary("download-normal")
         self.assertTrue(result["ok"])
         self.assertEqual(result["engine"], "RDT-Client")
+        self.assertEqual(result["trace_id"], "download-normal")
+        self.assertEqual(
+            app_module.submissions.get(result["submission_key"])["result"]["trace_id"],
+            "download-normal",
+        )
         self.assertEqual(summary["state"], "transport_done")
         self.assertEqual(summary["errors"], 0)
         self.assertEqual(summary["correlation"]["rdt_id"], "rdt-normal")
@@ -415,6 +420,102 @@ class DeliveryTracingTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["ok"])
         self.assertFalse(path.exists())
+
+    def test_pending_submission_links_trace_to_one_exact_arr_job(self) -> None:
+        info_hash = "a" * 40
+        trace_id = "download-correlation-exact"
+        key = "submission-correlation-exact"
+        app_module.submissions.begin(
+            key,
+            "Pelicula correlacionada",
+            "movies",
+            "movies",
+            "result-correlation",
+            "magnet:?xt=urn:btih:" + info_hash,
+            3600,
+        )
+        app_module.submissions.update(
+            key,
+            state="submitted_qbit",
+            engine="qBittorrent",
+            qbit_hash=info_hash,
+            result={"trace_id": trace_id, "hash": info_hash},
+        )
+        app_module.arr_trace.start("download", trace_id, {"title": "Pelicula correlacionada"})
+        row = app_module.submissions.get(key)
+        job = {
+            "job_id": "job-arr-exacto",
+            "category": "movies",
+            "created_at": row["created_at"] + 10,
+            "qbt_hash": info_hash.upper(),
+            "rdt_id": "",
+        }
+        jobs_response = Mock()
+        jobs_response.json.return_value = [job]
+        event_response = Mock()
+
+        with (
+            patch.object(app_module.requests, "get", return_value=jobs_response) as get,
+            patch.object(app_module.requests, "post", return_value=event_response) as post,
+        ):
+            linked = app_module.link_pending_submissions()
+
+        self.assertEqual(linked, 1)
+        get.assert_called_once()
+        post.assert_called_once()
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["phase"], "correlation")
+        self.assertEqual(payload["structured"]["trace_id"], trace_id)
+        self.assertEqual(payload["structured"]["job_id"], job["job_id"])
+        stored = app_module.submissions.get(key)["result"]
+        self.assertTrue(stored["correlation_linked"])
+        self.assertEqual(stored["job_id"], job["job_id"])
+        self.assertEqual(self.trace_summary(trace_id)["correlation"]["job_id"], job["job_id"])
+
+    def test_pending_submission_does_not_link_ambiguous_exact_jobs(self) -> None:
+        info_hash = "b" * 40
+        trace_id = "download-correlation-ambiguous"
+        key = "submission-correlation-ambiguous"
+        app_module.submissions.begin(
+            key,
+            "Pelicula ambigua",
+            "movies",
+            "movies",
+            "result-ambiguous",
+            "magnet:?xt=urn:btih:" + info_hash,
+            3600,
+        )
+        app_module.submissions.update(
+            key,
+            state="submitted_qbit",
+            engine="qBittorrent",
+            qbit_hash=info_hash,
+            result={"trace_id": trace_id, "hash": info_hash},
+        )
+        row = app_module.submissions.get(key)
+        jobs = [
+            {
+                "job_id": f"job-arr-{index}",
+                "category": "movies",
+                "created_at": row["created_at"] + index,
+                "qbt_hash": info_hash,
+            }
+            for index in (1, 2)
+        ]
+        jobs_response = Mock()
+        jobs_response.json.return_value = jobs
+
+        with (
+            patch.object(app_module.requests, "get", return_value=jobs_response),
+            patch.object(app_module.requests, "post") as post,
+        ):
+            linked = app_module.link_pending_submissions()
+
+        self.assertEqual(linked, 0)
+        post.assert_not_called()
+        stored = app_module.submissions.get(key)["result"]
+        self.assertNotIn("job_id", stored)
+        self.assertFalse(stored.get("correlation_linked", False))
 
 
 class DeliveryFrontendContractTests(unittest.TestCase):

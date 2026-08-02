@@ -63,6 +63,7 @@ class Config:
     series_reports_root: Optional[Path] = None
     series_review_dir: Optional[Path] = None
     series_mode: str = "legacy"
+    missing_source_grace_seconds: int = 300
 
     def __post_init__(self) -> None:
         if self.series_reports_root is None:
@@ -167,6 +168,9 @@ class Config:
                 )
             ),
             series_mode=_series_mode(os.environ.get("ARR_SERIES_MODE", "legacy")),
+            missing_source_grace_seconds=int(
+                os.environ.get("ARR_MISSING_SOURCE_GRACE_SECONDS", "300")
+            ),
         )
 
     def ensure_directories(self) -> None:

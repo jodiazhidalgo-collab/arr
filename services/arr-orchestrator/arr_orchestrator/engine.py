@@ -163,6 +163,7 @@ class Engine:
         self.observer = Observer()
         self._stable: Dict[str, Tuple[str, float]] = {}
         self._stable_log_at: Dict[str, float] = {}
+        self._missing_source_since: Dict[str, float] = {}
         self._worker_status_log_at: Dict[str, float] = {}
         self._worker_status_checked_at: Dict[str, float] = {}
         self._worker_started_at: Dict[str, float] = {}
@@ -883,6 +884,64 @@ class Engine:
             payload.update(extra)
         self._stable_log_at[job_id] = now
         self.db.add_event(job_id, "stability", event_type, message, payload)
+
+    def _wait_for_missing_source(
+        self,
+        job: Dict[str, object],
+        now: Optional[float] = None,
+    ) -> None:
+        job_id = str(job["job_id"])
+        checked_at = time.time() if now is None else now
+        missing_since = self._missing_source_since.get(job_id)
+        grace_seconds = max(1, int(self.config.missing_source_grace_seconds))
+        if missing_since is None:
+            self._missing_source_since[job_id] = checked_at
+            self.db.add_event(
+                job_id,
+                "stability",
+                "warning",
+                "Origen no disponible; se inicia margen antes de descartar",
+                {
+                    "state": "waiting_stable",
+                    "category": job.get("category"),
+                    "source_path": job.get("source_path"),
+                    "missing_source_grace_seconds": grace_seconds,
+                },
+            )
+            return
+        missing_seconds = max(0.0, checked_at - missing_since)
+        if missing_seconds < grace_seconds:
+            return
+        self._missing_source_since.pop(job_id, None)
+        self._stable_log_at.pop(job_id, None)
+        self._stable.pop(job_id, None)
+        self.db.transition(
+            job_id,
+            "discarded",
+            "stability",
+            "Origen ausente tras el margen de seguridad; trabajo descartado",
+            last_error_code="source_missing_after_grace",
+            last_error_message=(
+                f"El origen no reaparecio durante {grace_seconds} segundos"
+            ),
+        )
+
+    def _clear_missing_source_wait(self, job: Dict[str, object]) -> None:
+        job_id = str(job["job_id"])
+        missing_since = self._missing_source_since.pop(job_id, None)
+        if missing_since is None:
+            return
+        self.db.add_event(
+            job_id,
+            "stability",
+            "decision",
+            "El origen ha reaparecido; continua la comprobacion de estabilidad",
+            {
+                "state": "waiting_stable",
+                "category": job.get("category"),
+                "missing_seconds": round(max(0.0, time.time() - missing_since), 1),
+            },
+        )
 
     def _heartbeat(self) -> None:
         self._last_heartbeat = time.time()
@@ -1627,7 +1686,9 @@ class Engine:
             job = self.db.get_job(str(job["job_id"]))
         if job["state"] == "waiting_stable":
             if source_path is None or not source_path.exists():
+                self._wait_for_missing_source(job)
                 return
+            self._clear_missing_source_wait(job)
             if self._ignored_watcher_job(job, source_path):
                 job_id = str(job["job_id"])
                 self._stable_log_at.pop(job_id, None)

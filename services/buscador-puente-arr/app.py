@@ -35,6 +35,9 @@ QBIT_BASE = os.getenv("QBIT_BASE", "http://gluetun:8080").rstrip("/")
 QBIT_USER = os.getenv("QBIT_USER", "admin")
 QBIT_PASS = os.getenv("QBIT_PASS", "")
 QBIT_SAVE_ROOT = os.getenv("QBIT_SAVE_ROOT", "/data/downloads/torrents/complete").rstrip("/")
+ARR_ORCHESTRATOR_URL = os.getenv(
+    "ARR_ORCHESTRATOR_URL", "http://arr-orchestrator:8787"
+).rstrip("/")
 LOG_DIR = Path(os.getenv("LOG_DIR", "/app/logs"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 ARR_DIAGNOSTICS_ROOT = Path(os.getenv("ARR_DIAGNOSTICS_ROOT", "/diagnostics/arr"))
@@ -58,6 +61,8 @@ RESULT_CACHE_LIMIT = 3000
 RDT_FINISHED_CLEANUP_DELAY_SEC = int(os.getenv("RDT_FINISHED_CLEANUP_DELAY_SEC", "30"))
 SUBMISSION_REUSE_SEC = int(os.getenv("SUBMISSION_REUSE_SEC", str(6 * 60 * 60)))
 MONITOR_ORPHAN_CLEANUP_SEC = int(os.getenv("MONITOR_ORPHAN_CLEANUP_SEC", str(6 * 60 * 60)))
+CORRELATION_HTTP_TIMEOUT_SEC = 5
+CORRELATION_MAX_AGE_SEC = 7 * 24 * 60 * 60
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1880,6 +1885,7 @@ def finish_submission(
     title: str,
     requested_category: str,
     category: str,
+    trace_id: str = "",
 ) -> dict:
     result = dict(result or {})
     result.update({
@@ -1890,6 +1896,8 @@ def finish_submission(
         "submission_state": state,
         "submission_key": key,
     })
+    if trace_id:
+        result["trace_id"] = trace_id
     submissions.update(
         key,
         state=state,
@@ -1957,7 +1965,15 @@ def cleanup_monitor_artifact(item: dict, reason: str) -> None:
         logger.warning("monitor artifact cleanup failed path=%s error=%s", torrent_path, str(exc)[:160])
 
 
-def register_monitor(result: dict, title: str, category: str, raw: bytes | None = None, magnet: str = "", submission_key_value: str = "") -> None:
+def register_monitor(
+    result: dict,
+    title: str,
+    category: str,
+    raw: bytes | None = None,
+    magnet: str = "",
+    submission_key_value: str = "",
+    trace_id: str = "",
+) -> None:
     rdt_id = str(result.get("rdt_id") or "")
     if not rdt_id:
         return
@@ -1972,6 +1988,7 @@ def register_monitor(result: dict, title: str, category: str, raw: bytes | None 
         "last_status": str(result.get("status") or ""),
         "finished_seen_ts": 0,
         "submission_key": submission_key_value,
+        "trace_id": trace_id,
     }
     if magnet:
         item["kind"] = "magnet"
@@ -2091,6 +2108,7 @@ def monitor_fallback(session: requests.Session, item: dict, reason: str, setting
             "requested_category": str(item.get("requested_category") or category),
             "fallback_from": reason[:180],
             "submission_key": key,
+            "trace_id": str(item.get("trace_id") or ""),
         }
         submissions.update(
             key,
@@ -2138,6 +2156,7 @@ def monitor_cleanup_finished(session: requests.Session, key: str, item: dict, ro
             "engine": "RDT-Client",
             "rdt_id": str(item.get("rdt_id") or key),
             "submission_key": submission_key_value,
+            "trace_id": str(item.get("trace_id") or ""),
         }
         submissions.update(
             submission_key_value,
@@ -2231,12 +2250,117 @@ def monitor_once() -> None:
         save_monitor_state(state)
 
 
+def normalized_infohash(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if re.fullmatch(r"[a-f0-9]{40}", text) else ""
+
+
+def correlation_matches(row: dict, jobs: list[dict]) -> list[dict]:
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    qbit_hash = normalized_infohash(row.get("qbit_hash") or result.get("hash"))
+    rdt_id = str(row.get("rdt_id") or result.get("rdt_id") or "").strip()
+    if not qbit_hash and not rdt_id:
+        return []
+    category = normalized_category(str(row.get("resolved_category") or ""))
+    created_at = float(row.get("created_at") or 0)
+    matches = []
+    for job in jobs:
+        if normalized_category(str(job.get("category") or "")) != category:
+            continue
+        job_created_at = float(job.get("created_at") or 0)
+        if created_at and not (
+            created_at - 300 <= job_created_at <= created_at + CORRELATION_MAX_AGE_SEC
+        ):
+            continue
+        job_hash = normalized_infohash(job.get("qbt_hash") or job.get("infohash"))
+        job_rdt_id = str(job.get("rdt_id") or "").strip()
+        if (qbit_hash and job_hash == qbit_hash) or (rdt_id and job_rdt_id == rdt_id):
+            matches.append(job)
+    return matches
+
+
+def link_pending_submissions() -> int:
+    pending = []
+    for row in submissions.recent(100):
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        if not str(result.get("trace_id") or "").strip():
+            continue
+        if result.get("correlation_linked"):
+            continue
+        if not (
+            normalized_infohash(row.get("qbit_hash") or result.get("hash"))
+            or str(row.get("rdt_id") or result.get("rdt_id") or "").strip()
+        ):
+            continue
+        pending.append(row)
+    if not pending:
+        return 0
+
+    response = requests.get(
+        f"{ARR_ORCHESTRATOR_URL}/jobs",
+        timeout=CORRELATION_HTTP_TIMEOUT_SEC,
+    )
+    response.raise_for_status()
+    jobs = response.json()
+    if not isinstance(jobs, list):
+        raise RuntimeError("respuesta de jobs ARR no valida")
+
+    linked = 0
+    for row in pending:
+        matches = correlation_matches(row, jobs)
+        if len(matches) != 1:
+            continue
+        job = matches[0]
+        job_id = str(job.get("job_id") or "").strip()
+        result = dict(row.get("result") or {})
+        trace_id = str(result.get("trace_id") or "").strip()
+        if not job_id or not trace_id:
+            continue
+        qbit_hash = normalized_infohash(row.get("qbit_hash") or result.get("hash"))
+        rdt_id = str(row.get("rdt_id") or result.get("rdt_id") or "").strip()
+        correlation = {
+            "trace_id": trace_id,
+            "download_trace_id": trace_id,
+            "correlation_id": str(row.get("key") or ""),
+            "job_id": job_id,
+        }
+        if qbit_hash:
+            correlation["qbit_hash"] = qbit_hash
+        if rdt_id:
+            correlation["rdt_id"] = rdt_id
+        event_response = requests.post(
+            f"{ARR_ORCHESTRATOR_URL}/jobs/{quote(job_id, safe='')}/events",
+            json={
+                "phase": "correlation",
+                "event_type": "decision",
+                "message": "Traza del buscador enlazada con job ARR",
+                "structured": correlation,
+            },
+            timeout=CORRELATION_HTTP_TIMEOUT_SEC,
+        )
+        event_response.raise_for_status()
+        trace_metadata = dict(correlation)
+        trace_metadata.pop("job_id", None)
+        trace_metadata.pop("trace_id", None)
+        arr_trace.link_job("download", trace_id, job_id, **trace_metadata)
+        result.update({"job_id": job_id, "correlation_linked": True})
+        submissions.update(str(row.get("key") or ""), result=result)
+        linked += 1
+    return linked
+
+
 def monitor_loop() -> None:
     while True:
         try:
             monitor_once()
         except Exception as exc:
             logger.warning("monitor loop failed error=%s", str(exc)[:180])
+        try:
+            linked = link_pending_submissions()
+            if linked:
+                logger.info("arr trace correlations linked count=%s", linked)
+        except Exception as exc:
+            logger.warning("arr trace correlation failed error=%s", str(exc)[:180])
         time.sleep(60)
 
 
@@ -2311,11 +2435,11 @@ def deliver(
                 arr_trace.event("download", trace_id, "transport", "started", "Enviando magnet a RDT", {"engine": "RDT-Client"})
                 result = rdt_upload_magnet(download_url, category, cleanup)
                 if not cleanup:
-                    register_monitor(result, title, category, magnet=download_url, submission_key_value=key)
-                    final = finish_submission(key, "rdt_monitoring", result, title, requested_for_key, category)
+                    register_monitor(result, title, category, magnet=download_url, submission_key_value=key, trace_id=trace_id)
+                    final = finish_submission(key, "rdt_monitoring", result, title, requested_for_key, category, trace_id)
                     arr_trace.finish("download", trace_id, "rdt_monitoring", final)
                     return final
-                final = finish_submission(key, "transport_done", result, title, requested_for_key, category)
+                final = finish_submission(key, "transport_done", result, title, requested_for_key, category, trace_id)
                 arr_trace.finish("download", trace_id, "transport_done", final)
                 return final
             except Exception as main_error:
@@ -2346,7 +2470,7 @@ def deliver(
                     )
                     raise
                 qbit["fallback_from"] = str(main_error)[:180]
-                final = finish_submission(key, "submitted_qbit", qbit, title, requested_for_key, category)
+                final = finish_submission(key, "submitted_qbit", qbit, title, requested_for_key, category, trace_id)
                 arr_trace.finish("download", trace_id, "submitted_qbit", final)
                 return final
 
@@ -2372,13 +2496,13 @@ def deliver(
                 result = rdt_upload_torrent(raw, title, category, cleanup)
             if not cleanup:
                 if resolved_magnet:
-                    register_monitor(result, title, category, magnet=resolved_magnet, submission_key_value=key)
+                    register_monitor(result, title, category, magnet=resolved_magnet, submission_key_value=key, trace_id=trace_id)
                 else:
-                    register_monitor(result, title, category, raw=raw, submission_key_value=key)
-                final = finish_submission(key, "rdt_monitoring", result, title, requested_for_key, category)
+                    register_monitor(result, title, category, raw=raw, submission_key_value=key, trace_id=trace_id)
+                final = finish_submission(key, "rdt_monitoring", result, title, requested_for_key, category, trace_id)
                 arr_trace.finish("download", trace_id, "rdt_monitoring", final)
                 return final
-            final = finish_submission(key, "transport_done", result, title, requested_for_key, category)
+            final = finish_submission(key, "transport_done", result, title, requested_for_key, category, trace_id)
             arr_trace.finish("download", trace_id, "transport_done", final)
             return final
         except Exception as main_error:
@@ -2412,7 +2536,7 @@ def deliver(
                 )
                 raise
             qbit["fallback_from"] = str(main_error)[:180]
-            final = finish_submission(key, "submitted_qbit", qbit, title, requested_for_key, category)
+            final = finish_submission(key, "submitted_qbit", qbit, title, requested_for_key, category, trace_id)
             arr_trace.finish("download", trace_id, "submitted_qbit", final)
             return final
 
