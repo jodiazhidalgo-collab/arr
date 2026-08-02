@@ -281,10 +281,9 @@ def _tree_contents(root, *, ignore_root_names=frozenset()):
 def _assert_review_matches_source(layout, payload, result):
     review_root = layout["review"] / result["review_path"]
     assert review_root.is_dir()
-    assert _tree_contents(
-        review_root,
-        ignore_root_names=core_module._REVIEW_METADATA,
-    ) == _tree_contents(payload["source_root"])
+    assert not Path(payload["source_root"]).exists()
+    assert (review_root / "reason.json").is_file()
+    assert (review_root / "Revision de serie.txt").is_file()
     return review_root
 
 
@@ -320,7 +319,7 @@ def test_success_persists_full_journal_and_terminal_replays(layout):
     ]
 
 
-def test_done_manifest_hashes_only_the_new_pack_not_the_existing_series(layout):
+def test_done_manifest_lists_only_new_pack_without_rehashing_video(layout):
     payload = _payload(
         layout,
         videos=[("Serie/Season 01/Serie.S01E02.mkv", b"new-source")],
@@ -345,7 +344,7 @@ def test_done_manifest_hashes_only_the_new_pack_not_the_existing_series(layout):
     for entry in entries:
         path = layout["tv"] / Path(*PurePosixPath(entry["path"]).parts)
         assert entry["size"] == path.stat().st_size
-        assert entry["content_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+        assert entry["content_sha256"] == ""
     encoded_entries = json.dumps(
         entries,
         ensure_ascii=False,
@@ -382,7 +381,7 @@ def test_tampered_terminal_manifest_cannot_replace_journal_bound_digest(layout):
         _coordinator(layout).submit(payload)
 
 
-def test_prepared_publication_staging_stays_on_the_tv_atomic_mount(layout):
+def test_processed_output_stays_inside_workshop_until_direct_move(layout):
     payload = _payload(layout)
     coordinator = _coordinator(layout)
 
@@ -390,8 +389,10 @@ def test_prepared_publication_staging_stays_on_the_tv_atomic_mount(layout):
 
     assert existed is False
     assert prepared.prepared_series_root is not None
-    assert prepared.prepared_series_root.parent == layout["tv"]
-    assert prepared.prepared_series_root.name.startswith(".Serie.series-worker.")
+    assert prepared.prepared_series_root == (
+        Path(payload["job_root"]) / "series_work/processed/Serie"
+    )
+    assert list(layout["tv"].iterdir()) == []
 
 
 def test_same_active_job_is_202_and_other_job_is_busy(layout):
@@ -772,11 +773,11 @@ def test_second_episode_failure_reviews_complete_pack_without_publishing(
     assert result["review_reasons"] == ["procesamiento_fallido:fallo controlado"]
     assert publisher.calls == []
     assert not (layout["tv"] / "Serie").exists()
-    assert _tree_contents(payload["source_root"]) == {
+    review = _assert_review_matches_source(layout, payload, result)
+    assert _tree_contents(review, ignore_root_names=core_module._REVIEW_METADATA) == {
         "Serie/Season 01/Serie.S01E01.mkv": b"one",
         "Serie/Season 01/Serie.S01E02.mkv": b"two",
     }
-    _assert_review_matches_source(layout, payload, result)
     assert callbacks[-1] == (
         "series_review",
         "finished",
@@ -825,7 +826,7 @@ def test_processing_failure_releases_heavy_lock_before_review_copy(
     assert lock_state == {"held": False, "exits": 2}
 
 
-def test_enospc_on_second_episode_never_publishes_and_preserves_complete_source(
+def test_enospc_on_second_episode_never_publishes_and_preserves_complete_pack(
     layout,
     monkeypatch,
 ):
@@ -861,9 +862,9 @@ def test_enospc_on_second_episode_never_publishes_and_preserves_complete_source(
     assert result["review_path"]
     assert publisher.calls == []
     assert not (layout["tv"] / "Serie").exists()
-    assert not list(layout["tv"].glob(".*.series-worker.*.prepared"))
-    assert _tree_contents(source_root) == source_before
-    _assert_review_matches_source(layout, payload, result)
+    assert not list(layout["tv"].glob(".*series-worker*"))
+    review = _assert_review_matches_source(layout, payload, result)
+    assert _tree_contents(review, ignore_root_names=core_module._REVIEW_METADATA) == source_before
     snapshot = json.loads(
         (layout["reports"] / "job-1/journal.json").read_text("utf-8")
     )
@@ -889,10 +890,10 @@ def test_processing_failure_and_review_failure_returns_failed_with_source_intact
     source_before = _tree_contents(payload["source_root"])
     callbacks = []
 
-    def fail_review_copy(*_args, **_kwargs):
-        raise OSError(errno.EIO, "controlled review copy failure")
+    def fail_review_move(*_args, **_kwargs):
+        raise OSError(errno.EIO, "controlled review move failure")
 
-    monkeypatch.setattr(core_module.shutil, "copytree", fail_review_copy)
+    monkeypatch.setattr(core_module.shutil, "move", fail_review_move)
     monkeypatch.setattr(
         core_module,
         "_emit_callback",
@@ -912,7 +913,7 @@ def test_processing_failure_and_review_failure_returns_failed_with_source_intact
 
     assert result["status"] == "failed"
     assert result["error_code"] == "OSError"
-    assert "controlled review copy failure" in result["error"]
+    assert "controlled review move failure" in result["error"]
     assert result["published"] == []
     assert result["review_path"] == ""
     assert result["provisional"] == []
@@ -998,7 +999,7 @@ def test_range_collision_detects_existing_intermediate_episode(layout):
 
 
 @pytest.mark.parametrize("sidecar", [False, True])
-def test_verified_output_substitution_before_copy_reviews_whole_pack(
+def test_verified_output_is_not_rehashed_before_direct_move(
     layout,
     sidecar,
 ):
@@ -1026,13 +1027,9 @@ def test_verified_output_substitution_before_copy_reviews_whole_pack(
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
-    assert result["status"] == "review"
-    assert any(
-        reason.startswith("procesamiento_fallido:")
-        for reason in result["review_reasons"]
-    )
-    assert publisher.calls == []
-    assert not (layout["tv"] / "Serie").exists()
+    assert result["status"] == "done"
+    assert len(publisher.calls) == 1
+    assert (layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv").is_file()
 
 
 def test_unicode_compatibility_collision_in_library_reviews_entire_pack(layout):
@@ -1079,7 +1076,7 @@ def test_library_drift_during_processing_fails_closed_to_review(layout):
     assert appeared.read_bytes() == b"drift"
 
 
-def test_identical_collision_is_satisfied_without_processing(layout):
+def test_identical_collision_goes_to_review_without_hashing_or_processing(layout):
     payload = _payload(layout)
     source = Path(payload["source_root"]) / "Serie/Season 01/Serie.S01E01.mkv"
     existing = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
@@ -1099,10 +1096,9 @@ def test_identical_collision_is_satisfied_without_processing(layout):
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
-    assert result["status"] == "done"
-    assert result["satisfied"] == ["Serie/Season 01/Serie.S01E01.mkv"]
-    assert publisher.calls[0][3] == ("Season 01/Serie.S01E01.mkv",)
-    assert set(publisher.calls[0][5]) == {"Season 01/Serie.S01E01.mkv"}
+    assert result["status"] == "review"
+    assert any(reason.startswith("colision_existente:") for reason in result["review_reasons"])
+    assert publisher.calls == []
 
 
 def test_unicode_compatibility_identical_collision_is_reviewed_fail_closed(layout):
@@ -1221,7 +1217,7 @@ def test_rolled_back_replay_cleans_delivery_before_terminal_result(layout):
     assert terminal.payload["result"]["status"] == "failed"
     assert recovery_calls == [True]
     assert not shadow.exists()
-    assert not prepared.prepared_series_root.exists()
+    assert not (prepared.prepared_series_root / "partial.mkv").exists()
 
 
 def test_restart_replays_manifest_with_unicode_equivalent_sidecars(layout):
@@ -1256,7 +1252,7 @@ def test_restart_replays_manifest_with_unicode_equivalent_sidecars(layout):
     )
 
 
-def test_missing_tools_and_atomicity_return_503_before_accept(layout):
+def test_missing_tools_return_503_and_atomic_probe_is_not_called(layout):
     payload = _payload(layout)
     store = RulesStore(config_path=layout["root"] / "rules.json")
     missing = SeriesCoordinator(
@@ -1270,21 +1266,17 @@ def test_missing_tools_and_atomicity_return_503_before_accept(layout):
     assert not (layout["reports"] / "job-1").exists()
     assert list(layout["review"].iterdir()) == []
 
-    atomic_payload = _payload(
-        layout,
-        job_id="job-atomic",
-        videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
-    )
+    calls = []
     atomic = SeriesCoordinator(
         rules_store=store,
-        atomic_preflight=lambda root: (_ for _ in ()).throw(OSError("unsupported")),
+        atomic_preflight=lambda root: calls.append(root),
         tool_checker=lambda: [],
+        processor_factory=lambda: FakeProcessor(),
+        publisher=FakePublisher(),
+        lock_factory=lambda *args, **kwargs: nullcontext({"enabled": True}),
     )
-    with pytest.raises(ServiceUnavailable, match="atómica") as atomic_error:
-        atomic.submit(atomic_payload)
-    assert atomic_error.value.http_status == 503
-    assert not (layout["reports"] / "job-atomic").exists()
-    assert list(layout["review"].iterdir()) == []
+    assert atomic.health().http_status == 200
+    assert calls == []
 
 
 def test_terminal_replay_survives_source_cleanup_and_new_global_rules(layout):
@@ -1395,10 +1387,10 @@ def test_rolled_back_reconstructs_result_after_crash_before_result_file(
         payload = _payload(layout)
         coordinator = _coordinator(layout, processor=FakeProcessor(fail_on=1))
 
-        def fail_review_copy(*_args, **_kwargs):
-            raise OSError(errno.EIO, "controlled review copy failure")
+        def fail_review_move(*_args, **_kwargs):
+            raise OSError(errno.EIO, "controlled review move failure")
 
-        monkeypatch.setattr(core_module.shutil, "copytree", fail_review_copy)
+        monkeypatch.setattr(core_module.shutil, "move", fail_review_move)
 
     def crash_before_result(*_args, **_kwargs):
         raise OSError("corte antes de series_result")
@@ -1496,7 +1488,7 @@ def test_equivalent_nfkc_series_roots_are_always_ambiguous(layout):
     assert publisher.calls == []
 
 
-def test_identical_video_with_new_sidecar_is_processed_and_published(layout):
+def test_existing_video_with_new_sidecar_goes_to_review_without_reprocessing(layout):
     payload = _payload(
         layout,
         sidecars=[
@@ -1516,18 +1508,12 @@ def test_identical_video_with_new_sidecar_is_processed_and_published(layout):
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
-    assert result["status"] == "done"
-    assert processor.calls == 1
-    assert (layout["tv"] / "Serie/Season 01/Serie.S01E01.es.forced.srt").is_file()
-    assert set(coordinator.publisher.calls[0][5]) == {
-        "Season 01/Serie.S01E01.mkv"
-    }
+    assert result["status"] == "review"
+    assert processor.calls == 0
+    assert not (layout["tv"] / "Serie/Season 01/Serie.S01E01.es.forced.srt").exists()
 
 
-def test_real_publisher_accepts_identical_existing_video_and_sidecar(
-    layout,
-    monkeypatch,
-):
+def test_real_publisher_keeps_existing_video_and_sidecar_untouched(layout):
     subtitle = "1\n00:00:00,000 --> 00:00:01,000\nHola\n"
     payload = _payload(
         layout,
@@ -1537,14 +1523,9 @@ def test_real_publisher_accepts_identical_existing_video_and_sidecar(
     final_episode = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
     final_sidecar = final_episode.with_name("Serie.S01E01.es.forced.srt")
     final_episode.parent.mkdir(parents=True)
+    source_bytes = source.read_bytes()
     shutil.copy2(source, final_episode)
     final_sidecar.write_text(subtitle, encoding="utf-8")
-    monkeypatch.setattr(
-        delivery_module,
-        "preflight_atomic_exchange",
-        lambda root: {"supported": True, "st_dev": root.stat().st_dev},
-    )
-    monkeypatch.setattr(delivery_module, "_rename_exchange", _portable_exchange)
     processor = FakeSidecarProcessor()
     coordinator = _real_delivery_coordinator(layout, processor)
 
@@ -1553,17 +1534,15 @@ def test_real_publisher_accepts_identical_existing_video_and_sidecar(
 
     assert terminal.http_status == 200
     result = terminal.payload["result"]
-    assert result["status"] == "done"
-    assert processor.calls == 1
-    assert final_episode.read_bytes().startswith(b"processed-")
+    assert result["status"] == "review"
+    assert processor.calls == 0
+    assert final_episode.read_bytes() == source_bytes
     assert final_sidecar.read_text(encoding="utf-8") == subtitle
-    assert not list(layout["tv"].glob(".*.series-worker.*"))
+    _assert_review_matches_source(layout, payload, result)
+    assert not list(layout["tv"].glob(".*series-worker*"))
 
 
-def test_target_changed_after_collision_comparison_is_never_authorized(
-    layout,
-    monkeypatch,
-):
+def test_existing_target_is_never_authorized_for_overwrite(layout):
     subtitle = "1\n00:00:00,000 --> 00:00:01,000\nHola\n"
     payload = _payload(
         layout,
@@ -1572,51 +1551,28 @@ def test_target_changed_after_collision_comparison_is_never_authorized(
     source = Path(payload["source_root"]) / "Serie/Season 01/Serie.S01E01.mkv"
     final_episode = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
     final_episode.parent.mkdir(parents=True)
+    source_bytes = source.read_bytes()
     shutil.copy2(source, final_episode)
-    monkeypatch.setattr(
-        delivery_module,
-        "preflight_atomic_exchange",
-        lambda root: {"supported": True, "st_dev": root.stat().st_dev},
-    )
-    monkeypatch.setattr(delivery_module, "_rename_exchange", _portable_exchange)
-    original_same_file = core_module._same_file
-    comparisons = 0
-
-    def replace_after_comparison(left, right):
-        nonlocal comparisons
-        identical = original_same_file(left, right)
-        if identical and Path(right) == final_episode:
-            comparisons += 1
-            if comparisons == 2:
-                final_episode.write_bytes(b"external-change")
-        return identical
-
-    monkeypatch.setattr(core_module, "_same_file", replace_after_comparison)
     coordinator = _real_delivery_coordinator(layout, FakeSidecarProcessor())
 
     coordinator.submit(payload)
     terminal = coordinator.wait("job-1")
 
-    assert comparisons >= 2
     assert terminal.http_status == 200
     result = terminal.payload["result"]
     assert result["status"] == "review"
     assert result["published"] == []
-    assert final_episode.read_bytes() == b"external-change"
+    assert final_episode.read_bytes() == source_bytes
     _assert_review_matches_source(layout, payload, result)
 
 
-def test_satisfied_episode_hardlink_failure_reviews_without_copy_fallback(
-    layout,
-    monkeypatch,
-):
+def test_existing_episode_moves_new_pack_to_review_without_touching_library(layout):
     payload = _payload(layout)
     source = Path(payload["source_root"]) / "Serie/Season 01/Serie.S01E01.mkv"
     existing = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
     existing.parent.mkdir(parents=True)
     shutil.copy2(source, existing)
     publisher = FakePublisher()
-    monkeypatch.setattr(core_module.os, "link", lambda *_a, **_k: (_ for _ in ()).throw(OSError("no link")))
     coordinator = _coordinator(layout, publisher=publisher)
 
     coordinator.submit(payload)
@@ -1624,11 +1580,14 @@ def test_satisfied_episode_hardlink_failure_reviews_without_copy_fallback(
 
     assert result["status"] == "review"
     assert publisher.calls == []
-    assert source.is_file() and existing.is_file()
-    assert not list(layout["tv"].glob(".*.series-worker.*.prepared"))
+    assert not source.exists()
+    assert existing.is_file()
+    review = layout["review"] / result["review_path"]
+    assert (review / "Serie/Season 01/Serie.S01E01.mkv").is_file()
+    assert not list(layout["tv"].glob(".*series-worker*"))
 
 
-def test_partial_prepared_copy_is_removed_before_terminal_review(layout, monkeypatch):
+def test_processing_failure_leaves_no_hidden_staging_in_tv(layout):
     payload = _payload(
         layout,
         videos=[
@@ -1636,108 +1595,63 @@ def test_partial_prepared_copy_is_removed_before_terminal_review(layout, monkeyp
             ("Serie/Season 01/Serie.S01E02.mkv", b"two"),
         ],
     )
-    original_copy = core_module._copy_verified_file
-    calls = []
-
-    def fail_second_copy(source, destination, *args, **kwargs):
-        calls.append((source, destination))
-        if len(calls) == 2:
-            raise OSError("fallo controlado en la segunda copia")
-        return original_copy(source, destination, *args, **kwargs)
-
-    monkeypatch.setattr(core_module, "_copy_verified_file", fail_second_copy)
     publisher = FakePublisher()
-    coordinator = _coordinator(layout, publisher=publisher)
+    coordinator = _coordinator(
+        layout,
+        processor=FakeProcessor(fail_on=2),
+        publisher=publisher,
+    )
 
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
     assert result["status"] == "review"
     assert publisher.calls == []
-    assert not list(layout["tv"].glob(".*.series-worker.*.prepared"))
+    assert not list(layout["tv"].glob(".*series-worker*"))
     _assert_review_matches_source(layout, payload, result)
 
 
-@pytest.mark.parametrize("owned_partial", [False, True])
-def test_review_retry_cleans_only_its_identified_staging(layout, owned_partial):
+def test_review_moves_pack_once_without_hidden_staging(layout, monkeypatch):
     payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
+    original_move = core_module.shutil.move
+    calls = []
+
+    def recorded_move(source, destination, *args, **kwargs):
+        calls.append((Path(source), Path(destination)))
+        return original_move(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(core_module.shutil, "move", recorded_move)
     coordinator = _coordinator(layout)
-    prepared, existed, _record = coordinator._candidate(validate_payload(payload))
-    assert existed is False
-    reasons = tuple(prepared.manifest.review_reasons)
-    destination_name = f"job-1-{prepared.manifest.digest[:12]}"
-    temporary = layout["review"] / f".{destination_name}.series-worker.tmp"
-    temporary.mkdir()
-    if owned_partial:
-        (temporary / "reason.json").write_text(
-            json.dumps(
-                {
-                    "job_id": "job-1",
-                    "manifest_digest": prepared.manifest.digest,
-                    "reasons": list(reasons),
-                }
-            ),
-            encoding="utf-8",
-        )
-        (temporary / "partial.mkv").write_bytes(b"partial")
 
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
     assert result["status"] == "review"
-    assert not temporary.exists()
-    assert (layout["review"] / result["review_path"] / "reason.json").is_file()
+    assert len(calls) == 1
+    review = layout["review"] / result["review_path"]
+    assert (review / "Serie/bonus.mkv").read_bytes() == b"bonus"
+    assert not Path(payload["source_root"]).exists()
+    assert not list(layout["review"].glob(".*series-worker*"))
 
 
-def test_review_retry_never_deletes_foreign_staging(layout):
+def test_review_never_overwrites_existing_job_destination(layout):
     payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
     coordinator = _coordinator(layout)
     prepared, existed, _record = coordinator._candidate(validate_payload(payload))
     assert existed is False
-    destination_name = f"job-1-{prepared.manifest.digest[:12]}"
-    temporary = layout["review"] / f".{destination_name}.series-worker.tmp"
-    temporary.mkdir()
-    (temporary / "reason.json").write_text(
-        json.dumps({"job_id": "otro-job"}),
-        encoding="utf-8",
-    )
-    (temporary / "foreign.bin").write_bytes(b"keep")
+    destination = layout["review"] / f"job-1-{prepared.manifest.digest[:12]}"
+    destination.mkdir()
+    (destination / "foreign.bin").write_bytes(b"keep")
 
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
     assert result["status"] == "failed"
-    assert (temporary / "foreign.bin").read_bytes() == b"keep"
+    assert (Path(payload["source_root"]) / "Serie/bonus.mkv").read_bytes() == b"bonus"
+    assert (destination / "foreign.bin").read_bytes() == b"keep"
 
 
-def test_review_copy_must_match_source_before_becoming_review(
-    layout,
-    monkeypatch,
-):
-    payload = _payload(
-        layout,
-        videos=[("Serie/bonus.mkv", b"bonus")],
-        sidecars=[("LEEME.nfo", "original")],
-    )
-    original_copytree = core_module.shutil.copytree
-
-    def corrupt_copy(source, destination, *args, **kwargs):
-        result = original_copytree(source, destination, *args, **kwargs)
-        (Path(destination) / "LEEME.nfo").write_text("corrupto", encoding="utf-8")
-        return result
-
-    monkeypatch.setattr(core_module.shutil, "copytree", corrupt_copy)
-    coordinator = _coordinator(layout)
-
-    coordinator.submit(payload)
-    result = coordinator.wait("job-1").payload["result"]
-
-    assert result["status"] == "failed"
-    assert (Path(payload["source_root"]) / "LEEME.nfo").read_text("utf-8") == "original"
-    assert not any(layout["review"].iterdir())
-
-
-def test_health_runs_atomic_preflight_once_and_reuses_device_cache(layout):
+def test_health_checks_destination_without_running_atomic_probe(layout):
     calls = []
     coordinator = SeriesCoordinator(
         rules_store=RulesStore(config_path=layout["root"] / "health-rules.json"),
@@ -1754,116 +1668,13 @@ def test_health_runs_atomic_preflight_once_and_reuses_device_cache(layout):
     first = coordinator.health()
     second = coordinator.health()
     assert first.http_status == second.http_status == 200
-    assert first.payload["checks"]["atomicity"]["verified"] is True
-    assert second.payload["checks"]["atomicity"]["verified"] is True
-    assert len(calls) == 1
-
-
-def test_health_atomicity_cache_expires_and_same_device_failure_turns_503(layout):
-    now = [0.0]
-    outcomes = [
-        {"supported": True, "st_dev": layout["tv"].stat().st_dev},
-        OSError(errno.EROFS, "controlled read-only remount"),
-    ]
-
-    def preflight(_root):
-        outcome = outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    coordinator = SeriesCoordinator(
-        rules_store=RulesStore(config_path=layout["root"] / "health-ttl-rules.json"),
-        tool_checker=lambda: [],
-        atomic_preflight=preflight,
-        health_clock=lambda: now[0],
-        health_atomicity_cache_ttl_sec=300.0,
-    )
-
-    first = coordinator.health()
-    now[0] = 299.0
-    cached = coordinator.health()
-    now[0] = 300.0
-    expired = coordinator.health()
-
-    assert first.http_status == cached.http_status == 200
-    assert first.payload["checks"]["atomicity"]["verified_age_sec"] == 0.0
-    assert cached.payload["checks"]["atomicity"]["verified_age_sec"] == 299.0
-    assert expired.http_status == 503
-    assert expired.payload["checks"]["atomicity"] == {
-        "ok": False,
+    assert first.payload["checks"]["atomicity"] == {
+        "ok": True,
+        "mode": "direct_move",
         "verified": False,
     }
-    assert outcomes == []
-    assert coordinator._health_atomicity_cache is None
-
-
-def test_concurrent_health_after_cache_expiry_runs_one_atomic_preflight(layout):
-    now = [0.0]
-    entered = threading.Event()
-    release = threading.Event()
-    calls = []
-
-    def preflight(root):
-        calls.append(now[0])
-        if len(calls) == 2:
-            entered.set()
-            assert release.wait(timeout=5)
-        return {"supported": True, "st_dev": root.stat().st_dev}
-
-    coordinator = SeriesCoordinator(
-        rules_store=RulesStore(
-            config_path=layout["root"] / "health-concurrent-ttl-rules.json"
-        ),
-        tool_checker=lambda: [],
-        atomic_preflight=preflight,
-        health_clock=lambda: now[0],
-        health_atomicity_cache_ttl_sec=300.0,
-    )
-    assert coordinator.health().http_status == 200
-    now[0] = 300.0
-    results = []
-    threads = [threading.Thread(target=lambda: results.append(coordinator.health())) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    assert entered.wait(timeout=5)
-    release.set()
-    for thread in threads:
-        thread.join(timeout=5)
-
-    assert not any(thread.is_alive() for thread in threads)
-    assert len(calls) == 2
-    assert [result.http_status for result in results] == [200, 200]
-    assert all(
-        result.payload["checks"]["atomicity"]["verified_age_sec"] == 0.0
-        for result in results
-    )
-
-
-def test_health_rechecks_atomicity_when_device_cache_changes(layout):
-    calls = []
-
-    def preflight(root):
-        calls.append(root.stat().st_dev)
-        return {"supported": True, "st_dev": root.stat().st_dev}
-
-    coordinator = SeriesCoordinator(
-        rules_store=RulesStore(config_path=layout["root"] / "health-device-rules.json"),
-        tool_checker=lambda: [],
-        atomic_preflight=preflight,
-    )
-
-    first = coordinator.health()
-    coordinator._health_atomicity_cache = {
-        "supported": True,
-        "st_dev": layout["tv"].stat().st_dev + 1,
-    }
-    second = coordinator.health()
-
-    assert first.http_status == second.http_status == 200
-    assert first.payload["checks"]["atomicity"]["verified"] is True
-    assert second.payload["checks"]["atomicity"]["verified"] is True
-    assert calls == [layout["tv"].stat().st_dev] * 2
+    assert second.payload["checks"]["atomicity"] == first.payload["checks"]["atomicity"]
+    assert calls == []
 
 
 @pytest.mark.parametrize("journal_state", ["PREPARED", "PROCESSING"])
@@ -1932,108 +1743,7 @@ def test_default_tool_checker_uses_bounded_parallel_smoke(layout, monkeypatch):
     assert calls == [((*BASE_TOOLS, *OCR_TOOLS), 3, True)]
 
 
-def test_failed_or_stale_preflight_invalidates_health_cache(layout):
-    outcomes = [
-        {"supported": True, "st_dev": layout["tv"].stat().st_dev},
-        OSError(errno.EIO, "controlled preflight failure"),
-        OSError(errno.EIO, "controlled health preflight failure"),
-    ]
-
-    def preflight(_root):
-        outcome = outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    coordinator = SeriesCoordinator(
-        rules_store=RulesStore(config_path=layout["root"] / "health-cache-rules.json"),
-        processor_factory=lambda: FakeProcessor(),
-        publisher=FakePublisher(),
-        tool_checker=lambda: [],
-        atomic_preflight=preflight,
-        lock_factory=lambda *args, **kwargs: nullcontext({"enabled": True}),
-    )
-    coordinator.submit(_payload(layout, job_id="job-cache-1"))
-    coordinator.wait("job-cache-1")
-    assert coordinator.health().payload["checks"]["atomicity"]["verified"] is True
-
-    second = _payload(
-        layout,
-        job_id="job-cache-2",
-        videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
-    )
-    with pytest.raises(ServiceUnavailable, match="atómica") as failed:
-        coordinator.submit(second)
-    assert failed.value.http_status == 503
-    assert not (layout["reports"] / "job-cache-2").exists()
-    assert list(layout["review"].iterdir()) == []
-    unhealthy = coordinator.health()
-    assert unhealthy.http_status == 503
-    assert unhealthy.payload["checks"]["atomicity"] == {
-        "ok": False,
-        "verified": False,
-    }
-    assert coordinator._health_atomicity_cache is None
-
-    outcomes.append(
-        {"supported": True, "st_dev": layout["tv"].stat().st_dev}
-    )
-    coordinator._health_atomicity_cache = {
-        "supported": True,
-        "st_dev": layout["tv"].stat().st_dev + 1,
-    }
-    stale = coordinator.health()
-    assert stale.http_status == 200
-    assert stale.payload["checks"]["atomicity"]["verified"] is True
-    assert coordinator._health_atomicity_cache["st_dev"] == layout["tv"].stat().st_dev
-
-
-def test_unexpected_preflight_failure_invalidates_health_cache(layout):
-    outcomes = [
-        {"supported": True, "st_dev": layout["tv"].stat().st_dev},
-        ValueError("controlled unexpected preflight failure"),
-        ValueError("controlled unexpected health preflight failure"),
-    ]
-
-    def preflight(_root):
-        outcome = outcomes.pop(0)
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    coordinator = SeriesCoordinator(
-        rules_store=RulesStore(config_path=layout["root"] / "unexpected-cache-rules.json"),
-        processor_factory=lambda: FakeProcessor(),
-        publisher=FakePublisher(),
-        tool_checker=lambda: [],
-        atomic_preflight=preflight,
-        lock_factory=lambda *args, **kwargs: nullcontext({"enabled": True}),
-    )
-    coordinator.submit(_payload(layout, job_id="job-unexpected-cache-1"))
-    coordinator.wait("job-unexpected-cache-1")
-    assert coordinator.health().payload["checks"]["atomicity"]["verified"] is True
-
-    second = _payload(
-        layout,
-        job_id="job-unexpected-cache-2",
-        videos=[("Otra/Season 01/Otra.S01E01.mkv", b"two")],
-    )
-    with pytest.raises(ServiceUnavailable, match="atómica") as failed:
-        coordinator.submit(second)
-    assert failed.value.http_status == 503
-    assert not (layout["reports"] / "job-unexpected-cache-2").exists()
-    assert list(layout["review"].iterdir()) == []
-
-    unhealthy = coordinator.health()
-    assert unhealthy.http_status == 503
-    assert unhealthy.payload["checks"]["atomicity"] == {
-        "ok": False,
-        "verified": False,
-    }
-    assert coordinator._health_atomicity_cache is None
-
-
-def test_health_rejects_unsupported_atomicity_without_caching(layout):
+def test_unsupported_atomic_probe_is_ignored_by_fast_direct_health(layout):
     calls = []
     coordinator = SeriesCoordinator(
         rules_store=RulesStore(config_path=layout["root"] / "unsupported-health-rules.json"),
@@ -2047,21 +1757,13 @@ def test_health_rejects_unsupported_atomicity_without_caching(layout):
     first = coordinator.health()
     second = coordinator.health()
 
-    assert first.http_status == second.http_status == 503
-    assert first.payload["checks"]["atomicity"] == {
-        "ok": False,
-        "verified": False,
-    }
-    assert second.payload["checks"]["atomicity"] == {
-        "ok": False,
-        "verified": False,
-    }
-    assert len(calls) == 2
-    assert coordinator._health_atomicity_cache is None
+    assert first.http_status == second.http_status == 200
+    assert first.payload["checks"]["atomicity"]["mode"] == "direct_move"
+    assert second.payload["checks"]["atomicity"]["mode"] == "direct_move"
+    assert calls == []
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="renameat2 requiere Linux")
-def test_health_real_preflight_leaves_no_probe_residue(layout, monkeypatch):
+def test_health_leaves_no_probe_residue(layout, monkeypatch):
     monkeypatch.setenv(
         "SERIES_ATOMIC_PREFLIGHT_LOCK_PATH",
         str(layout["root"] / "locks/series-atomic-preflight.lock"),
@@ -2076,8 +1778,8 @@ def test_health_real_preflight_leaves_no_probe_residue(layout, monkeypatch):
     second = coordinator.health()
 
     assert first.http_status == second.http_status == 200
-    assert first.payload["checks"]["atomicity"]["verified"] is True
-    assert second.payload["checks"]["atomicity"]["verified"] is True
+    assert first.payload["checks"]["atomicity"]["mode"] == "direct_move"
+    assert second.payload["checks"]["atomicity"]["mode"] == "direct_move"
     assert list(layout["tv"].iterdir()) == []
 
 

@@ -143,7 +143,7 @@ def _series_job(
 
 
 def _manifest(episode: Path, source_root: Path) -> dict[str, object]:
-    content_hash = hashlib.sha256(episode.read_bytes()).hexdigest()
+    content_hash = ""
     source_relpath = episode.relative_to(source_root).as_posix()
     source_fingerprint = hashlib.sha256(
         f"{source_relpath}\0{episode.stat().st_size}\0{episode.stat().st_mtime_ns}".encode(
@@ -197,7 +197,7 @@ def _published_manifest(final_series: Path) -> dict[str, object]:
             {
                 "path": relative.as_posix(),
                 "size": path.stat().st_size,
-                "content_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "content_sha256": "",
             }
         )
     canonical = json.dumps(
@@ -230,7 +230,7 @@ def _done_result(
         "series_root": "Mi Serie",
         "review_path": "",
         "delivery": {
-            "mode": "new",
+            "mode": "direct_move",
             "generation": "d" * 32,
             "recovered": False,
             "cleanup_pending": False,
@@ -959,146 +959,25 @@ def test_late_terminal_after_timeout_is_still_reconciled(tmp_path: Path) -> None
         database.close()
 
 
-def test_cleanup_pending_worker_recovery_is_consumed_by_orchestrator_without_json_rewrite(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_direct_result_has_no_shadow_cleanup_or_verifier_thread(tmp_path: Path) -> None:
     engine, database = _engine(tmp_path)
     try:
-        job, job_root, _source_root, _episode = _series_job(engine, database)
+        job, job_root, source_root, episode = _series_job(engine, database)
         job_id = str(job["job_id"])
-        for name, value in (
-            ("SERIES_WORKER_ALLOWED_ROOTS", engine.config.workshop_root),
-            ("SERIES_WORKER_FINAL_ROOT", engine.config.tv_output),
-            ("SERIES_WORKER_REVIEW_ROOT", engine.config.series_review_dir),
-            ("SERIES_WORKER_REPORT_ROOT", engine.config.series_reports_root),
-            ("SERIES_WORKER_LOCK_PATH", tmp_path / "locks" / "series.lock"),
-        ):
-            monkeypatch.setenv(name, str(value))
+        manifest = _manifest(episode, source_root)
+        final_episode = engine.config.tv_output / "Mi Serie/Season 01" / episode.name
+        final_episode.parent.mkdir(parents=True)
+        final_episode.write_bytes(b"processed")
+        result = _done_result(job_id, manifest, final_episode.parents[1])
 
-        coordinator_args = {
-            "rules_store": RulesStore(config_path=tmp_path / "series-rules.json"),
-            "processor_factory": _CoordinatorProcessor,
-            "publisher": _PendingCleanupPublisher(),
-            "atomic_preflight": lambda root: {
-                "supported": True,
-                "st_dev": root.stat().st_dev,
-            },
-            "tool_checker": lambda: [],
-            "lock_factory": lambda *args, **kwargs: nullcontext({"enabled": True}),
-        }
-        first = SeriesCoordinator(
-            **coordinator_args,
-            recoverer=lambda *args: (_ for _ in ()).throw(
-                AssertionError("La primera ejecución no debe recuperar")
-            ),
-        )
-        engine.series_worker = _CoordinatorWorker(first)
-
-        engine._run_series_postprocess(job)
-
-        result_path = engine.config.series_reports_root / job_id / "series_result.json"
-        deadline = time.monotonic() + 3.0
-        pending = None
-        while time.monotonic() < deadline:
-            try:
-                candidate = json.loads(result_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, json.JSONDecodeError):
-                time.sleep(0.01)
-                continue
-            if isinstance(candidate, dict) and bool(
-                (candidate.get("delivery") or {}).get("cleanup_pending")
-            ):
-                pending = candidate
-                break
-            time.sleep(0.01)
-        assert pending is not None
-        assert pending["delivery"]["cleanup_pending"] is True
-        assert engine._load_series_worker_result(job_id) is None
-
-        recovery_calls = []
-
-        def finish_worker_cleanup(*_args):
-            recovery_calls.append(True)
-            return {
-                "status": "committed",
-                "mode": "new",
-                "generation": "recovered-generation",
-                "recovered": True,
-                "cleanup_pending": [],
-            }
-
-        restarted = SeriesCoordinator(
-            **{
-                **coordinator_args,
-                "rules_store": RulesStore(config_path=tmp_path / "series-rules.json"),
-            },
-            recoverer=finish_worker_cleanup,
-        )
-        engine.series_worker = _CoordinatorWorker(restarted)
-
-        engine._recover_interrupted_jobs()
+        engine._apply_series_worker_result(job, result, recovery=False)
         completed = _wait_state(database, job_id, "ready_cleanup")
 
-        recovered = json.loads(result_path.read_text(encoding="utf-8"))
-        assert recovered["delivery"]["cleanup_pending"] is False
-        assert recovered["delivery"]["recovered"] is True
-        assert recovery_calls == [True]
         assert completed["last_error_code"] is None
         assert job_root.is_dir()
+        assert not hasattr(engine, "_series_verification_threads")
+        assert not list(engine.config.tv_output.glob(".*series-worker*"))
     finally:
-        database.close()
-
-
-def test_series_verifier_threads_have_a_global_limit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    engine, database = _engine(tmp_path)
-    release = threading.Event()
-    entered = threading.Event()
-    entered_count = 0
-    entered_lock = threading.Lock()
-
-    def blocked_verify(*_args, **_kwargs):
-        nonlocal entered_count
-        with entered_lock:
-            entered_count += 1
-            if entered_count == 2:
-                entered.set()
-        release.wait(timeout=3)
-
-    monkeypatch.setattr(engine, "_verify_series_terminal_hashes", blocked_verify)
-    try:
-        jobs = [
-            _series_job(
-                engine,
-                database,
-                state="series_postprocess_running",
-                name=f"Serie {index} S01E01",
-            )[0]
-            for index in range(3)
-        ]
-        for job in jobs:
-            engine._schedule_series_terminal_verification(
-                job,
-                {"status": "done", "kind": "series"},
-                recovery=True,
-            )
-
-        assert entered.wait(timeout=2)
-        with engine._series_verification_lock:
-            running_ids = {
-                job_id
-                for job_id, thread in engine._series_verification_threads.items()
-                if thread.is_alive()
-            }
-        assert len(running_ids) == 2
-        assert str(jobs[2]["job_id"]) not in running_ids
-    finally:
-        release.set()
-        for thread in list(engine._series_verification_threads.values()):
-            thread.join(timeout=3)
         database.close()
 
 
@@ -1130,7 +1009,7 @@ def test_ready_manifest_must_cover_every_source_file(
         database.close()
 
 
-def test_final_hash_tamper_never_reaches_cleanup(tmp_path: Path) -> None:
+def test_same_size_final_content_is_not_rehashed_before_cleanup(tmp_path: Path) -> None:
     engine, database = _engine(tmp_path)
     try:
         job, job_root, source_root, episode = _series_job(engine, database)
@@ -1151,17 +1030,16 @@ def test_final_hash_tamper_never_reaches_cleanup(tmp_path: Path) -> None:
         )
 
         engine._run_series_postprocess(job)
-        updated = _wait_state(database, str(job["job_id"]), "manual_review")
+        updated = _wait_state(database, str(job["job_id"]), "ready_cleanup")
 
-        assert updated["last_error_code"] == "series_worker_hash_verification_failed"
-        assert Path(updated["stage_path"]).parent == engine.config.series_review_dir
-        assert not job_root.exists()
+        assert updated["last_error_code"] is None
+        assert job_root.exists()
         assert final_episode.read_bytes() == b"tampered--one"
     finally:
         database.close()
 
 
-def test_final_manifest_must_include_sidecars_and_exact_inventory(tmp_path: Path) -> None:
+def test_final_validation_checks_declared_outputs_without_scanning_whole_series(tmp_path: Path) -> None:
     engine, database = _engine(tmp_path)
     try:
         job, _, source_root, episode = _series_job(engine, database)
@@ -1185,8 +1063,7 @@ def test_final_manifest_must_include_sidecars_and_exact_inventory(tmp_path: Path
         ).encode("utf-8")
         result["published_manifest"]["digest"] = hashlib.sha256(canonical).hexdigest()
 
-        with pytest.raises(ValueError, match="biblioteca no coincide"):
-            engine._validate_series_worker_result(job, result)
+        assert engine._validate_series_worker_result(job, result) is None
     finally:
         database.close()
 

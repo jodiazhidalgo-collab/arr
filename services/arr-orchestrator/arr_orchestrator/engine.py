@@ -118,8 +118,6 @@ SERIES_PIPELINE_SCHEMA = "arr-series-pipeline-v1"
 SERIES_CANARY_PREFIX = "codex_live_flow_probe_"
 SERIES_PUBLISHED_MANIFEST_SCHEMA = "series-published-manifest-v1"
 SERIES_GENERATION_MARKER = ".series-worker-generation.json"
-SERIES_VERIFY_MAX_CONCURRENCY = 2
-SERIES_OUTPUT_SIDECAR_SUFFIXES = {".srt", ".ass", ".ssa", ".sub", ".idx"}
 SERIES_FULL_PIPELINE_STATES = {
     "ready_stage",
     "staging",
@@ -168,8 +166,6 @@ class Engine:
         self._worker_status_checked_at: Dict[str, float] = {}
         self._worker_started_at: Dict[str, float] = {}
         self._series_retry_at: Dict[str, float] = {}
-        self._series_verification_threads: Dict[str, threading.Thread] = {}
-        self._series_verification_lock = threading.Lock()
         self._last_reconcile = 0.0
         self._last_heartbeat = 0.0
         self._last_series_dependency_check = 0.0
@@ -4012,7 +4008,7 @@ class Engine:
                 f"{source.as_posix()}\0{size}\0{mtime_ns}".encode("utf-8")
             ).hexdigest()
             if (
-                re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+                (expected_hash and re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None)
                 or not stat.S_ISREG(source_stat.st_mode)
                 or not self._path_is_inside(source_file, source_root)
                 or source_stat.st_size != size
@@ -4041,7 +4037,7 @@ class Engine:
                 except OSError as error:
                     raise ValueError("Falta un subtitulo externo declarado") from error
                 if (
-                    re.fullmatch(r"[0-9a-f]{64}", sidecar_hash) is None
+                    (sidecar_hash and re.fullmatch(r"[0-9a-f]{64}", sidecar_hash) is None)
                     or not isinstance(sidecar_size, int)
                     or isinstance(sidecar_size, bool)
                     or sidecar_size < 0
@@ -4133,7 +4129,7 @@ class Engine:
                 or not isinstance(size, int)
                 or isinstance(size, bool)
                 or size < 0
-                or re.fullmatch(r"[0-9a-f]{64}", content_hash) is None
+                or (content_hash and re.fullmatch(r"[0-9a-f]{64}", content_hash) is None)
                 or relative.as_posix() in declared
             ):
                 raise ValueError("El manifiesto final contiene una ruta o huella invalida")
@@ -4159,34 +4155,27 @@ class Engine:
         if hashlib.sha256(canonical).hexdigest() != digest:
             raise ValueError("La huella del manifiesto final de Series no coincide")
         final_series = self.config.tv_output.joinpath(*series_root.parts)
-        actual_inside = self._series_regular_file_inventory(final_series)
-        if SERIES_GENERATION_MARKER in actual_inside:
+        if final_series.is_symlink() or not final_series.is_dir():
+            raise ValueError("La raíz final de Series no es válida")
+        if (final_series / SERIES_GENERATION_MARKER).exists():
             raise ValueError("La biblioteca conserva el marcador interno de Series")
         for path, size in declared.items():
             relative = PurePosixPath(path)
-            inside = PurePosixPath(*relative.parts[1:]).as_posix()
-            if actual_inside.get(inside) != size:
+            destination = final_series.joinpath(*relative.parts[1:])
+            try:
+                destination_stat = destination.lstat()
+            except OSError as error:
+                raise ValueError(
+                    "La biblioteca no coincide con el manifiesto final del pack"
+                ) from error
+            if (
+                not stat.S_ISREG(destination_stat.st_mode)
+                or destination_stat.st_size != size
+                or not self._path_is_inside(destination, final_series)
+            ):
                 raise ValueError("La biblioteca no coincide con el manifiesto final del pack")
         if any(path.as_posix() not in declared for path in published_paths):
             raise ValueError("Falta un episodio del pack en el manifiesto final")
-        for published in published_paths:
-            inside = PurePosixPath(*published.parts[1:])
-            prefix = f"{inside.stem}.".casefold()
-            for actual_path in actual_inside:
-                candidate = PurePosixPath(actual_path)
-                if (
-                    candidate.parent == inside.parent
-                    and candidate.name.casefold().startswith(prefix)
-                    and candidate.suffix.casefold() in SERIES_OUTPUT_SIDECAR_SUFFIXES
-                ):
-                    declared_path = PurePosixPath(
-                        series_root.name,
-                        *candidate.parts,
-                    ).as_posix()
-                    if declared_path not in declared:
-                        raise ValueError(
-                            "La biblioteca no coincide con los subtitulos del pack"
-                        )
 
     def _validate_series_worker_result(
         self,
@@ -4230,10 +4219,10 @@ class Engine:
             delivery = result.get("delivery")
             if (
                 not isinstance(delivery, dict)
-                or delivery.get("mode") not in {"new", "exchange"}
+                or delivery.get("mode") != "direct_move"
                 or delivery.get("cleanup_pending") is not False
             ):
-                raise ValueError("La entrega atómica de Series no está completada")
+                raise ValueError("La entrega directa de Series no está completada")
             self._validate_series_published_manifest(
                 result,
                 series_root,
@@ -4410,16 +4399,15 @@ class Engine:
                 {"status": status},
             )
         if status == "done":
-            current = self.db.update_job(
+            self.db.transition(
                 job_id,
+                "ready_cleanup",
+                "series",
+                "Series Worker publicó el episodio y ARR comprobó su destino",
+                output_root=str(self.config.tv_output),
                 result_json=json.dumps(result, ensure_ascii=False),
-                last_error_code="series_verification_pending",
-                last_error_message="Verificacion independiente de hashes en curso",
-            )
-            self._schedule_series_terminal_verification(
-                current,
-                result,
-                recovery=recovery,
+                last_error_code=None,
+                last_error_message=None,
             )
             return
         if review is None:
@@ -4457,142 +4445,6 @@ class Engine:
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
-
-    @staticmethod
-    def _sha256_file(path: Path) -> str:
-        digest = hashlib.sha256()
-        if path.is_symlink():
-            raise ValueError("No se calculan huellas a traves de enlaces simbolicos")
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-                raise ValueError("La huella solo admite archivos regulares")
-            with os.fdopen(descriptor, "rb", closefd=False) as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        finally:
-            os.close(descriptor)
-        return digest.hexdigest()
-
-    def _verify_series_terminal_hashes(
-        self,
-        job: Dict[str, object],
-        result: Dict[str, object],
-    ) -> None:
-        _job_root, source_root = self._series_paths_for_job(job)
-        manifest = result.get("manifest")
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("entries"), list):
-            raise ValueError("No existe manifiesto de entrada verificable")
-        for entry in manifest["entries"]:
-            if not isinstance(entry, dict):
-                raise ValueError("El manifiesto de entrada cambio durante la verificacion")
-            source = self._safe_series_relative(entry.get("source_relpath"), "source hash")
-            source_file = source_root.joinpath(*source.parts)
-            if self._sha256_file(source_file) != str(entry.get("content_sha256") or ""):
-                raise ValueError("La huella de un episodio de entrada no coincide")
-            sidecars = entry.get("subtitle_sidecars")
-            if not isinstance(sidecars, list):
-                raise ValueError("El manifiesto de entrada perdio sus subtitulos")
-            for sidecar in sidecars:
-                if not isinstance(sidecar, dict):
-                    raise ValueError("El manifiesto contiene un subtitulo invalido")
-                relative = self._safe_series_relative(
-                    sidecar.get("source_relpath"),
-                    "subtitle hash",
-                )
-                path = source_root.joinpath(*relative.parts)
-                if self._sha256_file(path) != str(sidecar.get("content_sha256") or ""):
-                    raise ValueError("La huella de un subtitulo de entrada no coincide")
-
-        published = result.get("published_manifest")
-        if not isinstance(published, dict) or not isinstance(published.get("entries"), list):
-            raise ValueError("No existe manifiesto final verificable")
-        for entry in published["entries"]:
-            if not isinstance(entry, dict):
-                raise ValueError("El manifiesto final cambio durante la verificacion")
-            relative = self._safe_series_relative(entry.get("path"), "published hash")
-            path = self.config.tv_output.joinpath(*relative.parts)
-            if self._sha256_file(path) != str(entry.get("content_sha256") or ""):
-                raise ValueError("La huella de un archivo publicado no coincide")
-
-        # Segunda lectura barata para detectar altas, bajas o cambios de tamaño
-        # ocurridos mientras se calculaban las huellas.
-        self._validate_series_worker_result(job, result)
-
-    def _schedule_series_terminal_verification(
-        self,
-        job: Dict[str, object],
-        result: Dict[str, object],
-        *,
-        recovery: bool,
-    ) -> None:
-        job_id = str(job["job_id"])
-        with self._series_verification_lock:
-            current_thread = self._series_verification_threads.get(job_id)
-            if current_thread is not None and current_thread.is_alive():
-                return
-            running = sum(
-                1
-                for thread in self._series_verification_threads.values()
-                if thread.is_alive()
-            )
-            if running >= SERIES_VERIFY_MAX_CONCURRENCY:
-                return
-            thread = threading.Thread(
-                target=self._run_series_terminal_verification,
-                args=(job_id, dict(result), recovery),
-                name=f"arr-series-verify-{job_id}",
-                daemon=True,
-            )
-            self._series_verification_threads[job_id] = thread
-            self.db.add_event(
-                job_id,
-                "recovery" if recovery else "series_verify",
-                "started",
-                "Verificación independiente del pack publicado iniciada",
-                {"async": True, "hashes": True},
-            )
-            thread.start()
-
-    def _run_series_terminal_verification(
-        self,
-        job_id: str,
-        result: Dict[str, object],
-        recovery: bool,
-    ) -> None:
-        try:
-            current = self.db.get_job(job_id)
-            if current is None or str(current.get("state") or "") != "series_postprocess_running":
-                return
-            self._verify_series_terminal_hashes(current, result)
-            current = self.db.get_job(job_id)
-            if current is None or str(current.get("state") or "") != "series_postprocess_running":
-                return
-            self.db.transition(
-                job_id,
-                "ready_cleanup",
-                "series_verify",
-                "Series Worker publicó el pack y ARR verificó todas sus huellas",
-                output_root=str(self.config.tv_output),
-                last_error_code=None,
-                last_error_message=None,
-                result_json=json.dumps(result, ensure_ascii=False),
-            )
-        except (OSError, TypeError, ValueError) as error:
-            current = self.db.get_job(job_id)
-            if current is not None and str(current.get("state") or "") == "series_postprocess_running":
-                job_root = self.config.workshop_root / job_id
-                self._preserve_series_job_for_review(
-                    current,
-                    job_root,
-                    "series_worker_hash_verification_failed",
-                    str(error),
-                    phase="recovery" if recovery else "series_verify",
-                )
-        finally:
-            with self._series_verification_lock:
-                if self._series_verification_threads.get(job_id) is threading.current_thread():
-                    self._series_verification_threads.pop(job_id, None)
 
     def _run_series_review_cleanup(self, job: Dict[str, object]) -> None:
         job_id = str(job["job_id"])
@@ -4750,17 +4602,12 @@ class Engine:
                 100,
             )
         )
-        with self._series_verification_lock:
-            verifier_running = any(
-                candidate_id != job_id and thread.is_alive()
-                for candidate_id, thread in self._series_verification_threads.items()
-            )
-        if other_running or verifier_running:
+        if other_running:
             self._series_retry_at[job_id] = time.time() + WORKER_STATUS_POLL_SECONDS
             self._record_series_wait(
                 job,
                 "pipeline_busy",
-                "Otro pack de Series sigue publicándose o verificándose",
+                "Otro capítulo de Series sigue procesándose",
             )
             return
         try:
@@ -4842,10 +4689,6 @@ class Engine:
         recovery: bool = False,
     ) -> None:
         job_id = str(job["job_id"])
-        with self._series_verification_lock:
-            verifier = self._series_verification_threads.get(job_id)
-            if verifier is not None and verifier.is_alive():
-                return
         try:
             pending_result = json.loads(str(job.get("result_json") or "null"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -4866,10 +4709,15 @@ class Engine:
                     phase="recovery" if recovery else "series",
                 )
                 return
-            self._schedule_series_terminal_verification(
-                job,
-                pending_result,
-                recovery=True,
+            self.db.transition(
+                job_id,
+                "ready_cleanup",
+                "recovery",
+                "Resultado directo de Series reconciliado",
+                output_root=str(self.config.tv_output),
+                last_error_code=None,
+                last_error_message=None,
+                result_json=json.dumps(pending_result, ensure_ascii=False),
             )
             return
         now = time.time()

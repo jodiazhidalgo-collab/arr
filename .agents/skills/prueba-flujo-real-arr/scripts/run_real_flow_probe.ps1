@@ -137,6 +137,22 @@ printf "%s\n" \
   "1" \
   "00:00:00,200 --> 00:00:01,200" \
   "Subtitulo externo del probe ARR" \
+  "" \
+  "2" \
+  "00:00:02,000 --> 00:00:03,000" \
+  "Segunda frase del probe ARR" \
+  "" \
+  "3" \
+  "00:00:04,000 --> 00:00:05,000" \
+  "Tercera frase del probe ARR" \
+  "" \
+  "4" \
+  "00:00:06,000 --> 00:00:07,000" \
+  "Cuarta frase del probe ARR" \
+  "" \
+  "5" \
+  "00:00:08,000 --> 00:00:09,000" \
+  "Quinta frase del probe ARR" \
   > "$build_root/Treme.tmdb-17967.S01E03.es.srt"
 mv -- "$build_root" "$probe_root"
 trap - EXIT
@@ -536,7 +552,7 @@ def validate_series_cleanup_contract(result, job_id):
         Path(series_root).name != series_root
         or series_name_key(series_root) != SERIES_EXPECTED_KEY
         or not isinstance(delivery, dict)
-        or delivery.get("mode") != "new"
+        or delivery.get("mode") != "direct_move"
         or delivery.get("cleanup_pending") is not False
         or not SERIES_GENERATION_RE.fullmatch(str(delivery.get("generation") or ""))
         or not isinstance(manifest, dict)
@@ -566,7 +582,7 @@ def validate_series_cleanup_contract(result, job_id):
         not isinstance(published_manifest, dict)
         or published_manifest.get("schema") != "series-published-manifest-v1"
         or not isinstance(published_manifest.get("entries"), list)
-        or len(published_manifest["entries"]) != 1
+        or len(published_manifest["entries"]) != 2
     ):
         return None
     published_entries = published_manifest["entries"]
@@ -583,11 +599,11 @@ def validate_series_cleanup_contract(result, job_id):
             or not isinstance(item.get("size"), int)
             or isinstance(item.get("size"), bool)
             or item["size"] < 0
-            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or digest != ""
         ):
             return None
         suffixes.append(Path(path).suffix.lower())
-    if suffixes != [".mkv"]:
+    if sorted(suffixes) != [".mkv", ".srt"]:
         return None
     encoded = json.dumps(
         published_entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -658,15 +674,11 @@ def verify_owned_series_root(path, job_id):
                 info = file_path.lstat()
                 if not stat.S_ISREG(info.st_mode) or file_path.is_symlink():
                     return False, "series_tree_has_unsafe_file"
-                digest = hashlib.sha256()
-                with file_path.open("rb") as handle:
-                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        digest.update(chunk)
                 actual_entries.append(
                     {
                         "path": file_path.relative_to(TV_FINAL_ROOT).as_posix(),
                         "size": info.st_size,
-                        "content_sha256": digest.hexdigest(),
+                        "content_sha256": "",
                     }
                 )
     except OSError:
@@ -678,7 +690,7 @@ def verify_owned_series_root(path, job_id):
         return False, "series_tree_manifest_mismatch"
     if sorted(set(actual_directories)) != expected_directories:
         return False, "series_tree_directory_mismatch"
-    return True, "owned_new_generation_verified"
+    return True, "owned_direct_move_verified"
 
 
 def expected_probe_outcome(inspection):
@@ -1376,7 +1388,7 @@ for item in items:
         or result.get("series_root") != manifest_series
         or series_name_key(result.get("series_root")) != expected_series_key
         or not isinstance(delivery, dict)
-        or delivery.get("mode") != "new"
+        or delivery.get("mode") != "direct_move"
         or delivery.get("cleanup_pending") is not False
         or delivery.get("generation") != expected_generation
         or not isinstance(published_manifest, dict)

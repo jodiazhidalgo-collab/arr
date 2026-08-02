@@ -280,7 +280,7 @@ def test_entries_run_sequentially_and_failure_never_publishes(tmp_path: Path) ->
     assert (source / first).exists() and (source / second).exists()
 
 
-def test_video_hash_drift_fails_even_with_same_size_and_mtime(tmp_path: Path) -> None:
+def test_video_avoids_full_hash_when_size_and_mtime_are_unchanged(tmp_path: Path) -> None:
     relative = "Serie/Season 01/Serie.S01E01.mkv"
     job, source, manifest = _job(tmp_path, [relative])
     video = source / relative
@@ -293,8 +293,9 @@ def test_video_hash_drift_fails_even_with_same_size_and_mtime(tmp_path: Path) ->
         ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
     )
 
-    with pytest.raises(EpisodeProcessingError, match="hash de la entrada"):
-        process_manifest(manifest, source, job, _snapshot(tmp_path), FakeRunner())
+    result = process_manifest(manifest, source, job, _snapshot(tmp_path), FakeRunner())
+
+    assert result.status == "verified"
 
 
 def test_selects_spanish_audio_converts_six_channels_and_discards_english(
@@ -381,7 +382,7 @@ def test_internal_delay_subtitle_is_prioritized_and_exported(tmp_path: Path) -> 
     assert (job / "series_work/processed/Serie/Season 01/Serie.S01E01.es.forced.srt").exists()
 
 
-def test_mkv_substitution_after_full_verification_is_rejected(
+def test_mkv_is_not_read_a_second_time_after_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -400,11 +401,12 @@ def test_mkv_substitution_after_full_verification_is_rejected(
 
     monkeypatch.setattr(processing_module, "_verify_output", verify_then_mutate)
 
-    with pytest.raises(EpisodeProcessingError, match="cambió durante su verificación"):
-        process_manifest(manifest, source, job, _snapshot(tmp_path), FakeRunner())
+    result = process_manifest(manifest, source, job, _snapshot(tmp_path), FakeRunner())
+
+    assert result.episodes[0].output_sha256 == ""
 
 
-def test_srt_substitution_after_validation_is_rejected(
+def test_srt_is_not_read_a_second_time_after_validation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -431,8 +433,9 @@ def test_srt_substitution_after_validation_is_rejected(
 
     monkeypatch.setattr(processing_module, "_srt_valid", validate_then_mutate)
 
-    with pytest.raises(EpisodeProcessingError, match="subtítulo cambió"):
-        process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
+    result = process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
+
+    assert result.episodes[0].subtitle_sha256 == ""
 
 
 def test_external_spanish_subtitle_is_embedded(tmp_path: Path) -> None:

@@ -22,7 +22,6 @@ from urllib.parse import urlsplit
 
 from .delivery import (
     MARKER_NAME,
-    AtomicDeliveryUnsupported,
     DeliveryError,
     RecoveryAmbiguous,
     preflight_atomic_exchange,
@@ -33,8 +32,6 @@ from .heavy_lock import HeavyLockTimeout, series_heavy_lock
 from .journal import (
     DurableJournal,
     JournalContradiction,
-    fsync_directory,
-    write_json_file_atomic,
 )
 from .manifest import (
     ManifestEntry,
@@ -458,9 +455,11 @@ def _manifest_from_dict(payload: dict[str, Any]) -> SeriesManifest:
                 raise ValueError("entrada durable con estructura no válida")
             string_fields = (
                 "source_relpath", "target_relpath", "series_name", "series_key",
-                "source_fingerprint", "content_sha256",
+                "source_fingerprint",
             )
             if any(not isinstance(item[field], str) or not item[field] for field in string_fields):
+                raise ValueError("entrada durable contiene texto no válido")
+            if not isinstance(item["content_sha256"], str):
                 raise ValueError("entrada durable contiene texto no válido")
             if (
                 not isinstance(item["season"], int)
@@ -491,7 +490,10 @@ def _manifest_from_dict(payload: dict[str, Any]) -> SeriesManifest:
                 or target.name != f"{PurePosixPath(source_relpath).stem}.mkv"
                 or item["series_key"] != _series_key(item["series_name"])
                 or not _is_sha256(item["source_fingerprint"])
-                or not _is_sha256(item["content_sha256"])
+                or (
+                    item["content_sha256"] != ""
+                    and not _is_sha256(item["content_sha256"])
+                )
             ):
                 raise ValueError("identidad de entrada durable no válida")
             raw_sidecars = item["subtitle_sidecars"]
@@ -510,7 +512,11 @@ def _manifest_from_dict(payload: dict[str, Any]) -> SeriesManifest:
                     or sidecar["size"] < 0
                     or not isinstance(sidecar["mtime_ns"], int)
                     or isinstance(sidecar["mtime_ns"], bool)
-                    or not _is_sha256(sidecar["content_sha256"])
+                    or not isinstance(sidecar["content_sha256"], str)
+                    or (
+                        sidecar["content_sha256"] != ""
+                        and not _is_sha256(sidecar["content_sha256"])
+                    )
                 ):
                     raise ValueError("sidecar durable no válido")
                 sidecars.append(
@@ -606,21 +612,6 @@ def _rules_from_dict(payload: dict[str, Any]) -> RulesSnapshot:
     ):
         raise ServiceUnavailable("rules_snapshot.json durable no es válido")
     return RulesSnapshot(rules=deepcopy(rules), fingerprint=fingerprint)
-
-
-def _same_file(left: Path, right: Path) -> bool:
-    if not left.is_file() or not right.is_file():
-        return False
-    if left.stat().st_size != right.stat().st_size:
-        return False
-    with left.open("rb") as first, right.open("rb") as second:
-        while True:
-            left_chunk = first.read(1024 * 1024)
-            right_chunk = second.read(1024 * 1024)
-            if left_chunk != right_chunk:
-                return False
-            if not left_chunk:
-                return True
 
 
 def _episode_identity(path: Path) -> tuple[int, frozenset[int]] | None:
@@ -761,13 +752,7 @@ def plan_collisions(
                     f"ruta_no_canonica_tv:{exact_relative}:{inside_series}"
                 )
                 continue
-            if exact.suffix.casefold() == ".mkv" and _same_file(source, exact):
-                if entry.subtitle_sidecars:
-                    pending.append(entry)
-                else:
-                    satisfied.append(entry)
-            else:
-                reasons.append(f"colision_diferente:{entry.target_relpath}")
+            reasons.append(f"colision_existente:{entry.target_relpath}")
             continue
         wanted_episodes = frozenset(entry.episodes)
         overlaps = [
@@ -794,15 +779,13 @@ def _safe_fragment(value: str) -> str:
 
 
 def _prepared_root(
-    final_root: Path,
+    job_root: Path,
     series_name: str,
     job_id: str,
     generation: str,
 ) -> Path:
-    return final_root / (
-        f".{_safe_fragment(series_name)}.series-worker."
-        f"{_safe_fragment(job_id)}.{generation}.prepared"
-    )
+    del job_id, generation
+    return job_root / "series_work" / "processed" / series_name
 
 
 def _cleanup_prepared_staging(prepared: PreparedJob) -> None:
@@ -814,95 +797,32 @@ def _cleanup_prepared_staging(prepared: PreparedJob) -> None:
     if not series_name:
         raise SeriesWorkerError("Staging preparado sin identidad de serie")
     expected = _prepared_root(
-        prepared.payload.final_root,
+        prepared.payload.job_root,
         series_name,
         prepared.payload.job_id,
         prepared.generation,
     )
-    if staging != expected or staging.parent != prepared.payload.final_root:
+    processed_root = prepared.payload.job_root / "series_work" / "processed"
+    if staging != expected or staging.parent != processed_root:
         raise SeriesWorkerError("Staging preparado no coincide con la identidad durable")
     if not staging.exists():
         return
     if staging.is_symlink() or not staging.is_dir():
         raise SeriesWorkerError("Staging preparado no es un directorio propio seguro")
     shutil.rmtree(staging)
-    fsync_directory(staging.parent)
-
-
-def _copy_verified_file(
-    source: Path,
-    destination: Path,
-    *,
-    expected_size: int,
-    expected_sha256: str,
-    label: str,
-) -> str:
-    if (
-        not isinstance(expected_size, int)
-        or isinstance(expected_size, bool)
-        or expected_size <= 0
-        or re.fullmatch(r"[0-9a-f]{64}", expected_sha256 or "") is None
-    ):
-        raise SeriesWorkerError(f"Evidencia verificada inválida: {label}")
-    if source.is_symlink() or not source.is_file():
-        raise SeriesWorkerError(f"Archivo verificado inválido: {label}")
-    if destination.exists() or destination.is_symlink():
-        raise SeriesWorkerError(f"Destino preparado duplicado: {label}")
-    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.copy")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(source, flags)
-    digest = hashlib.sha256()
-    copied = 0
-    try:
-        path_before = source.lstat()
-        opened_before = os.fstat(descriptor)
-        if stat.S_ISLNK(opened_before.st_mode) or not stat.S_ISREG(opened_before.st_mode):
-            raise SeriesWorkerError(f"Archivo verificado no regular: {label}")
-        with os.fdopen(descriptor, "rb", closefd=False) as source_handle:
-            with temporary.open("xb") as destination_handle:
-                while chunk := source_handle.read(1024 * 1024):
-                    destination_handle.write(chunk)
-                    digest.update(chunk)
-                    copied += len(chunk)
-                destination_handle.flush()
-                os.fsync(destination_handle.fileno())
-        opened_after = os.fstat(descriptor)
-        path_after = source.lstat()
-        identities = {
-            (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
-            for item in (path_before, opened_before, opened_after, path_after)
-        }
-        if len(identities) != 1:
-            raise SeriesWorkerError(f"El archivo cambió durante la copia: {label}")
-        if copied != expected_size or digest.hexdigest() != expected_sha256:
-            raise SeriesWorkerError(
-                f"El archivo verificado cambió antes de copiar: {label}"
-            )
-        os.replace(temporary, destination)
-        fsync_directory(destination.parent)
-    finally:
-        os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-    destination_size, destination_sha256 = _hash_published_file(destination)
-    if destination_size != expected_size or destination_sha256 != expected_sha256:
-        destination.unlink(missing_ok=True)
-        fsync_directory(destination.parent)
-        raise SeriesWorkerError(f"La copia preparada no coincide: {label}")
-    return expected_sha256
 
 
 def _copy_provisional_to_prepared(
     prepared: PreparedJob,
     processing: ProcessingResult | None,
 ) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Recoge las salidas del taller sin copiarlas ni releerlas completas."""
+
     destination_root = prepared.prepared_series_root
     if destination_root is None:
-        raise SeriesWorkerError("No existe staging de publicación")
-    if destination_root.exists():
-        if destination_root.is_symlink() or destination_root.parent != prepared.payload.final_root:
-            raise SeriesWorkerError("Staging de publicación no reconocido")
-        shutil.rmtree(destination_root)
-    destination_root.mkdir(parents=True)
+        raise SeriesWorkerError("No existe salida procesada en el taller")
+    if destination_root.is_symlink() or not destination_root.is_dir():
+        raise SeriesWorkerError("La salida procesada del taller no es válida")
     by_source = {
         episode.source_relpath: episode
         for episode in (processing.episodes if processing else ())
@@ -911,75 +831,8 @@ def _copy_provisional_to_prepared(
         prepared.rules_snapshot.rules["subtitulos"]["sufijo_srt_externo"]
     )
     expected_files: list[str] = []
-    expected_file_digests: dict[str, str] = {}
-    final_series_root = prepared.collision.final_series_root
-    if final_series_root is None:
-        raise SeriesWorkerError("No existe raíz final de la serie")
-    if prepared.collision.satisfied and (
-        final_series_root.is_symlink() or not final_series_root.is_dir()
-    ):
-        raise ReviewRequiredError("La raíz de la serie cambió en la biblioteca")
-    for entry in prepared.collision.satisfied:
-        target_parts = PurePosixPath(entry.target_relpath).parts
-        relative = Path(*target_parts[1:])
-        current = final_series_root
-        for index, part in enumerate(relative.parts):
-            try:
-                matches = [
-                    child
-                    for child in current.iterdir()
-                    if _path_key(child.name) == _path_key(part)
-                ]
-            except OSError as error:
-                raise ReviewRequiredError(
-                    f"La biblioteca cambió: {entry.target_relpath}"
-                ) from error
-            if len(matches) != 1:
-                raise ReviewRequiredError(
-                    f"La biblioteca cambió: {entry.target_relpath}"
-                )
-            current = matches[0]
-            if current.is_symlink():
-                raise ReviewRequiredError(
-                    f"La biblioteca cambió: {entry.target_relpath}"
-                )
-            if index < len(relative.parts) - 1 and not current.is_dir():
-                raise ReviewRequiredError(
-                    f"La biblioteca cambió: {entry.target_relpath}"
-                )
-        source = prepared.payload.source_root / Path(
-            *PurePosixPath(entry.source_relpath).parts
-        )
-        if source.is_symlink() or not source.is_file() or not _same_file(source, current):
-            raise ReviewRequiredError(
-                f"La biblioteca cambió: {entry.target_relpath}"
-            )
-        destination = destination_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.exists() or destination.is_symlink():
-            raise SeriesWorkerError(
-                f"Destino preparado duplicado: {entry.target_relpath}"
-            )
-        try:
-            os.link(current, destination, follow_symlinks=False)
-        except (NotImplementedError, OSError) as error:
-            raise ReviewRequiredError(
-                f"No se pudo crear el hardlink satisfecho: {entry.target_relpath}"
-            ) from error
-        if destination.is_symlink() or not destination.is_file() or not _same_file(
-            current, destination
-        ):
-            raise ReviewRequiredError(
-                f"La biblioteca cambió: {entry.target_relpath}"
-            )
-        relative_text = relative.as_posix()
-        _destination_size, destination_sha256 = _hash_published_file(destination)
-        if destination_sha256 != entry.content_sha256:
-            raise ReviewRequiredError(
-                f"La biblioteca cambió: {entry.target_relpath}"
-            )
-        expected_files.append(relative_text)
-        expected_file_digests[relative_text] = entry.content_sha256
+    if prepared.collision.satisfied:
+        raise ReviewRequiredError("Hay episodios existentes en la biblioteca")
     for entry in prepared.collision.pending:
         episode = by_source.get(entry.source_relpath)
         if episode is None:
@@ -1001,22 +854,18 @@ def _copy_provisional_to_prepared(
         target_parts = PurePosixPath(entry.target_relpath).parts
         relative = Path(*target_parts[1:])
         destination = destination_root / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination != provisional:
+            raise SeriesWorkerError(
+                f"La salida del taller no coincide: {entry.source_relpath}"
+            )
+        if destination.is_symlink() or not destination.is_file():
+            raise SeriesWorkerError(f"Falta salida procesada: {entry.source_relpath}")
+        if destination.stat().st_size != episode.output_size:
+            raise SeriesWorkerError(f"Tamaño de salida inesperado: {entry.source_relpath}")
         relative_text = relative.as_posix()
-        expected_file_digests[relative_text] = _copy_verified_file(
-            provisional,
-            destination,
-            expected_size=episode.output_size,
-            expected_sha256=episode.output_sha256,
-            label=entry.source_relpath,
-        )
         expected_files.append(relative_text)
         expected_srt = provisional.with_name(f"{provisional.stem}{subtitle_suffix}")
-        subtitle_evidence = (
-            episode.subtitle_provisional_relpath,
-            episode.subtitle_size,
-            episode.subtitle_sha256,
-        )
+        subtitle_evidence = (episode.subtitle_provisional_relpath, episode.subtitle_size)
         if any(value is not None for value in subtitle_evidence) and not all(
             value is not None for value in subtitle_evidence
         ):
@@ -1037,175 +886,32 @@ def _copy_provisional_to_prepared(
             subtitle_destination = destination.with_name(
                 f"{destination.stem}{subtitle_suffix}"
             )
+            if provisional_srt.is_symlink() or not provisional_srt.is_file():
+                raise SeriesWorkerError(
+                    f"Falta sidecar procesado: {entry.source_relpath}"
+                )
+            if provisional_srt.stat().st_size != episode.subtitle_size:
+                raise SeriesWorkerError(
+                    f"Tamaño de sidecar inesperado: {entry.source_relpath}"
+                )
             subtitle_text = subtitle_destination.relative_to(
                 destination_root
             ).as_posix()
-            expected_file_digests[subtitle_text] = _copy_verified_file(
-                provisional_srt,
-                subtitle_destination,
-                expected_size=episode.subtitle_size,
-                expected_sha256=episode.subtitle_sha256 or "",
-                label=f"{entry.source_relpath} (SRT)",
-            )
             expected_files.append(subtitle_text)
         elif expected_srt.exists() or expected_srt.is_symlink():
             raise SeriesWorkerError(
                 f"Apareció un sidecar no verificado: {entry.source_relpath}"
             )
     ordered_files = tuple(sorted(expected_files, key=str.casefold))
-    if set(ordered_files) != set(expected_file_digests):
-        raise SeriesWorkerError("La evidencia preparada no cubre todo el pack")
-    return ordered_files, expected_file_digests
-
-
-def _allowed_existing_publication_files(
-    prepared: PreparedJob,
-    expected_files: tuple[str, ...],
-) -> dict[str, str]:
-    """Congela solo destinos existentes cuyo contenido conocido es aceptable.
-
-    Los vídeos se comparan con la huella inmutable del manifiesto de entrada.
-    Los sidecars generados se comparan con el archivo ya preparado. La entrega
-    vuelve a comprobar estas huellas dentro de su lock, cerrando la carrera
-    entre esta captura y el intercambio atómico.
-    """
-
-    final_series_root = prepared.collision.final_series_root
-    prepared_series_root = prepared.prepared_series_root
-    if final_series_root is None or prepared_series_root is None:
-        raise SeriesWorkerError("Faltan rutas de publicación")
-
-    video_digests: dict[str, str] = {}
-    for entry in prepared.manifest.entries:
-        parts = PurePosixPath(entry.target_relpath).parts
-        if len(parts) < 2:
-            raise SeriesWorkerError("El manifiesto contiene un destino sin raíz")
-        relative = PurePosixPath(*parts[1:]).as_posix()
-        video_digests[_path_key(relative)] = entry.content_sha256
-
-    allowed: dict[str, str] = {}
-    for raw_relative in expected_files:
-        relative = validate_relative_path(raw_relative)
-        relative_path = Path(*PurePosixPath(relative).parts)
-        target = final_series_root / relative_path
-        if not target.exists():
-            continue
-        if target.is_symlink() or not target.is_file():
-            continue
-        _target_size, target_digest = _hash_published_file(target)
-        expected_digest = video_digests.get(_path_key(relative))
-        if expected_digest is None:
-            prepared_path = prepared_series_root / relative_path
-            _prepared_size, expected_digest = _hash_published_file(prepared_path)
-        if target_digest == expected_digest:
-            allowed[relative] = target_digest
-    return allowed
+    return ordered_files, {}
 
 
 _REVIEW_METADATA = frozenset({"reason.json", "Revision de serie.txt"})
 
 
-def _review_tree_signature(
-    root: Path,
-    *,
-    ignore_metadata: bool = False,
-) -> dict[str, str]:
-    if root.is_symlink() or not root.is_dir():
-        raise SeriesWorkerError("El árbol de revisión no es un directorio físico")
-    signature: dict[str, str] = {}
-    for current, directories, filenames in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        relative_root = current_path.relative_to(root)
-        for name in directories:
-            path = current_path / name
-            info = path.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                raise SeriesWorkerError("El pack contiene una carpeta no regular")
-            relative = (relative_root / name).as_posix()
-            signature[f"D:{relative}"] = "directory"
-        for name in filenames:
-            if ignore_metadata and relative_root == Path(".") and name in _REVIEW_METADATA:
-                continue
-            path = current_path / name
-            info = path.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise SeriesWorkerError("El pack contiene un archivo no regular")
-            relative = (relative_root / name).as_posix()
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    digest.update(chunk)
-            signature[f"F:{relative}"] = digest.hexdigest()
-    return signature
-
-
-def _write_text_durable(path: Path, text: str) -> None:
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        fsync_directory(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _fsync_review_tree(root: Path) -> None:
-    directories: list[Path] = []
-    for current, child_directories, filenames in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        directories.append(current_path)
-        for name in child_directories:
-            path = current_path / name
-            if path.is_symlink() or not path.is_dir():
-                raise SeriesWorkerError("La copia de revisión contiene una carpeta no regular")
-        for name in filenames:
-            path = current_path / name
-            if path.is_symlink() or not path.is_file():
-                raise SeriesWorkerError("La copia de revisión contiene un archivo no regular")
-            flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
-            descriptor = os.open(path, flags)
-            try:
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-    for directory in reversed(directories):
-        fsync_directory(directory)
-
-
-def _reset_review_temporary(
-    temporary: Path,
-    expected_reason: dict[str, Any],
-) -> None:
-    if not temporary.exists():
-        return
-    if temporary.is_symlink() or not temporary.is_dir():
-        raise SeriesWorkerError("Staging de revisión existente no es seguro")
-    try:
-        entries = list(temporary.iterdir())
-        marker = _read_json(temporary / "reason.json")
-    except ServiceUnavailable as error:
-        marker = None
-        marker_error = error
-    else:
-        marker_error = None
-    only_marker_temps = bool(entries) and all(
-        entry.is_file()
-        and entry.name.startswith(".reason.json.")
-        and entry.name.endswith(".tmp")
-        for entry in entries
-    )
-    if entries and marker != expected_reason and not only_marker_temps:
-        if marker_error is not None:
-            raise SeriesWorkerError("Staging de revisión tiene marcador ilegible") from marker_error
-        raise SeriesWorkerError("Staging de revisión pertenece a otro trabajo")
-    shutil.rmtree(temporary)
-    fsync_directory(temporary.parent)
-
-
 def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, Any]:
+    """Mueve el pack completo a revisión una sola vez, igual que películas."""
+
     payload = prepared.payload
     suffix = prepared.manifest.digest[:12]
     destination = payload.review_root / f"{_safe_fragment(payload.job_id)}-{suffix}"
@@ -1220,59 +926,20 @@ def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, A
             raise SeriesWorkerError(
                 f"El pack usa un nombre reservado para revisión: {reserved}"
             )
-    source_signature = _review_tree_signature(payload.source_root)
     if destination.exists():
-        if destination.is_symlink() or not destination.is_dir():
-            raise SeriesWorkerError("Destino de revisión existente no es seguro")
-        if _review_tree_signature(destination, ignore_metadata=True) != source_signature:
-            raise SeriesWorkerError("La copia de revisión existente no coincide con el origen")
-        if _read_json(destination / "reason.json") != expected_reason:
-            raise SeriesWorkerError("La copia de revisión existente no conserva su motivo")
-        try:
-            stored_text = (destination / "Revision de serie.txt").read_text(
-                encoding="utf-8"
-            )
-        except OSError as error:
-            raise SeriesWorkerError("La copia de revisión no conserva su resumen") from error
-        if stored_text != expected_text:
-            raise SeriesWorkerError("La copia de revisión contradice su resumen")
-        _fsync_review_tree(destination)
-        fsync_directory(payload.review_root)
-    else:
-        temporary = payload.review_root / f".{destination.name}.series-worker.tmp"
-        _reset_review_temporary(temporary, expected_reason)
-        try:
-            temporary.mkdir()
-            fsync_directory(payload.review_root)
-            write_json_file_atomic(temporary / "reason.json", expected_reason)
-            shutil.copytree(
-                payload.source_root,
-                temporary,
-                symlinks=False,
-                dirs_exist_ok=True,
-            )
-            copied_signature = _review_tree_signature(
-                temporary,
-                ignore_metadata=True,
-            )
-            if copied_signature != source_signature:
-                raise SeriesWorkerError("La copia de revisión no coincide con el origen")
-            if _review_tree_signature(payload.source_root) != source_signature:
-                raise SeriesWorkerError("El origen cambió durante la copia de revisión")
-            _write_text_durable(
-                temporary / "Revision de serie.txt",
-                expected_text,
-            )
-            _fsync_review_tree(temporary)
-            os.rename(temporary, destination)
-            fsync_directory(payload.review_root)
-            if _review_tree_signature(destination, ignore_metadata=True) != source_signature:
-                raise SeriesWorkerError("La copia de revisión publicada no coincide con el origen")
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
-    if _review_tree_signature(payload.source_root) != source_signature:
-        raise SeriesWorkerError("El origen cambió antes de confirmar la revisión")
+        raise SeriesWorkerError("Ya existe el destino de revisión de este trabajo")
+    if payload.source_root.is_symlink() or not payload.source_root.is_dir():
+        raise SeriesWorkerError("El pack de revisión no es una carpeta física")
+    payload.review_root.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(payload.source_root), str(destination))
+    (destination / "reason.json").write_text(
+        json.dumps(expected_reason, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (destination / "Revision de serie.txt").write_text(
+        expected_text,
+        encoding="utf-8",
+    )
     return {
         "status": "review",
         "job_id": payload.job_id,
@@ -1283,57 +950,6 @@ def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, A
         "review_reasons": list(reasons),
         "published": [],
     }
-
-
-def _hash_published_file(path: Path) -> tuple[int, str]:
-    before = path.lstat()
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise SeriesWorkerError("La biblioteca publicada contiene un archivo no regular")
-    digest = hashlib.sha256()
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-    )
-    with os.fdopen(descriptor, "rb") as handle:
-        opened = os.fstat(handle.fileno())
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-        ):
-            raise SeriesWorkerError("El archivo publicado cambió antes de su hash")
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        opened_after = os.fstat(handle.fileno())
-    after = path.lstat()
-    identity_before = (
-        before.st_dev,
-        before.st_ino,
-        before.st_size,
-        before.st_mtime_ns,
-    )
-    identity_opened_after = (
-        opened_after.st_dev,
-        opened_after.st_ino,
-        opened_after.st_size,
-        opened_after.st_mtime_ns,
-    )
-    identity_after = (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    )
-    if (
-        stat.S_ISLNK(after.st_mode)
-        or not stat.S_ISREG(after.st_mode)
-        or identity_before != identity_opened_after
-        or identity_before != identity_after
-    ):
-        raise SeriesWorkerError("La biblioteca publicada cambió durante su manifiesto")
-    return int(after.st_size), digest.hexdigest()
 
 
 def _published_manifest(prepared: PreparedJob) -> dict[str, Any]:
@@ -1347,44 +963,40 @@ def _published_manifest(prepared: PreparedJob) -> dict[str, Any]:
         raise SeriesWorkerError("La raíz publicada de la serie no es segura")
     snapshot = prepared.journal.snapshot()
     details = snapshot.get("details", {}) if isinstance(snapshot, dict) else {}
-    expected = details.get("expected_file_digests")
-    if not isinstance(expected, dict) or not expected:
-        raise SeriesWorkerError("La publicación no conserva las huellas del pack")
-    pack_digests = dict(expected)
-    sidecar_suffixes = {".srt", ".ass", ".ssa", ".sub", ".idx"}
-    for manifest_entry in prepared.manifest.entries:
-        target_parts = PurePosixPath(manifest_entry.target_relpath).parts
-        if len(target_parts) < 2:
-            raise SeriesWorkerError("El pack publicado contiene un destino inválido")
-        relative_video = PurePosixPath(*target_parts[1:])
-        parent = series_root.joinpath(*relative_video.parent.parts)
-        if not parent.is_dir() or parent.is_symlink():
-            raise SeriesWorkerError("La carpeta final del episodio no es segura")
-        prefix = f"{relative_video.stem}.".casefold()
-        for sibling in parent.iterdir():
-            if (
-                sibling.name.casefold().startswith(prefix)
-                and sibling.suffix.casefold() in sidecar_suffixes
-            ):
-                sidecar_relative = sibling.relative_to(series_root).as_posix()
-                if sidecar_relative not in pack_digests:
-                    _sidecar_size, sidecar_digest = _hash_published_file(sibling)
-                    pack_digests[sidecar_relative] = sidecar_digest
+    expected = details.get("expected_files")
+    if not isinstance(expected, list) or not expected:
+        expected = []
+        sidecar_suffixes = {".srt", ".ass", ".ssa", ".sub", ".idx"}
+        for manifest_entry in prepared.manifest.entries:
+            parts = PurePosixPath(manifest_entry.target_relpath).parts
+            if len(parts) < 2:
+                raise SeriesWorkerError("El pack publicado contiene un destino inválido")
+            relative_video = PurePosixPath(*parts[1:])
+            expected.append(relative_video.as_posix())
+            parent = series_root.joinpath(*relative_video.parent.parts)
+            if parent.is_dir() and not parent.is_symlink():
+                prefix = f"{relative_video.stem}.".casefold()
+                for sibling in parent.iterdir():
+                    if (
+                        sibling.is_file()
+                        and not sibling.is_symlink()
+                        and sibling.name.casefold().startswith(prefix)
+                        and sibling.suffix.casefold() in sidecar_suffixes
+                    ):
+                        expected.append(sibling.relative_to(series_root).as_posix())
 
     entries: list[dict[str, Any]] = []
-    for raw_relative, expected_digest in pack_digests.items():
+    for raw_relative in expected:
         relative = validate_relative_path(raw_relative)
-        if not _is_sha256(expected_digest):
-            raise SeriesWorkerError("La publicación conserva una huella inválida")
         path = series_root.joinpath(*PurePosixPath(relative).parts)
-        size, content_sha256 = _hash_published_file(path)
-        if content_sha256 != expected_digest:
-            raise SeriesWorkerError("La huella final del pack no coincide")
+        if path.is_symlink() or not path.is_file():
+            raise SeriesWorkerError("Falta un archivo publicado del pack")
+        size = path.stat().st_size
         entries.append(
             {
                 "path": PurePosixPath(series_root.name, *PurePosixPath(relative).parts).as_posix(),
                 "size": size,
-                "content_sha256": content_sha256,
+                "content_sha256": "",
             }
         )
     entries.sort(key=lambda item: (_path_key(item["path"]), item["path"]))
@@ -1424,7 +1036,8 @@ def _validate_published_manifest(value: Any) -> dict[str, Any]:
             or not isinstance(size, int)
             or isinstance(size, bool)
             or size < 0
-            or not _is_sha256(content_sha256)
+            or not isinstance(content_sha256, str)
+            or (content_sha256 != "" and not _is_sha256(content_sha256))
         ):
             raise ServiceUnavailable("Entrada de manifiesto publicado no válida")
         try:
@@ -1533,6 +1146,8 @@ class SeriesCoordinator:
         self.processor_factory = processor_factory
         self.publisher = publisher
         self.recoverer = recoverer
+        # Se conserva el argumento por compatibilidad con clientes antiguos,
+        # pero el flujo rápido ya no crea ni ejecuta probes de intercambio.
         self.atomic_preflight = atomic_preflight
         self.tool_checker = tool_checker or (
             lambda: unavailable_tools(
@@ -1558,9 +1173,6 @@ class SeriesCoordinator:
         self._active: dict[str, Any] | None = None
         self._threads: dict[str, threading.Thread] = {}
         self._last_errors: dict[str, str] = {}
-        self._health_atomicity_cache: dict[str, Any] | None = None
-        self._health_atomicity_cached_at: float | None = None
-        self._health_atomicity_lock = threading.Lock()
 
     def rules_payload(self) -> dict[str, Any]:
         if self.rules_store is None:
@@ -1583,7 +1195,7 @@ class SeriesCoordinator:
         checks: dict[str, Any] = {
             "rules": {"ok": False},
             "tools": {"ok": False},
-            "atomicity": {"ok": False, "verified": False},
+            "atomicity": {"ok": False, "mode": "direct_move"},
         }
         errors: list[str] = []
         try:
@@ -1600,59 +1212,14 @@ class SeriesCoordinator:
             errors.append("tools:" + _safe_error(error))
         try:
             final_root = _configured_path("SERIES_WORKER_FINAL_ROOT", DEFAULT_FINAL_ROOT)
-            final_stat = final_root.stat()
             if not final_root.is_dir():
                 raise NotADirectoryError(str(final_root))
-            with self._health_atomicity_lock:
-                now = float(self.health_clock())
-                cached = (
-                    dict(self._health_atomicity_cache)
-                    if self._health_atomicity_cache is not None
-                    else None
-                )
-                cached_at = self._health_atomicity_cached_at
-                current_device = int(final_stat.st_dev)
-                if cached is not None and (
-                    cached.get("supported") is not True
-                    or int(cached.get("st_dev", -1)) != current_device
-                    or cached_at is None
-                    or now - cached_at >= self.health_atomicity_cache_ttl_sec
-                ):
-                    self._health_atomicity_cache = None
-                    self._health_atomicity_cached_at = None
-                    cached = None
-                    cached_at = None
-                if cached is None:
-                    try:
-                        atomic_result = self.atomic_preflight(final_root)
-                        after_device = int(final_root.stat().st_dev)
-                        if (
-                            not isinstance(atomic_result, dict)
-                            or atomic_result.get("supported") is not True
-                            or int(atomic_result.get("st_dev", -1)) != current_device
-                            or after_device != current_device
-                        ):
-                            raise AtomicDeliveryUnsupported(
-                                "El preflight no verificó el dispositivo actual"
-                            )
-                    except Exception:
-                        self._health_atomicity_cache = None
-                        self._health_atomicity_cached_at = None
-                        raise
-                    cached = dict(atomic_result)
-                    self._health_atomicity_cache = dict(cached)
-                    cached_at = float(self.health_clock())
-                    self._health_atomicity_cached_at = cached_at
             checks["atomicity"] = {
-                **cached,
                 "ok": True,
-                "verified": True,
-                "verified_age_sec": max(0.0, now - float(cached_at)),
+                "mode": "direct_move",
+                "verified": False,
             }
         except Exception as error:
-            with self._health_atomicity_lock:
-                self._health_atomicity_cache = None
-                self._health_atomicity_cached_at = None
             errors.append("atomicity:" + _safe_error(error))
         ok = not errors
         return Submission(
@@ -1690,7 +1257,7 @@ class SeriesCoordinator:
                 "request_digest",
                 "prepared_series_root",
             }
-            allowed_keys = required_keys | {"atomic_preflight"}
+            allowed_keys = required_keys | {"atomic_preflight", "publication_preflight"}
         elif stage == "prepared":
             required_keys = common_keys | {
                 "stage",
@@ -1698,10 +1265,14 @@ class SeriesCoordinator:
                 "request_digest",
                 "prepared_series_root",
             }
-            allowed_keys = required_keys | {"atomic_preflight", "collision_plan"}
+            allowed_keys = required_keys | {
+                "atomic_preflight",
+                "publication_preflight",
+                "collision_plan",
+            }
         else:
             required_keys = common_keys | {"stage"}
-            allowed_keys = required_keys | {"atomic_preflight"}
+            allowed_keys = required_keys | {"atomic_preflight", "publication_preflight"}
         if not required_keys.issubset(existing) or not set(existing).issubset(allowed_keys):
             raise ServiceUnavailable("request.json durable tiene una estructura inválida")
         stored_payload = existing.get("payload")
@@ -1852,7 +1423,7 @@ class SeriesCoordinator:
         prepared_root = None
         if manifest.ready and manifest.series_name:
             prepared_root = _prepared_root(
-                reserved.payload.final_root,
+                reserved.payload.job_root,
                 collision.final_series_root.name
                 if collision.final_series_root is not None
                 else manifest.series_name,
@@ -1890,27 +1461,16 @@ class SeriesCoordinator:
         if missing:
             raise ServiceUnavailable("Faltan herramientas: " + ", ".join(missing))
         try:
-            atomic_result = self.atomic_preflight(final_root)
+            if not final_root.is_dir():
+                raise NotADirectoryError(str(final_root))
             current_device = int(final_root.stat().st_dev)
-            if (
-                not isinstance(atomic_result, dict)
-                or atomic_result.get("supported") is not True
-                or int(atomic_result.get("st_dev", -1)) != current_device
-            ):
-                raise AtomicDeliveryUnsupported(
-                    "El preflight no verificó el dispositivo actual"
-                )
         except Exception as error:
-            with self._health_atomicity_lock:
-                self._health_atomicity_cache = None
-                self._health_atomicity_cached_at = None
-            raise ServiceUnavailable(
-                "Publicación atómica no disponible: " + _safe_error(error)
-            ) from error
-        with self._health_atomicity_lock:
-            self._health_atomicity_cache = dict(atomic_result)
-            self._health_atomicity_cached_at = float(self.health_clock())
-        return dict(atomic_result)
+            raise ServiceUnavailable("Destino de Series no disponible") from error
+        return {
+            "operation": "direct_move",
+            "supported": True,
+            "st_dev": current_device,
+        }
 
     def _preflight_prepared(
         self,
@@ -1921,13 +1481,13 @@ class SeriesCoordinator:
             atomic_result = self._operational_preflight(prepared.payload.final_root)
         current_device = int(prepared.payload.final_root.stat().st_dev)
         if int(atomic_result.get("st_dev", -1)) != current_device:
-            raise ServiceUnavailable("El preflight no pertenece al dispositivo actual")
+            raise ServiceUnavailable("El destino cambió de dispositivo")
         request_record = _read_json(prepared.journal.job_dir / REQUEST_FILE)
         if request_record is None:
             raise ServiceUnavailable("request.json durable desapareció durante preflight")
         prepared.journal.write_json_atomic(
             REQUEST_FILE,
-            {**request_record, "atomic_preflight": atomic_result},
+            {**request_record, "publication_preflight": atomic_result},
         )
 
     def _preparation_failure_job(
@@ -2092,7 +1652,7 @@ class SeriesCoordinator:
                 raise ServiceUnavailable("El staging durable no tiene identidad de serie")
             allowed_prepared_roots = {
                 _prepared_root(
-                    persisted_validated.final_root,
+                    persisted_validated.job_root,
                     series_name,
                     persisted_validated.job_id,
                     generation,
@@ -2145,7 +1705,7 @@ class SeriesCoordinator:
         prepared_root = None
         if manifest.ready and manifest.series_name:
             prepared_root = _prepared_root(
-                validated.final_root,
+                validated.job_root,
                 collision.final_series_root.name
                 if collision.final_series_root is not None
                 else manifest.series_name,
@@ -2207,10 +1767,9 @@ class SeriesCoordinator:
             "manifest_digest": prepared.manifest.digest,
             "rules_fingerprint": prepared.rules_snapshot.fingerprint,
             "mode": mode,
-            "marker_name": MARKER_NAME,
         }
         if prepared.prepared_series_root is not None and prepared.collision.final_series_root is not None:
-            mode = "exchange" if prepared.collision.final_series_root.exists() else "new"
+            mode = "direct_move"
             details.update(
                 {
                     "mode": mode,
@@ -2498,9 +2057,8 @@ class SeriesCoordinator:
             processing_lock_entered = True
 
         try:
-            # El primer flock es solo un gate no bloqueante: evita aceptar y
-            # hashear mientras otro worker ya procesa, pero no monopoliza el
-            # motor audiovisual durante manifest, hardlinks o SHA finales.
+            # El primer flock es solo un gate no bloqueante: conserva la cola
+            # de uno en uno y se libera antes de preparar el trabajo.
             release_gate()
             request_record = _read_json(
                 validated.reports_root / validated.job_id / REQUEST_FILE
@@ -2805,13 +2363,9 @@ class SeriesCoordinator:
                     "Biblioteca cambió; pack enviado a revisión",
                 )
                 return result
-            expected_files, expected_file_digests = _copy_provisional_to_prepared(
+            expected_files, _unused_digests = _copy_provisional_to_prepared(
                 prepared,
                 processing,
-            )
-            allowed_existing_files = _allowed_existing_publication_files(
-                prepared,
-                expected_files,
             )
             if prepared.prepared_series_root is None or prepared.collision.final_series_root is None:
                 raise SeriesWorkerError("Faltan rutas de publicación")
@@ -2821,8 +2375,8 @@ class SeriesCoordinator:
                 prepared.collision.final_series_root,
                 prepared.journal,
                 expected_files=expected_files,
-                expected_file_digests=expected_file_digests,
-                allowed_existing_files=allowed_existing_files,
+                expected_file_digests={},
+                allowed_existing_files={},
             )
             if delivery_result.get("status") != "committed":
                 raise DeliveryError("La publicación no terminó COMMITTED")

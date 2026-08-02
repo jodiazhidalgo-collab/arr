@@ -32,7 +32,7 @@ def test_single_episode_builds_relative_mkv_target(tmp_path: Path) -> None:
     assert entry.episodes == (3,)
     assert entry.source_relpath == "Mi Serie/Season 01/Mi.Serie.S01E03.mp4"
     assert entry.target_relpath == "Mi Serie/Season 01/Mi.Serie.S01E03.mkv"
-    assert len(entry.content_sha256) == 64
+    assert entry.content_sha256 == ""
     assert not Path(entry.target_relpath).is_absolute()
 
 
@@ -186,7 +186,7 @@ def test_digest_changes_when_a_physical_file_changes(tmp_path: Path) -> None:
     assert first.digest != second.digest
 
 
-def test_video_content_hash_detects_same_size_and_mtime_mutation(tmp_path: Path) -> None:
+def test_video_manifest_uses_lightweight_size_and_mtime_snapshot(tmp_path: Path) -> None:
     source = tmp_path / "series_filebot_output"
     video = _video(source, "Serie/Season 01/Serie.S01E01.mkv", b"one")
     first = discover_manifest(source)
@@ -198,11 +198,11 @@ def test_video_content_hash_detects_same_size_and_mtime_mutation(tmp_path: Path)
 
     assert video.stat().st_size == first.entries[0].size
     assert video.stat().st_mtime_ns == first.entries[0].mtime_ns
-    assert first.entries[0].content_sha256 != second.entries[0].content_sha256
-    assert first.digest != second.digest
+    assert first.entries[0].content_sha256 == second.entries[0].content_sha256 == ""
+    assert first.digest == second.digest
 
 
-def test_sidecars_are_frozen_with_content_hash_and_change_manifest_digest(
+def test_sidecars_use_lightweight_size_and_mtime_snapshot(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "series_filebot_output"
@@ -217,7 +217,7 @@ def test_sidecars_are_frozen_with_content_hash_and_change_manifest_digest(
     assert len(first.entries[0].subtitle_sidecars) == 1
     frozen = first.entries[0].subtitle_sidecars[0]
     assert frozen.source_relpath.endswith(".es.srt")
-    assert len(frozen.content_sha256) == 64
+    assert frozen.content_sha256 == ""
 
     sidecar.write_text(
         "1\n00:00:00,000 --> 00:00:01,000\nAdio\n", encoding="utf-8"
@@ -226,7 +226,7 @@ def test_sidecars_are_frozen_with_content_hash_and_change_manifest_digest(
     assert sidecar.stat().st_size == frozen.size
     assert sidecar.stat().st_mtime_ns == frozen.mtime_ns
     second = discover_manifest(source)
-    assert first.digest != second.digest
+    assert first.digest == second.digest
 
 
 def test_unicode_equivalent_sidecars_are_reviewed_and_ordered_deterministically(

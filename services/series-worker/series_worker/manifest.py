@@ -183,14 +183,6 @@ def _source_fingerprint(relative: str, stat: os.stat_result) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _content_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _matching_sidecars(
     video: Path,
     root: Path,
@@ -213,7 +205,9 @@ def _matching_sidecars(
                 source_relpath=relative,
                 size=info.st_size,
                 mtime_ns=info.st_mtime_ns,
-                content_sha256=_content_sha256(candidate),
+                # Compatibilidad del documento durable. La validacion activa
+                # usa tamaño y mtime, sin releer el subtitulo para hashearlo.
+                content_sha256="",
             )
         )
     return tuple(
@@ -334,7 +328,9 @@ def discover_manifest(
                 size=stat.st_size,
                 mtime_ns=stat.st_mtime_ns,
                 source_fingerprint=_source_fingerprint(source_relative, stat),
-                content_sha256=_content_sha256(path),
+                # No se hace una lectura completa extra del episodio. El
+                # fingerprint ligero ya congela ruta, tamaño y mtime.
+                content_sha256="",
                 subtitle_sidecars=sidecars,
             )
         )

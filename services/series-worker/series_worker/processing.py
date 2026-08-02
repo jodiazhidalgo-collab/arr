@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import html
-import hashlib
 import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import unicodedata
 import uuid
@@ -665,41 +663,6 @@ def analyze_episode(
     )
 
 
-def _content_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _stable_file_evidence(path: Path) -> tuple[int, str]:
-    """Obtiene tamaño y SHA del mismo archivo regular abierto, sin carreras de ruta."""
-
-    before = path.lstat()
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise ProcessingError("La salida verificada no es un archivo regular.")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    digest = hashlib.sha256()
-    try:
-        opened_before = os.fstat(descriptor)
-        with os.fdopen(descriptor, "rb", closefd=False) as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-        opened_after = os.fstat(descriptor)
-    finally:
-        os.close(descriptor)
-    after = path.lstat()
-    identities = {
-        (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
-        for item in (before, opened_before, opened_after, after)
-    }
-    if len(identities) != 1:
-        raise ProcessingError("La salida cambió mientras se calculaba su huella.")
-    return int(after.st_size), digest.hexdigest()
-
-
 def _validated_sidecars(
     source_root: Path,
     sidecars: Sequence[ManifestSidecar],
@@ -716,8 +679,6 @@ def _validated_sidecars(
         info = resolved.stat()
         if info.st_size != sidecar.size or info.st_mtime_ns != sidecar.mtime_ns:
             raise ProcessingError("Un sidecar cambió después de congelar el manifiesto.")
-        if _content_sha256(resolved) != sidecar.content_sha256:
-            raise ProcessingError("El hash de un sidecar ya no coincide con el manifiesto.")
         result.append(resolved)
     return tuple(result)
 
@@ -952,18 +913,10 @@ def _export_subtitle(
                 timeout=900,
                 label="exportación de subtítulo interno",
             )
-        evidence_before = _stable_file_evidence(temporary)
         if not _srt_valid(temporary):
             raise ProcessingError("El subtítulo externo provisional no es válido.")
-        evidence_after = _stable_file_evidence(temporary)
-        if evidence_after != evidence_before:
-            raise ProcessingError("El subtítulo cambió durante su verificación.")
-        _fsync_file(temporary)
         os.replace(temporary, destination)
-        _fsync_parent(destination)
-        if _stable_file_evidence(destination) != evidence_before:
-            raise ProcessingError("El subtítulo verificado cambió antes de congelarlo.")
-        return destination, evidence_before[0], evidence_before[1]
+        return destination, int(destination.stat().st_size), ""
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1011,18 +964,13 @@ def _execute_plan(
                     timeout=900,
                     label="capítulos MKV",
                 )
-        verified_evidence = _stable_file_evidence(temporary)
+        # Una sola verificacion audiovisual, igual que Media Worker de
+        # peliculas. No se calculan SHA ni se relee varias veces el MKV.
         verification = _verify_output(temporary, plan, runner)
-        if _stable_file_evidence(temporary) != verified_evidence:
-            raise ProcessingError("El MKV cambió durante su verificación completa.")
         verification["chapters"] = chapters
         exported_subtitle = _export_subtitle(plan, output, rules_snapshot.rules, runner)
-        _fsync_file(temporary)
         os.replace(temporary, output)
-        _fsync_parent(output)
-        if _stable_file_evidence(output) != verified_evidence:
-            raise ProcessingError("El MKV verificado cambió antes de congelarlo.")
-        return verification, exported_subtitle, verified_evidence
+        return verification, exported_subtitle, (int(output.stat().st_size), "")
     finally:
         temporary.unlink(missing_ok=True)
         chapter_file.unlink(missing_ok=True)
@@ -1072,10 +1020,6 @@ class SeriesProcessor:
                 stat = resolved_input.stat()
                 if stat.st_size != entry.size or stat.st_mtime_ns != entry.mtime_ns:
                     raise ProcessingError("La entrada cambió después de congelar el manifiesto.")
-                if _content_sha256(resolved_input) != entry.content_sha256:
-                    raise ProcessingError(
-                        "El hash de la entrada ya no coincide con el manifiesto."
-                    )
                 output = _safe_output(job, entry.target_relpath)
                 ocr_workspace = (
                     job
