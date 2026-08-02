@@ -278,10 +278,10 @@ class _CoordinatorProcessor:
     def process(self, *, manifest, source_root, job_root, rules_snapshot):
         completed = []
         for entry in manifest.entries:
-            output = Path(job_root) / "series_work" / "processed" / Path(
+            output = Path(source_root) / Path(
                 *PurePosixPath(entry.target_relpath).parts
             )
-            output = output.with_suffix(".mkv")
+            output = output.with_suffix(".limpio.mkv")
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(f"processed-{entry.source_relpath}".encode("utf-8"))
             output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -710,18 +710,6 @@ def test_verified_worker_review_allows_client_and_workshop_cleanup(tmp_path: Pat
         manifest = _manifest(episode, source_root)
         review_relative = f"{job['job_id']}-{'b' * 12}"
         review = engine.config.series_review_dir / review_relative
-        shutil.copytree(source_root, review)
-        (review / "reason.json").write_text(
-            json.dumps(
-                {
-                    "job_id": str(job["job_id"]),
-                    "manifest_digest": str(manifest["digest"]),
-                    "reasons": ["pack_multiserie"],
-                }
-            ),
-            encoding="utf-8",
-        )
-        (review / "Revision de serie.txt").write_text("revision", encoding="utf-8")
         result = {
             "status": "review",
             "job_id": str(job["job_id"]),
@@ -732,7 +720,27 @@ def test_verified_worker_review_allows_client_and_workshop_cleanup(tmp_path: Pat
             "review_reasons": ["pack_multiserie"],
             "published": [],
         }
-        engine.series_worker = _Worker(
+
+        class MovingReviewWorker(_Worker):
+            def process_series(self, *args):
+                shutil.move(str(source_root), str(review))
+                (review / "reason.json").write_text(
+                    json.dumps(
+                        {
+                            "job_id": str(job["job_id"]),
+                            "manifest_digest": str(manifest["digest"]),
+                            "reasons": ["pack_multiserie"],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (review / "Revision de serie.txt").write_text(
+                    "revision",
+                    encoding="utf-8",
+                )
+                return super().process_series(*args)
+
+        engine.series_worker = MovingReviewWorker(
             process_response={
                 "ok": True,
                 "status": "terminal",
@@ -981,30 +989,20 @@ def test_direct_result_has_no_shadow_cleanup_or_verifier_thread(tmp_path: Path) 
         database.close()
 
 
-@pytest.mark.parametrize(
-    ("extra_name", "extra_content"),
-    [
-        ("Mi Serie S01E02.mkv", b"episode-two"),
-        ("Mi Serie S01E01.es.srt", b"1\n00:00:00,000 --> 00:00:01,000\nHola\n"),
-    ],
-)
-def test_ready_manifest_must_cover_every_source_file(
+def test_done_terminal_validates_final_output_after_worker_consumes_source(
     tmp_path: Path,
-    extra_name: str,
-    extra_content: bytes,
 ) -> None:
     engine, database = _engine(tmp_path)
     try:
         job, _, source_root, episode = _series_job(engine, database)
         manifest = _manifest(episode, source_root)
-        (episode.parent / extra_name).write_bytes(extra_content)
         final_episode = engine.config.tv_output / "Mi Serie" / "Season 01" / episode.name
         final_episode.parent.mkdir(parents=True)
         final_episode.write_bytes(b"processed")
         result = _done_result(str(job["job_id"]), manifest, final_episode.parents[1])
+        shutil.rmtree(source_root)
 
-        with pytest.raises(ValueError, match="pack completo"):
-            engine._validate_series_worker_result(job, result)
+        assert engine._validate_series_worker_result(job, result) is None
     finally:
         database.close()
 

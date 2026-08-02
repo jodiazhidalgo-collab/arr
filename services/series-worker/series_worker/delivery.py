@@ -1,6 +1,7 @@
 """Publicacion directa de episodios desde el taller a la biblioteca TV.
 
-La limpieza audiovisual termina dentro de ``taller/<job_id>/series_work``.
+La limpieza audiovisual termina dentro de
+``taller/<job_id>/series_filebot_output``.
 Despues se mueve cada MKV/SRT verificado a ``Serie/Season`` igual que hace el
 flujo de peliculas: sin sombras de la serie, marcadores ni copias completas de
 la biblioteca.

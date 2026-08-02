@@ -56,10 +56,10 @@ class FakeProcessor:
                     entry=entry,
                     partial_results=completed,
                 )
-            output = Path(job_root) / "series_work" / "processed" / Path(
+            output = Path(source_root) / Path(
                 *PurePosixPath(entry.target_relpath).parts
             )
-            output = output.with_suffix(".mkv")
+            output = output.with_suffix(".limpio.mkv")
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(f"processed-{entry.source_relpath}".encode())
             output_sha256 = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -97,7 +97,8 @@ class FakeSidecarProcessor(FakeProcessor):
         episodes = []
         for episode in result.episodes:
             output = Path(kwargs["job_root"]) / episode.provisional_relpath
-            sidecar = output.with_name(f"{output.stem}.es.forced.srt")
+            clean_stem = output.stem.removesuffix(".limpio")
+            sidecar = output.with_name(f"{clean_stem}.es.forced.srt")
             sidecar.write_text(
                 "1\n00:00:00,000 --> 00:00:01,000\nHola\n",
                 encoding="utf-8",
@@ -319,6 +320,29 @@ def test_success_persists_full_journal_and_terminal_replays(layout):
     ]
 
 
+@pytest.mark.parametrize("suffix", [".mkv", ".mp4", ".avi"])
+def test_real_delivery_replaces_filebot_original_with_single_final_mkv(
+    layout,
+    suffix,
+):
+    relative = f"Serie/Season 01/Serie.S01E01{suffix}"
+    payload = _payload(layout, videos=[(relative, b"source")])
+    coordinator = _real_delivery_coordinator(layout, FakeProcessor())
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    final = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
+    assert result["status"] == "done"
+    assert final.read_bytes() == f"processed-{relative}".encode()
+    assert {
+        path.name
+        for path in final.parent.iterdir()
+        if path.is_file()
+    } == {"Serie.S01E01.mkv"}
+    assert not (Path(payload["job_root"]) / "series_work").exists()
+
+
 def test_done_manifest_lists_only_new_pack_without_rehashing_video(layout):
     payload = _payload(
         layout,
@@ -381,7 +405,7 @@ def test_tampered_terminal_manifest_cannot_replace_journal_bound_digest(layout):
         _coordinator(layout).submit(payload)
 
 
-def test_processed_output_stays_inside_workshop_until_direct_move(layout):
+def test_processed_output_stays_inside_filebot_output_until_direct_move(layout):
     payload = _payload(layout)
     coordinator = _coordinator(layout)
 
@@ -390,8 +414,9 @@ def test_processed_output_stays_inside_workshop_until_direct_move(layout):
     assert existed is False
     assert prepared.prepared_series_root is not None
     assert prepared.prepared_series_root == (
-        Path(payload["job_root"]) / "series_work/processed/Serie"
+        Path(payload["job_root"]) / "series_filebot_output/Serie"
     )
+    assert not (Path(payload["job_root"]) / "series_work").exists()
     assert list(layout["tv"].iterdir()) == []
 
 
@@ -842,7 +867,7 @@ def test_enospc_on_second_episode_never_publishes_and_preserves_complete_pack(
     original_write_bytes = Path.write_bytes
 
     def fail_second_processed_write(path, data):
-        if "series_work" in path.parts and path.name == "Serie.S01E02.mkv":
+        if path.name == "Serie.S01E02.limpio.mkv":
             raise OSError(errno.ENOSPC, "controlled no space left on device")
         return original_write_bytes(path, data)
 
@@ -1194,8 +1219,9 @@ def test_rolled_back_replay_cleans_delivery_before_terminal_result(layout):
     prepared, existed, record = first._candidate(validate_payload(payload))
     assert existed is False and prepared.prepared_series_root is not None
     first._persist_prepared(prepared, record)
-    prepared.prepared_series_root.mkdir(parents=True)
-    (prepared.prepared_series_root / "partial.mkv").write_bytes(b"partial")
+    partial = prepared.prepared_series_root / "Season 01/Serie.S01E01.limpio.mkv"
+    partial.parent.mkdir(parents=True, exist_ok=True)
+    partial.write_bytes(b"partial")
     shadow = layout["tv"] / ".Serie.series-worker-owned.shadow"
     shadow.mkdir()
     (shadow / "old.mkv").write_bytes(b"old")
@@ -1217,7 +1243,10 @@ def test_rolled_back_replay_cleans_delivery_before_terminal_result(layout):
     assert terminal.payload["result"]["status"] == "failed"
     assert recovery_calls == [True]
     assert not shadow.exists()
-    assert not (prepared.prepared_series_root / "partial.mkv").exists()
+    assert not partial.exists()
+    assert (
+        prepared.prepared_series_root / "Season 01/Serie.S01E01.mkv"
+    ).is_file()
 
 
 def test_restart_replays_manifest_with_unicode_equivalent_sidecars(layout):
@@ -1258,9 +1287,9 @@ def test_missing_tools_return_503_and_atomic_probe_is_not_called(layout):
     missing = SeriesCoordinator(
         rules_store=store,
         atomic_preflight=lambda root: {"supported": True},
-        tool_checker=lambda: ["mkvmerge"],
+        tool_checker=lambda: ["mkvpropedit"],
     )
-    with pytest.raises(ServiceUnavailable, match="mkvmerge") as missing_error:
+    with pytest.raises(ServiceUnavailable, match="mkvpropedit") as missing_error:
         missing.submit(payload)
     assert missing_error.value.http_status == 503
     assert not (layout["reports"] / "job-1").exists()

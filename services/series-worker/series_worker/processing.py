@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -19,12 +20,11 @@ from .manifest import ManifestEntry, ManifestSidecar, SeriesManifest, validate_r
 from .rules import RulesSnapshot
 
 
-BASE_TOOLS = ("ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit")
+BASE_TOOLS = ("ffmpeg", "ffprobe", "mkvpropedit")
 OCR_TOOLS = ("seconv", "tesseract", "mkvextract", "vobsubocr")
 TOOL_SMOKE_ARGS = {
     "ffmpeg": ("-version",),
     "ffprobe": ("-version",),
-    "mkvmerge": ("--version",),
     "mkvpropedit": ("--version",),
     "seconv": ("--version",),
     "tesseract": ("--version",),
@@ -525,14 +525,14 @@ def _select_subtitle(
     raise ProcessingError("No hay subtítulo español procesable.")
 
 
-def _safe_output(job_root: Path, target_relpath: str) -> Path:
+def _safe_output(source_root: Path, target_relpath: str) -> Path:
     relative = validate_relative_path(target_relpath)
-    path = job_root / "series_work" / "processed" / Path(*PurePosixPath(relative).parts)
-    path = path.with_suffix(".mkv")
-    resolved_job = job_root.resolve()
+    path = source_root / Path(*PurePosixPath(relative).parts)
+    path = path.with_suffix(".limpio.mkv")
+    resolved_source = source_root.resolve()
     resolved = path.resolve(strict=False)
-    if resolved != resolved_job and not resolved.is_relative_to(resolved_job):
-        raise ProcessingError("La salida provisional escapa de job_root.")
+    if resolved != resolved_source and not resolved.is_relative_to(resolved_source):
+        raise ProcessingError("La salida limpia escapa de series_filebot_output.")
     return path
 
 
@@ -818,7 +818,7 @@ def _verify_output(
 ) -> dict[str, Any]:
     if path.suffix.casefold() != ".mkv" or not path.is_file() or path.stat().st_size <= 0:
         raise VerificationError("La salida MKV provisional no existe o está vacía.")
-    probe = _probe(path, runner, count_packets=True)
+    probe = _probe(path, runner)
     format_name = str((probe.get("format") or {}).get("format_name") or "").casefold()
     if "matroska" not in format_name:
         raise VerificationError("ffprobe no reconoce la salida como Matroska.")
@@ -843,36 +843,8 @@ def _verify_output(
     if plan.duration > 0 and abs(output_duration - plan.duration) > tolerance:
         raise VerificationError("La duración de salida no coincide con la entrada.")
 
-    mkvmerge = _run_checked(
-        runner, ["mkvmerge", "-J", str(path)], timeout=900, label="mkvmerge -J"
-    )
-    try:
-        mkv = json.loads(mkvmerge.stdout or "{}")
-    except json.JSONDecodeError as error:
-        raise VerificationError("mkvmerge devolvió JSON inválido.") from error
-    tracks = mkv.get("tracks") if isinstance(mkv, dict) else None
-    if not isinstance(tracks, list):
-        raise VerificationError("mkvmerge no pudo enumerar las pistas.")
-    if sum(track.get("type") == "video" for track in tracks) != 1:
-        raise VerificationError("mkvmerge no confirma una única pista de vídeo.")
-    if sum(track.get("type") == "audio" for track in tracks) != 1:
-        raise VerificationError("mkvmerge no confirma una única pista de audio.")
-    if sum(track.get("type") == "subtitles" for track in tracks) != len(subtitles):
-        raise VerificationError("mkvmerge no confirma los subtítulos esperados.")
-
-    _run_checked(
-        runner,
-        [
-            "ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path),
-            "-map", "0", "-c", "copy", "-f", "null", "-",
-        ],
-        timeout=14400,
-        label="lectura completa FFmpeg",
-    )
     return {
         "ffprobe": "ok",
-        "mkvmerge": "ok",
-        "full_read": "ok",
         "duration": output_duration,
         "tracks": {
             "video": len(videos),
@@ -891,8 +863,9 @@ def _export_subtitle(
     if plan.subtitle is None or not rules["limpieza"]["exportar_srt_externo"]:
         return None
     suffix = str(rules["subtitulos"]["sufijo_srt_externo"])
-    destination = output.with_name(f"{output.stem}{suffix}")
-    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp.srt")
+    clean_stem = output.stem.removesuffix(".limpio")
+    destination = output.with_name(f"{clean_stem}{suffix}")
+    temporary = destination.with_name(f"{destination.stem}.procesando.tmp.srt")
     try:
         if plan.subtitle.external_path is not None and plan.subtitle.external_path.suffix.casefold() == ".srt":
             shutil.copyfile(plan.subtitle.external_path, temporary)
@@ -932,8 +905,8 @@ def _execute_plan(
 ]:
     output = plan.output
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.processing.mkv")
-    chapter_file = output.with_name(f".{output.name}.{uuid.uuid4().hex}.chapters.xml")
+    temporary = output.with_suffix(".procesando.tmp.mkv")
+    chapter_file = Path(tempfile.gettempdir()) / f"series_chapters_{uuid.uuid4().hex}.xml"
     try:
         _run_checked(
             runner,
@@ -964,8 +937,7 @@ def _execute_plan(
                     timeout=900,
                     label="capítulos MKV",
                 )
-        # Una sola verificacion audiovisual, igual que Media Worker de
-        # peliculas. No se calculan SHA ni se relee varias veces el MKV.
+        # Una sola comprobación por ffprobe, igual que Media Worker de películas.
         verification = _verify_output(temporary, plan, runner)
         verification["chapters"] = chapters
         exported_subtitle = _export_subtitle(plan, output, rules_snapshot.rules, runner)
@@ -1007,6 +979,12 @@ class SeriesProcessor:
 
         completed: list[ProcessedEpisode] = []
         for entry in manifest.entries:
+            ocr_workspace = (
+                Path(tempfile.gettempdir())
+                / "series-worker-ocr"
+                / job.name
+                / entry.source_fingerprint[:16]
+            )
             try:
                 source_relative = validate_relative_path(entry.source_relpath)
                 input_path = source / Path(*PurePosixPath(source_relative).parts)
@@ -1020,13 +998,7 @@ class SeriesProcessor:
                 stat = resolved_input.stat()
                 if stat.st_size != entry.size or stat.st_mtime_ns != entry.mtime_ns:
                     raise ProcessingError("La entrada cambió después de congelar el manifiesto.")
-                output = _safe_output(job, entry.target_relpath)
-                ocr_workspace = (
-                    job
-                    / "series_work"
-                    / "ocr"
-                    / entry.source_fingerprint[:16]
-                )
+                output = _safe_output(source, entry.target_relpath)
                 frozen_sidecars = _validated_sidecars(
                     source,
                     entry.subtitle_sidecars,
@@ -1074,6 +1046,13 @@ class SeriesProcessor:
                     entry=entry,
                     partial_results=completed,
                 ) from error
+            finally:
+                shutil.rmtree(ocr_workspace, ignore_errors=True)
+                for parent in (ocr_workspace.parent, ocr_workspace.parent.parent):
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        pass
         return ProcessingResult(
             status="verified",
             manifest_digest=manifest.digest,

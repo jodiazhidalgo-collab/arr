@@ -3637,6 +3637,8 @@ class Engine:
     def _series_paths_for_job(
         self,
         job: Dict[str, object],
+        *,
+        source_may_be_missing: bool = False,
     ) -> Tuple[Path, Path]:
         job_id = str(job["job_id"])
         stage_value = str(job.get("stage_path") or "").strip()
@@ -3655,8 +3657,11 @@ class Engine:
             lexical_job_root,
             "entrada de Series",
         )
+        if lexical_source_root != lexical_job_root / "series_filebot_output":
+            raise ValueError(
+                "La entrada de Series no coincide con series_filebot_output"
+            )
         job_root = lexical_job_root.resolve(strict=True)
-        source_root = lexical_source_root.resolve(strict=True)
         expected_job_root = self._require_series_lexical_path(
             self.config.workshop_root / job_id,
             self.config.workshop_root,
@@ -3664,11 +3669,17 @@ class Engine:
         ).resolve(strict=True)
         if job_root != expected_job_root or job_root.name != job_id:
             raise ValueError("El taller no coincide con <taller>/<job_id>")
-        expected_source = (job_root / "series_filebot_output").resolve(strict=True)
-        if source_root != expected_source or not source_root.is_dir():
-            raise ValueError(
-                "La entrada de Series no coincide con series_filebot_output"
-            )
+        expected_source = job_root / "series_filebot_output"
+        if expected_source.exists() or expected_source.is_symlink():
+            if expected_source.is_symlink() or not expected_source.is_dir():
+                raise ValueError(
+                    "La entrada de Series no coincide con series_filebot_output"
+                )
+            source_root = expected_source.resolve(strict=True)
+        elif source_may_be_missing:
+            source_root = expected_source
+        else:
+            raise ValueError("No existe la entrada de Series")
         for root, label in (
             (self.config.tv_output, "biblioteca TV"),
             (self.config.series_review_dir, "revisión de Series"),
@@ -3896,6 +3907,9 @@ class Engine:
         self,
         result: Dict[str, object],
         source_root: Path,
+        *,
+        verify_source: bool = True,
+        ignored_root_names: Tuple[str, ...] = (),
     ) -> Tuple[Dict[str, object], List[PurePosixPath]]:
         manifest_payload = result.get("manifest")
         if not isinstance(manifest_payload, dict):
@@ -3998,24 +4012,28 @@ class Engine:
                 or re.fullmatch(r"[0-9a-f]{64}", source_fingerprint) is None
             ):
                 raise ValueError("El manifiesto contiene una identidad de episodio inválida")
-            source_file = source_root.joinpath(*source.parts)
             expected_hash = str(entry.get("content_sha256") or "")
-            try:
-                source_stat = source_file.lstat()
-            except OSError as error:
-                raise ValueError("Falta un episodio de entrada declarado") from error
             expected_source_fingerprint = hashlib.sha256(
                 f"{source.as_posix()}\0{size}\0{mtime_ns}".encode("utf-8")
             ).hexdigest()
             if (
                 (expected_hash and re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None)
-                or not stat.S_ISREG(source_stat.st_mode)
-                or not self._path_is_inside(source_file, source_root)
-                or source_stat.st_size != size
-                or source_stat.st_mtime_ns != mtime_ns
                 or source_fingerprint != expected_source_fingerprint
             ):
                 raise ValueError("El manifiesto no coincide con el episodio de entrada")
+            if verify_source:
+                source_file = source_root.joinpath(*source.parts)
+                try:
+                    source_stat = source_file.lstat()
+                except OSError as error:
+                    raise ValueError("Falta un episodio de entrada declarado") from error
+                if (
+                    not stat.S_ISREG(source_stat.st_mode)
+                    or not self._path_is_inside(source_file, source_root)
+                    or source_stat.st_size != size
+                    or source_stat.st_mtime_ns != mtime_ns
+                ):
+                    raise ValueError("El manifiesto no coincide con el episodio de entrada")
             declared_files.add(source.as_posix())
             sidecars = entry.get("subtitle_sidecars")
             if not isinstance(sidecars, list):
@@ -4028,14 +4046,9 @@ class Engine:
                 )
                 if sidecar_relative.as_posix() in declared_files:
                     raise ValueError("El manifiesto repite un archivo de entrada")
-                sidecar_file = source_root.joinpath(*sidecar_relative.parts)
                 sidecar_hash = str(sidecar.get("content_sha256") or "")
                 sidecar_size = sidecar.get("size")
                 sidecar_mtime = sidecar.get("mtime_ns")
-                try:
-                    sidecar_stat = sidecar_file.lstat()
-                except OSError as error:
-                    raise ValueError("Falta un subtitulo externo declarado") from error
                 if (
                     (sidecar_hash and re.fullmatch(r"[0-9a-f]{64}", sidecar_hash) is None)
                     or not isinstance(sidecar_size, int)
@@ -4044,12 +4057,21 @@ class Engine:
                     or not isinstance(sidecar_mtime, int)
                     or isinstance(sidecar_mtime, bool)
                     or sidecar_mtime < 0
-                    or not stat.S_ISREG(sidecar_stat.st_mode)
-                    or not self._path_is_inside(sidecar_file, source_root)
-                    or sidecar_stat.st_size != sidecar_size
-                    or sidecar_stat.st_mtime_ns != sidecar_mtime
                 ):
                     raise ValueError("El manifiesto no coincide con el subtítulo externo")
+                if verify_source:
+                    sidecar_file = source_root.joinpath(*sidecar_relative.parts)
+                    try:
+                        sidecar_stat = sidecar_file.lstat()
+                    except OSError as error:
+                        raise ValueError("Falta un subtitulo externo declarado") from error
+                    if (
+                        not stat.S_ISREG(sidecar_stat.st_mode)
+                        or not self._path_is_inside(sidecar_file, source_root)
+                        or sidecar_stat.st_size != sidecar_size
+                        or sidecar_stat.st_mtime_ns != sidecar_mtime
+                    ):
+                        raise ValueError("El manifiesto no coincide con el subtítulo externo")
                 declared_files.add(sidecar_relative.as_posix())
             targets.append(target)
 
@@ -4064,14 +4086,23 @@ class Engine:
         ).encode("utf-8")
         if hashlib.sha256(canonical_manifest).hexdigest() != digest:
             raise ValueError("La huella del manifiesto de Series no coincide")
-        actual_files = self._series_regular_file_inventory(source_root)
-        if not declared_files.issubset(actual_files):
-            raise ValueError("El manifiesto declara archivos que no existen en el origen")
-        if manifest_status == "ready" and declared_files != set(actual_files):
-            raise ValueError("El manifiesto no cubre el pack completo de entrada")
+        if verify_source:
+            actual_files = self._series_regular_file_inventory(
+                source_root,
+                ignored_root_names=ignored_root_names,
+            )
+            if not declared_files.issubset(actual_files):
+                raise ValueError("El manifiesto declara archivos que no existen en el origen")
+            if manifest_status == "ready" and declared_files != set(actual_files):
+                raise ValueError("El manifiesto no cubre el pack completo de entrada")
         return manifest_payload, targets
 
-    def _series_regular_file_inventory(self, root: Path) -> Dict[str, int]:
+    def _series_regular_file_inventory(
+        self,
+        root: Path,
+        *,
+        ignored_root_names: Tuple[str, ...] = (),
+    ) -> Dict[str, int]:
         if root.is_symlink() or not root.is_dir():
             raise ValueError("La raiz del pack de Series no es un directorio fisico")
         inventory: Dict[str, int] = {}
@@ -4086,6 +4117,8 @@ class Engine:
                     raise ValueError("El pack de Series contiene una carpeta no regular")
             for name in filenames:
                 path = current_path / name
+                if current_path == root and name in ignored_root_names:
+                    continue
                 info = path.lstat()
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError("El pack de Series contiene un archivo no regular")
@@ -4190,11 +4223,15 @@ class Engine:
         status = str(result.get("status") or "")
         if status not in {"done", "review", "failed"}:
             raise ValueError("El resultado terminal de Series tiene estado inválido")
-        job_root, source_root = self._series_paths_for_job(job)
+        _job_root, source_root = self._series_paths_for_job(
+            job,
+            source_may_be_missing=status in {"done", "review"},
+        )
         self._record_series_worker_fingerprint(job, result)
         manifest_payload, targets = self._validate_series_manifest(
             result,
             source_root,
+            verify_source=status == "failed",
         )
         if status == "done":
             if not targets:
@@ -4254,17 +4291,12 @@ class Engine:
                 != str(manifest_payload.get("digest") or "")
             ):
                 raise ValueError("La revisión de Series no coincide con el trabajo")
-            source_signature = review_content_signature(
-                source_root,
-                whole_tree=True,
-            )
-            review_signature = review_content_signature(
+            self._validate_series_manifest(
+                result,
                 review,
-                whole_tree=True,
-                ignored_names=("reason.json", "Revision de serie.txt"),
+                verify_source=True,
+                ignored_root_names=("reason.json", "Revision de serie.txt"),
             )
-            if not source_signature or source_signature != review_signature:
-                raise ValueError("La revisión no conserva el pack completo")
             return review
         return None
 

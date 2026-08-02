@@ -33,7 +33,7 @@ def _journal(path: Path, job_id: str = "job-1") -> DurableJournal:
 
 
 def test_new_episode_moves_directly_without_hidden_library_artifacts(tmp_path):
-    prepared = tmp_path / "taller/job-1/series_work/processed/Serie"
+    prepared = tmp_path / "taller/job-1/series_filebot_output/Serie"
     final = tmp_path / "tv/Serie"
     final.parent.mkdir(parents=True)
     source = _write(prepared / "Season 01/Serie.S01E01.mkv")
@@ -58,7 +58,7 @@ def test_new_episode_moves_directly_without_hidden_library_artifacts(tmp_path):
 
 
 def test_existing_series_receives_only_new_episode_and_keeps_old_one(tmp_path):
-    prepared = tmp_path / "taller/job-1/series_work/processed/Serie"
+    prepared = tmp_path / "taller/job-1/series_filebot_output/Serie"
     final = tmp_path / "tv/Serie"
     final.parent.mkdir(parents=True)
     old = _write(final / "Season 01/Serie.S01E01.mkv", b"old")
@@ -80,7 +80,7 @@ def test_existing_series_receives_only_new_episode_and_keeps_old_one(tmp_path):
 
 
 def test_video_and_srt_move_together_from_workshop(tmp_path):
-    prepared = tmp_path / "taller/job-1/series_work/processed/Serie"
+    prepared = tmp_path / "taller/job-1/series_filebot_output/Serie"
     final = tmp_path / "tv/Serie"
     final.parent.mkdir(parents=True)
     _write(prepared / "Season 01/Serie.S01E01.mkv", b"mkv")
@@ -133,7 +133,7 @@ def test_cross_mount_fallback_copies_once_and_removes_workshop_file(
 
 
 def test_existing_destination_is_not_overwritten(tmp_path):
-    prepared = tmp_path / "taller/job-1/series_work/processed/Serie"
+    prepared = tmp_path / "taller/job-1/series_filebot_output/Serie"
     final = tmp_path / "tv/Serie"
     relative = "Season 01/Serie.S01E01.mkv"
     _write(prepared / relative, b"new")
@@ -153,7 +153,7 @@ def test_existing_destination_is_not_overwritten(tmp_path):
 
 
 def test_recovery_finishes_remaining_direct_moves(tmp_path):
-    prepared = tmp_path / "taller/job-1/series_work/processed/Serie"
+    prepared = tmp_path / "taller/job-1/series_filebot_output/Serie"
     final = tmp_path / "tv/Serie"
     first = "Season 01/Serie.S01E01.mkv"
     second = "Season 01/Serie.S01E02.mkv"
@@ -191,7 +191,7 @@ def test_preflight_is_read_only_and_creates_no_probe(tmp_path):
     ["../escape.mkv", "/absolute.mkv", ".series-worker-generation.json"],
 )
 def test_unsafe_expected_path_is_rejected(tmp_path, relative):
-    prepared = tmp_path / "taller/job-1/series_work/processed/Serie"
+    prepared = tmp_path / "taller/job-1/series_filebot_output/Serie"
     prepared.mkdir(parents=True)
     final = tmp_path / "tv/Serie"
     final.parent.mkdir(parents=True)

@@ -183,16 +183,15 @@ def test_unavailable_tools_catches_absent_crash_timeout_and_nonzero() -> None:
         absent={"ffmpeg"},
         outcomes={
             "ffprobe": OSError("exec format error"),
-            "mkvmerge": subprocess.TimeoutExpired(["mkvmerge", "--version"], 3),
             "mkvpropedit": 2,
         },
     )
 
     assert unavailable_tools(
         runner,
-        ("mkvpropedit", "ffmpeg", "mkvmerge", "ffprobe"),
+        ("mkvpropedit", "ffmpeg", "ffprobe"),
         timeout=3,
-    ) == ["ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit"]
+    ) == ["ffmpeg", "ffprobe", "mkvpropedit"]
     assert all(call[0][0] != "ffmpeg" for call in runner.calls)
 
 
@@ -250,13 +249,25 @@ def test_supported_inputs_are_processed_to_mkv_without_touching_original(
     job, source, manifest = _job(tmp_path, [relative])
     original = (source / relative).read_bytes()
 
-    result = process_manifest(manifest, source, job, _snapshot(tmp_path), FakeRunner())
+    runner = FakeRunner()
+    result = process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
 
-    output = job / "series_work/processed/Serie/Season 01/Serie.S01E01.mkv"
+    output = source / "Serie/Season 01/Serie.S01E01.limpio.mkv"
     assert result.status == "verified"
     assert output.is_file()
     assert (source / relative).read_bytes() == original
-    assert result.episodes[0].provisional_relpath == "series_work/processed/Serie/Season 01/Serie.S01E01.mkv"
+    assert result.episodes[0].provisional_relpath == (
+        "series_filebot_output/Serie/Season 01/Serie.S01E01.limpio.mkv"
+    )
+    assert not (job / "series_work").exists()
+    ffmpeg_outputs = [
+        command[-1]
+        for command, _cwd in runner.commands
+        if command[0] == "ffmpeg" and command[-1].endswith(".mkv")
+    ]
+    assert any(path.endswith(".limpio.procesando.tmp.mkv") for path in ffmpeg_outputs)
+    assert all(command[0] != "mkvmerge" for command, _cwd in runner.commands)
+    assert all(command[-3:] != ["-f", "null", "-"] for command, _cwd in runner.commands)
 
 
 def test_entries_run_sequentially_and_failure_never_publishes(tmp_path: Path) -> None:
@@ -274,8 +285,8 @@ def test_entries_run_sequentially_and_failure_never_publishes(tmp_path: Path) ->
         )
 
     assert len(captured.value.partial_results) == 1
-    assert (job / "series_work/processed/Serie/Season 01/Serie.S01E01.mkv").exists()
-    assert not (job / "series_work/processed/Serie/Season 01/Serie.S01E02.mkv").exists()
+    assert (source / "Serie/Season 01/Serie.S01E01.limpio.mkv").exists()
+    assert not (source / "Serie/Season 01/Serie.S01E02.limpio.mkv").exists()
     assert not (job / "tv").exists()
     assert (source / first).exists() and (source / second).exists()
 
@@ -379,7 +390,8 @@ def test_internal_delay_subtitle_is_prioritized_and_exported(tmp_path: Path) -> 
     result = process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
 
     assert result.episodes[0].subtitle_mode == "internal_delay"
-    assert (job / "series_work/processed/Serie/Season 01/Serie.S01E01.es.forced.srt").exists()
+    assert (source / "Serie/Season 01/Serie.S01E01.es.forced.srt").exists()
+    assert not (job / "series_work").exists()
 
 
 def test_mkv_is_not_read_a_second_time_after_verification(
@@ -611,7 +623,7 @@ def test_real_ffmpeg_fixture_is_probed_and_planned(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(
-    any(not shutil.which(tool) for tool in ("ffmpeg", "ffprobe", "mkvmerge", "mkvpropedit")),
+    any(not shutil.which(tool) for tool in ("ffmpeg", "ffprobe", "mkvpropedit")),
     reason="Toolchain audiovisual completa no disponible",
 )
 def test_real_remux_verifies_tracks_metadata_dispositions_chapters_and_delay(
@@ -648,7 +660,7 @@ def test_real_remux_verifies_tracks_metadata_dispositions_chapters_and_delay(
         _snapshot(tmp_path),
         SubprocessRunner(),
     )
-    output = job / "series_work/processed/Serie/Season 01/Serie.S01E01.mkv"
+    output = source_root / "Serie/Season 01/Serie.S01E01.limpio.mkv"
     inspected = subprocess.run(
         [
             "ffprobe", "-v", "error", "-show_format", "-show_streams",

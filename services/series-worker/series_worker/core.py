@@ -785,44 +785,26 @@ def _prepared_root(
     generation: str,
 ) -> Path:
     del job_id, generation
+    return job_root / "series_filebot_output" / series_name
+
+
+def _legacy_prepared_root(job_root: Path, series_name: str) -> Path:
+    """Ruta antigua aceptada únicamente para recuperar trabajos ya persistidos."""
+
     return job_root / "series_work" / "processed" / series_name
 
 
-def _cleanup_prepared_staging(prepared: PreparedJob) -> None:
-    staging = prepared.prepared_series_root
-    final_series = prepared.collision.final_series_root
-    if staging is None:
-        return
-    series_name = final_series.name if final_series is not None else prepared.manifest.series_name
-    if not series_name:
-        raise SeriesWorkerError("Staging preparado sin identidad de serie")
-    expected = _prepared_root(
-        prepared.payload.job_root,
-        series_name,
-        prepared.payload.job_id,
-        prepared.generation,
-    )
-    processed_root = prepared.payload.job_root / "series_work" / "processed"
-    if staging != expected or staging.parent != processed_root:
-        raise SeriesWorkerError("Staging preparado no coincide con la identidad durable")
-    if not staging.exists():
-        return
-    if staging.is_symlink() or not staging.is_dir():
-        raise SeriesWorkerError("Staging preparado no es un directorio propio seguro")
-    shutil.rmtree(staging)
-
-
-def _copy_provisional_to_prepared(
+def _finalize_processed_in_place(
     prepared: PreparedJob,
     processing: ProcessingResult | None,
 ) -> tuple[tuple[str, ...], dict[str, str]]:
-    """Recoge las salidas del taller sin copiarlas ni releerlas completas."""
+    """Reemplaza cada original de FileBot por su ``.limpio`` ya comprobado."""
 
     destination_root = prepared.prepared_series_root
     if destination_root is None:
         raise SeriesWorkerError("No existe salida procesada en el taller")
     if destination_root.is_symlink() or not destination_root.is_dir():
-        raise SeriesWorkerError("La salida procesada del taller no es válida")
+        raise SeriesWorkerError("La carpeta de FileBot de la serie no es válida")
     by_source = {
         episode.source_relpath: episode
         for episode in (processing.episodes if processing else ())
@@ -843,10 +825,9 @@ def _copy_provisional_to_prepared(
         )
         expected_provisional = (
             prepared.payload.job_root
-            / "series_work"
-            / "processed"
+            / "series_filebot_output"
             / Path(*PurePosixPath(entry.target_relpath).parts)
-        ).with_suffix(".mkv")
+        ).with_suffix(".limpio.mkv")
         if provisional != expected_provisional:
             raise SeriesWorkerError(
                 f"Salida provisional fuera de su destino: {entry.source_relpath}"
@@ -854,17 +835,25 @@ def _copy_provisional_to_prepared(
         target_parts = PurePosixPath(entry.target_relpath).parts
         relative = Path(*target_parts[1:])
         destination = destination_root / relative
-        if destination != provisional:
-            raise SeriesWorkerError(
-                f"La salida del taller no coincide: {entry.source_relpath}"
-            )
-        if destination.is_symlink() or not destination.is_file():
-            raise SeriesWorkerError(f"Falta salida procesada: {entry.source_relpath}")
-        if destination.stat().st_size != episode.output_size:
+        original_relative = validate_relative_path(entry.source_relpath)
+        original = prepared.payload.source_root / Path(
+            *PurePosixPath(original_relative).parts
+        )
+        if provisional.is_symlink() or not provisional.is_file():
+            raise SeriesWorkerError(f"Falta salida limpia: {entry.source_relpath}")
+        if provisional.stat().st_size != episode.output_size:
             raise SeriesWorkerError(f"Tamaño de salida inesperado: {entry.source_relpath}")
+        if original.is_symlink() or not original.is_file():
+            raise SeriesWorkerError(f"Falta el original de FileBot: {entry.source_relpath}")
+        if destination != original and (destination.exists() or destination.is_symlink()):
+            raise SeriesWorkerError(f"Ya existe el destino limpio: {entry.target_relpath}")
+        os.replace(provisional, destination)
+        if original != destination:
+            original.unlink(missing_ok=True)
         relative_text = relative.as_posix()
         expected_files.append(relative_text)
-        expected_srt = provisional.with_name(f"{provisional.stem}{subtitle_suffix}")
+        clean_stem = provisional.stem.removesuffix(".limpio")
+        expected_srt = provisional.with_name(f"{clean_stem}{subtitle_suffix}")
         subtitle_evidence = (episode.subtitle_provisional_relpath, episode.subtitle_size)
         if any(value is not None for value in subtitle_evidence) and not all(
             value is not None for value in subtitle_evidence
@@ -904,6 +893,34 @@ def _copy_provisional_to_prepared(
             )
     ordered_files = tuple(sorted(expected_files, key=str.casefold))
     return ordered_files, {}
+
+
+def _discard_generated_artifacts(prepared: PreparedJob) -> None:
+    """Retira solo temporales creados por Series; conserva intacto FileBot."""
+
+    source_root = prepared.payload.source_root
+    subtitle_suffix = str(
+        prepared.rules_snapshot.rules["subtitulos"]["sufijo_srt_externo"]
+    )
+    original_sidecars = {
+        sidecar.source_relpath
+        for entry in prepared.manifest.entries
+        for sidecar in entry.subtitle_sidecars
+    }
+    for entry in prepared.manifest.entries:
+        target = source_root / Path(*PurePosixPath(entry.target_relpath).parts)
+        clean = target.with_suffix(".limpio.mkv")
+        temporary = clean.with_suffix(".procesando.tmp.mkv")
+        clean.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+        clean_stem = clean.stem.removesuffix(".limpio")
+        sidecar = clean.with_name(f"{clean_stem}{subtitle_suffix}")
+        sidecar_relative = sidecar.relative_to(source_root).as_posix()
+        if sidecar_relative not in original_sidecars:
+            sidecar.unlink(missing_ok=True)
+        sidecar.with_name(f"{sidecar.stem}.procesando.tmp.srt").unlink(
+            missing_ok=True
+        )
 
 
 _REVIEW_METADATA = frozenset({"reason.json", "Revision de serie.txt"})
@@ -1657,6 +1674,10 @@ class SeriesCoordinator:
                     persisted_validated.job_id,
                     generation,
                 ),
+                _legacy_prepared_root(
+                    persisted_validated.job_root,
+                    series_name,
+                ),
             }
             if prepared_root not in allowed_prepared_roots:
                 raise ServiceUnavailable("El staging durable no coincide con el job")
@@ -2139,6 +2160,7 @@ class SeriesCoordinator:
             or prepared.collision.final_series_root is None
         ):
             return
+        _discard_generated_artifacts(prepared)
         recovered = self.recoverer(
             prepared.payload.job_id,
             prepared.prepared_series_root,
@@ -2156,7 +2178,6 @@ class SeriesCoordinator:
         state = prepared.journal.state
         if state == "ROLLED_BACK":
             self._complete_rolled_back_cleanup(prepared)
-        _cleanup_prepared_staging(prepared)
         if state not in {"COMMITTED", "ROLLED_BACK", "COMMITTING"}:
             prepared.journal.transition(
                 "ROLLED_BACK",
@@ -2274,7 +2295,6 @@ class SeriesCoordinator:
             return self._resume_delivery(prepared)
         if state == "ROLLED_BACK":
             self._complete_rolled_back_cleanup(prepared)
-            _cleanup_prepared_staging(prepared)
             result = self._failed_result(
                 prepared, SeriesWorkerError("El job ya quedó ROLLED_BACK")
             )
@@ -2309,8 +2329,9 @@ class SeriesCoordinator:
                 pending_count=len(prepared.collision.pending),
                 satisfied_count=len(prepared.collision.satisfied),
             )
+        processing: ProcessingResult | None = None
+        finalized = False
         try:
-            processing: ProcessingResult | None = None
             if prepared.collision.pending:
                 subset = SeriesManifest(
                     status="ready",
@@ -2354,6 +2375,7 @@ class SeriesCoordinator:
                     )
                 )
                 release_heavy_lock()
+                _discard_generated_artifacts(prepared)
                 result = _review_pack(prepared, reasons)
                 self._finish_without_publish(prepared, result)
                 _emit_callback(
@@ -2363,10 +2385,11 @@ class SeriesCoordinator:
                     "Biblioteca cambió; pack enviado a revisión",
                 )
                 return result
-            expected_files, _unused_digests = _copy_provisional_to_prepared(
+            expected_files, _unused_digests = _finalize_processed_in_place(
                 prepared,
                 processing,
             )
+            finalized = True
             if prepared.prepared_series_root is None or prepared.collision.final_series_root is None:
                 raise SeriesWorkerError("Faltan rutas de publicación")
             delivery_result = self.publisher(
@@ -2396,6 +2419,8 @@ class SeriesCoordinator:
                     "Publicación pendiente de recuperación",
                 )
                 raise
+            if not finalized:
+                _discard_generated_artifacts(prepared)
             if _caused_by(error, ReviewRequiredError):
                 release_heavy_lock()
                 try:
