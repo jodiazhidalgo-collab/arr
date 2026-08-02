@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import app as app_module
 from modulos.arr_trace import ArrTrace
 from modulos.persistent_jobs import PersistentJobStore
+from modulos.rdt_monitor import MonitorStore, TorrentListing
 from modulos.submission_store import SubmissionStore
 
 
@@ -25,14 +26,212 @@ class DeliveryTracingTests(unittest.TestCase):
         app_module.ui_jobs = PersistentJobStore(self.root / "ui_jobs", app_module.logger)
         app_module.submissions = SubmissionStore(self.root / "submissions.sqlite3", app_module.logger)
         app_module.arr_trace = ArrTrace(self.root / "diagnostics" / "arr", app_module.logger)
+        self.original_monitor_store = app_module.rdt_monitor._store
+        self.monitor_store = MonitorStore(
+            self.root / "monitor_state.json",
+            self.root / "monitor_torrents",
+            app_module.logger,
+        )
+        app_module.rdt_monitor._store = self.monitor_store
+        app_module.rdt_monitor._listing_cache = None
+        app_module.rdt_monitor._observations = {}
 
     def tearDown(self) -> None:
+        app_module.rdt_monitor._store = self.original_monitor_store
+        app_module.rdt_monitor._listing_cache = None
+        app_module.rdt_monitor._observations = {}
         self.temporary.cleanup()
+
+    def seed_monitor_state(self, state: dict) -> None:
+        for item in state.values():
+            self.monitor_store.register_item(dict(item))
+
+    def reset_monitor_store(self, suffix: str) -> None:
+        self.monitor_store = MonitorStore(
+            self.root / f"monitor_state_{suffix}.json",
+            self.root / f"monitor_torrents_{suffix}",
+            app_module.logger,
+        )
+        app_module.rdt_monitor._store = self.monitor_store
+        app_module.rdt_monitor._listing_cache = None
+        app_module.rdt_monitor._observations = {}
+
+    @staticmethod
+    def monitor_listing(rows: list[dict], context=None) -> TorrentListing:
+        return TorrentListing(context=context or object(), rows=tuple(rows))
 
     def trace_summary(self, trace_id: str) -> dict:
         matches = list((self.root / "diagnostics" / "arr" / "download").glob(f"*/{trace_id}/summary.json"))
         self.assertEqual(len(matches), 1)
         return json.loads(matches[0].read_text(encoding="utf-8"))
+
+    def test_monitor_empty_state_skips_login_and_save(self) -> None:
+        with (
+            patch.object(app_module, "_rdt_monitor_list_torrents") as listing,
+            patch.object(self.monitor_store, "apply_deltas", wraps=self.monitor_store.apply_deltas) as apply,
+        ):
+            app_module.rdt_monitor.poll_once()
+
+        listing.assert_not_called()
+        apply.assert_not_called()
+
+    def test_monitor_active_download_keeps_current_unknown_progress_without_fallback(self) -> None:
+        now = 1_000_000
+        key = "rdt-active-download"
+        item = {
+            "rdt_id": key,
+            "title": "Pelicula descargando",
+            "category": "movies",
+            "first_seen": now - 60,
+            "last_progress_ts": now - 60,
+            "last_progress": -1.0,
+            "last_status": "Waiting",
+        }
+        state = {key: item}
+        row = {
+            "torrentId": key,
+            "statusText": "Downloading file 1/1 (37.50% - 1 MB/s)",
+            "downloadsCount": 1,
+            "completed": False,
+        }
+        session = object()
+        self.seed_monitor_state(state)
+
+        with (
+            patch.object(app_module, "load_settings", return_value=settings(True)),
+            patch.object(
+                app_module,
+                "_rdt_monitor_list_torrents",
+                return_value=self.monitor_listing([row], session),
+            ) as get_rows,
+            patch.object(app_module, "qbit_add_magnet") as fallback,
+            patch.object(app_module.time, "time", return_value=now),
+        ):
+            app_module.rdt_monitor.poll_once()
+
+        get_rows.assert_called_once_with()
+        fallback.assert_not_called()
+        stored = self.monitor_store.snapshot()[key]
+        self.assertEqual(stored["last_progress"], -1.0)
+        self.assertEqual(stored["last_progress_ts"], now - 60)
+        self.assertEqual(stored["last_status"], "Waiting")
+
+    def test_monitor_list_error_preserves_item_without_last_error(self) -> None:
+        key = "rdt-temporary-error"
+        item = {
+            "rdt_id": key,
+            "title": "Pelicula con error temporal",
+            "category": "movies",
+            "last_progress": -1.0,
+        }
+        state = {key: item}
+        self.seed_monitor_state(state)
+        before = self.monitor_store.state_path.read_bytes()
+
+        with (
+            patch.object(app_module, "load_settings", return_value=settings(True)),
+            patch.object(
+                app_module,
+                "_rdt_monitor_list_torrents",
+                side_effect=RuntimeError("RDT-Client: HTTP 503"),
+            ),
+            patch.object(app_module, "qbit_add_magnet") as fallback,
+        ):
+            app_module.rdt_monitor.poll_once()
+
+        fallback.assert_not_called()
+        self.assertEqual(self.monitor_store.state_path.read_bytes(), before)
+        self.assertNotIn("last_error", self.monitor_store.snapshot()[key])
+
+    def test_rdt_wait_ready_starts_with_exact_per_id_endpoint(self) -> None:
+        torrent_id = "rdt-current-contract"
+        session = object()
+        row = {
+            "torrentId": torrent_id,
+            "statusText": "Downloading file 1/1 (1.00% - 1 MB/s)",
+            "downloadsCount": 1,
+        }
+
+        with (
+            patch.object(app_module, "load_settings", return_value=settings()),
+            patch.object(app_module, "rdt_json", return_value=row) as get_row,
+            patch.object(app_module, "rdt_find_row") as find_row,
+        ):
+            result = app_module.rdt_wait_ready(session, torrent_id)
+
+        get_row.assert_called_once_with(session, f"/Api/Torrents/Get/{torrent_id}")
+        find_row.assert_not_called()
+        self.assertEqual(result["rdt_id"], torrent_id)
+
+    def test_monitor_list_adapter_uses_one_exact_local_list_endpoint(self) -> None:
+        session = object()
+        rows = [{"torrentId": "rdt-list-contract"}]
+
+        with (
+            patch.object(app_module, "rdt_login", return_value=session) as login,
+            patch.object(app_module, "rdt_json", return_value=rows) as get_rows,
+        ):
+            listing = app_module._rdt_monitor_list_torrents()
+
+        login.assert_called_once_with()
+        get_rows.assert_called_once_with(session, "/Api/Torrents")
+        self.assertEqual(listing.context, session)
+        self.assertEqual(listing.rows, tuple(rows))
+
+    def test_engine_status_preserves_current_top_level_contract(self) -> None:
+        item = {
+            "rdt_id": "rdt-engine-status",
+            "last_progress": -1.0,
+            "progress": None,
+            "progress_status": "Preparing",
+            "progress_observed_at": 1_000_000,
+            "progress_stale": False,
+        }
+
+        with patch.object(app_module.rdt_monitor, "snapshot", return_value={item["rdt_id"]: item}):
+            response = app_module.app.test_client().get("/api/engine-status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            set(payload),
+            {"ok", "monitoring", "items", "submissions", "recent_submissions"},
+        )
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["monitoring"], 1)
+        self.assertEqual(payload["items"], [item])
+        self.assertEqual(
+            {"progress", "progress_status", "progress_observed_at", "progress_stale"},
+            set(payload["items"][0]) - {"rdt_id", "last_progress"},
+        )
+
+    def test_monitor_loop_keeps_current_order_and_sixty_second_sleep(self) -> None:
+        events = []
+
+        def stop_after_sleep(seconds: int) -> None:
+            events.append(("sleep", seconds))
+            raise RuntimeError("stop monitor loop after one iteration")
+
+        with (
+            patch.object(
+                app_module.rdt_monitor,
+                "poll_once",
+                side_effect=lambda: events.append("poll_once"),
+            ),
+            patch.object(
+                app_module,
+                "link_pending_submissions",
+                side_effect=lambda: events.append("link_pending_submissions") or 0,
+            ),
+            patch.object(app_module.time, "sleep", side_effect=stop_after_sleep),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop monitor loop after one iteration"):
+                app_module.monitor_loop()
+
+        self.assertEqual(
+            events,
+            ["poll_once", "link_pending_submissions", ("sleep", 60)],
+        )
 
     def test_monitor_cleans_retained_finished_row_even_when_fallback_is_disabled(self) -> None:
         self.assertEqual(app_module.RDT_FINISHED_CLEANUP_DELAY_SEC, 30)
@@ -48,27 +247,25 @@ class DeliveryTracingTests(unittest.TestCase):
         }
         state = {key: item}
         session = object()
-        saved = []
+        self.seed_monitor_state(state)
 
         with (
             patch.object(app_module, "load_settings", return_value=settings(False)),
-            patch.object(app_module, "load_monitor_state", return_value=state),
-            patch.object(app_module, "save_monitor_state", side_effect=lambda value: saved.append(dict(value))),
-            patch.object(app_module, "rdt_login", return_value=session),
             patch.object(
                 app_module,
-                "rdt_json",
-                return_value={"status": "finished", "progress": 100, "completed": True},
+                "_rdt_monitor_list_torrents",
+                return_value=self.monitor_listing(
+                    [{"torrentId": key, "status": "finished", "progress": 100, "completed": True}],
+                    session,
+                ),
             ),
             patch.object(app_module, "rdt_cleanup_finished") as cleanup,
-            patch.object(app_module, "cleanup_monitor_artifact"),
             patch.object(app_module.time, "time", return_value=now),
         ):
-            app_module.monitor_once()
+            app_module.rdt_monitor.poll_once()
 
         cleanup.assert_called_once_with(session, key)
-        self.assertEqual(state, {})
-        self.assertEqual(saved, [{}])
+        self.assertEqual(self.monitor_store.snapshot(), {})
 
     def test_missing_finished_row_never_triggers_qbit(self) -> None:
         for fallback_enabled in (False, True):
@@ -82,7 +279,8 @@ class DeliveryTracingTests(unittest.TestCase):
                     "submission_key": f"submission-{fallback_enabled}",
                 }
                 state = {key: item}
-                saved = []
+                self.reset_monitor_store(f"missing-{fallback_enabled}")
+                self.seed_monitor_state(state)
                 app_module.submissions.begin(
                     item["submission_key"],
                     item["title"],
@@ -105,96 +303,70 @@ class DeliveryTracingTests(unittest.TestCase):
                         "load_settings",
                         return_value=settings(fallback_enabled),
                     ),
-                    patch.object(app_module, "load_monitor_state", return_value=state),
                     patch.object(
                         app_module,
-                        "save_monitor_state",
-                        side_effect=lambda value: saved.append(dict(value)),
+                        "_rdt_monitor_list_torrents",
+                        return_value=self.monitor_listing([]),
                     ),
-                    patch.object(app_module, "rdt_login", return_value=object()),
-                    patch.object(
-                        app_module,
-                        "rdt_json",
-                        side_effect=RuntimeError("HTTP 404"),
-                    ),
-                    patch.object(app_module, "rdt_find_row", return_value=None),
-                    patch.object(
-                        app_module,
-                        "cleanup_monitor_artifact",
-                    ) as artifact_cleanup,
-                    patch.object(
-                        app_module,
-                        "monitor_fallback",
-                        side_effect=AssertionError("qB no debe intervenir"),
-                    ),
+                    patch.object(app_module, "qbit_add_magnet", side_effect=AssertionError("qB no debe intervenir")),
+                    patch.object(self.monitor_store, "cleanup_artifact", wraps=self.monitor_store.cleanup_artifact) as artifact_cleanup,
                 ):
-                    app_module.monitor_once()
+                    app_module.rdt_monitor.poll_once()
 
                 artifact_cleanup.assert_called_once_with(item, "finished-missing")
-                self.assertEqual(state, {})
-                self.assertEqual(saved, [{}])
+                self.assertEqual(self.monitor_store.snapshot(), {})
                 submission = app_module.submissions.get(item["submission_key"])
                 self.assertEqual(submission["state"], "transport_done")
                 self.assertEqual(submission["rdt_id"], key)
 
     def test_finished_item_ignores_regressed_rdt_row_without_qbit(self) -> None:
         now = 1_000_000
-        for route in ("direct", "rediscovered"):
+        for route in ("id", "hash"):
             for elapsed, should_cleanup in ((29, False), (30, True)):
                 with self.subTest(route=route, elapsed=elapsed):
                     key = f"rdt-regressed-{route}-{elapsed}"
-                    row = {"status": "error", "progress": 0, "completed": False}
-                    direct_get = (
-                        patch.object(app_module, "rdt_json", return_value=row)
-                        if route == "direct"
-                        else patch.object(
-                            app_module,
-                            "rdt_json",
-                            side_effect=RuntimeError("HTTP 404"),
-                        )
-                    )
+                    info_hash = ("a" if route == "id" else "b") * 40
+                    row = {
+                        "torrentId": key if route == "id" else "rdt-renamed",
+                        "hash": info_hash,
+                        "status": "error",
+                        "progress": 0,
+                        "completed": False,
+                    }
                     item = {
                         "rdt_id": key,
                         "title": "Pelicula ya terminada",
                         "category": "movies",
                         "finished_seen_ts": now - elapsed,
+                        "hash": info_hash,
+                        "kind": "magnet",
                     }
                     state = {key: item}
-                    saved = []
                     session = object()
+                    self.reset_monitor_store(f"regressed-{route}-{elapsed}")
+                    self.seed_monitor_state(state)
 
                     with (
                         patch.object(app_module, "load_settings", return_value=settings(True)),
-                        patch.object(app_module, "load_monitor_state", return_value=state),
                         patch.object(
                             app_module,
-                            "save_monitor_state",
-                            side_effect=lambda value: saved.append(dict(value)),
+                            "_rdt_monitor_list_torrents",
+                            return_value=self.monitor_listing([row], session),
                         ),
-                        patch.object(app_module, "rdt_login", return_value=session),
-                        direct_get,
-                        patch.object(app_module, "rdt_find_row", return_value=row) as find_row,
                         patch.object(app_module, "rdt_cleanup_finished") as cleanup,
-                        patch.object(app_module, "cleanup_monitor_artifact"),
-                        patch.object(app_module, "monitor_fallback") as fallback,
+                        patch.object(app_module, "qbit_add_magnet") as fallback,
                         patch.object(app_module.time, "time", return_value=now),
                     ):
-                        app_module.monitor_once()
+                        app_module.rdt_monitor.poll_once()
 
                     fallback.assert_not_called()
-                    if route == "direct":
-                        find_row.assert_not_called()
-                    else:
-                        find_row.assert_called_once()
 
                     if should_cleanup:
                         cleanup.assert_called_once_with(session, key)
-                        self.assertEqual(state, {})
-                        self.assertEqual(saved, [{}])
+                        self.assertEqual(self.monitor_store.snapshot(), {})
                     else:
                         cleanup.assert_not_called()
-                        self.assertIn(key, state)
-                        self.assertEqual(saved, [state])
+                        self.assertIn(key, self.monitor_store.snapshot())
 
     def test_delivery_trace_normal_rdt_submission(self) -> None:
         with (

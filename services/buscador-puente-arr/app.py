@@ -18,6 +18,7 @@ import requests
 from flask import Flask, Response, jsonify, redirect, render_template, request
 from modulos.arr_trace import ArrTrace
 from modulos.persistent_jobs import PersistentJobStore
+from modulos.rdt_monitor import MonitorStore, RdtMonitor, RdtMonitorPorts, TorrentListing
 from modulos.search_history import SearchHistoryStore
 from modulos.submission_store import SubmissionStore, submission_key
 
@@ -51,7 +52,6 @@ SEARCH_HISTORY_PATH = DATA_DIR / "search_history.sqlite3"
 VIDEO_EXT_RE = re.compile(r"\.(mkv|mp4|avi|mov|m4v|wmv|ts|m2ts)$", re.I)
 ENGINE_LOCK = threading.Lock()
 SETTINGS_LOCK = threading.Lock()
-MONITOR_LOCK = threading.Lock()
 RESULT_CACHE_LOCK = threading.Lock()
 MONITOR_START_LOCK = threading.Lock()
 MONITOR_STARTED = False
@@ -66,7 +66,6 @@ CORRELATION_MAX_AGE_SEC = 7 * 24 * 60 * 60
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-MONITOR_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger("buscador-puente-arr")
 logger.setLevel(logging.INFO)
@@ -1843,22 +1842,38 @@ def qbit_delete(session: requests.Session, info_hash: str) -> None:
     logger.warning("qbit cleanup failed hash=%s", info_hash)
 
 
-def load_monitor_state() -> dict:
-    with MONITOR_LOCK:
-        try:
-            if MONITOR_STATE_PATH.exists():
-                data = json.loads(MONITOR_STATE_PATH.read_text(encoding="utf-8") or "{}")
-                return data if isinstance(data, dict) else {}
-        except Exception as exc:
-            logger.warning("monitor state load failed error=%s", str(exc)[:160])
-        return {}
+_monitor_store = MonitorStore(MONITOR_STATE_PATH, MONITOR_DIR, logger)
 
 
-def save_monitor_state(state: dict) -> None:
-    with MONITOR_LOCK:
-        tmp = MONITOR_STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(MONITOR_STATE_PATH)
+def _rdt_monitor_list_torrents() -> TorrentListing:
+    session = rdt_login()
+    rows = rdt_json(session, "/Api/Torrents") or []
+    if not isinstance(rows, list):
+        raise RuntimeError("listado RDT no valido")
+    return TorrentListing(
+        context=session,
+        rows=tuple(row for row in rows if isinstance(row, dict)),
+    )
+
+rdt_monitor = RdtMonitor(
+    store=_monitor_store,
+    ports=RdtMonitorPorts(
+        load_settings=lambda: load_settings(),
+        list_torrents=lambda: _rdt_monitor_list_torrents(),
+        rdt_delete=lambda session, torrent_id: rdt_delete(session, torrent_id),
+        rdt_cleanup_finished=lambda session, torrent_id: rdt_cleanup_finished(session, torrent_id),
+        qbit_add_magnet=lambda magnet, category, cleanup: qbit_add_magnet(magnet, category, cleanup),
+        qbit_add_torrent=lambda raw, title, category, cleanup: qbit_add_torrent(raw, title, category, cleanup),
+        submissions_update=lambda *args, **kwargs: submissions.update(*args, **kwargs),
+        normalized_category=lambda category: normalized_category(category),
+        magnet_hash=lambda magnet: magnet_hash(magnet),
+        torrent_info=lambda raw: torrent_info(raw),
+        now=lambda: time.time(),
+    ),
+    logger=logger,
+    finished_cleanup_delay_sec=RDT_FINISHED_CLEANUP_DELAY_SEC,
+    orphan_cleanup_sec=MONITOR_ORPHAN_CLEANUP_SEC,
+)
 
 
 def reusable_submission_result(row: dict, title: str, requested_category: str, category: str) -> dict:
@@ -1907,347 +1922,6 @@ def finish_submission(
         result=result,
     )
     return result
-
-
-def cleanup_orphan_monitor_artifacts(min_age_sec: int = MONITOR_ORPHAN_CLEANUP_SEC) -> int:
-    now = time.time()
-    state = load_monitor_state()
-    referenced: set[Path] = set()
-    for item in state.values():
-        torrent_path = str(item.get("torrent_path") or "").strip()
-        if not torrent_path:
-            continue
-        try:
-            path = Path(torrent_path)
-            if not path.is_absolute():
-                path = MONITOR_DIR / path
-            referenced.add(path.resolve())
-        except Exception:
-            continue
-
-    cleaned = 0
-    monitor_root = MONITOR_DIR.resolve()
-    for path in MONITOR_DIR.glob("*.torrent"):
-        try:
-            resolved = path.resolve()
-            if monitor_root not in resolved.parents:
-                continue
-            if resolved in referenced:
-                continue
-            age = now - path.stat().st_mtime
-            if age < min_age_sec:
-                continue
-            resolved.unlink(missing_ok=True)
-            cleaned += 1
-        except Exception as exc:
-            logger.warning("monitor orphan cleanup failed file=%s error=%s", path.name, str(exc)[:160])
-    if cleaned:
-        logger.info("monitor orphan artifacts cleaned count=%s", cleaned)
-    return cleaned
-
-
-def cleanup_monitor_artifact(item: dict, reason: str) -> None:
-    torrent_path = str(item.get("torrent_path") or "").strip()
-    if not torrent_path:
-        return
-    try:
-        path = Path(torrent_path)
-        if not path.is_absolute():
-            path = MONITOR_DIR / path
-        resolved = path.resolve()
-        monitor_root = MONITOR_DIR.resolve()
-        if monitor_root not in resolved.parents and resolved != monitor_root:
-            logger.warning("monitor artifact cleanup skipped outside dir path=%s", torrent_path)
-            return
-        resolved.unlink(missing_ok=True)
-        logger.info("monitor artifact cleaned path=%s reason=%s", resolved.name, reason)
-    except Exception as exc:
-        logger.warning("monitor artifact cleanup failed path=%s error=%s", torrent_path, str(exc)[:160])
-
-
-def register_monitor(
-    result: dict,
-    title: str,
-    category: str,
-    raw: bytes | None = None,
-    magnet: str = "",
-    submission_key_value: str = "",
-    trace_id: str = "",
-) -> None:
-    rdt_id = str(result.get("rdt_id") or "")
-    if not rdt_id:
-        return
-    now = int(time.time())
-    item = {
-        "rdt_id": rdt_id,
-        "title": title,
-        "category": normalized_category(category),
-        "first_seen": now,
-        "last_progress_ts": now,
-        "last_progress": -1.0,
-        "last_status": str(result.get("status") or ""),
-        "finished_seen_ts": 0,
-        "submission_key": submission_key_value,
-        "trace_id": trace_id,
-    }
-    if magnet:
-        item["kind"] = "magnet"
-        item["magnet"] = magnet
-        item["hash"] = magnet_hash(magnet)
-    elif raw:
-        info = torrent_info(raw)
-        torrent_path = MONITOR_DIR / f"{info['hash']}.torrent"
-        if not torrent_path.exists():
-            torrent_path.write_bytes(raw)
-        item["kind"] = "torrent"
-        item["hash"] = info["hash"]
-        item["torrent_path"] = str(torrent_path)
-    else:
-        return
-    state = load_monitor_state()
-    state[rdt_id] = item
-    save_monitor_state(state)
-
-
-def status_progress(row: dict) -> float:
-    for key in ("progress", "rdProgress", "downloadProgress", "percent", "percentage"):
-        value = row.get(key)
-        if value is None:
-            continue
-        try:
-            number = float(str(value).replace(",", "."))
-            return number * 100 if 0 <= number <= 1 else number
-        except ValueError:
-            pass
-    text = " ".join(str(row.get(key) or "") for key in ("statusText", "rdStatusRaw", "status", "error"))
-    match = re.search(r"(\d+(?:[\.,]\d+)?)\s*%", text)
-    if match:
-        try:
-            return float(match.group(1).replace(",", "."))
-        except ValueError:
-            return -1.0
-    return -1.0
-
-
-def rdt_status_text(row: dict) -> str:
-    return " ".join(str(row.get(key) or "") for key in ("statusText", "rdStatusRaw", "status", "error")).strip()
-
-
-def rdt_local_download_complete(row: dict) -> bool:
-    downloads = row.get("downloads")
-    if isinstance(downloads, list):
-        if not downloads:
-            return False
-        return all(
-            isinstance(download, dict)
-            and download.get("completed") not in (None, "", False)
-            for download in downloads
-        )
-
-    return row.get("completed") not in (None, "", False)
-
-
-def monitor_is_finished(row: dict) -> bool:
-    try:
-        if int(row.get("finished_seen_ts") or 0) > 0:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return rdt_local_download_complete(row)
-
-
-def monitor_should_fallback(row: dict, item: dict, settings: dict, now: int) -> tuple[bool, str]:
-    text = rdt_status_text(row)
-    low = text.lower()
-    if any(word in low for word in ("error", "failed", "fallo", "missing")):
-        return True, text[:160] or "estado malo"
-
-    progress = status_progress(row)
-    downloads = int(row.get("downloadsCount") or 0)
-    if downloads > 0 or "finished" in low or "downloaded" in low or "completed" in low:
-        return False, "ya tiene descarga"
-
-    last_progress = float(item.get("last_progress", -1))
-    if progress > last_progress + 0.01:
-        item["last_progress"] = progress
-        item["last_progress_ts"] = now
-        item["last_status"] = text
-        return False, "ha progresado"
-
-    last_ts = int(item.get("last_progress_ts") or item.get("first_seen") or now)
-    quiet_for = now - last_ts
-    rdt = settings.get("rdt", {})
-    limit = int(rdt.get("ready_timeout_sec", 5))
-    if quiet_for >= limit:
-        return True, f"sin progreso {quiet_for}s progreso={progress:.2f}%"
-    item["last_status"] = text
-    return False, f"esperando {quiet_for}s progreso={progress:.2f}%"
-
-
-def monitor_fallback(session: requests.Session, item: dict, reason: str, settings: dict) -> None:
-    category = normalized_category(str(item.get("category") or ""))
-    title = str(item.get("title") or "jackett")
-    key = str(item.get("submission_key") or "")
-    if key:
-        submissions.update(key, state="fallback_to_qbit", last_error=reason)
-    if item.get("kind") == "magnet":
-        qbit = qbit_add_magnet(str(item.get("magnet") or ""), category, False)
-    else:
-        torrent_path = Path(str(item.get("torrent_path") or ""))
-        if not torrent_path.exists():
-            raise RuntimeError("no encuentro torrent guardado para fallback")
-        qbit = qbit_add_torrent(torrent_path.read_bytes(), title, category, False)
-    if settings.get("rdt", {}).get("cleanup_on_fallback", True):
-        rdt_delete(session, str(item.get("rdt_id") or ""))
-    if key:
-        qbit_result = {
-            **qbit,
-            "ok": True,
-            "title": title,
-            "category": category,
-            "requested_category": str(item.get("requested_category") or category),
-            "fallback_from": reason[:180],
-            "submission_key": key,
-            "trace_id": str(item.get("trace_id") or ""),
-        }
-        submissions.update(
-            key,
-            state="submitted_qbit",
-            engine=qbit_result.get("engine", "qBittorrent"),
-            qbit_hash=qbit_result.get("hash", ""),
-            result=qbit_result,
-            last_error=reason[:180],
-        )
-    cleanup_monitor_artifact(item, "fallback")
-    logger.info("monitor fallback title=%s category=%s reason=%s", title, category, reason)
-
-
-def monitor_cleanup_finished(session: requests.Session, key: str, item: dict, row: dict, now: int, state: dict) -> bool:
-    text = rdt_status_text(row)
-    progress = status_progress(row)
-    try:
-        old_progress = float(item.get("last_progress", -1))
-    except (TypeError, ValueError):
-        old_progress = -1.0
-
-    item["last_progress"] = max(old_progress, progress, 100.0)
-    item["last_progress_ts"] = now
-    item["last_status"] = text or str(item.get("last_status") or "")
-    item["completed"] = True
-    item.pop("magnet", None)
-
-    finished_seen_ts = int(item.get("finished_seen_ts") or 0)
-    if not finished_seen_ts:
-        item["finished_seen_ts"] = now
-        logger.info("monitor finished seen id=%s title=%s wait=%ss", key, str(item.get("title") or "")[:120], RDT_FINISHED_CLEANUP_DELAY_SEC)
-        return False
-
-    if now - finished_seen_ts < RDT_FINISHED_CLEANUP_DELAY_SEC:
-        return False
-
-    rdt_cleanup_finished(session, str(item.get("rdt_id") or key))
-    submission_key_value = str(item.get("submission_key") or "")
-    if submission_key_value:
-        result = {
-            "ok": True,
-            "title": str(item.get("title") or ""),
-            "category": str(item.get("category") or "manual"),
-            "requested_category": str(item.get("requested_category") or item.get("category") or "manual"),
-            "engine": "RDT-Client",
-            "rdt_id": str(item.get("rdt_id") or key),
-            "submission_key": submission_key_value,
-            "trace_id": str(item.get("trace_id") or ""),
-        }
-        submissions.update(
-            submission_key_value,
-            state="transport_done",
-            engine="RDT-Client",
-            rdt_id=str(item.get("rdt_id") or key),
-            result=result,
-        )
-    cleanup_monitor_artifact(item, "finished")
-    state.pop(key, None)
-    logger.info("monitor cleaned finished rdt item id=%s preserve_local=true", key)
-    return True
-
-
-def monitor_finalize_missing_finished(key: str, item: dict, state: dict) -> None:
-    submission_key_value = str(item.get("submission_key") or "")
-    if submission_key_value:
-        submissions.update(
-            submission_key_value,
-            state="transport_done",
-            engine="RDT-Client",
-            rdt_id=str(item.get("rdt_id") or key),
-        )
-    cleanup_monitor_artifact(item, "finished-missing")
-    state.pop(key, None)
-    logger.info("monitor removed finished missing rdt item id=%s", key)
-
-
-def monitor_missing_item(session: requests.Session, key: str, item: dict, settings: dict, now: int, state: dict) -> bool:
-    row = rdt_find_row(session, str(item.get("rdt_id") or key), str(item.get("hash") or ""), set())
-    if row:
-        if monitor_is_finished(row) or monitor_is_finished(item):
-            monitor_cleanup_finished(session, key, item, row, now, state)
-            return True
-        fallback, reason = monitor_should_fallback(row, item, settings, now)
-        if fallback:
-            monitor_fallback(session, item, reason, settings)
-            state.pop(key, None)
-        return True
-
-    if monitor_is_finished(item):
-        monitor_finalize_missing_finished(key, item, state)
-        return True
-
-    monitor_fallback(session, item, "rdt item missing before progress", settings)
-    state.pop(key, None)
-    logger.info("monitor fallback missing rdt item id=%s", key)
-    return True
-
-
-def monitor_once() -> None:
-    settings = load_settings()
-    fallback_enabled = bool(
-        settings.get("rdt", {}).get("fallback_enabled", True)
-        and settings.get("qbit", {}).get("fallback_enabled", True)
-    )
-    state = load_monitor_state()
-    if not state:
-        return
-    session = rdt_login()
-    now = int(time.time())
-    changed = False
-    for key, item in list(state.items()):
-        try:
-            row = rdt_json(session, f"/Api/Torrents/Get/{quote(str(item.get('rdt_id') or key), safe='')}") or {}
-            if monitor_is_finished(row) or monitor_is_finished(item):
-                monitor_cleanup_finished(session, key, item, row, now, state)
-                changed = True
-                continue
-            if not fallback_enabled:
-                continue
-            fallback, reason = monitor_should_fallback(row, item, settings, now)
-            if fallback:
-                monitor_fallback(session, item, reason, settings)
-                state.pop(key, None)
-            changed = True
-        except Exception as exc:
-            error = str(exc)
-            if "HTTP 404" in error or "Not Found" in error:
-                if fallback_enabled:
-                    monitor_missing_item(session, key, item, settings, now, state)
-                    changed = True
-                elif monitor_is_finished(item):
-                    monitor_finalize_missing_finished(key, item, state)
-                    changed = True
-                continue
-            item["last_error"] = error[:180]
-            changed = True
-            logger.warning("monitor item failed id=%s error=%s", key, error[:180])
-    if changed:
-        save_monitor_state(state)
 
 
 def normalized_infohash(value: Any) -> str:
@@ -2352,7 +2026,7 @@ def link_pending_submissions() -> int:
 def monitor_loop() -> None:
     while True:
         try:
-            monitor_once()
+            rdt_monitor.poll_once()
         except Exception as exc:
             logger.warning("monitor loop failed error=%s", str(exc)[:180])
         try:
@@ -2375,7 +2049,7 @@ def start_monitor() -> None:
 
 
 def create_app() -> Flask:
-    cleanup_orphan_monitor_artifacts()
+    rdt_monitor.cleanup_orphans()
     start_monitor()
     return app
 
@@ -2435,7 +2109,14 @@ def deliver(
                 arr_trace.event("download", trace_id, "transport", "started", "Enviando magnet a RDT", {"engine": "RDT-Client"})
                 result = rdt_upload_magnet(download_url, category, cleanup)
                 if not cleanup:
-                    register_monitor(result, title, category, magnet=download_url, submission_key_value=key, trace_id=trace_id)
+                    rdt_monitor.register(
+                        result,
+                        title,
+                        category,
+                        magnet=download_url,
+                        submission_key_value=key,
+                        trace_id=trace_id,
+                    )
                     final = finish_submission(key, "rdt_monitoring", result, title, requested_for_key, category, trace_id)
                     arr_trace.finish("download", trace_id, "rdt_monitoring", final)
                     return final
@@ -2496,9 +2177,23 @@ def deliver(
                 result = rdt_upload_torrent(raw, title, category, cleanup)
             if not cleanup:
                 if resolved_magnet:
-                    register_monitor(result, title, category, magnet=resolved_magnet, submission_key_value=key, trace_id=trace_id)
+                    rdt_monitor.register(
+                        result,
+                        title,
+                        category,
+                        magnet=resolved_magnet,
+                        submission_key_value=key,
+                        trace_id=trace_id,
+                    )
                 else:
-                    register_monitor(result, title, category, raw=raw, submission_key_value=key, trace_id=trace_id)
+                    rdt_monitor.register(
+                        result,
+                        title,
+                        category,
+                        raw=raw,
+                        submission_key_value=key,
+                        trace_id=trace_id,
+                    )
                 final = finish_submission(key, "rdt_monitoring", result, title, requested_for_key, category, trace_id)
                 arr_trace.finish("download", trace_id, "rdt_monitoring", final)
                 return final
@@ -2660,7 +2355,7 @@ def api_classify():
 
 @app.get("/api/engine-status")
 def api_engine_status():
-    state = load_monitor_state()
+    state = rdt_monitor.snapshot()
     return jsonify({
         "ok": True,
         "monitoring": len(state),
