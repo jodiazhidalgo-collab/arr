@@ -12,6 +12,8 @@ from arr_orchestrator.identity.resolver.title_candidates import (
     ordered_title_candidates,
     series_title_candidates,
 )
+from arr_orchestrator.identity.resolver.scoring import score_candidate
+from arr_orchestrator.identity.resolver.service import RESOLVER_ALGORITHM_VERSION
 from arr_orchestrator.name_resolver import (
     NameResolver,
     ResolutionError,
@@ -141,6 +143,28 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(payload["details"]["token"], "<REDACTED>")
         self.assertEqual(payload["details"]["query"], "Pelicula de prueba")
         self.assertNotIn("must-not-leak", json.dumps(payload, ensure_ascii=False))
+
+    def test_trace_snapshot_is_sanitized_and_independent(self):
+        resolver, _ = self.resolver({})
+        resolver._trace = {
+            "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+            "decision": {
+                "status": "ACCEPTED",
+                "eligibility_reason": "single_primary_title",
+            },
+            "token": "must-not-leak",
+        }
+
+        snapshot = resolver.trace_snapshot()
+
+        self.assertEqual(
+            snapshot["resolver_algorithm_version"],
+            RESOLVER_ALGORITHM_VERSION,
+        )
+        self.assertEqual(snapshot["token"], "<REDACTED>")
+        self.assertNotIn("must-not-leak", json.dumps(snapshot, ensure_ascii=False))
+        snapshot["decision"]["status"] = "MUTATED"
+        self.assertEqual(resolver._trace["decision"]["status"], "ACCEPTED")
 
     def test_ambiguous_preview_never_reads_filesystem_evidence_or_leaks_paths(self):
         first = movie_payload(1, "El desconocido", "Unknown", 2000)
@@ -294,7 +318,10 @@ class NameResolverTests(unittest.TestCase):
         payload = resolver.preview("Canta 2016", "movies", rules)
 
         self.assertEqual(payload["status"], "REJECTED_MARGIN")
-        self.assertEqual(payload["candidates"][0]["tmdb_id"], 427416)
+        self.assertEqual(
+            [item["tmdb_id"] for item in payload["candidates"]],
+            [335797, 427416],
+        )
         self.assertEqual(
             payload["decision"]["original_language_preference"]["enabled"],
             False,
@@ -304,9 +331,10 @@ class NameResolverTests(unittest.TestCase):
         )
 
     def test_single_english_candidate_is_not_rescued_as_an_ambiguity(self):
-        unrelated = movie_payload(99, "Completamente distinto", "Different", 1900, "en")
+        unrelated = movie_payload(99, "Nadaa", "Nadaa", 1900, "en")
         rules = factory_identity_rules()
         rules["resolver"]["acceptance"]["min_score"] = -100
+        rules["resolver"]["acceptance"]["min_margin"] = 20
         resolver, _ = self.resolver(
             {"/search/movie": {"results": [unrelated]}, "/movie/99": unrelated}
         )
@@ -560,7 +588,17 @@ class NameResolverTests(unittest.TestCase):
 
         payload = resolver.preview("Objetivo", "movies", rules)
 
-        self.assertEqual(payload["status"], "REJECTED_MARGIN")
+        self.assertEqual(payload["status"], "REJECTED")
+        self.assertEqual(
+            payload["decision"]["status"],
+            "REJECTED",
+        )
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "title_selection_uncertain",
+        )
+        self.assertTrue(payload["decision"]["eligibility_blocked"])
+        self.assertTrue(payload["selection_uncertain"])
         self.assertEqual(
             [item["tmdb_id"] for item in payload["candidates"]],
             [1, 2, 3],
@@ -569,6 +607,10 @@ class NameResolverTests(unittest.TestCase):
             payload["decision"]["oldest_exact_title_preference"]["applied"]
         )
         detail_paths = [call[0].split("/3", 1)[1] for call in session.calls]
+        self.assertEqual(
+            [path for path in detail_paths if path.startswith("/movie/")],
+            ["/movie/1", "/movie/2", "/movie/3"],
+        )
         self.assertNotIn("/movie/4", detail_paths)
 
     def test_preview_preserves_zero_min_score_when_classifying_rejection(self):
@@ -598,6 +640,14 @@ class NameResolverTests(unittest.TestCase):
         self.assertEqual(direct_payload["status"], "ACCEPTED")
         self.assertTrue(direct_payload["decision"]["bypass"])
         self.assertEqual(direct_payload["decision"]["source"], "tmdb_id")
+        self.assertEqual(
+            direct_payload["decision"]["eligibility_reason"],
+            "tmdb_id_validated",
+        )
+        self.assertEqual(
+            direct_payload["identity"]["resolver_algorithm_version"],
+            RESOLVER_ALGORITHM_VERSION,
+        )
         self.assertFalse(direct_payload["decision"]["has_second_candidate"])
         self.assertEqual(
             direct_payload["candidates"][0]["breakdown"],
@@ -622,12 +672,20 @@ class NameResolverTests(unittest.TestCase):
         self.assertTrue(forced_payload["decision"]["bypass"])
         self.assertEqual(forced_payload["decision"]["source"], "forced_match")
         self.assertEqual(
+            forced_payload["decision"]["eligibility_reason"],
+            "forced_match_validated",
+        )
+        self.assertEqual(
             forced_payload["candidates"][0]["breakdown"][0]["key"],
             "direct_identity",
         )
+        self.assertEqual(
+            forced_payload["candidates"][0]["title_match_level"],
+            "direct",
+        )
 
     def test_preview_score_rejection_and_no_candidates_have_distinct_decisions(self):
-        wrong = movie_payload(22, "Completamente distinto", "Completely Different", 2024)
+        wrong = movie_payload(22, "Objetiv", "Objetiv", 2024)
         resolver, _ = self.resolver(
             {"/search/movie": {"results": [wrong]}, "/movie/22": wrong}
         )
@@ -730,10 +788,42 @@ class NameResolverTests(unittest.TestCase):
         first = resolver.resolve(job, input_root)
         call_count = len(session.calls)
         second = resolver.resolve(job, input_root)
+        cache_trace = resolver.trace_snapshot()
 
         self.assertEqual(first.tmdb_id, second.tmdb_id)
         self.assertEqual(len(session.calls), call_count)
         self.assertEqual(second.source, "cache")
+        self.assertEqual(
+            first.resolver_algorithm_version,
+            RESOLVER_ALGORITHM_VERSION,
+        )
+        self.assertEqual(
+            second.resolver_algorithm_version,
+            RESOLVER_ALGORITHM_VERSION,
+        )
+        self.assertTrue(cache_trace["cache_hit"])
+        self.assertEqual(cache_trace["candidates"], [])
+        self.assertEqual(
+            cache_trace["resolver_algorithm_version"],
+            RESOLVER_ALGORITHM_VERSION,
+        )
+        self.assertEqual(
+            cache_trace["decision"],
+            {
+                "status": "ACCEPTED",
+                "accepted": True,
+                "has_scoring": True,
+                "source": "cache",
+                "cache_reused": True,
+                "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+                "eligibility_reason": "cache_v3_reuse",
+                "eligibility_blocked": False,
+                "score": second.score,
+                "margin": second.margin,
+            },
+        )
+        self.assertNotIn("candidate_provenance", cache_trace)
+        self.assertNotIn("search_strategy", cache_trace)
 
     def test_cache_signature_uses_resolution_rules_but_ignores_formatting(self):
         correct = movie_payload(9279, "Un padre en apuros", "Jingle All the Way", 1996)
@@ -803,7 +893,10 @@ class NameResolverTests(unittest.TestCase):
         self.assertIn("The Visitors", identity.aliases)
         self.assertIn("Los visitantes", identity.aliases)
         search_calls = [call for call in session.calls if "/search/movie" in call[0]]
-        self.assertGreaterEqual(len(search_calls), 3)
+        self.assertEqual(
+            [call[1]["language"] for call in search_calls],
+            ["es-ES", "en-US"],
+        )
         detail_calls = [call for call in session.calls if "/movie/" in call[0]]
         self.assertLessEqual(len(detail_calls), 3)
 
@@ -897,6 +990,234 @@ class NameResolverTests(unittest.TestCase):
         self.assertTrue(
             any(call[1].get("query") == "The Visitors" for call in session.calls)
         )
+
+    def test_preview_configured_alias_keeps_explicit_primary_authority(self):
+        correct = movie_payload(11687, "The Visitors", "Les Visiteurs", 1993)
+        false_primary = movie_payload(
+            9001,
+            "Visitantes del tiempo",
+            "Visitantes del tiempo",
+            1993,
+        )
+
+        def search(params):
+            if params.get("query") == "The Visitors":
+                return {"results": [correct]}
+            return {"results": [false_primary]}
+
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/11687": correct,
+                "/movie/9001": false_primary,
+            }
+        )
+        resolver.configure_rules(
+            {
+                "movies": {
+                    "query_aliases": ["Visitantes del tiempo | The Visitors"],
+                }
+            }
+        )
+
+        payload = resolver.preview("Visitantes.del.tiempo.1993.mkv", "movies")
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 11687)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "configured_primary",
+        )
+        self.assertEqual(payload["candidates"][0]["title_match_level"], "configured")
+        self.assertIn(
+            "configured",
+            payload["candidates"][0]["search_provenance"]["sources"],
+        )
+        self.assertEqual(
+            payload["search_strategy"]["early_stop_reason"],
+            "configured_primary_confirmed",
+        )
+
+    def test_configured_alias_year_arbitration_preserves_safe_cases(self):
+        primary_2020 = movie_payload(2, "Target", "Target", 2020)
+
+        def preview_for(configured, name):
+            def search(params):
+                if params.get("query") == "Configured Target":
+                    return {"results": [configured]}
+                if params.get("query") == "Target":
+                    return {"results": [primary_2020]}
+                return {"results": []}
+
+            resolver, _ = self.resolver(
+                {
+                    "/search/movie": search,
+                    f"/movie/{configured['id']}": configured,
+                    "/movie/2": primary_2020,
+                }
+            )
+            resolver.configure_rules(
+                {
+                    "movies": {
+                        "query_aliases": ["Target | Configured Target"],
+                    }
+                }
+            )
+            return resolver.preview(name, "movies")
+
+        mismatched = preview_for(
+            movie_payload(1, "Configured Target", "Configured Target", 1990),
+            "Target (2020).mkv",
+        )
+        without_year = preview_for(
+            movie_payload(3, "Configured Target", "Configured Target", 1990),
+            "Target.mkv",
+        )
+        exact_year = preview_for(
+            movie_payload(4, "Configured Target", "Configured Target", 2020),
+            "Target (2020).mkv",
+        )
+
+        self.assertEqual(mismatched["status"], "ACCEPTED")
+        self.assertEqual(mismatched["identity"]["tmdb_id"], 2)
+        self.assertEqual(
+            mismatched["decision"]["eligibility_reason"],
+            "single_primary_title",
+        )
+        for payload, expected_id in ((without_year, 3), (exact_year, 4)):
+            with self.subTest(expected_id=expected_id):
+                self.assertEqual(payload["status"], "ACCEPTED")
+                self.assertEqual(payload["identity"]["tmdb_id"], expected_id)
+                self.assertEqual(
+                    payload["decision"]["eligibility_reason"],
+                    "configured_primary",
+                )
+
+    def test_tv_wrong_year_configured_alias_cannot_stop_before_primary(self):
+        configured_1995 = tv_payload(
+            10,
+            "The Office",
+            "The Office",
+            1995,
+            seasons=6,
+        )
+        primary_2005 = tv_payload(
+            20,
+            "La oficina",
+            "La oficina",
+            2005,
+            seasons=9,
+        )
+
+        def search(params):
+            if params.get("query") == "The Office":
+                return {"results": [configured_1995]}
+            if params.get("query") == "La oficina":
+                return {"results": [primary_2005]}
+            return {"results": []}
+
+        resolver, session = self.resolver(
+            {
+                "/search/tv": search,
+                "/tv/10": configured_1995,
+                "/tv/20": primary_2005,
+            }
+        )
+        resolver.configure_rules(
+            {
+                "tv": {
+                    "query_aliases": ["La oficina | The Office"],
+                }
+            }
+        )
+
+        payload = resolver.preview(
+            "La oficina (2005) S02E01.mkv",
+            "tv",
+        )
+
+        search_queries = [
+            call[1].get("query")
+            for call in session.calls
+            if "/search/tv" in call[0]
+        ]
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 20)
+        self.assertEqual(payload["identity"]["season"], 2)
+        self.assertEqual(search_queries[:2], ["The Office", "La oficina"])
+        self.assertEqual(len(search_queries), 2)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "single_primary_title",
+        )
+        self.assertEqual(
+            payload["search_strategy"]["early_stop_reason"],
+            "single_primary_confirmed",
+        )
+        self.assertFalse(payload["search_strategy"]["early_detail_attempted"])
+
+    def test_tv_configured_alias_without_season_count_waits_for_primary(self):
+        configured_search = tv_payload(
+            30,
+            "The Office",
+            "The Office",
+            2005,
+            seasons=1,
+        )
+        configured_search.pop("number_of_seasons")
+        configured_detail = tv_payload(
+            30,
+            "The Office",
+            "The Office",
+            2005,
+            seasons=1,
+        )
+        primary = tv_payload(
+            40,
+            "La oficina",
+            "La oficina",
+            2005,
+            seasons=9,
+        )
+
+        def search(params):
+            return {
+                "results": (
+                    [configured_search]
+                    if params.get("query") == "The Office"
+                    else [primary]
+                    if params.get("query") == "La oficina"
+                    else []
+                )
+            }
+
+        resolver, session = self.resolver(
+            {
+                "/search/tv": search,
+                "/tv/30": configured_detail,
+                "/tv/40": primary,
+            }
+        )
+        resolver.configure_rules(
+            {"tv": {"query_aliases": ["La oficina | The Office"]}}
+        )
+
+        payload = resolver.preview("La oficina (2005) S02E01.mkv", "tv")
+        queries = [
+            call[1].get("query")
+            for call in session.calls
+            if "/search/tv" in call[0]
+        ]
+
+        self.assertEqual(queries[:2], ["The Office", "La oficina"])
+        self.assertGreaterEqual(len(queries), 2)
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 40)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "single_primary_title",
+        )
+        self.assertFalse(payload["search_strategy"]["early_detail_attempted"])
 
     def test_configured_query_alias_runs_before_false_automatic_winner(self):
         correct = movie_payload(11687, "The Visitors", "Les Visiteurs", 1993)
@@ -1241,6 +1562,702 @@ class NameResolverTests(unittest.TestCase):
         self.assertTrue(
             any(call[1].get("query") == "Codigo Traje Rojo" for call in session.calls)
         )
+
+    def test_preview_simple_primary_keeps_score_and_stops_after_one_search(self):
+        correct = movie_payload(50, "Objetivo", "Objetivo", 2024)
+        resolver, session = self.resolver(
+            {"/search/movie": {"results": [correct]}, "/movie/50": correct}
+        )
+
+        payload = resolver.preview("Objetivo.2024.mkv", "movies")
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 50)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "single_primary_title",
+        )
+        self.assertGreaterEqual(payload["decision"]["score"], 75)
+        self.assertEqual(payload["candidates"][0]["title_match_level"], "primary")
+        search_calls = [
+            call for call in session.calls if "/search/movie" in call[0]
+        ]
+        self.assertEqual(len(search_calls), 1)
+        self.assertEqual(payload["search_strategy"]["early_stop_phase"], "primary")
+        self.assertEqual(
+            payload["search_strategy"]["early_stop_reason"],
+            "single_primary_confirmed",
+        )
+        self.assertFalse(payload["search_strategy"]["early_detail_attempted"])
+        self.assertFalse(payload["search_strategy"]["early_detail_reused"])
+        self.assertEqual(payload["search_strategy"]["detail_requests"], 1)
+        self.assertEqual(
+            [call[0].split("/3", 1)[1] for call in session.calls if "/movie/" in call[0]],
+            ["/movie/50"],
+        )
+
+    def test_incontrolable_progressive_detail_fixes_regional_search_year_and_reuses_it(self):
+        regional_search = movie_payload(1317149, "I Swear", "I Swear", 2026)
+        detailed = movie_payload(1317149, "Incontrolable", "I Swear", 2025)
+
+        def search(params):
+            return {
+                "results": [regional_search]
+                if params.get("query") == "Incontrolable"
+                else []
+            }
+
+        resolver, session = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/1317149": detailed,
+            }
+        )
+
+        payload = resolver.preview(
+            "Incontrolable (I Swear) (2025).mkv",
+            "movies",
+        )
+
+        search_calls = [call for call in session.calls if "/search/movie" in call[0]]
+        detail_calls = [call for call in session.calls if "/movie/1317149" in call[0]]
+        strategy = payload["search_strategy"]
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 1317149)
+        self.assertEqual(payload["identity"]["year"], 2025)
+        self.assertEqual(payload["decision"]["eligibility_reason"], "corroborated_titles")
+        self.assertEqual(len(search_calls), 1)
+        self.assertEqual(len(detail_calls), 1)
+        self.assertTrue(strategy["early_detail_attempted"])
+        self.assertTrue(strategy["early_detail_reused"])
+        self.assertEqual(strategy["detail_requests"], 1)
+        self.assertEqual(strategy["early_stop_reason"], "all_atomic_titles_confirmed")
+        self.assertEqual(payload["candidates"][0]["title_match_level"], "corroborated")
+
+    def test_el_oso_progressive_detail_accepts_raw_alternate_below_threshold(self):
+        guessed = {
+            "title": "El oso",
+            "year": 2022,
+            "season": 1,
+            "_title_evidence": [
+                {
+                    "value": "El oso",
+                    "role": "primary",
+                    "source": "parentheses",
+                    "group_id": "parser:0",
+                },
+                {
+                    "value": "The Bear",
+                    "role": "alternate",
+                    "source": "parentheses",
+                    "group_id": "parser:0",
+                },
+            ],
+        }
+        raw_candidate = ResolverCandidate(
+            136315,
+            "tv",
+            "The Bear",
+            "The Bear",
+            2022,
+            ["The Bear"],
+            season_count=3,
+        )
+        raw_score, _ = score_candidate(raw_candidate, guessed, [], False)
+        self.assertLess(raw_score, 75)
+
+        raw = tv_payload(136315, "The Bear", "The Bear", 2022, seasons=3)
+        detailed = tv_payload(136315, "El oso", "The Bear", 2022, seasons=3)
+
+        def search(params):
+            return {
+                "results": [raw]
+                if params.get("query") == "El oso"
+                else []
+            }
+
+        resolver, session = self.resolver(
+            {
+                "/search/tv": search,
+                "/tv/136315": detailed,
+            }
+        )
+        payload = resolver.preview(
+            "El oso (The Bear) (2022) S01E01.mkv",
+            "tv",
+        )
+
+        strategy = payload["search_strategy"]
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 136315)
+        self.assertEqual(payload["decision"]["eligibility_reason"], "corroborated_titles")
+        self.assertEqual(
+            sum("/search/tv" in call[0] for call in session.calls),
+            1,
+        )
+        self.assertEqual(
+            sum("/tv/136315" in call[0] for call in session.calls),
+            1,
+        )
+        self.assertTrue(strategy["early_detail_attempted"])
+        self.assertTrue(strategy["early_detail_reused"])
+        self.assertEqual(strategy["detail_requests"], 1)
+        self.assertEqual(strategy["early_stop_reason"], "all_atomic_titles_confirmed")
+
+    def test_progressive_detail_failure_is_not_retried_and_forces_review(self):
+        raw = movie_payload(1317149, "I Swear", "I Swear", 2025)
+
+        def search(params):
+            return {
+                "results": [raw]
+                if params.get("query") == "Incontrolable"
+                else []
+            }
+
+        resolver, session = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/1317149": FakeResponse(
+                    {"status_message": "temporary failure"},
+                    status_code=500,
+                ),
+            }
+        )
+
+        payload = resolver.preview(
+            "Incontrolable (I Swear) (2025).mkv",
+            "movies",
+        )
+
+        strategy = payload["search_strategy"]
+        self.assertEqual(payload["status"], "REJECTED")
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "title_selection_uncertain",
+        )
+        self.assertTrue(payload["selection_uncertain"])
+        self.assertTrue(strategy["early_detail_attempted"])
+        self.assertFalse(strategy["early_detail_reused"])
+        self.assertTrue(strategy["detail_incomplete"])
+        self.assertEqual(strategy["detail_requests"], 1)
+        self.assertEqual(
+            sum("/movie/1317149" in call[0] for call in session.calls),
+            1,
+        )
+
+    def test_preview_incontrolable_real_case_requires_both_title_halves(self):
+        target = movie_payload(1317149, "Incontrolable", "I Swear", 2025)
+        juror = movie_payload(1044736, "El jurado", "Je le jure", 2025)
+        unrelated = movie_payload(1409966, "7天", "7天", 2025)
+
+        def search(params):
+            if params.get("query") == "I Swear":
+                return {"results": [juror, unrelated, target]}
+            return {"results": []}
+
+        resolver, session = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/1317149": target,
+                "/movie/1044736": juror,
+                "/movie/1409966": unrelated,
+            }
+        )
+
+        payload = resolver.preview(
+            "Incontrolable (I Swear) (2025).mkv",
+            "movies",
+        )
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 1317149)
+        self.assertEqual(
+            payload["identity"]["resolver_algorithm_version"],
+            RESOLVER_ALGORITHM_VERSION,
+        )
+        self.assertEqual(
+            payload["decision"]["resolver_algorithm_version"],
+            RESOLVER_ALGORITHM_VERSION,
+        )
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "corroborated_titles",
+        )
+        self.assertEqual(payload["decision"]["eligible_candidate_count"], 1)
+        self.assertFalse(payload["decision"]["eligibility_blocked"])
+        self.assertFalse(
+            payload["decision"]["strict_alternate_fallback"]["applied"]
+        )
+        candidates = {item["tmdb_id"]: item for item in payload["candidates"]}
+        self.assertTrue(candidates[1317149]["eligible"])
+        self.assertFalse(candidates[1044736]["eligible"])
+        self.assertFalse(candidates[1409966]["eligible"])
+        self.assertEqual(candidates[1317149]["title_match_level"], "corroborated")
+        self.assertTrue(
+            all(
+                "identity_exact" in match
+                for candidate in candidates.values()
+                for match in candidate["title_matches"]
+            )
+        )
+        self.assertIn(
+            "alternate",
+            candidates[1317149]["search_provenance"]["sources"],
+        )
+        self.assertNotIn("query", candidates[1317149]["search_provenance"])
+        self.assertEqual(payload["search_strategy"]["mode"], "phased_round_robin")
+        self.assertEqual(
+            payload["search_strategy"]["early_stop_reason"],
+            "all_atomic_titles_confirmed",
+        )
+        self.assertFalse(payload["selection_uncertain"])
+        self.assertTrue(
+            any(
+                item["tmdb_id"] == 1317149 and item["alternate_only"]
+                for item in payload["candidate_provenance"]
+            )
+        )
+        provenance_json = json.dumps(
+            payload["candidate_provenance"],
+            ensure_ascii=False,
+        )
+        self.assertNotIn("Incontrolable", provenance_json)
+        self.assertNotIn("I Swear", provenance_json)
+        queries = [
+            call[1].get("query")
+            for call in session.calls
+            if "/search/movie" in call[0]
+        ]
+        self.assertIn("Incontrolable", queries)
+        self.assertIn("I Swear", queries)
+        self.assertLessEqual(len(queries), 4)
+
+    def test_composite_tmdb_title_corroborates_and_stops_on_primary_search(self):
+        target = movie_payload(
+            1317149,
+            "Incontrolable (I Swear)",
+            "I Swear",
+            2025,
+        )
+
+        def search(params):
+            return {
+                "results": [target]
+                if params.get("query") == "Incontrolable"
+                else []
+            }
+
+        resolver, session = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/1317149": target,
+            }
+        )
+
+        payload = resolver.preview(
+            "Incontrolable (I Swear) (2025).mkv",
+            "movies",
+        )
+
+        search_calls = [
+            call for call in session.calls if "/search/movie" in call[0]
+        ]
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 1317149)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "corroborated_titles",
+        )
+        self.assertEqual(payload["candidates"][0]["title_match_level"], "corroborated")
+        self.assertEqual(len(search_calls), 1)
+        self.assertLessEqual(len(search_calls), 4)
+        self.assertEqual(
+            payload["search_strategy"]["early_stop_reason"],
+            "all_atomic_titles_confirmed",
+        )
+        self.assertFalse(payload["search_strategy"]["early_detail_attempted"])
+        self.assertFalse(payload["search_strategy"]["early_detail_reused"])
+        self.assertEqual(payload["search_strategy"]["detail_requests"], 1)
+        self.assertEqual(
+            sum("/movie/1317149" in call[0] for call in session.calls),
+            1,
+        )
+
+    def test_corroborated_detail_wins_over_omitted_alternate_uncertainty(self):
+        target = movie_payload(1317149, "Incontrolable", "I Swear", 2025)
+        primary_one = movie_payload(
+            1044736,
+            "Incontrolable",
+            "Primary decoy one",
+            2025,
+        )
+        primary_two = movie_payload(
+            1044737,
+            "Incontrolable",
+            "Primary decoy two",
+            2025,
+        )
+        omitted_alternate = movie_payload(
+            1409966,
+            "I Swear",
+            "I Swear",
+            2025,
+        )
+
+        def search(params):
+            if params.get("query") == "Incontrolable":
+                return {"results": [primary_one, primary_two, target]}
+            if params.get("query") == "I Swear":
+                return {"results": [omitted_alternate]}
+            return {"results": []}
+
+        resolver, session = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/1044736": primary_one,
+                "/movie/1044737": primary_two,
+                "/movie/1317149": target,
+            }
+        )
+        rules = factory_identity_rules()
+        rules["resolver"]["acceptance"]["early_stop_score"] = 999
+        rules["resolver"]["acceptance"]["early_stop_margin"] = 999
+
+        payload = resolver.preview(
+            "Incontrolable (I Swear) (2025).mkv",
+            "movies",
+            rules,
+        )
+
+        detailed_ids = [item["tmdb_id"] for item in payload["candidates"]]
+        provenance = {
+            item["tmdb_id"]: item for item in payload["candidate_provenance"]
+        }
+        detail_paths = [
+            call[0].split("/3", 1)[1]
+            for call in session.calls
+            if "/movie/" in call[0]
+        ]
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 1317149)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "corroborated_titles",
+        )
+        self.assertEqual(payload["decision"]["eligible_candidate_count"], 1)
+        self.assertFalse(payload["decision"]["eligibility_blocked"])
+        self.assertTrue(payload["selection_uncertain"])
+        self.assertTrue(payload["selection_uncertainty_alternate_only"])
+        self.assertEqual(len(detailed_ids), 3)
+        self.assertIn(1317149, detailed_ids)
+        self.assertEqual(provenance[1409966]["exact_sources"], ["alternate"])
+        self.assertTrue(provenance[1409966]["alternate_only"])
+        self.assertFalse(provenance[1409966]["selected_for_detail"])
+        self.assertEqual(payload["raw_exact_candidate_counts"]["total"], 4)
+        self.assertNotIn("/movie/1409966", detail_paths)
+
+    def test_preview_movie_strict_alternate_needs_unique_exact_year(self):
+        target = movie_payload(200, "Remote Truth", "Remote Truth", 2024)
+        rival = movie_payload(201, "Titulo local", "Titulo local", 2023)
+
+        def search(params):
+            if params.get("query") == "Titulo local":
+                return {"results": [rival]}
+            if params.get("query") == "Remote Truth":
+                return {"results": [target]}
+            return {"results": []}
+
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/200": target,
+                "/movie/201": rival,
+            }
+        )
+
+        payload = resolver.preview(
+            "Titulo local (Remote Truth) (2024).mkv",
+            "movies",
+        )
+
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 200)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "strict_alternate_fallback",
+        )
+        self.assertTrue(
+            payload["decision"]["strict_alternate_fallback"]["applied"]
+        )
+        self.assertTrue(payload["candidates"][0]["eligible"])
+        self.assertEqual(payload["candidates"][0]["title_match_level"], "alternate")
+
+    def test_preview_omitted_part_number_cannot_drive_strict_alternate_fallback(self):
+        target = movie_payload(
+            300,
+            "Long Saga Chapter IV final",
+            "Long Saga Chapter IV final",
+            2024,
+        )
+
+        def search(params):
+            if params.get("query") == "Long Saga Chapter final":
+                return {"results": [target]}
+            return {"results": []}
+
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": search,
+                "/movie/300": target,
+            }
+        )
+
+        guessed = {
+            "title": "Unrelated local title",
+            "year": 2024,
+            "_title_candidates": [
+                "Unrelated local title",
+                "Long Saga Chapter final",
+            ],
+            "_title_evidence": [
+                {
+                    "value": "Unrelated local title",
+                    "role": "primary",
+                    "source": "parentheses",
+                    "group_id": "parser:0",
+                },
+                {
+                    "value": "Long Saga Chapter final",
+                    "role": "alternate",
+                    "source": "parentheses",
+                    "group_id": "parser:0",
+                },
+            ],
+        }
+        with patch(
+            "arr_orchestrator.identity.resolver.service.best_guess",
+            return_value=guessed,
+        ):
+            payload = resolver.preview(
+                "Unrelated local title (Long Saga Chapter final) (2024).mkv",
+                "movies",
+            )
+
+        alternate_match = next(
+            item
+            for item in payload["candidates"][0]["title_matches"]
+            if item["role"] == "alternate"
+        )
+        self.assertEqual(payload["status"], "REJECTED")
+        self.assertEqual(
+            payload["decision"]["status"],
+            "REJECTED",
+        )
+        self.assertTrue(payload["decision"]["eligibility_blocked"])
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "title_evidence_unconfirmed",
+        )
+        self.assertFalse(
+            payload["decision"]["strict_alternate_fallback"]["applied"]
+        )
+        self.assertTrue(alternate_match["exact"])
+        self.assertFalse(alternate_match["identity_exact"])
+        self.assertIn(
+            {
+                "path": "resolver.title_matching.allow_omitted_part_number",
+                "detail": "Número de saga omitido",
+            },
+            payload["candidates"][0]["matching_rules"],
+        )
+
+    def test_preview_legacy_editorial_descriptor_is_rejected_by_eligibility(self):
+        descriptor = movie_payload(
+            301,
+            "Extended Edition",
+            "Extended Edition",
+            1982,
+        )
+        guessed = {
+            "title": "Blade Runner",
+            "_display_title": "Extended Edition",
+            "year": 1982,
+            "_title_candidates": ["Blade Runner", "Extended Edition"],
+        }
+        resolver, _ = self.resolver(
+            {
+                "/search/movie": {"results": [descriptor]},
+                "/movie/301": descriptor,
+            }
+        )
+
+        with patch(
+            "arr_orchestrator.identity.resolver.service.best_guess",
+            return_value=guessed,
+        ):
+            payload = resolver.preview(
+                "Blade Runner Extended Edition (1982).mkv",
+                "movies",
+            )
+
+        self.assertEqual(payload["status"], "REJECTED")
+        self.assertEqual(
+            payload["decision"]["status"],
+            "REJECTED",
+        )
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "title_evidence_unconfirmed",
+        )
+        self.assertTrue(payload["decision"]["eligibility_blocked"])
+        self.assertFalse(payload["candidates"][0]["eligible"])
+        self.assertEqual(payload["candidates"][0]["title_match_level"], "none")
+
+    def test_preview_la_oficina_needs_2005_and_rejects_impossible_season(self):
+        target = tv_payload(2316, "The Office", "The Office", 2005, seasons=9)
+        rival = tv_payload(999, "La oficina", "La oficina", 1995, seasons=6)
+
+        def search(params):
+            if params.get("query") == "La oficina":
+                return {"results": [rival]}
+            if params.get("query") == "The Office":
+                return {"results": [target]}
+            return {"results": []}
+
+        routes = {
+            "/search/tv": search,
+            "/tv/2316": target,
+            "/tv/999": rival,
+        }
+        resolver, session = self.resolver(routes)
+
+        without_year = resolver.preview(
+            "La oficina (The Office) S02E01.mkv",
+            "tv",
+        )
+
+        self.assertTrue(without_year["decision"]["eligibility_blocked"])
+        self.assertEqual(
+            without_year["decision"]["eligibility_reason"],
+            "title_evidence_conflict",
+        )
+        self.assertFalse(
+            without_year["decision"]["strict_alternate_fallback"]["applied"]
+        )
+        searched_without_year = [
+            call[1].get("query")
+            for call in session.calls
+            if "/search/tv" in call[0]
+        ]
+        self.assertIn("La oficina", searched_without_year)
+        self.assertIn("The Office", searched_without_year)
+
+        resolver_2005, _ = self.resolver(routes)
+        with_year = resolver_2005.preview(
+            "La oficina (The Office) (2005) S02E01.mkv",
+            "tv",
+        )
+
+        self.assertEqual(with_year["status"], "ACCEPTED")
+        self.assertEqual(with_year["identity"]["tmdb_id"], 2316)
+        self.assertEqual(
+            with_year["decision"]["eligibility_reason"],
+            "strict_alternate_fallback",
+        )
+        self.assertTrue(
+            with_year["decision"]["strict_alternate_fallback"]["applied"]
+        )
+
+        resolver_bad_season, _ = self.resolver(routes)
+        impossible = resolver_bad_season.preview(
+            "La oficina (The Office) (2005) S10E01.mkv",
+            "tv",
+        )
+
+        self.assertTrue(impossible["decision"]["eligibility_blocked"])
+        self.assertEqual(
+            impossible["decision"]["eligibility_reason"],
+            "season_impossible",
+        )
+
+    def test_tv_multititle_waits_for_season_details_before_strict_fallback(self):
+        primary_search = tv_payload(
+            1,
+            "La oficina",
+            "The Office",
+            2005,
+            seasons=1,
+        )
+        primary_search.pop("number_of_seasons")
+        primary_detail = tv_payload(
+            1,
+            "La oficina",
+            "The Office",
+            2005,
+            seasons=1,
+        )
+        alternate = tv_payload(
+            2,
+            "The Office",
+            "The Office",
+            2005,
+            seasons=9,
+        )
+
+        def search(params):
+            if params.get("query") == "La oficina":
+                return {"results": [primary_search]}
+            if params.get("query") == "The Office":
+                return {"results": [alternate]}
+            return {"results": []}
+
+        resolver, session = self.resolver(
+            {
+                "/search/tv": search,
+                "/tv/1": primary_detail,
+                "/tv/2": alternate,
+            }
+        )
+
+        payload = resolver.preview(
+            "La oficina (The Office) (2005) S02E01.mkv",
+            "tv",
+        )
+
+        queries = [
+            call[1].get("query")
+            for call in session.calls
+            if "/search/tv" in call[0]
+        ]
+        candidates = {item["tmdb_id"]: item for item in payload["candidates"]}
+        self.assertIn("La oficina", queries)
+        self.assertIn("The Office", queries)
+        self.assertLess(queries.index("La oficina"), queries.index("The Office"))
+        self.assertEqual(payload["status"], "ACCEPTED")
+        self.assertEqual(payload["identity"]["tmdb_id"], 2)
+        self.assertEqual(payload["identity"]["season"], 2)
+        self.assertEqual(
+            payload["decision"]["eligibility_reason"],
+            "strict_alternate_fallback",
+        )
+        self.assertTrue(
+            payload["decision"]["strict_alternate_fallback"]["applied"]
+        )
+        self.assertEqual(candidates[1]["season_count"], 1)
+        self.assertFalse(candidates[1]["eligible"])
+        self.assertEqual(candidates[2]["season_count"], 9)
+        self.assertTrue(candidates[2]["eligible"])
+        self.assertIsNone(payload["search_strategy"]["early_stop_reason"])
+        self.assertTrue(payload["search_strategy"]["early_detail_attempted"])
+        self.assertTrue(payload["search_strategy"]["early_detail_reused"])
+        self.assertEqual(payload["search_strategy"]["detail_requests"], 2)
+        detail_paths = [
+            call[0].split("/3", 1)[1]
+            for call in session.calls
+            if "/tv/" in call[0]
+        ]
+        self.assertEqual(detail_paths.count("/tv/1"), 1)
+        self.assertEqual(detail_paths.count("/tv/2"), 1)
 
     def test_resolver_uses_cleaned_tv_title_for_s03e53(self):
         correct = tv_payload(1, "La reina del flow", "La reina del flow", 2018, seasons=3)

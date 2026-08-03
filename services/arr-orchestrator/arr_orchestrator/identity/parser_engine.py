@@ -4,7 +4,14 @@ from .parser_classification import classification_evidence
 from .parser_cleaning import preclean
 from .parser_models import MediaDecision, ParsedName
 from .parser_rules import resolve_parser_rules
-from .parser_titles import episode_hint, extract_year, guessit_input, manual_name, title_candidates, title_from_cleaned
+from .parser_titles import (
+    episode_hint,
+    extract_year,
+    guessit_input,
+    manual_name,
+    title_evidence,
+    title_from_cleaned,
+)
 from .parser_trace import ParserTrace
 from .parser_tv import parse_tv
 
@@ -111,6 +118,7 @@ def parse_with_trace(
         "cleaned": parsed.cleaned,
         "title": parsed.display_title,
         "candidates": list(parsed.title_candidates),
+        "title_evidence": [item.to_dict() for item in parsed.title_evidence],
         "year": parsed.year,
         "category": parsed.media_hint,
         "confidence": parsed.confidence,
@@ -155,7 +163,8 @@ def _parse_release_name(
     cleaned = preclean(raw, rules, trace)
     year = extract_year(cleaned, rules, trace)
     tv = parse_tv(cleaned, rules, trace)
-    candidates = title_candidates(cleaned, year, tv, rules, trace)
+    title_items = title_evidence(cleaned, year, tv, rules, trace)
+    candidates = [item.value for item in title_items]
     display_title = candidates[0] if candidates else title_from_cleaned(cleaned, year, tv, rules, trace)
     guessit = guessit_input(display_title, year, tv)
     if trace is not None:
@@ -224,6 +233,7 @@ def _parse_release_name(
         cleaned=cleaned,
         display_title=display_title,
         title_candidates=candidates or ([display_title] if display_title else []),
+        title_evidence=title_items,
         year=year,
         media_hint=media_hint,
         confidence=confidence,

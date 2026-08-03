@@ -1,10 +1,13 @@
 """Comparacion configurable de titulos y trazabilidad sin puntos propios."""
 
+import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+from ..parser_titles import is_editorial_title_auxiliary
 from ..resolver_defaults import DEFAULT_TITLE_MATCHING
+from .title_candidates import legacy_title_role
 from .text import normalize_title
 
 _ORDINAL_TOKENS = {
@@ -37,6 +40,16 @@ _SINGLE_I_PART_MARKERS = {
     "vol",
     "volume",
     "volumen",
+}
+
+_TITLE_EVIDENCE_SOURCES = {
+    "parser",
+    "parentheses",
+    "bilingual",
+    "legacy",
+    "series_prefix",
+    "configured_alias",
+    "spanish_correction",
 }
 
 
@@ -106,6 +119,45 @@ def unique_title_values(values: Sequence[object]) -> List[str]:
     return result
 
 
+def candidate_title_aliases(values: Sequence[object]) -> List[str]:
+    """Extrae un átomo compuesto solo si TMDb confirma el otro por separado."""
+
+    result = unique_title_values(values)
+    raw_keys = {normalize_title(value) for value in result}
+    composite_outer_keys = set()
+    for value in result:
+        match = re.fullmatch(r"\s*(.+?)\s*\(([^()]+)\)\s*", value)
+        if not match:
+            continue
+        if _safe_candidate_title_atom(match.group(1)) and _safe_candidate_title_atom(
+            match.group(2)
+        ):
+            composite_outer_keys.add(normalize_title(match.group(1)))
+    for value in list(result):
+        match = re.fullmatch(r"\s*(.+?)\s*\(([^()]+)\)\s*", value)
+        if not match:
+            continue
+        outer = match.group(1).strip()
+        inner = match.group(2).strip()
+        if not _safe_candidate_title_atom(outer) or not _safe_candidate_title_atom(inner):
+            continue
+        additions = []
+        inner_key = normalize_title(inner)
+        if inner_key in raw_keys and inner_key not in composite_outer_keys:
+            additions.append(outer)
+        result = unique_title_values([*result, *additions])
+    return result
+
+
+def _safe_candidate_title_atom(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(
+        text
+        and not re.fullmatch(r"(?:19|20)\d{2}", text)
+        and not is_editorial_title_auxiliary(text)
+    )
+
+
 def supplemental_title_candidates(
     values: Sequence[object],
     settings: object = None,
@@ -120,6 +172,214 @@ def supplemental_title_candidates(
         if normalized and len(normalized.replace(" ", "")) >= minimum:
             result.append(value)
     return result
+
+
+def resolved_title_evidence(
+    guessed: Mapping[str, object],
+    settings: object = None,
+) -> List[Dict[str, str]]:
+    """Normaliza evidencia estructurada y sintetiza snapshots legacy."""
+
+    resolved = resolve_title_matching(settings)
+    minimum = int(resolved["supplemental_min_chars"])
+    result: List[Dict[str, str]] = []
+    seen = set()
+
+    def add(value: object, role: object, source: object, group_id: object) -> None:
+        text = str(value or "").strip()
+        normalized = normalize_title(text)
+        role_text = str(role or "alternate").strip() or "alternate"
+        if not normalized:
+            return
+        if role_text == "alternate" and len(normalized.replace(" ", "")) < minimum:
+            return
+        if role_text == "alternate" and is_editorial_title_auxiliary(text):
+            return
+        if role_text not in {
+            "primary",
+            "alternate",
+            "composite",
+            "derived_primary",
+            "configured_primary",
+        }:
+            role_text = "alternate"
+        source_text = str(source or "legacy").strip()
+        if source_text not in _TITLE_EVIDENCE_SOURCES:
+            source_text = "legacy"
+        group_text = _safe_evidence_group_id(group_id)
+        key = (normalized, role_text, group_text)
+        if key in seen:
+            return
+        seen.add(key)
+        result.append(
+            {
+                "value": text,
+                "role": role_text,
+                "source": source_text,
+                "group_id": group_text,
+            }
+        )
+
+    supplied = guessed.get("_title_evidence")
+    if isinstance(supplied, Sequence) and not isinstance(supplied, (str, bytes)):
+        for item in supplied:
+            if not isinstance(item, Mapping):
+                continue
+            add(
+                item.get("value"),
+                item.get("role"),
+                item.get("source"),
+                item.get("group_id"),
+            )
+
+    query = str(guessed.get("title") or "").strip()
+    display = str(guessed.get("_display_title") or "").strip()
+    if not result:
+        add(query or display, "primary", "legacy", "legacy:0")
+        if display and normalize_title(display) != normalize_title(query):
+            role = legacy_title_role(display, query)
+            add(display, role, "legacy", "legacy:0")
+        for value in guessed.get("_title_candidates") or []:
+            text = str(value or "").strip()
+            normalized = normalize_title(text)
+            if not normalized or normalized in {
+                normalize_title(query),
+                normalize_title(display),
+            }:
+                continue
+            role = legacy_title_role(text, query or display)
+            add(text, role, "legacy", "legacy:0")
+    elif not any(
+        item["role"] in {"primary", "derived_primary"}
+        for item in result
+    ):
+        add(query or display, "primary", "legacy", "legacy:0")
+
+    for value in guessed.get("_rule_query_aliases") or []:
+        add(value, "configured_primary", "configured_alias", "configured:0")
+    return result
+
+
+def _safe_evidence_group_id(value: object) -> str:
+    text = str(value or "").strip()
+    if not text or len(text) > 48:
+        return "legacy:0"
+    if not all(character.isalnum() or character in {"_", "-", ":"} for character in text):
+        return "legacy:0"
+    return text
+
+
+def title_evidence_values(
+    evidence: Sequence[Mapping[str, object]],
+    roles: Sequence[str],
+) -> List[str]:
+    wanted = set(roles)
+    return unique_title_values(
+        [item.get("value") for item in evidence if str(item.get("role")) in wanted]
+    )
+
+
+def analyze_candidate_title_evidence(
+    aliases: Sequence[str],
+    guessed: Mapping[str, object],
+    settings: object = None,
+    *,
+    near_min: float = 0.86,
+) -> Dict[str, object]:
+    """Clasifica coincidencias sin decidir todavía entre candidatos."""
+
+    evidence = resolved_title_evidence(guessed, settings)
+    alias_values = candidate_title_aliases(aliases)
+    matches: List[Dict[str, object]] = []
+    by_group: Dict[str, Dict[str, List[Dict[str, object]]]] = {}
+    for item in evidence:
+        value = str(item.get("value") or "")
+        role = str(item.get("role") or "alternate")
+        match = best_title_match([value], alias_values, settings)
+        supported = bool(match.exact or match.ratio >= float(near_min))
+        pair = match.exact_pair if match.exact else match.ratio_pair
+        identity_exact = bool(
+            match.exact
+            and match.exact_pair is not None
+            and not match.exact_pair.used_omitted_part_number
+        )
+        entry = {
+            "value": _compact_trace_value(value),
+            "role": role,
+            "source": str(item.get("source") or ""),
+            "group_id": str(item.get("group_id") or ""),
+            "exact": bool(match.exact),
+            "identity_exact": identity_exact,
+            "ratio": round(float(match.ratio), 4),
+            "token_overlap": round(float(match.token_overlap), 4),
+            "matched_alias": _compact_trace_value(pair.right_value if pair else ""),
+            "supported": supported,
+        }
+        matches.append(entry)
+        group = by_group.setdefault(entry["group_id"], {"primary": [], "alternate": []})
+        if role in {"primary", "derived_primary"}:
+            group["primary"].append(entry)
+        elif role == "alternate":
+            group["alternate"].append(entry)
+
+    primary = [
+        item
+        for item in matches
+        if item["role"] in {"primary", "derived_primary"} and item["supported"]
+    ]
+    alternate = [
+        item for item in matches if item["role"] == "alternate" and item["supported"]
+    ]
+    configured = [
+        item
+        for item in matches
+        if item["role"] == "configured_primary" and item["identity_exact"]
+    ]
+    composite = [
+        item
+        for item in matches
+        if item["role"] == "composite" and item["identity_exact"]
+    ]
+    corroborated_groups = []
+    for group_id, grouped in by_group.items():
+        if not grouped["primary"] or not grouped["alternate"]:
+            continue
+        if any(item["identity_exact"] for item in grouped["primary"]) and all(
+            item["identity_exact"] for item in grouped["alternate"]
+        ):
+            corroborated_groups.append(group_id)
+
+    if corroborated_groups:
+        level = "corroborated"
+    elif configured:
+        level = "configured"
+    elif primary:
+        level = "primary"
+    elif alternate:
+        level = "alternate"
+    else:
+        level = "none"
+    return {
+        "level": level,
+        "matches": matches[:16],
+        "identity_exact_roles": sorted(
+            {
+                str(item["role"])
+                for item in matches
+                if item["identity_exact"]
+            }
+        ),
+        "primary_supported": bool(primary),
+        "primary_exact": any(item["identity_exact"] for item in primary),
+        "alternate_supported": bool(alternate),
+        "alternate_exact": any(item["identity_exact"] for item in alternate),
+        "configured_exact": bool(configured),
+        "composite_exact": bool(composite),
+        "corroborated_groups": corroborated_groups,
+        "has_alternate_evidence": any(
+            item["role"] == "alternate" for item in matches
+        ),
+    }
 
 
 def scoring_title_values(

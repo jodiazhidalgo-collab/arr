@@ -1,11 +1,30 @@
 import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from .parser_cleaning import append_unique, fold, smart_title
-from .parser_models import ParsedName
+from .parser_cleaning import fold, smart_title
+from .parser_models import ParsedName, TitleEvidence
 from .parser_rules import parser_pattern, regex_items
 from .parser_trace import ParserTrace
 from .parser_tv import remove_tv_tokens
+
+
+_EDITORIAL_PARENTHESES = (
+    r"(?:extended|special|limited|deluxe|ultimate|anniversary|"
+    r"collector(?:s| s)?|theatrical|restored|remastered) "
+    r"(?:edition|cut|version)",
+    r"director(?:s| s)? (?:cut|edition|version)",
+    r"(?:uncut|unrated|remastered|restored)",
+    r"(?:final|uncut|unrated) (?:cut|version)",
+    r"(?:american|british|international|uk|us|u s) version",
+    r"(?:tv|television|mini|limited) series",
+    r"(?:miniseries|tv movie|television movie)",
+    r"(?:edicion|version|montaje) extendid[ao]",
+    r"(?:corte|edicion|montaje|version) del director",
+    r"edicion especial",
+    r"(?:montaje|version) cinematografic[ao]",
+    r"sin censura",
+    r"remasterizad[ao]",
+)
 
 
 def extract_year(
@@ -39,20 +58,84 @@ def title_candidates(
     rules: Mapping[str, Any],
     trace: Optional[ParserTrace] = None,
 ) -> List[str]:
+    return [
+        item.value
+        for item in title_evidence(cleaned, year, tv, rules, trace)
+    ]
+
+
+def title_evidence(
+    cleaned: str,
+    year: Optional[int],
+    tv: Mapping[str, object],
+    rules: Mapping[str, Any],
+    trace: Optional[ParserTrace] = None,
+) -> List[TitleEvidence]:
     title = title_from_cleaned(cleaned, year, tv, rules, trace)
-    candidates: List[str] = []
+    items: List[TitleEvidence] = []
     if title:
         bilingual = [part.strip() for part in re.split(r"\s+/\s+", title) if part.strip()]
         variants = bilingual if len(bilingual) > 1 else [title]
-        for variant in variants:
+        is_bilingual = len(variants) > 1
+        for index, variant in enumerate(variants):
             outer, inner = split_parenthesized_title(variant, rules)
-            for value in (outer, inner, variant):
-                append_unique(candidates, value)
+            source = "bilingual" if is_bilingual else "parentheses" if inner else "parser"
+            _append_title_evidence(
+                items,
+                outer,
+                "primary" if index == 0 else "alternate",
+                source,
+                "parser:0",
+            )
+            if inner:
+                _append_title_evidence(
+                    items,
+                    inner,
+                    "alternate",
+                    source,
+                    "parser:0",
+                )
+                _append_title_evidence(
+                    items,
+                    variant,
+                    "composite",
+                    source,
+                    "parser:0",
+                )
         # El nombre completo conserva contexto y sirve como candidato adicional.
-        append_unique(candidates, title)
+        if is_bilingual:
+            _append_title_evidence(
+                items,
+                title,
+                "composite",
+                "bilingual",
+                "parser:0",
+            )
     if trace is not None:
-        trace.record("title.candidates", title, candidates)
-    return candidates
+        trace.record("title.candidates", title, [item.value for item in items])
+        trace.record("title.evidence", title, [item.to_dict() for item in items])
+    return items
+
+
+def _append_title_evidence(
+    items: List[TitleEvidence],
+    value: str,
+    role: str,
+    source: str,
+    group_id: str,
+) -> None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" -_.,")
+    key = fold(text)
+    if not key or key in {fold(item.value) for item in items}:
+        return
+    items.append(
+        TitleEvidence(
+            value=text,
+            role=role,
+            source=source,
+            group_id=group_id,
+        )
+    )
 
 
 def split_parenthesized_title(title: str, rules: Mapping[str, Any]) -> Tuple[str, str]:
@@ -66,7 +149,16 @@ def split_parenthesized_title(title: str, rules: Mapping[str, Any]) -> Tuple[str
     year_pattern = str(year_rules.get("pattern") or r"(?<!\d)((?:19|20)\d{2})(?!\d)")
     if re.fullmatch(year_pattern, inner):
         return outer, ""
+    if is_editorial_title_auxiliary(inner):
+        return outer, ""
     return outer, inner
+
+
+def is_editorial_title_auxiliary(value: str) -> bool:
+    """Reconoce descriptores editoriales que nunca deben votar como titulo."""
+
+    normalized = fold(value)
+    return any(re.fullmatch(pattern, normalized) for pattern in _EDITORIAL_PARENTHESES)
 
 
 def title_from_cleaned(

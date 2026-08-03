@@ -16,6 +16,7 @@ from arr_orchestrator.identity import (
     normalize_identity_rules,
 )
 from arr_orchestrator.identity.parser_rules import DEFAULT_PARSER_RULES
+from arr_orchestrator.identity.resolver.candidate_search import search_candidates
 from arr_orchestrator.identity.resolver.policy import effective_policy
 from arr_orchestrator.identity.resolver_defaults import (
     DEFAULT_SERIES_CANDIDATES,
@@ -355,6 +356,54 @@ class IdentityRulesTests(unittest.TestCase):
             ],
         )
 
+    def test_search_limit_validator_accepts_v1_ranges_but_schema_keeps_runtime_caps(self):
+        historical = factory_identity_rules()
+        historical["resolver"]["search_limits"].update(
+            {
+                "max_searches": 32,
+                "detail_candidates": 4,
+                "initial_candidates": 4,
+            }
+        )
+        self.assertEqual(
+            normalize_identity_rules(historical)["resolver"]["search_limits"],
+            historical["resolver"]["search_limits"],
+        )
+
+        for key, invalid in (
+            ("max_searches", 33),
+            ("detail_candidates", 21),
+            ("initial_candidates", 21),
+        ):
+            with self.subTest(key=key, invalid=invalid):
+                rules = factory_identity_rules()
+                rules["resolver"]["search_limits"][key] = invalid
+                with self.assertRaises(IdentityRulesValidationError):
+                    normalize_identity_rules(rules)
+
+        groups = IdentitySettingsStore(FakeSettingsDatabase()).payload()["schema"][
+            "resolver"
+        ]["groups"]
+        controls = {
+            control["path"]: control
+            for group in groups
+            for control in group["controls"]
+        }
+        self.assertEqual(
+            {
+                key: controls[f"resolver.search_limits.{key}"]["max"]
+                for key in (
+                    "max_searches",
+                    "detail_candidates",
+                    "initial_candidates",
+                )
+            },
+            {
+                "max_searches": 8,
+                "detail_candidates": 3,
+                "initial_candidates": 3,
+            },
+        )
     def test_factory_rejects_runtime_http_below_contract_minimum(self):
         with self.assertRaisesRegex(ValueError, "resolver_http_timeout_ms"):
             factory_identity_rules(resolver_http_timeout_ms=99)
@@ -677,6 +726,78 @@ class IdentityStoreTests(unittest.TestCase):
         self.assertEqual(policy["series_candidates"], DEFAULT_SERIES_CANDIDATES)
         self.assertEqual(policy["title_matching"], DEFAULT_TITLE_MATCHING)
         self.assertEqual(payload["fingerprint"], identity_fingerprint(payload["rules"]))
+
+    def test_persisted_v1_historical_limits_keep_rules_and_use_runtime_caps(self):
+        legacy = changed_rules(language="fr-FR", score=83)
+        legacy["resolver"]["search_limits"].update(
+            {
+                "max_searches": 32,
+                "detail_candidates": 4,
+                "initial_candidates": 4,
+            }
+        )
+        legacy["resolver"]["query_variants"]["use_tail_cleanup"] = False
+        database = FakeSettingsDatabase()
+        database.values[IDENTITY_SETTING_KEY] = json.dumps(
+            {
+                "rules": legacy,
+                "revision": 9,
+                "saved_at": "2026-08-03T10:11:12.000Z",
+                "history": [],
+            }
+        )
+
+        payload = IdentitySettingsStore(database).payload()
+        policy = effective_policy(payload["rules"], "movies")
+
+        self.assertFalse(payload["repair_required"])
+        self.assertEqual(payload["revision"], 9)
+        self.assertEqual(
+            payload["rules"]["resolver"]["search_limits"],
+            legacy["resolver"]["search_limits"],
+        )
+        self.assertEqual(
+            policy["query_aliases"],
+            ["The Visitors | Los visitantes"],
+        )
+        self.assertEqual(
+            policy["forced_matches"],
+            ["The Visitors | 1993 | 11687"],
+        )
+        self.assertEqual(policy["language"], "fr-FR")
+        self.assertEqual(policy["acceptance"]["min_score"], 83)
+        self.assertFalse(policy["query_variants"]["use_tail_cleanup"])
+
+        calls = []
+        trace = {}
+        search_candidates(
+            "movie",
+            "Principal",
+            {
+                "title": "Principal",
+                "year": 2024,
+                "_title_candidates": [
+                    "Alterno Uno",
+                    "Alterno Dos",
+                    "Alterno Tres",
+                    "Alterno Cuatro",
+                    "Alterno Cinco",
+                    "Alterno Seis",
+                    "Alterno Siete",
+                ],
+            },
+            str(policy["language"]),
+            str(policy["region"]),
+            policy,
+            lambda _endpoint, params: calls.append(dict(params)) or {"results": []},
+            lambda *_args: self.fail("No debe pedir detalle sin candidatos"),
+            lambda candidates, *_args: list(candidates),
+            selection_trace=trace,
+        )
+
+        self.assertEqual(len(calls), 8)
+        self.assertEqual(trace["search_strategy"]["max_searches"], 8)
+        self.assertEqual(trace["search_strategy"]["detail_limit"], 3)
 
     def test_invalid_conflict_persistence_failure_and_noop_contracts(self):
         database = FakeSettingsDatabase()

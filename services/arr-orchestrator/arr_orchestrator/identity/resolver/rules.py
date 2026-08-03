@@ -3,7 +3,9 @@
 import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from ..parser_models import TitleEvidence
 from .text import as_int, normalize_title, unique
+from .title_candidates import ensure_title_evidence, merge_title_evidence
 
 
 TMDB_ID_PATTERN = re.compile(r"(?:tmdb|themoviedb)[-_. ]?(\d+)", re.IGNORECASE)
@@ -95,6 +97,22 @@ def apply_query_aliases(
     updated["_title_candidates"] = unique(title_candidates)
     if applied:
         updated["_rule_query_aliases"] = unique(applied)
+        configured = [
+            TitleEvidence(
+                value=value,
+                role="configured_primary",
+                source="configured_alias",
+                group_id="configured:0",
+            )
+            for value in unique(applied)
+        ]
+        updated["_title_evidence"] = [
+            item.to_dict()
+            for item in merge_title_evidence(
+                ensure_title_evidence(updated),
+                configured,
+            )
+        ]
     return updated
 
 

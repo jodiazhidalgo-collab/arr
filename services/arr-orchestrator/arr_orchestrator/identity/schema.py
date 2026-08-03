@@ -310,10 +310,10 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
                     *[
                         _control(f"resolver.search_limits.{key}", "number", label, help_text, min=1, max=maximum, step=1)
                         for key, label, help_text, maximum in (
-                            ("max_searches", "Maximo de consultas", "Tope total de busquedas TMDb.", 32),
+                            ("max_searches", "Maximo de consultas", "Tope total de busquedas TMDb.", 8),
                             ("results_per_search", "Resultados por consulta", "Resultados leidos de cada respuesta.", 100),
-                            ("detail_candidates", "Detalles de candidatos", "Maximo de fichas completas descargadas.", 20),
-                            ("initial_candidates", "Candidatos iniciales", "Primeros candidatos que pasan a detalle.", 20),
+                            ("detail_candidates", "Detalles de candidatos", "Maximo de fichas completas descargadas.", 3),
+                            ("initial_candidates", "Candidatos iniciales", "Primeros candidatos que pasan a detalle.", 3),
                         )
                     ],
                     _control("resolver.search_limits.include_exact_year_candidate", "toggle", "Incluir año exacto", "Reserva un candidato con el año exacto si no quedo arriba."),

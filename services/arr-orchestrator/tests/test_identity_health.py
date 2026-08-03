@@ -63,6 +63,31 @@ class IdentityHealthTests(unittest.TestCase):
             "rules": {"schema_version": 1, "parser": {}, "resolver": {}},
             "schema": {"parser": {}, "resolver": {}},
         }
+        resolver_contract = {
+            "ok": True,
+            "status": "REJECTED",
+            "decision": {
+                "status": "REJECTED",
+                "resolver_algorithm_version": "title-evidence-v1",
+                "eligibility_reason": "title_evidence_unconfirmed",
+                "eligible_candidate_count": 0,
+                "eligibility_blocked": True,
+                "strict_alternate_fallback": {"applied": False},
+            },
+            "candidates": [
+                {
+                    "tmdb_id": 1317149,
+                    "eligible": False,
+                    "search_provenance": {
+                        "sources": ["alternate"],
+                        "phases": ["alternate"],
+                        "exact_sources": ["alternate"],
+                        "exact_phases": ["alternate"],
+                        "hits": 1,
+                    },
+                }
+            ],
+        }
         server = start_health_server(
             0,
             lambda: {"status": "ok"},
@@ -85,9 +110,7 @@ class IdentityHealthTests(unittest.TestCase):
             identity_parser_tester=action(
                 "parser", {"ok": False, "error": "invalid_rules"}
             ),
-            identity_resolver_tester=action(
-                "resolver", {"ok": True, "status": "ACCEPTED"}
-            ),
+            identity_resolver_tester=action("resolver", resolver_contract),
         )
         try:
             port = server.server_address[1]
@@ -104,8 +127,22 @@ class IdentityHealthTests(unittest.TestCase):
             self.assertEqual(
                 _post(f"{base}/test-parser", {"name": "Alien"})[0], 400
             )
+            resolver_status, resolver_payload = _post(
+                f"{base}/test-resolver", {"name": "Alien"}
+            )
+            self.assertEqual(resolver_status, 200)
+            self.assertEqual(resolver_payload, resolver_contract)
             self.assertEqual(
-                _post(f"{base}/test-resolver", {"name": "Alien"})[0], 200
+                resolver_payload["status"],
+                "REJECTED",
+            )
+            self.assertEqual(
+                resolver_payload["decision"]["status"],
+                "REJECTED",
+            )
+            self.assertNotIn(
+                "query",
+                resolver_payload["candidates"][0]["search_provenance"],
             )
         finally:
             server.shutdown()

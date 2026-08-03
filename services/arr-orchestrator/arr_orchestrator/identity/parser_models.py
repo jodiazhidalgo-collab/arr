@@ -2,12 +2,24 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 
+@dataclass(frozen=True)
+class TitleEvidence:
+    value: str
+    role: str
+    source: str
+    group_id: str
+
+    def to_dict(self) -> Dict[str, str]:
+        return asdict(self)
+
+
 @dataclass
 class ParsedName:
     raw: str
     cleaned: str
     display_title: str
     title_candidates: List[str] = field(default_factory=list)
+    title_evidence: List[TitleEvidence] = field(default_factory=list)
     year: Optional[int] = None
     media_hint: str = "manual"
     confidence: str = "low"

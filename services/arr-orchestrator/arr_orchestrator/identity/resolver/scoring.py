@@ -6,14 +6,16 @@ from guessit import guessit
 
 from .models import ResolverCandidate
 from .title_matching import (
+    analyze_candidate_title_evidence,
     best_title_match,
+    candidate_title_aliases,
     matching_rules_for_pairs,
     merge_matching_rules,
-    parser_candidate_rules,
     parser_candidate_rules_for_pairs,
     resolve_title_matching,
-    scoring_title_values,
+    resolved_title_evidence,
     supplemental_title_candidates,
+    title_evidence_values,
     unique_title_values,
 )
 from .text import as_int, clean_release_name, normalize_title, spanish_missing_c_variants
@@ -57,6 +59,11 @@ def score_candidate(
     contributions: List[Tuple[str, float, float]] = []
     applied_matching_rules: List[List[Dict[str, str]]] = []
     candidate.matching_rules = []
+    candidate.eligible = True
+    candidate.eligibility_reasons = []
+    candidate.title_match_level = "none"
+    candidate.title_matches = []
+    candidate.title_identity_exact_roles = []
 
     def add(key: str, applied: float) -> bool:
         value = float(applied)
@@ -66,16 +73,28 @@ def score_candidate(
         return True
 
     if direct_identity:
+        candidate.title_match_level = "direct"
+        candidate.eligibility_reasons = ["direct_identity"]
         add("direct_identity", weights["direct_identity"])
         return _finalize_breakdown(contributions)
 
     query = str(guessed.get("title") or "")
-    title_candidates = supplemental_title_candidates(
-        guessed.get("_title_candidates") or [], matching_settings
+    structured_evidence = resolved_title_evidence(guessed, matching_settings)
+    primary_values = title_evidence_values(
+        structured_evidence,
+        ("primary", "derived_primary", "composite", "configured_primary"),
     )
-    query_values = scoring_title_values(query, title_candidates, matching_settings)
-    alias_values = unique_title_values(candidate.aliases)
-    title_match = best_title_match(query_values, alias_values, matching_settings)
+    if not primary_values and query:
+        primary_values = [query]
+    # Conserva el apoyo historico del parser (incluido el titulo simple) para
+    # no aumentar llamadas en entradas normales. La elegibilidad estructurada
+    # impide que este apoyo auxiliar decida por si solo una identidad bilingue.
+    title_candidates = supplemental_title_candidates(
+        guessed.get("_title_candidates") or [],
+        matching_settings,
+    )
+    alias_values = candidate_title_aliases(candidate.aliases)
+    title_match = best_title_match(primary_values, alias_values, matching_settings)
     title_pairs = []
     if title_match.exact:
         if add("title_exact", weights["title_exact"]):
@@ -92,20 +111,11 @@ def score_candidate(
         title_pairs.append(title_match.token_overlap_pair)
     if title_pairs:
         applied_matching_rules.append(matching_rules_for_pairs(title_pairs))
-        applied_matching_rules.append(
-            parser_candidate_rules_for_pairs(
-                title_pairs,
-                title_candidates,
-                query,
-            )
-        )
 
-    spanish_variant_sources: Dict[str, List[str]] = {}
     spanish_variants = []
-    for value in query_values:
+    for value in primary_values:
         for variant in spanish_missing_c_variants(value):
             spanish_variants.append(variant)
-            spanish_variant_sources.setdefault(normalize_title(variant), []).append(value)
     spanish_match = best_title_match(
         spanish_variants, alias_values, matching_settings
     )
@@ -116,22 +126,6 @@ def score_candidate(
     ):
         spanish_pairs = [spanish_match.exact_pair]
         applied_matching_rules.append(matching_rules_for_pairs(spanish_pairs))
-        spanish_sources = (
-            spanish_variant_sources.get(
-                normalize_title(spanish_match.exact_pair.left_value),
-                [],
-            )
-            if spanish_match.exact_pair is not None
-            else []
-        )
-        if any(
-            normalize_title(value) == normalize_title(query)
-            for value in spanish_sources
-        ):
-            spanish_sources = [query]
-        applied_matching_rules.append(
-            parser_candidate_rules(spanish_sources, title_candidates, query)
-        )
 
     if bool(matching_settings["score_parser_candidates"]):
         parser_match = best_title_match(
@@ -185,8 +179,51 @@ def score_candidate(
 
     add("category", weights["category"])
 
+    title_analysis = analyze_candidate_title_evidence(
+        candidate.aliases,
+        guessed,
+        matching_settings,
+        near_min=float(weights["parser_near_min"]),
+    )
+    if spanish_match.exact and not title_analysis["primary_supported"]:
+        title_analysis["primary_supported"] = True
+        title_analysis["primary_exact"] = True
+        if title_analysis["level"] in {"none", "alternate"}:
+            title_analysis["level"] = "primary"
+        title_analysis["matches"] = [
+            *list(title_analysis["matches"]),
+            {
+                "value": spanish_match.exact_pair.left_value,
+                "role": "primary",
+                "source": "spanish_correction",
+                "group_id": "correction:0",
+                "exact": True,
+                "identity_exact": True,
+                "ratio": 1.0,
+                "token_overlap": 1.0,
+                "matched_alias": spanish_match.exact_pair.right_value,
+                "supported": True,
+            },
+        ]
+        title_analysis["identity_exact_roles"] = sorted(
+            {
+                *list(title_analysis["identity_exact_roles"]),
+                "primary",
+            }
+        )
+    candidate.title_match_level = str(title_analysis["level"])
+    candidate.title_matches = list(title_analysis["matches"])
+    candidate.title_identity_exact_roles = list(
+        title_analysis["identity_exact_roles"]
+    )
+
     aliases = {normalize_title(value) for value in alias_values if value}
-    if evidence and any(
+    has_primary_confirmation = bool(
+        title_analysis["primary_supported"]
+        or title_analysis["configured_exact"]
+        or title_analysis["composite_exact"]
+    )
+    if has_primary_confirmation and evidence and any(
         normalize_title(str(dict(guessit(clean_release_name(value))).get("title") or "")) in aliases
         for value in evidence
     ):

@@ -314,6 +314,8 @@ def normalize_resolver(value: object) -> Dict[str, object]:
         },
         "rules.resolver.search_limits",
     )
+    # Compatibilidad con snapshots v1: estos valores fueron validos antes.
+    # El resolver aplica siempre los topes efectivos de 8 busquedas y 3 detalles.
     normalized_limits = {
         "max_searches": integer(
             limits.get("max_searches"),

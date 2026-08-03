@@ -2191,7 +2191,7 @@ class Engine:
                 self._defer_identity(job, input_root, error)
                 return
             except ResolverAmbiguous as error:
-                if self._can_continue_tv_without_identity(job, media_decision):
+                if self._can_continue_tv_without_identity(job, media_decision, error):
                     self.db.add_event(
                         str(job["job_id"]),
                         "identity",
@@ -2200,7 +2200,7 @@ class Engine:
                         {
                             "media_decision": media_decision.to_dict(),
                             "resolver_error": str(error),
-                            "resolver_details": error.details,
+                            "resolver_details": sanitize_for_export(error.details),
                         },
                     )
                     self.db.update_job(
@@ -2231,12 +2231,18 @@ class Engine:
                     last_error_code=None,
                     last_error_message=None,
                 )
+                identity_event = identity.to_dict()
+                trace_snapshot = getattr(self.name_resolver, "trace_snapshot", None)
+                if callable(trace_snapshot):
+                    resolver_trace = sanitize_for_export(trace_snapshot())
+                    if isinstance(resolver_trace, dict) and resolver_trace:
+                        identity_event["resolver_trace"] = resolver_trace
                 self.db.add_event(
                     str(job["job_id"]),
                     "identity",
                     "resolved",
                     f"Identidad confirmada: TMDb {identity.tmdb_id} - {identity.title}",
-                    identity.to_dict(),
+                    identity_event,
                 )
         else:
             self.db.add_event(
@@ -3077,12 +3083,24 @@ class Engine:
     def _can_continue_tv_without_identity(
         job: Dict[str, object],
         media_decision: MediaDecision,
+        error: Optional[ResolverAmbiguous] = None,
     ) -> bool:
+        details = error.details if error is not None else {}
+        reason_code = str(details.get("reason_code") or "")
+        identity_conflicts = {
+            "title_evidence_conflict",
+            "title_selection_uncertain",
+            "title_evidence_unconfirmed",
+            "alternate_fallback_requires_year",
+            "alternate_fallback_not_unique",
+            "season_impossible",
+        }
         return (
             str(job.get("category") or "") == "tv"
             and media_decision.media_type == "tv"
             and media_decision.confidence in {"high", "medium"}
             and not media_decision.block_reason
+            and reason_code not in identity_conflicts
         )
 
     def _send_media_decision_review(
@@ -3378,7 +3396,7 @@ class Engine:
             "phase": "identity",
             "reason": "identity_suspicious",
             "message": str(error),
-            "details": error.details,
+            "details": sanitize_for_export(error.details),
             "timestamp": time.time(),
         }
         write_reason(

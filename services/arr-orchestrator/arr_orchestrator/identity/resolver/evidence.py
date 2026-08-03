@@ -8,7 +8,11 @@ from guessit import guessit
 from ...filesystem import media_files
 from ...name_parser import parse_release_name
 from .text import clean_release_name, prefer_parser_title, unique
-from .title_candidates import ordered_title_candidates, series_title_candidates
+from .title_candidates import (
+    ordered_title_candidates,
+    ordered_title_evidence,
+    series_title_candidates,
+)
 
 
 TECHNICAL_NAMES = {"original", "filebot_input", "filebot_output", "extracted"}
@@ -112,6 +116,14 @@ def best_guess(
             title,
             series_titles,
         )
+        parsed["_title_evidence"] = [
+            item.to_dict()
+            for item in ordered_title_evidence(
+                parsed_name.title_evidence,
+                title,
+                series_titles,
+            )
+        ]
         parsed["_display_title"] = parsed_name.display_title
         parsed["_guessit_input"] = cleaned
         quality = int(settings.get("base", 100)) - index * int(settings.get("index_penalty", 1))

@@ -2,6 +2,7 @@ import json
 import unittest
 
 from arr_orchestrator.identity.defaults import factory_identity_rules
+from arr_orchestrator.identity.parser_models import ParsedName, TitleEvidence
 from arr_orchestrator.name_parser import (
     decide_media,
     factory_parser_rules,
@@ -261,6 +262,101 @@ class NameParserTests(unittest.TestCase):
         self.assertIn("Red One", parsed.title_candidates)
         self.assertIn("Código Traje Rojo", parsed.title_candidates)
 
+    def test_title_evidence_model_serializes_without_shared_mutable_state(self):
+        evidence = TitleEvidence(
+            value="Incontrolable",
+            role="primary",
+            source="parentheses",
+            group_id="parser:0",
+        )
+        first = ParsedName(
+            raw="Incontrolable.mkv",
+            cleaned="Incontrolable",
+            display_title="Incontrolable",
+            title_evidence=[evidence],
+        )
+        second = ParsedName(
+            raw="Otra.mkv",
+            cleaned="Otra",
+            display_title="Otra",
+        )
+
+        self.assertEqual(
+            evidence.to_dict(),
+            {
+                "value": "Incontrolable",
+                "role": "primary",
+                "source": "parentheses",
+                "group_id": "parser:0",
+            },
+        )
+        self.assertEqual(first.to_dict()["title_evidence"], [evidence.to_dict()])
+        first.title_evidence.append(
+            TitleEvidence("Unstoppable", "alternate", "parentheses", "parser:0")
+        )
+        self.assertEqual(second.title_evidence, [])
+
+    def test_structured_title_evidence_preserves_flat_candidate_contract(self):
+        samples = (
+            (
+                "Incontrolable (I Swear) (2025).mkv",
+                ["Incontrolable", "I Swear", "Incontrolable (I Swear)"],
+                [
+                    ("Incontrolable", "primary", "parentheses", "parser:0"),
+                    ("I Swear", "alternate", "parentheses", "parser:0"),
+                    (
+                        "Incontrolable (I Swear)",
+                        "composite",
+                        "parentheses",
+                        "parser:0",
+                    ),
+                ],
+            ),
+            (
+                "Historia / Global (2024).mkv",
+                ["Historia", "Global", "Historia / Global"],
+                [
+                    ("Historia", "primary", "bilingual", "parser:0"),
+                    ("Global", "alternate", "bilingual", "parser:0"),
+                    ("Historia / Global", "composite", "bilingual", "parser:0"),
+                ],
+            ),
+            (
+                "Titulo.2024.mkv",
+                ["Titulo"],
+                [("Titulo", "primary", "parser", "parser:0")],
+            ),
+        )
+
+        for raw_name, flat_candidates, structured in samples:
+            with self.subTest(raw_name=raw_name):
+                parsed = parse_release_name(raw_name)
+                self.assertEqual(parsed.title_candidates, flat_candidates)
+                self.assertEqual(
+                    [
+                        (item.value, item.role, item.source, item.group_id)
+                        for item in parsed.title_evidence
+                    ],
+                    structured,
+                )
+
+    def test_editorial_parentheses_never_become_alternate_title_evidence(self):
+        for raw_name, category, expected_title in (
+            ("Titulo (Extended Edition) (2024).mkv", "movies", "Titulo"),
+            ("Serie (Extended Edition) S01E01.mkv", "tv", "Serie"),
+        ):
+            with self.subTest(raw_name=raw_name):
+                parsed = parse_release_name(raw_name, category)
+                self.assertEqual(parsed.display_title, expected_title)
+                self.assertEqual(parsed.title_candidates, [parsed.display_title])
+                self.assertEqual(
+                    [
+                        (item.value, item.role, item.source, item.group_id)
+                        for item in parsed.title_evidence
+                    ],
+                    [(parsed.display_title, "primary", "parser", "parser:0")],
+                )
+
     def test_snatch_year_and_title(self):
         parsed = parse_release_name("Snatch.2000.2160p.AMZN.WEB-DL.x265")
         self.assertEqual(parsed.media_hint, "movies")
@@ -426,6 +522,17 @@ class NameParserTests(unittest.TestCase):
         self.assertEqual(payload["cleaned"], "Show Name S01E02 2024 1080p")
         self.assertEqual(payload["title"], "Show Name")
         self.assertEqual(payload["candidates"], ["Show Name"])
+        self.assertEqual(
+            payload["title_evidence"],
+            [
+                {
+                    "value": "Show Name",
+                    "role": "primary",
+                    "source": "parser",
+                    "group_id": "parser:0",
+                }
+            ],
+        )
         self.assertEqual(payload["year"], 2024)
         self.assertEqual(payload["category"], "tv")
         self.assertEqual(payload["confidence"], "high")

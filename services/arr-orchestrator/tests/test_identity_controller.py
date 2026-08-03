@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from arr_orchestrator.db import Database
 from arr_orchestrator.identity.controller import IdentityController
@@ -16,6 +17,7 @@ from arr_orchestrator.identity.defaults import (
     identity_profile_setting_key,
 )
 from arr_orchestrator.identity.fingerprint import identity_fingerprint
+from arr_orchestrator.name_resolver import ResolverAmbiguous
 
 
 RUNTIME_TEST_ROOT = Path(os.environ["ARR_PYTEST_DATA_DIR"])
@@ -90,6 +92,115 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(result["decision"]["status"], "TMDB_UNAVAILABLE")
         self.assertFalse(result["decision"]["has_scoring"])
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
+
+    def test_resolver_tester_preserves_structured_decision_and_safe_provenance(self) -> None:
+        controller = IdentityController(_config(), self.database)
+        preview = {
+            "ok": True,
+            "status": "ACCEPTED",
+            "resolver_algorithm_version": "title-evidence-v1",
+            "decision": {
+                "status": "ACCEPTED",
+                "resolver_algorithm_version": "title-evidence-v1",
+                "eligibility_reason": "corroborated_titles",
+                "eligible_candidate_count": 1,
+                "eligibility_blocked": False,
+                "strict_alternate_fallback": {"applied": False},
+            },
+            "candidates": [
+                {
+                    "tmdb_id": 1317149,
+                    "eligible": True,
+                    "eligibility_reasons": ["corroborated_titles"],
+                    "title_match_level": "corroborated",
+                    "title_matches": [],
+                    "search_provenance": {
+                        "sources": ["alternate"],
+                        "phases": ["alternate"],
+                        "exact_sources": ["alternate"],
+                        "exact_phases": ["alternate"],
+                        "hits": 1,
+                    },
+                }
+            ],
+        }
+
+        with patch.object(controller.resolver, "preview", return_value=preview):
+            result = controller.test_resolver(
+                {
+                    "name": "Incontrolable (I Swear) (2025).mkv",
+                    "category": "movies",
+                }
+            )
+
+        self.assertEqual(result["decision"], preview["decision"])
+        self.assertEqual(result["candidates"], preview["candidates"])
+        self.assertEqual(result["profile"], "common")
+        self.assertEqual(
+            result["parser_test"]["title_evidence"][0]["value"],
+            "Incontrolable",
+        )
+        self.assertNotIn(
+            "query",
+            result["candidates"][0]["search_provenance"],
+        )
+
+    def test_resolver_tester_keeps_panel_rejected_status_and_eligibility_reason(self) -> None:
+        controller = IdentityController(_config(), self.database)
+        reason = "title_evidence_unconfirmed"
+
+        def reject_eligibility(resolver, *_args, **_kwargs):
+            resolver._trace = {
+                "queries": [],
+                "candidates": [
+                    {
+                        "tmdb_id": 300,
+                        "eligible": False,
+                        "eligibility_reasons": [f"excluded:{reason}"],
+                    }
+                ],
+                "cache_hit": False,
+                "decision": {
+                    "status": "REJECTED",
+                    "accepted": False,
+                    "has_scoring": True,
+                    "resolver_algorithm_version": "title-evidence-v1",
+                    "eligibility_reason": reason,
+                    "eligible_candidate_count": 0,
+                    "eligibility_blocked": True,
+                    "strict_alternate_fallback": {"applied": False},
+                },
+            }
+            raise ResolverAmbiguous(
+                "La identidad no supera la barrera de evidencia",
+                {
+                    "reason_code": reason,
+                    "resolver_algorithm_version": "title-evidence-v1",
+                },
+            )
+
+        with patch.object(
+            type(controller.resolver),
+            "resolve",
+            autospec=True,
+            side_effect=reject_eligibility,
+        ):
+            result = controller.test_resolver(
+                {
+                    "name": (
+                        "Unrelated local title "
+                        "(Long Saga Chapter final) (2024).mkv"
+                    ),
+                    "category": "movies",
+                }
+            )
+
+        self.assertEqual(result["status"], "REJECTED")
+        self.assertEqual(result["decision"]["status"], "REJECTED")
+        self.assertEqual(result["decision"]["eligibility_reason"], reason)
+        self.assertTrue(result["decision"]["eligibility_blocked"])
+        self.assertEqual(result["details"]["reason_code"], reason)
+        self.assertEqual(result["profile"], "common")
 
     def test_resolver_tester_returns_human_contract_for_invalid_draft(self) -> None:
         controller = IdentityController(_config(), self.database)

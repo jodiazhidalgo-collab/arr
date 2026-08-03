@@ -31,6 +31,12 @@ class ResolverCandidate:
     season_count: Optional[int] = None
     original_language: str = ""
     matching_rules: List[Dict[str, str]] = field(default_factory=list)
+    eligible: bool = True
+    eligibility_reasons: List[str] = field(default_factory=list)
+    title_match_level: str = "none"
+    title_matches: List[Dict[str, object]] = field(default_factory=list)
+    title_identity_exact_roles: List[str] = field(default_factory=list)
+    search_provenance: Dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -52,6 +58,7 @@ class ResolvedIdentity:
     original_language: str = ""
     season: Optional[int] = None
     episodes: List[int] = field(default_factory=list)
+    resolver_algorithm_version: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -73,6 +80,9 @@ class ResolvedIdentity:
             source=str(payload.get("source") or "cache"),
             season=_optional_int(payload.get("season")),
             episodes=[int(value) for value in payload.get("episodes") or []],
+            resolver_algorithm_version=str(
+                payload.get("resolver_algorithm_version") or ""
+            ),
         )
 
 

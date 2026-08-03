@@ -45,6 +45,7 @@ from .rules import (
     parse_query_aliases as _parse_query_aliases,
 )
 from .scoring import score_candidate
+from .title_matching import resolved_title_evidence
 from .text import (
     as_int as _as_int,
     as_int_list as _as_int_list,
@@ -63,6 +64,7 @@ from .text import (
 
 MIN_HTTP_TIMEOUT_MS = 100
 SCORE_TIE_EPSILON = 1e-9
+RESOLVER_ALGORITHM_VERSION = "title-evidence-v1"
 
 
 class NameResolver:
@@ -107,7 +109,12 @@ class NameResolver:
         input_root: Path,
         rules_snapshot: Optional[Dict[str, object]] = None,
     ) -> ResolvedIdentity:
-        self._trace = {"queries": [], "candidates": [], "cache_hit": False}
+        self._trace = {
+            "queries": [],
+            "candidates": [],
+            "cache_hit": False,
+            "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+        }
         if not self.enabled:
             raise ResolverUnavailable("TMDB_API_TOKEN no configurado")
 
@@ -125,6 +132,7 @@ class NameResolver:
                 "Conflicto fuerte entre categoria y nombre",
                 {
                     "reason_code": "category_conflict",
+                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
                     "parser": parsed.to_dict(),
                     "category": category,
                 },
@@ -134,6 +142,7 @@ class NameResolver:
                 "Categoria manual o no audiovisual; no se consulta TMDb",
                 {
                     "reason_code": "category_not_resolvable",
+                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
                     "parser": parsed.to_dict(),
                     "category": category,
                 },
@@ -161,6 +170,7 @@ class NameResolver:
                 "GuessIt no pudo extraer un titulo util",
                 {
                     "reason_code": "empty_title",
+                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
                     "evidence": evidence,
                     "guess": guessed,
                 },
@@ -194,6 +204,19 @@ class NameResolver:
             self._trace["cache_hit"] = True
             identity = ResolvedIdentity.from_dict(json.loads(str(cached["payload_json"])))
             identity.source = "cache"
+            self._trace["candidates"] = []
+            self._trace["decision"] = {
+                "status": "ACCEPTED",
+                "accepted": True,
+                "has_scoring": True,
+                "source": "cache",
+                "cache_reused": True,
+                "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+                "eligibility_reason": "cache_v3_reuse",
+                "eligibility_blocked": False,
+                "score": identity.score,
+                "margin": identity.margin,
+            }
             return identity
 
         self._deadline = time.monotonic() + self.total_budget
@@ -222,9 +245,11 @@ class NameResolver:
                 "TMDb no devolvio candidatos",
                 {
                     "reason_code": "no_candidates",
+                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
                     "evidence": evidence,
                     "guess": guessed,
                     "query": query,
+                    "search_strategy": self._trace.get("search_strategy", {}),
                 },
             )
 
@@ -237,11 +262,33 @@ class NameResolver:
             source in {"tmdb_id", "imdb_id"}
             and bool(acceptance.get("direct_ids_bypass", True))
         ) or (source == "forced_match" and bool(acceptance.get("forced_bypass", True)))
-        normal_top = ranked[0]
-        normal_second_score = ranked[1].score if len(ranked) > 1 else 0.0
-        normal_margin = normal_top.score - normal_second_score
-        ranked, preference_applied = _prefer_original_language_candidate(
+        eligibility = _select_title_eligible_candidates(
             ranked,
+            guessed=guessed,
+            media_type=media_type,
+            source=source,
+            title_matching=rules.get("title_matching"),
+            selection_uncertain=bool(self._trace.get("selection_uncertain", False)),
+            selection_uncertainty_alternate_only=bool(
+                self._trace.get("selection_uncertainty_alternate_only", False)
+            ),
+            detail_incomplete=bool(
+                (self._trace.get("search_strategy") or {}).get("detail_incomplete", False)
+            ),
+        )
+        eligible_ranked = list(eligibility["eligible"])
+        ineligible_ranked = [candidate for candidate in ranked if not candidate.eligible]
+        eligibility_blocked = not eligible_ranked
+        strict_fallback_applied = bool(eligibility["strict_fallback_applied"])
+        normal_top = eligible_ranked[0] if eligible_ranked else ranked[0]
+        normal_second_score = (
+            eligible_ranked[1].score if len(eligible_ranked) > 1 else 0.0
+        )
+        normal_margin = (
+            normal_top.score - normal_second_score if eligible_ranked else 0.0
+        )
+        eligible_ranked, preference_applied = _prefer_original_language_candidate(
+            eligible_ranked,
             source=source,
             min_score=min_score,
             min_margin=min_margin,
@@ -254,8 +301,8 @@ class NameResolver:
         )
         oldest_preference_applied = False
         if not preference_applied:
-            ranked, oldest_preference_applied = _prefer_oldest_exact_title_movie_candidate(
-                ranked,
+            eligible_ranked, oldest_preference_applied = _prefer_oldest_exact_title_movie_candidate(
+                eligible_ranked,
                 media_type=media_type,
                 source=source,
                 guessed=guessed,
@@ -266,9 +313,12 @@ class NameResolver:
                 enabled=oldest_preference_enabled,
                 search_selection=self._trace.get("oldest_exact_title_search"),
             )
-        top = ranked[0]
-        second_score = ranked[1].score if len(ranked) > 1 else 0.0
-        margin = top.score - second_score
+        ranked = [*eligible_ranked, *ineligible_ranked] if eligible_ranked else list(ranked)
+        top = eligible_ranked[0] if eligible_ranked else ranked[0]
+        second_score = (
+            eligible_ranked[1].score if len(eligible_ranked) > 1 else 0.0
+        )
+        margin = top.score - second_score if eligible_ranked else 0.0
         score_passed = top.score >= min_score
         margin_passed = margin >= min_margin
         self._trace["candidates"] = [candidate.to_dict() for candidate in ranked]
@@ -294,10 +344,16 @@ class NameResolver:
         }
         decision_status = (
             "ACCEPTED"
-            if bypass
-            or (score_passed and margin_passed)
-            or preference_applied
-            or oldest_preference_applied
+            if not eligibility_blocked
+            and (
+                bypass
+                or strict_fallback_applied
+                or (score_passed and margin_passed)
+                or preference_applied
+                or oldest_preference_applied
+            )
+            else "REJECTED"
+            if eligibility_blocked
             else "REJECTED_SCORE"
             if not score_passed
             else "REJECTED_MARGIN"
@@ -308,9 +364,18 @@ class NameResolver:
             "has_scoring": True,
             "source": source,
             "bypass": bypass,
+            "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+            "eligibility_reason": eligibility["reason_code"],
+            "eligible_candidate_count": len(eligible_ranked),
+            "eligibility_blocked": eligibility_blocked,
+            "strict_alternate_fallback": {
+                "applied": strict_fallback_applied,
+                "requires_exact_year": True,
+                "requires_valid_season": media_type == "tv",
+            },
             "score": top.score,
             "second_score": second_score,
-            "has_second_candidate": len(ranked) > 1,
+            "has_second_candidate": len(eligible_ranked) > 1,
             "min_score": min_score,
             "score_passed": score_passed,
             "margin": margin,
@@ -321,13 +386,16 @@ class NameResolver:
         }
         if (
             not bypass
+            and not strict_fallback_applied
             and not preference_applied
             and not oldest_preference_applied
-            and (top.score < min_score or margin < min_margin)
+            and (eligibility_blocked or top.score < min_score or margin < min_margin)
         ):
             raise ResolverAmbiguous(
                 "La identidad no supera el umbral de seguridad",
                 {
+                    "reason_code": eligibility["reason_code"],
+                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
                     "evidence": evidence,
                     "guess": guessed,
                     "query": query,
@@ -336,6 +404,13 @@ class NameResolver:
                     "min_score": min_score,
                     "min_margin": min_margin,
                     "candidates": [candidate.to_dict() for candidate in ranked[:5]],
+                    "selection_uncertain": bool(
+                        self._trace.get("selection_uncertain", False)
+                    ),
+                    "raw_exact_candidate_counts": self._trace.get(
+                        "raw_exact_candidate_counts", {}
+                    ),
+                    "search_strategy": self._trace.get("search_strategy", {}),
                 },
             )
 
@@ -358,6 +433,7 @@ class NameResolver:
                 if _as_int(guessed.get("season")) is not None
                 else []
             ),
+            resolver_algorithm_version=RESOLVER_ALGORITHM_VERSION,
         )
         if cache_enabled and bool(cache_rules.get("write_enabled", True)) and not self._preview_mode:
             self.db.set_resolver_cache(
@@ -416,12 +492,18 @@ class NameResolver:
             details = sanitize_for_export(copy.deepcopy(error.details))
             if not isinstance(details, dict):
                 details = {}
-            status = (
+            traced_decision = preview._trace.get("decision")
+            traced_status = (
+                str(traced_decision.get("status") or "")
+                if isinstance(traced_decision, dict)
+                else ""
+            )
+            status = traced_status or (
                 "NO_CANDIDATES"
                 if details.get("reason_code") == "no_candidates"
                 else "REJECTED"
             )
-            if details.get("top_score") is not None:
+            if not traced_status and details.get("top_score") is not None:
                 score = float(details.get("top_score") or 0)
                 margin = float(details.get("margin") or 0)
                 min_score = (
@@ -466,6 +548,12 @@ class NameResolver:
                 **copy.deepcopy(preview._trace),
                 "decision": _preview_decision("TMDB_ERROR", preview._trace),
             }
+
+    def trace_snapshot(self) -> Dict[str, object]:
+        """Devuelve la última traza saneada para job_events e Informe Codex."""
+
+        snapshot = sanitize_for_export(copy.deepcopy(self._trace))
+        return dict(snapshot) if isinstance(snapshot, dict) else {}
 
     def output_matches(self, identity: ResolvedIdentity, output_names: Iterable[str]) -> bool:
         aliases = {_normalize_title(value) for value in identity.aliases if value}
@@ -608,6 +696,198 @@ class NameResolver:
 
     _first_match = staticmethod(_first_match)
     _cache_key = staticmethod(_cache_key)
+
+
+def _select_title_eligible_candidates(
+    ranked: Sequence[ResolverCandidate],
+    *,
+    guessed: Dict[str, object],
+    media_type: str,
+    source: str,
+    title_matching: object,
+    selection_uncertain: bool,
+    selection_uncertainty_alternate_only: bool = False,
+    detail_incomplete: bool = False,
+) -> Dict[str, object]:
+    """Separa seguridad de evidencia y puntuacion numerica."""
+
+    ordered = list(ranked)
+
+    def select(
+        candidates: Sequence[ResolverCandidate],
+        reason: str,
+        *,
+        strict_fallback: bool = False,
+    ) -> Dict[str, object]:
+        selected_ids = {candidate.tmdb_id for candidate in candidates}
+        for candidate in ordered:
+            candidate.eligible = candidate.tmdb_id in selected_ids
+            candidate.eligibility_reasons = [
+                reason if candidate.eligible else f"excluded:{reason}"
+            ]
+        return {
+            "eligible": [candidate for candidate in ordered if candidate.eligible],
+            "reason_code": reason,
+            "strict_fallback_applied": strict_fallback,
+        }
+
+    if source != "search":
+        return select(ordered, f"{source}_validated")
+
+    viable = [
+        candidate
+        for candidate in ordered
+        if not _candidate_has_invalid_season(candidate, guessed, media_type)
+    ]
+    if ordered and not viable:
+        return select([], "season_impossible")
+
+    evidence = resolved_title_evidence(guessed, title_matching)
+    has_alternate = any(item.get("role") == "alternate" for item in evidence)
+    has_composite = any(item.get("role") == "composite" for item in evidence)
+    guessed_year = _as_int(guessed.get("year"))
+    corroborated = [
+        candidate for candidate in viable if candidate.title_match_level == "corroborated"
+    ]
+    configured = [
+        candidate for candidate in viable if candidate.title_match_level == "configured"
+    ]
+    configured_for_year = (
+        configured
+        if guessed_year is None
+        else [candidate for candidate in configured if candidate.year == guessed_year]
+    )
+    if selection_uncertain:
+        if (
+            corroborated
+            and selection_uncertainty_alternate_only
+            and not detail_incomplete
+            and not configured_for_year
+        ):
+            return select(corroborated, "corroborated_titles")
+        return select([], "title_selection_uncertain")
+
+    if configured_for_year:
+        return select(configured_for_year, "configured_primary")
+
+    if not has_alternate and not has_composite:
+        primary_supported = [
+            candidate
+            for candidate in viable
+            if candidate.title_match_level in {"primary", "corroborated"}
+            or (
+                candidate.title_match_level == "configured"
+                and (guessed_year is None or candidate.year == guessed_year)
+            )
+        ]
+        if primary_supported:
+            return select(primary_supported, "single_primary_title")
+        return select([], "title_evidence_unconfirmed")
+
+    if corroborated:
+        return select(corroborated, "corroborated_titles")
+
+    primary = [
+        candidate
+        for candidate in viable
+        if _candidate_has_exact_primary(candidate)
+    ]
+    alternate = [
+        candidate
+        for candidate in viable
+        if _candidate_has_exact_role(candidate, "alternate")
+    ]
+
+    if primary and alternate:
+        year = guessed_year
+        if year is None:
+            return select([], "title_evidence_conflict")
+        exact_primary = [candidate for candidate in primary if candidate.year == year]
+        exact_alternate = [candidate for candidate in alternate if candidate.year == year]
+        if exact_primary and not exact_alternate:
+            return select(exact_primary, "primary_exact_year")
+        if exact_alternate and not exact_primary:
+            if len(exact_alternate) == 1 and _strict_alternate_season_valid(
+                exact_alternate[0], guessed, media_type
+            ):
+                return select(
+                    exact_alternate,
+                    "strict_alternate_fallback",
+                    strict_fallback=True,
+                )
+            return select([], "alternate_fallback_not_unique")
+        return select([], "title_evidence_conflict")
+
+    if primary:
+        return select(primary, "primary_without_alternate_conflict")
+
+    if alternate:
+        year = guessed_year
+        exact = [candidate for candidate in alternate if year is not None and candidate.year == year]
+        if (
+            len(exact) == 1
+            and _strict_alternate_season_valid(exact[0], guessed, media_type)
+        ):
+            return select(
+                exact,
+                "strict_alternate_fallback",
+                strict_fallback=True,
+            )
+        reason = "alternate_fallback_requires_year" if year is None else "alternate_fallback_not_unique"
+        return select([], reason)
+
+    return select([], "title_evidence_unconfirmed")
+
+
+def _candidate_has_exact_role(candidate: ResolverCandidate, role: str) -> bool:
+    if role in candidate.title_identity_exact_roles:
+        return True
+    return any(
+        item.get("role") == role
+        and item.get("identity_exact", item.get("exact")) is True
+        for item in candidate.title_matches
+    )
+
+
+def _candidate_has_exact_primary(candidate: ResolverCandidate) -> bool:
+    if {"primary", "derived_primary"} & set(candidate.title_identity_exact_roles):
+        return True
+    return any(
+        item.get("role") in {"primary", "derived_primary"}
+        and item.get("identity_exact", item.get("exact")) is True
+        for item in candidate.title_matches
+    )
+
+
+def _candidate_has_invalid_season(
+    candidate: ResolverCandidate,
+    guessed: Dict[str, object],
+    media_type: str,
+) -> bool:
+    if media_type != "tv":
+        return False
+    season = _as_int(guessed.get("season"))
+    return bool(
+        season is not None
+        and candidate.season_count is not None
+        and not 0 <= season <= candidate.season_count
+    )
+
+
+def _strict_alternate_season_valid(
+    candidate: ResolverCandidate,
+    guessed: Dict[str, object],
+    media_type: str,
+) -> bool:
+    if media_type != "tv":
+        return True
+    season = _as_int(guessed.get("season"))
+    if season is None:
+        return True
+    return bool(
+        candidate.season_count is not None
+        and 0 <= season <= candidate.season_count
+    )
 
 
 def _preview_decision(status: str, trace: Dict[str, object]) -> Dict[str, object]:

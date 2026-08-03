@@ -96,6 +96,35 @@ test_config.__test__ = False
 
 
 class CoreTests(unittest.TestCase):
+    def test_tv_identity_conflict_blocks_local_fallback_but_no_candidates_does_not(self):
+        decision = Mock(media_type="tv", confidence="high", block_reason=None)
+        job = {"category": "tv"}
+
+        for reason_code in (
+            "title_evidence_conflict",
+            "title_selection_uncertain",
+            "title_evidence_unconfirmed",
+            "alternate_fallback_requires_year",
+            "alternate_fallback_not_unique",
+            "season_impossible",
+        ):
+            with self.subTest(reason_code=reason_code):
+                error = ResolverAmbiguous(
+                    "Identidad ambigua",
+                    {"reason_code": reason_code},
+                )
+                self.assertFalse(
+                    Engine._can_continue_tv_without_identity(job, decision, error)
+                )
+
+        no_candidates = ResolverAmbiguous(
+            "Sin candidatos",
+            {"reason_code": "no_candidates"},
+        )
+        self.assertTrue(
+            Engine._can_continue_tv_without_identity(job, decision, no_candidates)
+        )
+
     def _run_tv_name_with_ambiguous_resolver(self, name: str, message: str):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
@@ -1982,6 +2011,16 @@ class CoreTests(unittest.TestCase):
                 def resolve(self, _job, _input_root):
                     return identity
 
+                def trace_snapshot(self):
+                    return {
+                        "resolver_algorithm_version": "title-evidence-v1",
+                        "decision": {
+                            "status": "ACCEPTED",
+                            "eligibility_reason": "single_primary_title",
+                        },
+                        "token": "must-not-leak",
+                    }
+
                 def output_matches(self, _identity, names):
                     return names == ["Un padre en apuros (1996)"]
 
@@ -2020,6 +2059,8 @@ class CoreTests(unittest.TestCase):
             engine._run_filebot(job)
 
             updated = database.get_job(job["job_id"])
+            persisted_events = database.events_for_job(job["job_id"])
+            database.close()
             self.assertEqual(updated["state"], "media_postprocess_ready")
             self.assertEqual(fake_filebot.received_identity.tmdb_id, 9279)
             self.assertEqual(
@@ -2029,6 +2070,30 @@ class CoreTests(unittest.TestCase):
                 "es-ES",
             )
             self.assertIn('"tmdb_id": 9279', updated["identity_json"])
+            identity_event = next(
+                event
+                for event in persisted_events
+                if event["phase"] == "identity"
+                and event["event_type"] == "decision"
+                and str(event["message"]).startswith("Identidad confirmada:")
+            )
+            structured = json.loads(identity_event["structured_json"])
+            self.assertEqual(
+                structured["resolver_trace"]["resolver_algorithm_version"],
+                "title-evidence-v1",
+            )
+            self.assertEqual(
+                structured["resolver_trace"]["decision"]["eligibility_reason"],
+                "single_primary_title",
+            )
+            self.assertEqual(
+                structured["resolver_trace"]["token"],
+                "<REDACTED>",
+            )
+            self.assertNotIn(
+                "must-not-leak",
+                identity_event["structured_json"],
+            )
             database.close()
 
     def test_wrong_filebot_identity_is_blocked_before_media_worker(self) -> None:

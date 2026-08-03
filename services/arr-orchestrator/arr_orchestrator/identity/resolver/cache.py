@@ -7,7 +7,7 @@ from typing import Dict, Optional, Sequence
 from .text import json_safe
 
 
-RESOLVER_CACHE_VERSION = 2
+RESOLVER_CACHE_VERSION = 3
 
 
 def cache_key(
