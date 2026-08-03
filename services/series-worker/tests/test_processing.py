@@ -11,15 +11,20 @@ import series_worker.processing as processing_module
 
 from series_worker.manifest import discover_manifest
 from series_worker.processing import (
+    AudioInvalidError,
     BASE_TOOLS,
     OCR_TOOLS,
     TOOL_SMOKE_ARGS,
     EpisodeProcessingError,
+    OCRSubtitleError,
     ProcessingError,
     SeriesProcessor,
+    SubtitleNotConvertibleError,
     SubprocessRunner,
     ReviewRequiredError,
+    VideoInvalidError,
     analyze_episode,
+    processing_review_identity,
     process_manifest,
     unavailable_tools,
 )
@@ -371,8 +376,58 @@ def test_single_untagged_audio_is_rejected_when_legacy_flag_is_disabled(
         ),
     )
 
-    with pytest.raises(ProcessingError, match="No hay audio español válido"):
+    with pytest.raises(AudioInvalidError, match="No hay audio español válido"):
         analyze_episode(source, tmp_path / "output.mkv", snapshot, runner)
+
+
+def test_invalid_video_track_count_is_a_typed_video_rejection(tmp_path: Path) -> None:
+    source = tmp_path / "Serie.S01E01.mkv"
+    source.write_bytes(b"episode")
+    probe = _stream_probe()
+    probe["streams"] = [
+        stream
+        for stream in probe["streams"]
+        if stream["codec_type"] != "video"
+    ]
+
+    with pytest.raises(VideoInvalidError, match="pistas de vídeo") as captured:
+        analyze_episode(
+            source,
+            tmp_path / "output.mkv",
+            _snapshot(tmp_path),
+            FakeRunner({source.name: probe}),
+        )
+
+    assert processing_review_identity(captured.value) == (
+        "series_video_invalid",
+        "video",
+    )
+
+
+def test_required_missing_subtitle_is_typed_without_parsing_its_text(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "Serie.S01E01.mkv"
+    source.write_bytes(b"episode")
+    snapshot = _snapshot(
+        tmp_path,
+        lambda rules: rules["subtitulos"].update(
+            {"sin_subtitulos_modo": "revisar"}
+        ),
+    )
+
+    with pytest.raises(SubtitleNotConvertibleError) as captured:
+        analyze_episode(
+            source,
+            tmp_path / "output.mkv",
+            snapshot,
+            FakeRunner({source.name: _stream_probe()}),
+        )
+
+    assert processing_review_identity(captured.value) == (
+        "series_subtitle_not_convertible",
+        "subtitle",
+    )
 
 
 def test_internal_delay_subtitle_is_prioritized_and_exported(tmp_path: Path) -> None:
@@ -539,6 +594,48 @@ def test_unknown_spanish_subtitle_codec_requires_review(tmp_path: Path) -> None:
         process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
 
     assert isinstance(captured.value.__cause__, ReviewRequiredError)
+    assert processing_review_identity(captured.value) == (
+        "series_subtitle_not_convertible",
+        "subtitle",
+    )
+
+
+def test_ocr_tool_failure_keeps_ocr_identity_through_episode_wrapper(
+    tmp_path: Path,
+) -> None:
+    relative = "Serie/Season 01/Serie.S01E01.mkv"
+    job, source, manifest = _job(tmp_path, [relative])
+    subtitle = {
+        "index": 2,
+        "codec_type": "subtitle",
+        "codec_name": "hdmv_pgs_subtitle",
+        "tags": {"language": "spa"},
+        "disposition": {},
+    }
+
+    class FailedOCRRunner(FakeRunner):
+        def run(self, argv, *, timeout, cwd=None):
+            if str(argv[0]) == "seconv":
+                return subprocess.CompletedProcess(
+                    [str(value) for value in argv],
+                    1,
+                    "",
+                    "detalle controlado sin palabra OCR",
+                )
+            return super().run(argv, timeout=timeout, cwd=cwd)
+
+    runner = FailedOCRRunner(
+        {"Serie.S01E01.mkv": _stream_probe(subtitle=subtitle)}
+    )
+
+    with pytest.raises(EpisodeProcessingError) as captured:
+        process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
+
+    assert isinstance(captured.value.__cause__, OCRSubtitleError)
+    assert processing_review_identity(captured.value) == (
+        "series_ocr_subtitle_failed",
+        "ocr",
+    )
 
 
 def test_ocr_result_reapplies_cue_limit_before_embedding(tmp_path: Path) -> None:

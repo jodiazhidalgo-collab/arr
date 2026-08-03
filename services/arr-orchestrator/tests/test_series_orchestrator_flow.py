@@ -17,11 +17,18 @@ from arr_orchestrator.db import Database
 import arr_orchestrator.engine as engine_module
 from arr_orchestrator.engine import (
     Engine,
+    SERIES_REVIEW_METADATA_FILES,
+    SERIES_REVIEW_REASON_SPECS,
     SERIES_REVIEW_SIGNATURE_SHA256_V1,
     SERIES_REVIEW_SIGNATURE_STAT_V1,
+    SERIES_WORKER_REVIEW_CODES_V2,
     WORKER_ACTIVE_MAX_SECONDS,
 )
-from arr_orchestrator.filesystem import ExtractionError, review_content_signature
+from arr_orchestrator.filesystem import (
+    ExtractionError,
+    review_content_signature,
+    write_reason,
+)
 from arr_orchestrator.series_worker import (
     SeriesWorkerBusy,
     SeriesWorkerConflict,
@@ -240,6 +247,130 @@ def _done_result(
             "cleanup_pending": False,
         },
     }
+
+
+def _review_result_v2(
+    *,
+    job_id: str,
+    manifest: dict[str, object],
+    review: Path,
+    review_relative: str,
+    reason_kind: str,
+    reasons: list[str] | None = None,
+    review_layout: str = "source_root",
+    review_source_prefix: str = "",
+) -> dict[str, object]:
+    reason_code = SERIES_WORKER_REVIEW_CODES_V2[reason_kind]
+    reason_file, reason_title, _explanation = SERIES_REVIEW_REASON_SPECS[
+        reason_kind
+    ]
+    raw_reasons = reasons or [f"motivo_tecnico:{reason_kind}"]
+    reason_lines = [
+        f"Explicacion visible para {reason_kind}.",
+        "Detalle visible controlado.",
+    ]
+    reason = {
+        "schema": "series-review-v2",
+        "profile": "series",
+        "category": "tv",
+        "job_id": job_id,
+        "manifest_digest": str(manifest["digest"]),
+        "reasons": raw_reasons,
+        "reason_code": reason_code,
+        "reason_kind": reason_kind,
+        "reason_file": reason_file,
+        "reason_title": reason_title,
+        "reason_lines": reason_lines,
+        "review_layout": review_layout,
+        "review_source_prefix": review_source_prefix,
+    }
+    (review / "reason.json").write_text(
+        json.dumps(reason, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (review / reason_file).write_text(
+        "\n".join([reason_title, *reason_lines]) + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "status": "review",
+        "job_id": job_id,
+        "kind": "series",
+        "rules_fingerprint": RULES_FINGERPRINT,
+        "manifest": manifest,
+        "review_path": review_relative,
+        "review_layout": review_layout,
+        "review_source_prefix": review_source_prefix,
+        "review_reasons": raw_reasons,
+        "published": [],
+        "reason_code": reason_code,
+        "reason_kind": reason_kind,
+        "reason_file": reason_file,
+        "reason_title": reason_title,
+        "reason_lines": reason_lines,
+    }
+
+
+def _write_orchestrator_review_reason_v2(
+    review: Path,
+    job_id: str,
+    *,
+    signature: str = "",
+    signature_method: str = SERIES_REVIEW_SIGNATURE_STAT_V1,
+) -> dict[str, object]:
+    reason_file, reason_title, explanation = SERIES_REVIEW_REASON_SPECS["process"]
+    reason = {
+        "schema": "series-review-v2",
+        "profile": "series",
+        "category": "tv",
+        "job_id": job_id,
+        "reason": "series_process_error",
+        "message": "Fallo controlado de prueba",
+        "reasons": ["series_process_error: Fallo controlado de prueba"],
+        "reason_code": "series_process_error",
+        "reason_kind": "process",
+        "reason_file": reason_file,
+        "reason_title": reason_title,
+        "reason_lines": [explanation, "Fallo controlado de prueba"],
+    }
+    if signature:
+        reason["_arr_review_signature"] = signature
+        reason["_arr_review_signature_method"] = signature_method
+    write_reason(
+        review,
+        reason,
+        reason_file,
+        list(reason["reason_lines"]),
+    )
+    return reason
+
+
+def _write_legacy_review_reason_v1(
+    review: Path,
+    job_id: str,
+    *,
+    reasons: list[str] | None = None,
+) -> dict[str, object]:
+    raw_reasons = reasons or ["colision_existente"]
+    reason = {
+        "schema": "series-review-v1",
+        "profile": "series",
+        "category": "tv",
+        "job_id": job_id,
+        "manifest_digest": "legacy",
+        "reasons": raw_reasons,
+        "review_layout": "source_root",
+        "review_source_prefix": "",
+    }
+    (review / "reason.json").write_text(
+        json.dumps(reason, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (review / "Serie repetida.txt").write_text(
+        "Serie repetida\n" + "\n".join(raw_reasons) + "\n",
+        encoding="utf-8",
+    )
+    return reason
 
 
 class _Worker:
@@ -667,11 +798,14 @@ def test_conflict_uses_clean_human_series_review_layout(tmp_path: Path) -> None:
         assert review.parent == engine.config.series_review_dir
         assert review.name == "Mi Serie - S01E01"
         assert (review / "Mi Serie - S01E01.mkv").read_bytes() == b"episode-one"
-        assert (review / "Serie repetida.txt").is_file()
+        assert (review / "Error de proceso.txt").is_file()
         reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert reason["schema"] == "series-review-v2"
         assert reason["profile"] == "series"
         assert reason["category"] == "tv"
         assert reason["reason"] == "job_conflict"
+        assert reason["reason_code"] == "job_conflict"
+        assert reason["reason_kind"] == "process"
         assert not any(review.rglob("*.nfo"))
         assert not job_root.exists()
     finally:
@@ -720,33 +854,20 @@ def test_verified_worker_review_allows_client_and_workshop_cleanup(tmp_path: Pat
         manifest = _manifest(episode, source_root)
         review_relative = f"{job['job_id']}-{'b' * 12}"
         review = engine.config.series_review_dir / review_relative
-        result = {
-            "status": "review",
-            "job_id": str(job["job_id"]),
-            "kind": "series",
-            "rules_fingerprint": RULES_FINGERPRINT,
-            "manifest": manifest,
-            "review_path": review_relative,
-            "review_reasons": ["pack_multiserie"],
-            "published": [],
-        }
+        result: dict[str, object] = {}
 
         class MovingReviewWorker(_Worker):
             def process_series(self, *args):
                 shutil.move(str(source_root), str(review))
-                (review / "reason.json").write_text(
-                    json.dumps(
-                        {
-                            "job_id": str(job["job_id"]),
-                            "manifest_digest": str(manifest["digest"]),
-                            "reasons": ["pack_multiserie"],
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                (review / "Revision de serie.txt").write_text(
-                    "revision",
-                    encoding="utf-8",
+                result.update(
+                    _review_result_v2(
+                        job_id=str(job["job_id"]),
+                        manifest=manifest,
+                        review=review,
+                        review_relative=review_relative,
+                        reason_kind="manual",
+                        reasons=["pack_multiserie"],
+                    )
                 )
                 return super().process_series(*args)
 
@@ -768,6 +889,56 @@ def test_verified_worker_review_allows_client_and_workshop_cleanup(tmp_path: Pat
         assert review.is_dir()
         assert _eventually_absent(job_root)
         assert not any(engine.config.tv_output.iterdir())
+        assert updated["last_error_code"] == "series_manual_review"
+        reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert reason["clients_cleanup_pending"] is False
+        assert (review / "Revision de serie.txt").read_text(encoding="utf-8") == (
+            "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n"
+        )
+        detail = database.job_detail(str(job["job_id"]))
+        assert any(
+            event.get("structured", {}).get("last_error_code")
+            == "series_manual_review"
+            for event in detail["timeline"]
+        )
+    finally:
+        database.close()
+
+
+def test_worker_review_cleanup_pending_keeps_specific_code_in_db_and_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-audio"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind="audio",
+            reasons=["audio_no_valido:sin pista admitida"],
+        )
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: False)
+
+        engine._apply_series_worker_result(job, result, recovery=False)
+
+        pending = database.get_job(str(job["job_id"]))
+        assert pending["state"] == "series_review_cleanup"
+        assert pending["last_error_code"] == "series_audio_invalid"
+        assert job_root.is_dir()
+        detail = database.job_detail(str(job["job_id"]))
+        assert any(
+            isinstance(event.get("structured"), dict)
+            and event["structured"].get("status") == "review_cleanup_pending"
+            and event["structured"].get("reason_code") == "series_audio_invalid"
+            for event in detail["timeline"]
+        )
     finally:
         database.close()
 
@@ -828,6 +999,190 @@ def test_clean_worker_review_is_validated_inside_the_shared_review_root(
         database.close()
 
 
+@pytest.mark.parametrize(
+    "reason_kind",
+    ["duplicate", "audio", "video", "subtitle", "ocr", "manual", "process"],
+)
+def test_series_review_v2_accepts_every_worker_reason_family(
+    tmp_path: Path,
+    reason_kind: str,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-{reason_kind}"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind=reason_kind,
+        )
+
+        assert engine._validate_series_worker_result(job, result) == review
+        reason_file = str(result["reason_file"])
+        assert (review / reason_file).read_text(encoding="utf-8") == (
+            "\n".join(
+                [str(result["reason_title"]), *list(result["reason_lines"])]
+            )
+            + "\n"
+        )
+        assert {
+            path.name
+            for path in review.iterdir()
+            if path.name in {spec[0] for spec in SERIES_REVIEW_REASON_SPECS.values()}
+        } == {reason_file}
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["reason_file_traversal", "marker_content", "second_marker", "reason_code"],
+)
+def test_series_review_v2_rejects_unsafe_or_incoherent_human_marker(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-unsafe"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind="duplicate",
+        )
+        reason_path = review / "reason.json"
+        reason = json.loads(reason_path.read_text(encoding="utf-8"))
+        if tamper == "reason_file_traversal":
+            reason["reason_file"] = "../Serie repetida.txt"
+            result["reason_file"] = "../Serie repetida.txt"
+        elif tamper == "marker_content":
+            (review / "Serie repetida.txt").write_text(
+                "Serie repetida\ncontenido manipulado\n",
+                encoding="utf-8",
+            )
+        elif tamper == "second_marker":
+            (review / "Error de proceso.txt").write_text(
+                "Error de proceso\n",
+                encoding="utf-8",
+            )
+        else:
+            reason["reason_code"] = "series_process_error"
+            result["reason_code"] = "series_process_error"
+        reason_path.write_text(
+            json.dumps(reason, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError):
+            engine._validate_series_worker_result(job, result)
+    finally:
+        database.close()
+
+
+def test_series_review_rejects_unknown_schema_but_keeps_v1_compatible(
+    tmp_path: Path,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-unknown"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind="manual",
+        )
+        reason_path = review / "reason.json"
+        reason = json.loads(reason_path.read_text(encoding="utf-8"))
+        reason["schema"] = "series-review-v3"
+        reason_path.write_text(json.dumps(reason), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="esquema desconocido"):
+            engine._validate_series_worker_result(job, result)
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing_schema", "marker_content", "second_marker", "result_reasons"],
+)
+def test_series_review_v1_requires_exact_single_marker_contract(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-legacy-v1"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        reasons = ["colision_existente:Mi Serie/Season 01/Mi Serie S01E01.mkv"]
+        reason = {
+            "schema": "series-review-v1",
+            "profile": "series",
+            "category": "tv",
+            "job_id": str(job["job_id"]),
+            "manifest_digest": str(manifest["digest"]),
+            "reasons": reasons,
+            "review_layout": "source_root",
+            "review_source_prefix": "",
+        }
+        marker = review / "Serie repetida.txt"
+        marker.write_text(
+            "Serie repetida\n" + "\n".join(reasons) + "\n",
+            encoding="utf-8",
+        )
+        result = {
+            "status": "review",
+            "job_id": str(job["job_id"]),
+            "kind": "series",
+            "rules_fingerprint": RULES_FINGERPRINT,
+            "manifest": manifest,
+            "review_path": review_relative,
+            "review_layout": "source_root",
+            "review_source_prefix": "",
+            "review_reasons": list(reasons),
+            "published": [],
+        }
+        if tamper == "missing_schema":
+            reason.pop("schema")
+        elif tamper == "marker_content":
+            marker.write_text("Serie repetida\n", encoding="utf-8")
+        elif tamper == "second_marker":
+            (review / "Error de proceso.txt").write_text(
+                "Error de proceso\n",
+                encoding="utf-8",
+            )
+        else:
+            result["review_reasons"] = ["otro_motivo"]
+        (review / "reason.json").write_text(
+            json.dumps(reason, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError):
+            engine._validate_series_worker_result(job, result)
+    finally:
+        database.close()
+
+
 def test_historical_worker_review_uses_legacy_root_only_with_durable_request(
     tmp_path: Path,
 ) -> None:
@@ -853,7 +1208,10 @@ def test_historical_worker_review_uses_legacy_root_only_with_durable_request(
             json.dumps(reason, ensure_ascii=False),
             encoding="utf-8",
         )
-        (review / "Serie repetida.txt").write_text("Serie repetida\n", encoding="utf-8")
+        (review / "Serie repetida.txt").write_text(
+            "Serie repetida\ncolision_existente\n",
+            encoding="utf-8",
+        )
         result = {
             "status": "review",
             "job_id": str(job["job_id"]),
@@ -931,16 +1289,121 @@ def test_orchestrator_fallback_uses_the_same_clean_series_review_layout(
         assert {path.name for path in review.iterdir()} == {
             "Mi Serie - S01E01.mkv",
             "Mi Serie - S01E01.es.forced.srt",
-            "Serie repetida.txt",
+            "Error de proceso.txt",
             "reason.json",
         }
         assert (review / "Mi Serie - S01E01.es.forced.srt").read_text(
             encoding="utf-8"
         ) == "subtitle"
         reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert reason["reason_code"] == "series_worker_unavailable"
+        assert reason["reason_kind"] == "process"
+        assert reason["reason_file"] == "Error de proceso.txt"
+        assert (review / reason["reason_file"]).read_text(encoding="utf-8") == (
+            "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n"
+        )
         assert reason["profile"] == "series"
         assert reason["category"] == "tv"
         assert not job_root.exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    ("error_code", "phase", "reason_kind", "reason_file"),
+    [
+        ("series_duplicate", "series", "duplicate", "Serie repetida.txt"),
+        ("series_filebot_duplicate", "filebot", "filebot", "Error de FileBot.txt"),
+        ("series_audio_invalid", "series", "audio", "Audio no valido.txt"),
+        ("series_video_invalid", "series", "video", "Video no valido.txt"),
+        (
+            "series_subtitle_not_convertible",
+            "series",
+            "subtitle",
+            "Subtitulo no convertible.txt",
+        ),
+        ("series_ocr_subtitle_failed", "series", "ocr", "OCR subtitulo fallido.txt"),
+        ("identity_ambiguous", "identity", "manual", "Revision de serie.txt"),
+        ("series_worker_unavailable", "series", "process", "Error de proceso.txt"),
+        ("filebot_timeout", "filebot", "filebot", "Error de FileBot.txt"),
+        ("extract_volume_missing", "extract", "extraction", "Error de extraccion.txt"),
+    ],
+)
+def test_orchestrator_fallback_reason_matrix_is_semantic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    phase: str,
+    reason_kind: str,
+    reason_file: str,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, _source_root, _episode = _series_job(engine, database)
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: True)
+
+        assert engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            error_code,
+            "detalle técnico controlado",
+            phase=phase,
+        )
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert updated["state"] == "manual_review"
+        assert updated["last_error_code"] == error_code
+        assert reason["reason_code"] == error_code
+        assert reason["reason_kind"] == reason_kind
+        assert reason["reason_file"] == reason_file
+        assert reason["reasons"] == [f"{error_code}: detalle técnico controlado"]
+        assert {
+            path.name
+            for path in review.iterdir()
+            if path.name in {spec[0] for spec in SERIES_REVIEW_REASON_SPECS.values()}
+        } == {reason_file}
+        marker_content = (review / reason_file).read_text(encoding="utf-8")
+        assert marker_content == (
+            "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n"
+        )
+        assert "Código técnico:" not in marker_content
+        assert not job_root.exists()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("dirty_layout", [False, True])
+def test_private_filebot_collision_is_never_labeled_as_series_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dirty_layout: bool,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, _source_root, _episode = _series_job(engine, database)
+        if dirty_layout:
+            extra = job_root / "original" / "sin-clasificar.bin"
+            extra.parent.mkdir()
+            extra.write_bytes(b"keep")
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: True)
+
+        assert engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_filebot_duplicate",
+            "duplicado real confirmado",
+            phase="filebot",
+        )
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert reason["reason_kind"] == "filebot"
+        assert (review / "Error de FileBot.txt").is_file()
+        assert not (review / "Serie repetida.txt").exists()
+        assert not (review / "Revision de serie.txt").exists()
     finally:
         database.close()
 
@@ -970,6 +1433,476 @@ def test_orchestrator_fallback_preserves_whole_tree_for_unknown_output_file(
         assert next(review.rglob("*.mkv")).read_bytes() == b"episode-one"
         assert (review / "series_filebot_output").is_dir()
         assert not job_root.exists()
+    finally:
+        database.close()
+
+
+def test_orchestrator_fallback_never_overwrites_reserved_root_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, _source_root, _episode = _series_job(engine, database)
+        reserved = job_root / "Audio no valido.txt"
+        reserved.write_bytes(b"contenido-del-usuario")
+        cleanup_calls: list[bool] = []
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda *_args, **_kwargs: cleanup_calls.append(True) or True,
+        )
+
+        assert not engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_worker_unavailable",
+            "fallo controlado",
+        )
+
+        assert reserved.read_bytes() == b"contenido-del-usuario"
+        assert job_root.is_dir()
+        assert cleanup_calls == []
+        updated = database.get_job(str(job["job_id"]))
+        assert str(updated["last_error_code"]).endswith(
+            "_preservation_unconfirmed"
+        )
+    finally:
+        database.close()
+
+
+@LINUX_SYMLINK_ONLY
+def test_write_reason_atomically_replaces_marker_symlinks_without_following_them(
+    tmp_path: Path,
+) -> None:
+    review = tmp_path / "review"
+    review.mkdir()
+    outside_reason = tmp_path / "outside-reason.json"
+    outside_marker = tmp_path / "outside-marker.txt"
+    outside_reason.write_text("NO TOCAR JSON", encoding="utf-8")
+    outside_marker.write_text("NO TOCAR TXT", encoding="utf-8")
+    (review / "reason.json").symlink_to(outside_reason)
+    (review / "Error de proceso.txt").symlink_to(outside_marker)
+
+    write_reason(
+        review,
+        {"job_id": "job-atomic", "reason_file": "Error de proceso.txt"},
+        "Error de proceso.txt",
+        ["Detalle seguro"],
+    )
+
+    assert outside_reason.read_text(encoding="utf-8") == "NO TOCAR JSON"
+    assert outside_marker.read_text(encoding="utf-8") == "NO TOCAR TXT"
+    assert not (review / "reason.json").is_symlink()
+    assert not (review / "Error de proceso.txt").is_symlink()
+    assert json.loads((review / "reason.json").read_text(encoding="utf-8")) == {
+        "job_id": "job-atomic",
+        "reason_file": "Error de proceso.txt",
+    }
+    assert (review / "Error de proceso.txt").read_text(encoding="utf-8") == (
+        "Error de proceso\nDetalle seguro\n"
+    )
+
+
+@LINUX_SYMLINK_ONLY
+def test_write_reason_rejects_a_symlinked_destination_directory(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside-directory"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("NO TOCAR", encoding="utf-8")
+    linked_review = tmp_path / "linked-review"
+    linked_review.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        write_reason(
+            linked_review,
+            {"job_id": "job-directory-link"},
+            "Error de proceso.txt",
+            ["Detalle que no debe escribirse fuera"],
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "NO TOCAR"
+    assert {path.name for path in outside.iterdir()} == {"sentinel.txt"}
+
+
+def test_write_reason_rejects_a_replaced_directory_identity(tmp_path: Path) -> None:
+    review = tmp_path / "review-identity"
+    review.mkdir()
+    info = review.lstat()
+    expected_identity = (int(info.st_dev), int(info.st_ino))
+    original = tmp_path / "original-review-identity"
+    review.rename(original)
+    review.mkdir()
+    sentinel = review / "sentinel.txt"
+    sentinel.write_text("NO TOCAR", encoding="utf-8")
+
+    with pytest.raises(OSError, match="carpeta del motivo cambió"):
+        write_reason(
+            review,
+            {"job_id": "job-replaced-directory"},
+            "Error de proceso.txt",
+            ["Detalle que no debe escribirse"],
+            expected_directory_identity=expected_identity,
+        )
+
+    assert {path.name for path in review.iterdir()} == {"sentinel.txt"}
+    assert sentinel.read_text(encoding="utf-8") == "NO TOCAR"
+
+
+def test_write_reason_blocks_if_an_old_marker_cannot_be_removed(tmp_path: Path) -> None:
+    review = tmp_path / "review-blocked-marker"
+    review.mkdir()
+    blocked_marker = review / "Audio no valido.txt"
+    blocked_marker.mkdir()
+
+    with pytest.raises(OSError):
+        write_reason(
+            review,
+            {"job_id": "job-blocked-marker"},
+            "Error de proceso.txt",
+            ["No debe coexistir con otro marcador"],
+        )
+
+    assert blocked_marker.is_dir()
+    assert not (review / "Error de proceso.txt").exists()
+
+
+def test_orchestrator_fallback_binds_reason_to_the_preserved_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, _source_root, _episode = _series_job(engine, database)
+        relocated = tmp_path / "fallback-original-review"
+        cleanup_calls: list[bool] = []
+        original_write_reason = engine_module.write_reason
+
+        def replace_before_open(destination, *args, **kwargs) -> None:
+            Path(destination).rename(relocated)
+            Path(destination).mkdir()
+            (Path(destination) / "sentinel.txt").write_text(
+                "NO TOCAR",
+                encoding="utf-8",
+            )
+            original_write_reason(destination, *args, **kwargs)
+
+        monkeypatch.setattr(engine_module, "write_reason", replace_before_open)
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda *_args, **_kwargs: cleanup_calls.append(True) or True,
+        )
+
+        assert not engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_worker_unavailable",
+            "fallo controlado",
+        )
+
+        review = Path(str(database.get_job(str(job["job_id"]))["stage_path"]))
+        assert {path.name for path in review.iterdir()} == {"sentinel.txt"}
+        assert [path for path in relocated.rglob("*.mkv") if path.is_file()]
+        assert cleanup_calls == []
+    finally:
+        database.close()
+
+
+def test_orchestrator_fallback_does_not_confirm_a_swap_during_client_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, _source_root, _episode = _series_job(engine, database)
+        relocated = tmp_path / "fallback-review-before-cleanup-swap"
+        cleanup_calls: list[bool] = []
+
+        def swap_during_cleanup(*_args, **_kwargs) -> bool:
+            cleanup_calls.append(True)
+            review = Path(str(database.get_job(str(job["job_id"]))["stage_path"]))
+            review.rename(relocated)
+            review.mkdir()
+            (review / "sentinel.txt").write_text("NO TOCAR", encoding="utf-8")
+            return True
+
+        monkeypatch.setattr(engine, "_cleanup_clients", swap_during_cleanup)
+
+        assert not engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_worker_unavailable",
+            "fallo controlado",
+        )
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        assert updated["state"] == "manual_review"
+        assert str(updated["last_error_code"]).endswith("_preservation_unconfirmed")
+        assert {path.name for path in review.iterdir()} == {"sentinel.txt"}
+        assert (relocated / "reason.json").is_file()
+        assert [path for path in relocated.rglob("*.mkv") if path.is_file()]
+        assert cleanup_calls == [True]
+    finally:
+        database.close()
+
+
+def test_orchestrator_v2_rejects_a_movie_marker_as_a_second_marker(
+    tmp_path: Path,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, _source_root, _episode = _series_job(engine, database)
+        review = engine.config.series_review_dir / "v2-extra-movie-marker"
+        review.mkdir()
+        (review / "episode.mkv").write_bytes(b"preserved")
+        reason = _write_orchestrator_review_reason_v2(review, str(job["job_id"]))
+        (review / "Pelicula repetida.txt").write_text(
+            "Pelicula repetida\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match="más de un marcador"):
+            engine._validate_series_review_reason(
+                review,
+                reason,
+                expected_job_id=str(job["job_id"]),
+            )
+    finally:
+        database.close()
+
+
+@LINUX_SYMLINK_ONLY
+def test_review_cleanup_blocks_a_metadata_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-atomic-retry"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind="process",
+        )
+        result["_arr_review_signature"] = engine._series_review_signature_digest(review)
+        result["_arr_review_signature_method"] = SERIES_REVIEW_SIGNATURE_STAT_V1
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision v2 verificada",
+            stage_path=str(review),
+            result_json=json.dumps(result),
+        )
+        outside_reason = tmp_path / "outside-cleanup-reason.json"
+        outside_marker = tmp_path / "outside-cleanup-marker.txt"
+        outside_reason.write_text("NO TOCAR JSON", encoding="utf-8")
+        outside_marker.write_text("NO TOCAR TXT", encoding="utf-8")
+
+        def swap_metadata(*_args, **_kwargs) -> bool:
+            reason_path = review / "reason.json"
+            marker_path = review / str(result["reason_file"])
+            reason_path.unlink()
+            marker_path.unlink()
+            reason_path.symlink_to(outside_reason)
+            marker_path.symlink_to(outside_marker)
+            return True
+
+        monkeypatch.setattr(engine, "_cleanup_clients", swap_metadata)
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        assert updated["state"] == "series_review_cleanup"
+        assert str(updated["last_error_code"]).endswith("review_integrity_failed")
+        assert job_root.is_dir()
+        assert outside_reason.read_text(encoding="utf-8") == "NO TOCAR JSON"
+        assert outside_marker.read_text(encoding="utf-8") == "NO TOCAR TXT"
+        assert (review / "reason.json").is_symlink()
+        assert (review / str(result["reason_file"])).is_symlink()
+    finally:
+        database.close()
+
+
+def test_review_cleanup_binds_the_atomic_writer_to_the_validated_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-writer-identity"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind="process",
+        )
+        result["_arr_review_signature"] = engine._series_review_signature_digest(review)
+        result["_arr_review_signature_method"] = SERIES_REVIEW_SIGNATURE_STAT_V1
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision v2 verificada",
+            stage_path=str(review),
+            result_json=json.dumps(result),
+        )
+        relocated = tmp_path / "writer-original-review"
+        original_write_reason = engine_module.write_reason
+
+        def replace_before_open(destination, *args, **kwargs) -> None:
+            review.rename(relocated)
+            review.mkdir()
+            (review / "sentinel.txt").write_text("NO TOCAR", encoding="utf-8")
+            original_write_reason(destination, *args, **kwargs)
+
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(engine_module, "write_reason", replace_before_open)
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        assert updated["state"] == "series_review_cleanup"
+        assert job_root.is_dir()
+        assert {path.name for path in review.iterdir()} == {"sentinel.txt"}
+        assert (relocated / "reason.json").is_file()
+        assert (relocated / str(result["reason_file"])).is_file()
+    finally:
+        database.close()
+
+
+@LINUX_SYMLINK_ONLY
+def test_review_cleanup_rejects_an_ancestor_swap_inside_the_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-ancestor-swap"
+        review_root = engine.config.series_review_dir
+        review = review_root / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind="process",
+        )
+        result["_arr_review_signature"] = engine._series_review_signature_digest(review)
+        result["_arr_review_signature_method"] = SERIES_REVIEW_SIGNATURE_STAT_V1
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision v2 verificada",
+            stage_path=str(review),
+            result_json=json.dumps(result),
+        )
+        relocated_root = tmp_path / "relocated-review-root"
+        outside_root = tmp_path / "outside-ancestor-root"
+        outside_review = outside_root / review_relative
+        outside_root.mkdir()
+        sentinel = outside_root / "sentinel.txt"
+        sentinel.write_text("NO TOCAR", encoding="utf-8")
+        original_write_reason = engine_module.write_reason
+
+        def replace_ancestor_before_open(destination, *args, **kwargs) -> None:
+            review_root.rename(relocated_root)
+            review_root.symlink_to(outside_root, target_is_directory=True)
+            original_write_reason(destination, *args, **kwargs)
+
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(
+            engine_module,
+            "write_reason",
+            replace_ancestor_before_open,
+        )
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        assert updated["state"] == "series_review_cleanup"
+        assert job_root.is_dir()
+        assert not outside_review.exists()
+        assert sentinel.read_text(encoding="utf-8") == "NO TOCAR"
+        assert {path.name for path in outside_root.iterdir()} == {"sentinel.txt"}
+        relocated_review = relocated_root / review_relative
+        assert (relocated_review / "reason.json").is_file()
+        assert (relocated_review / str(result["reason_file"])).is_file()
+    finally:
+        database.close()
+
+
+@LINUX_SYMLINK_ONLY
+def test_review_cleanup_blocks_a_whole_directory_symlink_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review_relative = f"{job['job_id']}-directory-swap"
+        review = engine.config.series_review_dir / review_relative
+        shutil.move(str(source_root), str(review))
+        result = _review_result_v2(
+            job_id=str(job["job_id"]),
+            manifest=manifest,
+            review=review,
+            review_relative=review_relative,
+            reason_kind="process",
+        )
+        result["_arr_review_signature"] = engine._series_review_signature_digest(review)
+        result["_arr_review_signature_method"] = SERIES_REVIEW_SIGNATURE_STAT_V1
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision v2 verificada",
+            stage_path=str(review),
+            result_json=json.dumps(result),
+        )
+        relocated = tmp_path / "relocated-original-review"
+        outside = tmp_path / "outside-directory-swap"
+        outside.mkdir()
+        sentinel = outside / "sentinel.txt"
+        sentinel.write_text("NO TOCAR", encoding="utf-8")
+
+        def swap_directory(*_args, **_kwargs) -> bool:
+            review.rename(relocated)
+            review.symlink_to(outside, target_is_directory=True)
+            return True
+
+        monkeypatch.setattr(engine, "_cleanup_clients", swap_directory)
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        assert updated["state"] == "series_review_cleanup"
+        assert str(updated["last_error_code"]).endswith("review_integrity_failed")
+        assert job_root.is_dir()
+        assert sentinel.read_text(encoding="utf-8") == "NO TOCAR"
+        assert {path.name for path in outside.iterdir()} == {"sentinel.txt"}
+        assert (relocated / "reason.json").is_file()
+        assert (relocated / str(result["reason_file"])).is_file()
     finally:
         database.close()
 
@@ -1570,8 +2503,10 @@ def test_series_extraction_failure_preserves_whole_pack_before_client_cleanup(
         assert review.parent == engine.config.series_review_dir
         assert (review / "original" / f"{job['name']}.rar").read_bytes() == b"archive"
         assert (review / partial.relative_to(job_root)).read_bytes() == b"partial"
-        assert (review / "Revision de serie.txt").is_file()
+        assert (review / "Error de extraccion.txt").is_file()
         assert reason["reason"] == expected_code
+        assert reason["reason_code"] == expected_code
+        assert reason["reason_kind"] == "extraction"
         assert reason["phase"] == "extract"
         assert len(str(reason["_arr_review_signature"])) == 64
         assert cleanup_calls == [(str(job["job_id"]), True)]
@@ -1769,13 +2704,54 @@ def test_series_extraction_review_retries_failed_client_cleanup(
         review = Path(str(recovered["stage_path"]))
         durable_reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
         assert durable_reason["clients_cleanup_pending"] is False
-        assert "limpiado sin borrar archivos" in (
-            review / "Revision de serie.txt"
-        ).read_text(encoding="utf-8")
+        marker_content = (review / "Error de extraccion.txt").read_text(
+            encoding="utf-8"
+        )
+        assert "limpiado sin borrar archivos" in marker_content
+        assert "pendiente de reintento automático" not in marker_content
+        assert "pendiente de reintento automatico" not in marker_content
+        assert marker_content.count("limpiado sin borrar archivos") == 1
+        assert not (review / "Revision de serie.txt").exists()
         assert cleanup_calls == [
             f"{job['job_id']}:True",
             f"{job['job_id']}:True",
         ]
+    finally:
+        database.close()
+
+
+def test_fallback_reason_with_maximum_safe_message_remains_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    cleanup_outcomes = iter((False, True))
+    try:
+        job, job_root, _source_root, _episode = _series_job(engine, database)
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda *_args, **_kwargs: next(cleanup_outcomes),
+        )
+
+        assert engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_worker_unavailable",
+            "x" * 1200,
+        )
+        pending = database.get_job(str(job["job_id"]))
+        assert pending["last_error_code"] == (
+            "series_worker_unavailable_client_cleanup_pending"
+        )
+
+        engine._reconcile_late_worker_results()
+
+        recovered = database.get_job(str(job["job_id"]))
+        assert recovered["last_error_code"] == "series_worker_unavailable"
+        reason = json.loads(str(recovered["result_json"]))
+        assert reason["clients_cleanup_pending"] is False
+        assert len(reason["message"]) == 1200
     finally:
         database.close()
 
@@ -2263,6 +3239,11 @@ def test_series_review_cleanup_recovers_after_workshop_was_already_removed(
         review.mkdir()
         (review / "episode.mkv").write_bytes(b"preserved")
         review_signature = engine._series_review_signature_digest(review)
+        _write_orchestrator_review_reason_v2(
+            review,
+            str(job["job_id"]),
+            signature=review_signature,
+        )
         pending = database.transition(
             str(job["job_id"]),
             "series_review_cleanup",
@@ -2298,7 +3279,7 @@ def test_review_cleanup_revalidates_copy_before_clients_and_workshop(
         job, job_root, source_root, _ = _series_job(engine, database)
         review = engine.config.series_review_dir / "verified-review"
         shutil.copytree(source_root, review)
-        (review / "reason.json").write_text("{}", encoding="utf-8")
+        _write_orchestrator_review_reason_v2(review, str(job["job_id"]))
         result = {
             "status": "review",
             "review_reasons": ["test"],
@@ -2324,7 +3305,7 @@ def test_review_cleanup_revalidates_copy_before_clients_and_workshop(
         target = next(
             path
             for path in review.rglob("*")
-            if path.is_file() and path.name != "reason.json"
+            if path.is_file() and path.name not in SERIES_REVIEW_METADATA_FILES
         )
         target.write_bytes(b"truncated")
         monkeypatch.setattr(
@@ -2343,6 +3324,169 @@ def test_review_cleanup_revalidates_copy_before_clients_and_workshop(
         database.close()
 
 
+def test_review_cleanup_rechecks_content_changed_by_client_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, _ = _series_job(engine, database)
+        review = engine.config.series_review_dir / "changed-during-client-cleanup"
+        shutil.copytree(source_root, review)
+        target = next(review.rglob("*.mkv"))
+        signature = engine._series_review_signature_digest(review)
+        _write_orchestrator_review_reason_v2(
+            review,
+            str(job["job_id"]),
+            signature=signature,
+        )
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision verificada",
+            stage_path=str(review),
+            result_json=json.dumps(
+                {
+                    "status": "review",
+                    "review_reasons": ["test"],
+                    "_arr_review_signature": signature,
+                    "_arr_review_signature_method": SERIES_REVIEW_SIGNATURE_STAT_V1,
+                }
+            ),
+        )
+        cleanup_calls: list[bool] = []
+
+        def change_preserved_episode(*_args, **_kwargs) -> bool:
+            cleanup_calls.append(True)
+            target.write_bytes(b"episodio truncado durante limpieza")
+            return True
+
+        monkeypatch.setattr(engine, "_cleanup_clients", change_preserved_episode)
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        assert updated["state"] == "series_review_cleanup"
+        assert str(updated["last_error_code"]).endswith("review_integrity_failed")
+        assert cleanup_calls == [True]
+        assert job_root.is_dir()
+    finally:
+        database.close()
+
+
+def test_late_cleanup_writer_binds_to_the_validated_review_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, source_root, _ = _series_job(engine, database)
+        review = engine.config.series_review_dir / "late-writer-identity"
+        shutil.copytree(source_root, review)
+        signature = engine._series_review_signature_digest(review)
+        reason = _write_orchestrator_review_reason_v2(
+            review,
+            str(job["job_id"]),
+            signature=signature,
+        )
+        pending = database.transition(
+            str(job["job_id"]),
+            "manual_review",
+            "series_review",
+            "Limpieza de clientes pendiente",
+            stage_path=str(review),
+            last_error_code="series_process_error_client_cleanup_pending",
+            result_json=json.dumps(reason),
+        )
+        relocated = tmp_path / "late-writer-original-review"
+        original_write_reason = engine_module.write_reason
+
+        def replace_before_open(destination, *args, **kwargs) -> None:
+            review.rename(relocated)
+            review.mkdir()
+            (review / "sentinel.txt").write_text("NO TOCAR", encoding="utf-8")
+            original_write_reason(destination, *args, **kwargs)
+
+        monkeypatch.setattr(engine_module, "write_reason", replace_before_open)
+
+        with pytest.raises(OSError):
+            engine._mark_series_review_cleanup_completed(pending)
+
+        assert {path.name for path in review.iterdir()} == {"sentinel.txt"}
+        assert (relocated / "reason.json").is_file()
+        assert (relocated / str(reason["reason_file"])).is_file()
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["missing_schema", "unknown_schema", "marker", "foreign_marker"],
+)
+def test_series_review_cleanup_revalidates_legacy_v1_contract_before_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, _ = _series_job(engine, database)
+        review = engine.config.series_review_dir / "legacy-v1-retry"
+        shutil.copytree(source_root, review)
+        reason = _write_legacy_review_reason_v1(review, str(job["job_id"]))
+        signature = engine._series_review_signature_digest(review)
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision v1 verificada",
+            stage_path=str(review),
+            result_json=json.dumps(
+                {
+                    "status": "review",
+                    "review_reasons": list(reason["reasons"]),
+                    "_arr_review_signature": signature,
+                    "_arr_review_signature_method": SERIES_REVIEW_SIGNATURE_STAT_V1,
+                }
+            ),
+        )
+        if tamper == "marker":
+            (review / "Serie repetida.txt").write_text(
+                "Serie repetida\ncontenido manipulado\n",
+                encoding="utf-8",
+            )
+        elif tamper == "foreign_marker":
+            (review / "Pelicula repetida.txt").write_text(
+                "Pelicula repetida\n",
+                encoding="utf-8",
+            )
+        else:
+            reason_path = review / "reason.json"
+            changed = json.loads(reason_path.read_text(encoding="utf-8"))
+            if tamper == "missing_schema":
+                changed.pop("schema")
+            else:
+                changed["schema"] = "series-review-v3"
+            reason_path.write_text(json.dumps(changed), encoding="utf-8")
+        cleanup_calls: list[bool] = []
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda *_args, **_kwargs: cleanup_calls.append(True) or True,
+        )
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        assert updated["state"] == "series_review_cleanup"
+        assert str(updated["last_error_code"]).endswith("review_integrity_failed")
+        assert cleanup_calls == []
+        assert job_root.is_dir()
+    finally:
+        database.close()
+
+
 def test_series_review_cleanup_accepts_legacy_sha256_signature(
     tmp_path: Path,
 ) -> None:
@@ -2355,6 +3499,12 @@ def test_series_review_cleanup_accepts_legacy_sha256_signature(
         legacy_signature = engine._series_review_signature_digest(
             review,
             SERIES_REVIEW_SIGNATURE_SHA256_V1,
+        )
+        _write_orchestrator_review_reason_v2(
+            review,
+            str(job["job_id"]),
+            signature=legacy_signature,
+            signature_method=SERIES_REVIEW_SIGNATURE_SHA256_V1,
         )
         pending = database.transition(
             str(job["job_id"]),
@@ -2381,6 +3531,49 @@ def test_series_review_cleanup_accepts_legacy_sha256_signature(
         database.close()
 
 
+def test_pending_client_cleanup_rejects_unknown_review_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, _ = _series_job(engine, database)
+        review = engine.config.series_review_dir / "pending-client-cleanup"
+        shutil.copytree(source_root, review)
+        signature = engine._series_review_signature_digest(review)
+        reason = _write_orchestrator_review_reason_v2(
+            review,
+            str(job["job_id"]),
+            signature=signature,
+        )
+        pending = database.transition(
+            str(job["job_id"]),
+            "manual_review",
+            "series_review",
+            "Limpieza de clientes pendiente",
+            stage_path=str(review),
+            last_error_code="series_process_error_client_cleanup_pending",
+            result_json=json.dumps(reason),
+        )
+        reason["schema"] = "series-review-v3"
+        (review / "reason.json").write_text(json.dumps(reason), encoding="utf-8")
+        cleanup_calls: list[bool] = []
+        monkeypatch.setattr(
+            engine,
+            "_cleanup_clients",
+            lambda *_args, **_kwargs: cleanup_calls.append(True) or True,
+        )
+
+        engine._reconcile_late_worker_results()
+
+        updated = database.get_job(str(pending["job_id"]))
+        assert str(updated["last_error_code"]).endswith("review_integrity_failed")
+        assert cleanup_calls == []
+        assert job_root.is_dir()
+    finally:
+        database.close()
+
+
 def test_legacy_review_without_signature_compares_content_not_mtime(
     tmp_path: Path,
 ) -> None:
@@ -2394,6 +3587,7 @@ def test_legacy_review_without_signature_compares_content_not_mtime(
             review_episode,
             ns=(source_episode.stat().st_atime_ns, source_episode.stat().st_mtime_ns + 1),
         )
+        _write_legacy_review_reason_v1(review, str(job["job_id"]))
         pending = database.transition(
             str(job["job_id"]),
             "series_review_cleanup",
@@ -2424,13 +3618,13 @@ def test_review_signature_ignores_only_root_metadata(tmp_path: Path) -> None:
     (source / "nested").mkdir(parents=True)
     (source / "nested" / "reason.json").write_text("legitimo", encoding="utf-8")
     shutil.copytree(source, review)
-    (review / "reason.json").write_text("metadata", encoding="utf-8")
-    (review / "Revision de serie.txt").write_text("metadata", encoding="utf-8")
+    for filename in SERIES_REVIEW_METADATA_FILES:
+        (review / filename).write_text("metadata", encoding="utf-8")
 
     assert review_content_signature(source, whole_tree=True) == review_content_signature(
         review,
         whole_tree=True,
-        ignored_names=("reason.json", "Revision de serie.txt"),
+        ignored_names=SERIES_REVIEW_METADATA_FILES,
     )
 
 

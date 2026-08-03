@@ -49,6 +49,7 @@ from .processing import (
     ProcessingResult,
     ReviewRequiredError,
     SeriesProcessor,
+    processing_review_identity,
     unavailable_tools,
 )
 from .rules import RulesSnapshot, RulesStore, RulesValidationError, rules_fingerprint
@@ -1036,24 +1037,277 @@ def _discard_generated_artifacts(prepared: PreparedJob) -> None:
         )
 
 
-_REVIEW_METADATA = frozenset(
-    {"reason.json", "Revision de serie.txt", "Serie repetida.txt"}
+@dataclass(frozen=True)
+class _ReviewContract:
+    reason_code: str
+    reason_kind: str
+    reason_file: str
+    reason_title: str
+    reason_lines: tuple[str, ...]
+
+    def fields(self) -> dict[str, Any]:
+        return {
+            "reason_code": self.reason_code,
+            "reason_kind": self.reason_kind,
+            "reason_file": self.reason_file,
+            "reason_title": self.reason_title,
+            "reason_lines": list(self.reason_lines),
+        }
+
+    def text(self) -> str:
+        return "\n".join((self.reason_title, *self.reason_lines)) + "\n"
+
+
+_REVIEW_TYPES = {
+    "series_duplicate": ("duplicate", "Serie repetida.txt", "Serie repetida"),
+    "series_audio_invalid": ("audio", "Audio no valido.txt", "Audio no valido"),
+    "series_video_invalid": ("video", "Video no valido.txt", "Video no valido"),
+    "series_subtitle_not_convertible": (
+        "subtitle",
+        "Subtitulo no convertible.txt",
+        "Subtitulo no convertible",
+    ),
+    "series_ocr_subtitle_failed": (
+        "ocr",
+        "OCR subtitulo fallido.txt",
+        "OCR subtitulo fallido",
+    ),
+    "series_manual_review": ("manual", "Revision de serie.txt", "Revision de serie"),
+    "series_process_error": ("process", "Error de proceso.txt", "Error de proceso"),
+}
+_REVIEW_SUMMARIES = {
+    "duplicate": "Ya existe en la biblioteca al menos uno de los episodios del pack.",
+    "audio": "El pack no cumple las reglas de audio.",
+    "video": "El pack no cumple las reglas de vídeo.",
+    "subtitle": "El subtítulo no se puede convertir automáticamente.",
+    "ocr": "Ha fallado el OCR del subtítulo.",
+    "manual": "El pack necesita revisión manual antes de publicarse.",
+    "process": "El pack no se ha podido procesar de forma segura.",
+}
+_DUPLICATE_REASON_CODES = frozenset(
+    {"colision_existente", "colision_otra_extension", "colision_otro_nombre"}
 )
+_PROCESS_REASON_CODES = frozenset({"preparacion_fallida", "procesamiento_fallido"})
+_REASON_LABELS = {
+    "episodio_no_reconocido": "No se pudo reconocer el episodio",
+    "colision_casefold": "El pack contiene rutas equivalentes",
+    "episodio_duplicado": "El pack contiene el mismo episodio más de una vez",
+    "colision_sidecar_casefold": "El pack contiene subtítulos con rutas equivalentes",
+    "archivo_no_clasificado": "Archivo sin clasificar",
+    "sin_episodios_validos": "El pack no contiene episodios válidos",
+    "varias_series": "El pack contiene varias series",
+    "manifest_no_apto": "El manifiesto del pack no es apto",
+    "varias_raices_casefold_en_tv": "La biblioteca contiene varias raíces equivalentes",
+    "raiz_final_no_es_directorio": "La raíz final de la serie no es un directorio",
+    "symlink_en_serie_final": "La raíz final de la serie es un enlace simbólico",
+    "colision_directorio_casefold_tv": "La biblioteca contiene directorios equivalentes",
+    "entrada_no_regular_en_serie_final": "La biblioteca contiene una entrada no regular",
+    "colision_casefold_tv": "La biblioteca contiene rutas equivalentes",
+    "target_sin_raiz": "El destino no conserva la raíz de la serie",
+    "directorio_no_canonico_tv": "La biblioteca usa un directorio no canónico",
+    "temporada_en_directorio_distinto_tv": "La temporada ya existe en otro directorio",
+    "ruta_no_canonica_tv": "El episodio ya existe con una ruta no canónica",
+    "colision_existente": "Episodio ya existente en la biblioteca",
+    "colision_otra_extension": "Episodio ya existente con otra extensión",
+    "colision_otro_nombre": "Episodio ya existente con otro nombre",
+    "biblioteca_cambio_durante_procesado": "La biblioteca cambió durante el procesado",
+    "preparacion_fallida": "Falló la preparación del pack",
+}
+_REVIEW_OUTPUT_MARKERS = frozenset(
+    value[1] for value in _REVIEW_TYPES.values()
+)
+_REVIEW_MARKERS = frozenset(
+    {
+        *_REVIEW_OUTPUT_MARKERS,
+        "Error de FileBot.txt",
+        "Error de extraccion.txt",
+        "Pelicula repetida.txt",
+        "Revision manual.txt",
+    }
+)
+_REVIEW_METADATA = frozenset({"reason.json", *_REVIEW_MARKERS})
 
 
-def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, Any]:
+def _reason_code(reason: str) -> str:
+    return str(reason).partition(":")[0].strip().casefold()
+
+
+def _reason_detail(reason: str) -> str:
+    raw = re.sub(r"\s+", " ", str(reason)).strip()
+    code, separator, detail = raw.partition(":")
+    if code in {"procesamiento_fallido", "procesamiento_requiere_revision"}:
+        line = detail.strip() or raw
+    else:
+        label = _REASON_LABELS.get(code.casefold())
+        if label is None:
+            line = raw
+        else:
+            line = (
+                f"{label}: {detail.strip()}"
+                if separator and detail.strip()
+                else label
+            )
+    return line[:1200].strip()
+
+
+def _review_contract(
+    reasons: tuple[str, ...],
+    *,
+    processing_identity: tuple[str, str] | None = None,
+) -> _ReviewContract:
+    if (
+        not reasons
+        or any(
+            not isinstance(reason, str)
+            or not reason
+            or reason != reason.strip()
+            or len(reason) > 8192
+            or "\x00" in reason
+            for reason in reasons
+        )
+    ):
+        raise SeriesWorkerError("Las razones técnicas de Series no son válidas")
+    codes = tuple(_reason_code(reason) for reason in reasons)
+    if processing_identity is not None:
+        reason_code, expected_kind = processing_identity
+    elif codes and all(code in _DUPLICATE_REASON_CODES for code in codes):
+        reason_code, expected_kind = "series_duplicate", "duplicate"
+    elif any(code in _PROCESS_REASON_CODES for code in codes):
+        reason_code, expected_kind = "series_process_error", "process"
+    else:
+        reason_code, expected_kind = "series_manual_review", "manual"
+    configured = _REVIEW_TYPES.get(reason_code)
+    if configured is None or configured[0] != expected_kind:
+        raise SeriesWorkerError("Clasificación de revisión de Series no válida")
+    reason_kind, reason_file, reason_title = configured
+    details = tuple(_reason_detail(reason) for reason in reasons if str(reason).strip())
+    reason_lines = (_REVIEW_SUMMARIES[reason_kind], *details)
+    return _ReviewContract(
+        reason_code=reason_code,
+        reason_kind=reason_kind,
+        reason_file=reason_file,
+        reason_title=reason_title,
+        reason_lines=reason_lines,
+    )
+
+
+def _review_result(
+    prepared: PreparedJob,
+    destination: Path,
+    review_layout: str,
+    review_source_prefix: str,
+    reasons: tuple[str, ...],
+    contract: _ReviewContract | None,
+) -> dict[str, Any]:
+    result = {
+        "status": "review",
+        "job_id": prepared.payload.job_id,
+        "kind": "series",
+        "rules_fingerprint": prepared.rules_snapshot.fingerprint,
+        "manifest": prepared.manifest.to_dict(),
+        "review_path": destination.relative_to(
+            prepared.payload.review_root
+        ).as_posix(),
+        "review_layout": review_layout,
+        "review_source_prefix": review_source_prefix,
+        "review_reasons": list(reasons),
+        "published": [],
+    }
+    if contract is not None:
+        result.update(contract.fields())
+    return result
+
+
+def _existing_review_contract(
+    destination: Path,
+    reason: dict[str, Any],
+) -> _ReviewContract | None:
+    schema = reason.get("schema")
+    if schema == "series-review-v1":
+        reasons = reason.get("reasons")
+        if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
+            raise SeriesWorkerError("La revisión v1 conservada tiene motivos inválidos")
+        expected = "Serie repetida\n" + "\n".join(reasons) + "\n"
+        marker = destination / "Serie repetida.txt"
+        if (
+            marker.is_symlink()
+            or not marker.is_file()
+            or marker.read_text(encoding="utf-8") != expected
+        ):
+            raise SeriesWorkerError("La revisión v1 conservada no supera su contrato")
+        existing_markers = {
+            path.name
+            for path in destination.iterdir()
+            if path.name in _REVIEW_MARKERS and (path.exists() or path.is_symlink())
+        }
+        if existing_markers != {"Serie repetida.txt"}:
+            raise SeriesWorkerError("La revisión v1 no conserva un único marcador")
+        return None
+    if schema != "series-review-v2":
+        raise SeriesWorkerError("La revisión conservada usa un esquema desconocido")
+    raw_reason_lines = reason.get("reason_lines")
+    if not isinstance(raw_reason_lines, list) or not all(
+        isinstance(line, str) for line in raw_reason_lines
+    ):
+        raise SeriesWorkerError("La revisión v2 conservada tiene líneas inválidas")
+    try:
+        reason_lines = tuple(raw_reason_lines)
+        contract = _ReviewContract(
+            reason_code=str(reason["reason_code"]),
+            reason_kind=str(reason["reason_kind"]),
+            reason_file=str(reason["reason_file"]),
+            reason_title=str(reason["reason_title"]),
+            reason_lines=reason_lines,
+        )
+    except (KeyError, TypeError) as error:
+        raise SeriesWorkerError("La revisión v2 conservada está incompleta") from error
+    configured = _REVIEW_TYPES.get(contract.reason_code)
+    if (
+        configured is None
+        or configured != (
+            contract.reason_kind,
+            contract.reason_file,
+            contract.reason_title,
+        )
+        or not reason_lines
+        or not all(isinstance(line, str) and line.strip() for line in reason_lines)
+    ):
+        raise SeriesWorkerError("La revisión v2 conservada tiene clasificación inválida")
+    marker = destination / contract.reason_file
+    if (
+        marker.is_symlink()
+        or not marker.is_file()
+        or marker.read_text(encoding="utf-8") != contract.text()
+    ):
+        raise SeriesWorkerError("La revisión v2 conservada no supera su contrato")
+    existing_markers = {
+        path.name
+        for path in destination.iterdir()
+        if path.name in _REVIEW_MARKERS and (path.exists() or path.is_symlink())
+    }
+    if existing_markers != {contract.reason_file}:
+        raise SeriesWorkerError("La revisión v2 no conserva un único marcador")
+    return contract
+
+
+def _review_pack(
+    prepared: PreparedJob,
+    reasons: tuple[str, ...],
+    *,
+    processing_identity: tuple[str, str] | None = None,
+) -> dict[str, Any]:
     """Mueve el pack completo a revisión una sola vez, igual que películas."""
 
     payload = prepared.payload
     match_reason = {
-        "schema": "series-review-v1",
         "profile": "series",
         "category": "tv",
         "job_id": payload.job_id,
         "manifest_digest": prepared.manifest.digest,
         "reasons": list(reasons),
     }
-    expected_text = "Serie repetida\n" + "\n".join(reasons) + "\n"
+    contract = _review_contract(reasons, processing_identity=processing_identity)
+    expected_text = contract.text()
     source, review_source_prefix, review_layout = _review_source(prepared)
     payload.review_root.mkdir(parents=True, exist_ok=True)
     label = _review_folder_label(prepared.manifest)
@@ -1064,75 +1318,94 @@ def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, A
     )
     if already_moved:
         existing_reason = _read_review_reason(destination) or {}
-        return {
-            "status": "review",
-            "job_id": payload.job_id,
-            "kind": "series",
-            "rules_fingerprint": prepared.rules_snapshot.fingerprint,
-            "manifest": prepared.manifest.to_dict(),
-            "review_path": destination.relative_to(payload.review_root).as_posix(),
-            "review_layout": str(existing_reason.get("review_layout") or review_layout),
-            "review_source_prefix": str(
-                existing_reason.get("review_source_prefix") or review_source_prefix
-            ),
-            "review_reasons": list(reasons),
-            "published": [],
-        }
+        existing_contract = _existing_review_contract(destination, existing_reason)
+        if existing_contract is not None and existing_contract != contract:
+            raise SeriesWorkerError(
+                "La revisión v2 conservada no coincide con el motivo calculado"
+            )
+        return _review_result(
+            prepared,
+            destination,
+            str(existing_reason.get("review_layout") or review_layout),
+            str(existing_reason.get("review_source_prefix") or review_source_prefix),
+            reasons,
+            existing_contract,
+        )
     expected_reason = {
+        "schema": "series-review-v2",
         **match_reason,
+        **contract.fields(),
         "review_layout": review_layout,
         "review_source_prefix": review_source_prefix,
     }
     reason_path = source / "reason.json"
-    text_path = source / "Serie repetida.txt"
+    text_path = source / contract.reason_file
+    existing_metadata: dict[str, bytes] = {}
+    retry_reason = _read_review_reason(source)
+    legacy_reason = {
+        "schema": "series-review-v1",
+        **match_reason,
+        "review_layout": review_layout,
+        "review_source_prefix": review_source_prefix,
+    }
     for reserved in _REVIEW_METADATA:
         reserved_path = source / reserved
-        if not reserved_path.exists():
+        if not (reserved_path.exists() or reserved_path.is_symlink()):
             continue
+        if reserved_path.is_symlink() or not reserved_path.is_file():
+            raise SeriesWorkerError(
+                f"El pack usa un nombre reservado para revisión: {reserved}"
+            )
         own_retry_metadata = (
             reserved == "reason.json"
-            and _read_review_reason(source) == expected_reason
+            and retry_reason in (expected_reason, legacy_reason)
         ) or (
-            reserved == "Serie repetida.txt"
-            and reserved_path.is_file()
+            retry_reason == expected_reason
+            and reserved == contract.reason_file
             and reserved_path.read_text(encoding="utf-8") == expected_text
+        ) or (
+            retry_reason == legacy_reason
+            and reserved == "Serie repetida.txt"
+            and reserved_path.read_text(encoding="utf-8")
+            == "Serie repetida\n" + "\n".join(reasons) + "\n"
         )
         if not own_retry_metadata:
             raise SeriesWorkerError(
                 f"El pack usa un nombre reservado para revisión: {reserved}"
             )
+        existing_metadata[reserved] = reserved_path.read_bytes()
     if source.is_symlink() or not source.is_dir():
         raise SeriesWorkerError("El pack de revisión no es una carpeta física")
-    reason_path.write_text(
-        json.dumps(expected_reason, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    text_path.write_text(
-        expected_text,
-        encoding="utf-8",
-    )
     try:
+        for reserved in existing_metadata:
+            (source / reserved).unlink()
+        reason_path.write_text(
+            json.dumps(expected_reason, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        text_path.write_text(expected_text, encoding="utf-8")
         shutil.move(str(source), str(destination))
     except Exception:
-        reason_path.unlink(missing_ok=True)
-        text_path.unlink(missing_ok=True)
+        if source.is_dir() and not source.is_symlink():
+            for reserved in _REVIEW_METADATA:
+                candidate = source / reserved
+                if candidate.is_file() and not candidate.is_symlink():
+                    candidate.unlink()
+            for reserved, content in existing_metadata.items():
+                (source / reserved).write_bytes(content)
         raise
     if payload.source_root.is_dir() and not payload.source_root.is_symlink():
         remaining = tuple(payload.source_root.rglob("*"))
         if not any(path.is_file() or path.is_symlink() for path in remaining):
             shutil.rmtree(payload.source_root, ignore_errors=True)
-    return {
-        "status": "review",
-        "job_id": payload.job_id,
-        "kind": "series",
-        "rules_fingerprint": prepared.rules_snapshot.fingerprint,
-        "manifest": prepared.manifest.to_dict(),
-        "review_path": destination.relative_to(payload.review_root).as_posix(),
-        "review_layout": review_layout,
-        "review_source_prefix": review_source_prefix,
-        "review_reasons": list(reasons),
-        "published": [],
-    }
+    return _review_result(
+        prepared,
+        destination,
+        review_layout,
+        review_source_prefix,
+        reasons,
+        contract,
+    )
 
 
 def _published_manifest(prepared: PreparedJob) -> dict[str, Any]:
@@ -1259,7 +1532,17 @@ def _safe_error(error: BaseException) -> str:
     text = str(error).strip() or type(error).__name__
     text = re.sub(r"(?i)(token|password|secret|auth)\s*[:=]\s*\S+", r"\1=<REDACTED>", text)
     text = re.sub(r"(?i)https?://\S+", "<URL>", text)
-    text = re.sub(r"(?i)(?:[A-Z]:[\\/]|/data/|/config/)\S*", "<PATH>", text)
+    text = re.sub(
+        r"(?i)(?:[A-Z]:[\\/]|/(?:data|config|tmp|opt|var|home|mnt|volume\d+)/)"
+        r"[^\r\n]*?(?=:\s|$)",
+        "<PATH>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(?:[A-Z]:[\\/]|/(?:data|config|tmp|opt|var|home|mnt|volume\d+)/)\S*",
+        "<PATH>",
+        text,
+    )
     return re.sub(r"\s+", " ", text)[:500]
 
 
@@ -2598,6 +2881,7 @@ class SeriesCoordinator:
                     result = _review_pack(
                         prepared,
                         ("procesamiento_requiere_revision:" + _safe_error(error),),
+                        processing_identity=processing_review_identity(error),
                     )
                 except Exception as review_error:
                     result = self._failed_result(prepared, review_error)
@@ -2614,6 +2898,7 @@ class SeriesCoordinator:
                 result = _review_pack(
                     prepared,
                     ("procesamiento_fallido:" + _safe_error(error),),
+                    processing_identity=processing_review_identity(error),
                 )
             except Exception as review_error:
                 result = self._failed_result(prepared, review_error)

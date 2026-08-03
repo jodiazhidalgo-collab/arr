@@ -212,6 +212,218 @@ class ReviewProfileFilterTests(unittest.TestCase):
             {movie.name: "movies", unknown.name: None},
         )
 
+    def test_declared_reason_file_is_preferred_and_exposes_v2_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repetidas_vs_error"
+            folder = root / "Serie con video invalido"
+            _write_reason(
+                folder,
+                {
+                    "schema": "series-review-v2",
+                    "profile": "series",
+                    "category": "tv",
+                    "job_id": SERIES_JOB,
+                    "reason_file": "Video no valido.txt",
+                    "reason_code": "video_invalid",
+                    "reason_kind": "video",
+                },
+            )
+            (folder / "Audio no valido.txt").write_text(
+                "Audio no valido\ntexto que no debe elegirse\n",
+                encoding="utf-8",
+            )
+            (folder / "Video no valido.txt").write_text(
+                "Video no valido\nDebe haber exactamente un video.\n",
+                encoding="utf-8",
+            )
+            with patch.object(server, "REVIEW_DIR", root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                root,
+            ):
+                shows = server._review_payload(profile="series")
+
+        self.assertEqual(len(shows["items"]), 1)
+        item = shows["items"][0]
+        self.assertEqual(item["reason_file"], "Video no valido.txt")
+        self.assertIn("exactamente un video", item["reason_text"])
+        self.assertNotIn("no debe elegirse", item["reason_text"])
+        self.assertEqual(item["reason_code"], "video_invalid")
+        self.assertEqual(item["reason_kind"], "video")
+
+    def test_unsafe_or_missing_declared_reason_file_uses_legacy_txt_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            movie_root = base / "movie-review"
+            series_root = base / "series-review"
+            series_root.mkdir()
+            unsafe = movie_root / "Unsafe"
+            _write_reason(
+                unsafe,
+                {
+                    "profile": "movies",
+                    "reason_file": "../fuera.txt",
+                    "reason": "identity_suspicious",
+                },
+            )
+            (base / "fuera.txt").write_text("NO LEER", encoding="utf-8")
+            (unsafe / "Revision manual.txt").write_text(
+                "Revision manual\nIdentidad ambigua.\n",
+                encoding="utf-8",
+            )
+            missing = movie_root / "Missing"
+            _write_reason(
+                missing,
+                {
+                    "profile": "movies",
+                    "reason_file": "No existe.txt",
+                    "reason": "destination_exists_before_processing",
+                },
+            )
+            (missing / "Pelicula repetida.txt").write_text(
+                "Pelicula repetida\nYa existe destino final.\n",
+                encoding="utf-8",
+            )
+            with patch.object(server, "REVIEW_DIR", movie_root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                series_root,
+            ):
+                movies = server._review_payload(profile="movies")
+
+        items = {item["name"]: item for item in movies["items"]}
+        self.assertEqual(items["Unsafe"]["reason_file"], "Revision manual.txt")
+        self.assertNotIn("NO LEER", items["Unsafe"]["reason_text"])
+        self.assertEqual(items["Unsafe"]["reason_code"], "identity_suspicious")
+        self.assertEqual(items["Unsafe"]["reason_kind"], "manual")
+        self.assertEqual(items["Missing"]["reason_file"], "Pelicula repetida.txt")
+        self.assertEqual(items["Missing"]["reason_kind"], "duplicate")
+
+    def test_legacy_series_marker_is_typed_from_real_reason_not_its_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repetidas_vs_error"
+            audio = root / "Serie - S01E01"
+            process = root / "Serie - S01E02"
+            internal_duplicate = root / "Serie - S01E03"
+            casefold_collision = root / "Serie - S01E04"
+            library_duplicate = root / "Serie - S01E05"
+            mixed_manifest = root / "Serie - S01E06"
+            cases = (
+                (audio, "procesamiento_fallido:No hay audio español válido."),
+                (
+                    process,
+                    "procesamiento_fallido:Falló Audio Master - S01E02.mkv: "
+                    "ffprobe no devolvió pistas.",
+                ),
+                (
+                    internal_duplicate,
+                    "episodio_duplicado:S01E03:Serie.S01E03.mkv:Serie.S01E03.1080p.mkv",
+                ),
+                (
+                    casefold_collision,
+                    "colision_casefold:Serie.S01E04.mkv:serie.s01e04.mkv",
+                ),
+                (
+                    library_duplicate,
+                    "colision_existente:Serie/Season 01/Serie.S01E05.mkv",
+                ),
+            )
+            for folder, raw_reason in cases:
+                _write_reason(
+                    folder,
+                    {
+                        "schema": "series-review-v1",
+                        "profile": "series",
+                        "category": "tv",
+                        "job_id": SERIES_JOB,
+                        "reasons": [raw_reason],
+                    },
+                )
+                (folder / "Serie repetida.txt").write_text(
+                    f"Serie repetida\n{raw_reason}\n",
+                    encoding="utf-8",
+                )
+            mixed_reasons = [
+                "manifest_no_apto",
+                "colision_existente:Serie/Season 01/Serie.S01E06.mkv",
+            ]
+            _write_reason(
+                mixed_manifest,
+                {
+                    "schema": "series-review-v1",
+                    "profile": "series",
+                    "category": "tv",
+                    "job_id": SERIES_JOB,
+                    "reasons": mixed_reasons,
+                },
+            )
+            (mixed_manifest / "Serie repetida.txt").write_text(
+                "Serie repetida\n" + "\n".join(mixed_reasons) + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(server, "REVIEW_DIR", root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                root,
+            ):
+                shows = server._review_payload(profile="series")
+
+        items = {item["name"]: item for item in shows["items"]}
+        self.assertEqual(items[audio.name]["reason_code"], "procesamiento_fallido")
+        self.assertEqual(items[audio.name]["reason_kind"], "audio")
+        self.assertEqual(items[process.name]["reason_code"], "procesamiento_fallido")
+        self.assertEqual(items[process.name]["reason_kind"], "process")
+        self.assertEqual(items[internal_duplicate.name]["reason_kind"], "manual")
+        self.assertEqual(items[casefold_collision.name]["reason_kind"], "manual")
+        self.assertEqual(items[library_duplicate.name]["reason_kind"], "duplicate")
+        self.assertEqual(items[mixed_manifest.name]["reason_kind"], "manual")
+
+    def test_legacy_processing_review_wrapper_is_manual_unless_detail_is_typed(self) -> None:
+        cases = (
+            (
+                "procesamiento_requiere_revision: detalle que requiere decisión humana",
+                "manual",
+            ),
+            (
+                "procesamiento_requiere_revision: No hay audio español válido.",
+                "audio",
+            ),
+            (
+                "procesamiento_requiere_revision: Se esperaban 1 pistas de vídeo y hay 0.",
+                "video",
+            ),
+            (
+                "procesamiento_requiere_revision: Codec de subtítulo desconocido.",
+                "subtitle",
+            ),
+            (
+                "procesamiento_requiere_revision: Ha fallado el OCR del subtítulo.",
+                "ocr",
+            ),
+            (
+                "procesamiento_requiere_revision: Falló la extracción del pack.",
+                "extraction",
+            ),
+            (
+                "procesamiento_requiere_revision: FileBot no pudo clasificar el pack.",
+                "filebot",
+            ),
+            (
+                "procesamiento_requiere_revision: Episodio ya existente en la biblioteca.",
+                "duplicate",
+            ),
+        )
+
+        for raw_reason, expected_kind in cases:
+            with self.subTest(expected_kind=expected_kind):
+                reason_code, reason_kind = server._review_reason_metadata(
+                    {"reasons": [raw_reason]},
+                    "Serie repetida.txt",
+                    f"Serie repetida\n{raw_reason}\n",
+                )
+                self.assertEqual(reason_code, "procesamiento_requiere_revision")
+                self.assertEqual(reason_kind, expected_kind)
+
     def test_shared_root_job_metadata_wins_over_a_misleading_folder_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "repetidas_vs_error"

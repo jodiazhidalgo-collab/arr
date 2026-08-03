@@ -302,6 +302,83 @@ class RulesPanelContractTests(unittest.TestCase):
         self.assertIn("arr-media-panel-revision-profile", self.panel_js)
         self.assertIn("arr-media-panel-informes-profile", self.panel_js)
 
+    def test_review_reason_type_controls_visible_label_and_tone(self) -> None:
+        self.assertIn("const reason = reviewReasonPresentation(item);", self.panel_js)
+        self.assertIn("const reasonText = reviewReasonText(item, reason);", self.panel_js)
+        self.assertIn("pill(reason.label, reason.tone)", self.panel_js)
+        panel = Path(server.__file__).resolve().parent / "web" / "static" / "js" / "panel.js"
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const fakeApp = { innerHTML: "" };
+            const fakeTitle = { textContent: "" };
+            const tabButtons = ["identidad", "limpieza-peliculas", "limpieza-series", "ajustes", "motor", "historial", "revision", "informes"].map(view => ({
+              dataset: { view },
+              classList: { toggle: () => {} },
+              addEventListener: () => {}
+            }));
+            global.location = { hash: "#revision", href: "" };
+            global.history = { replaceState: () => {} };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            global.document = {
+              getElementById: id => id === "app" ? fakeApp : id === "title" ? fakeTitle : null,
+              querySelectorAll: selector => selector === ".tabs button" ? tabButtons : [],
+              addEventListener: () => {}
+            };
+            global.window = {
+              ArrIdentityUI: { show: async () => {} },
+              addEventListener: () => {}
+            };
+            global.fetch = async path => ({
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify(path.includes("/api/review") ? { items: [], review_dir: "<REVIEW>" } : {})
+            });
+
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+
+            const audioItem = {
+              profile: "series",
+              reason_file: "Serie repetida.txt",
+              reason_code: "procesamiento_fallido",
+              reason_kind: "audio",
+              reason_text: "Serie repetida\nNo hay audio español válido.\n"
+            };
+            const audio = reviewReasonPresentation(audioItem);
+            if (audio.label !== "Audio no válido" || audio.tone !== "bad") {
+              throw new Error(`Audio mal presentado: ${JSON.stringify(audio)}`);
+            }
+            const audioText = reviewReasonText(audioItem, audio);
+            if (audioText.includes("Serie repetida") || !audioText.startsWith("Audio no válido\n")) {
+              throw new Error(`Cabecera de audio engañosa: ${audioText}`);
+            }
+
+            const processItem = { ...audioItem, reason_kind: "process", reason_text: "Serie repetida\nFFmpeg falló.\n" };
+            const processReason = reviewReasonPresentation(processItem);
+            if (processReason.label !== "Error de proceso" || processReason.tone !== "bad") {
+              throw new Error(`Proceso mal presentado: ${JSON.stringify(processReason)}`);
+            }
+            if (reviewReasonText(processItem, processReason).includes("Serie repetida")) {
+              throw new Error("El error de proceso sigue apareciendo como repetido");
+            }
+
+            const duplicate = reviewReasonPresentation({ profile: "series", reason_code: "colision_existente", reason_kind: "duplicate" });
+            if (duplicate.label !== "Serie repetida" || duplicate.tone !== "warn") {
+              throw new Error(`Duplicado mal presentado: ${JSON.stringify(duplicate)}`);
+            }
+            const identity = reviewReasonPresentation({ reason_code: "category_conflict", reason_kind: "manual" });
+            if (identity.label !== "Categoría contradictoria" || identity.tone !== "warn") {
+              throw new Error(`Revisión manual mal presentada: ${JSON.stringify(identity)}`);
+            }
+            const fallback = reviewReasonPresentation({ reason_file: "Aviso antiguo.txt" });
+            if (fallback.label !== "Aviso antiguo" || fallback.typed) {
+              throw new Error(`Fallback legacy roto: ${JSON.stringify(fallback)}`);
+            }
+            """,
+            panel,
+        )
+
     def test_report_open_checks_http_status_and_renders_a_visible_error(self) -> None:
         self.assertIn("const response = await fetch(", self.panel_js)
         self.assertIn("if (!response.ok)", self.panel_js)

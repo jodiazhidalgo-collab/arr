@@ -68,6 +68,21 @@ MAX_PROFILE_EVIDENCE_PATHS = 200
 MAX_REPORT_METADATA_BYTES = 512 * 1024
 MAX_REVIEW_JOB_DETAIL_LOOKUPS = 4
 REVIEW_JOB_DETAIL_TIMEOUT_SEC = 2
+REVIEW_REASON_KINDS = frozenset(
+    {
+        "duplicate",
+        "audio",
+        "video",
+        "subtitle",
+        "ocr",
+        "manual",
+        "process",
+        "filebot",
+        "extraction",
+        "mixed",
+        "review",
+    }
+)
 SERIES_JOB_DIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SERIES_TECHNICAL_REPORT_FILES = frozenset(
     {
@@ -947,6 +962,354 @@ def _review_item_profile(
     )
 
 
+def _safe_review_reason_filename(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    name = value.strip()
+    if (
+        not name
+        or name != value
+        or len(name) > 255
+        or "\x00" in name
+        or "/" in name
+        or "\\" in name
+        or Path(name).name != name
+        or Path(name).suffix.casefold() != ".txt"
+    ):
+        return ""
+    return name
+
+
+def _review_reason_file(
+    folder: Path,
+    payload: Dict[str, Any],
+    txts: List[Path],
+) -> Tuple[str, Optional[Path]]:
+    declared = _safe_review_reason_filename(payload.get("reason_file"))
+    if declared:
+        candidate = folder / declared
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                return declared, candidate
+        except OSError:
+            pass
+    fallback = txts[0] if txts else None
+    return (fallback.name, fallback) if fallback else ("", None)
+
+
+def _normalized_reason_code(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    raw = value.strip().casefold()
+    if not raw:
+        return ""
+    raw = raw.split(":", 1)[0]
+    return re.sub(r"[^a-z0-9]+", "_", raw).strip("_")[:96]
+
+
+def _normalized_reason_kind(value: Any) -> str:
+    kind = _normalized_reason_code(value)
+    aliases = {
+        "duplicated": "duplicate",
+        "collision": "duplicate",
+        "audio_invalid": "audio",
+        "video_invalid": "video",
+        "subtitles": "subtitle",
+        "subtitle_invalid": "subtitle",
+        "subtitle_ocr": "ocr",
+        "ocr_failed": "ocr",
+        "identity": "manual",
+        "identity_review": "manual",
+        "manual_review": "manual",
+        "error": "process",
+        "process_error": "process",
+        "filebot_error": "filebot",
+        "extract": "extraction",
+        "extraction_error": "extraction",
+    }
+    kind = aliases.get(kind, kind)
+    return kind if kind in REVIEW_REASON_KINDS else ""
+
+
+def _reason_kind_from_code(value: Any) -> str:
+    code = _normalized_reason_code(value)
+    if not code:
+        return ""
+    if code in {
+        "duplicate",
+        "destination_exists",
+        "destination_exists_before_processing",
+        "colision_existente",
+        "colision_otra_extension",
+        "colision_otro_nombre",
+        "series_duplicate",
+        "series_destination_exists",
+    }:
+        return "duplicate"
+    if code.startswith("extract_") or code.startswith("series_extract_"):
+        return "extraction"
+    if "filebot" in code:
+        return "filebot"
+    if "ocr" in code:
+        return "ocr"
+    if "audio" in code:
+        return "audio"
+    if "subtitle" in code or "subtitulo" in code:
+        return "subtitle"
+    if "video" in code:
+        return "video"
+    if code in {
+        "category_conflict",
+        "no_usable_title",
+        "identity_ambiguous",
+        "identity_suspicious",
+        "media_decision_blocked",
+        "multiple_movie_outputs",
+        "episodio_no_reconocido",
+        "episodio_duplicado",
+        "colision_casefold",
+        "colision_sidecar_casefold",
+        "archivo_no_clasificado",
+        "sin_episodios_validos",
+        "varias_series",
+        "manifest_no_apto",
+        "biblioteca_cambio_durante_procesado",
+        "series_manual_review",
+        "series_input_episode_manifest_invalid",
+        "series_input_physical_manifest_invalid",
+        "series_identity_episode_input_mismatch",
+        "series_identity_output_mismatch",
+    } or code.startswith("identity_"):
+        return "manual"
+    if code in {
+        "procesamiento_fallido",
+        "preparacion_fallida",
+        "series_process_error",
+        "process_error",
+    } or code.endswith("_failed"):
+        return "process"
+    if code == "procesamiento_requiere_revision":
+        return "review"
+    return ""
+
+
+def _reason_kind_from_text(value: Any) -> str:
+    text = str(value or "").casefold()
+    if not text:
+        return ""
+    if "ocr" in text:
+        return "ocr"
+    if any(
+        token in text
+        for token in (
+            "no hay audio",
+            "audio español",
+            "audio espanol",
+            "reglas de audio",
+            "audio no valido",
+            "audio no válido",
+            "pista de audio",
+        )
+    ):
+        return "audio"
+    if any(
+        token in text
+        for token in (
+            "codec de subt",
+            "subtítulo español",
+            "subtitulo espanol",
+            "subtítulo no convertible",
+            "subtitulo no convertible",
+            "subtítulo no procesable",
+            "subtitulo no procesable",
+            "reglas de subt",
+        )
+    ):
+        return "subtitle"
+    if any(
+        token in text
+        for token in (
+            "pistas de vídeo",
+            "pistas de video",
+            "pista de vídeo",
+            "pista de video",
+            "reglas de vídeo",
+            "reglas de video",
+            "video no valido",
+            "vídeo no válido",
+            "sin vídeo",
+            "sin video",
+        )
+    ):
+        return "video"
+    if any(token in text for token in ("extraccion", "extracción", "extract_")):
+        return "extraction"
+    if any(
+        token in text
+        for token in (
+            "destination_exists",
+            "destino final ya existe",
+            "ya existe destino",
+            "episodio ya existente en la biblioteca",
+            "filebot indica que el destino ya existe",
+        )
+    ):
+        return "duplicate"
+    if "filebot" in text:
+        return "filebot"
+    if any(
+        token in text
+        for token in (
+            "identity",
+            "identidad",
+            "category_conflict",
+            "categoria contradictoria",
+            "categoría contradictoria",
+            "tmdb",
+            "manual_review",
+            "revision manual",
+            "revisión manual",
+            "multiple_movie_outputs",
+        )
+    ):
+        return "manual"
+    if any(
+        token in text
+        for token in (
+            "process",
+            "procesamiento",
+            "ffmpeg",
+            "verification",
+            "verificacion",
+            "verificación",
+            "failed",
+            "fallo",
+            "falló",
+            "error",
+        )
+    ):
+        return "process"
+    return ""
+
+
+def _reason_text_body(reason_file: str, reason_text: str) -> str:
+    lines = str(reason_text or "").splitlines()
+    if not lines:
+        return ""
+    expected_header = Path(reason_file).stem.strip().casefold()
+    if expected_header and lines[0].strip().casefold() == expected_header:
+        lines = lines[1:]
+    return "\n".join(lines)
+
+
+def _reason_kind_from_filename(reason_file: str) -> str:
+    filename = str(reason_file or "").strip().casefold()
+    if filename in {"serie repetida.txt", "pelicula repetida.txt", "película repetida.txt"}:
+        return "duplicate"
+    return _reason_kind_from_text(Path(filename).stem)
+
+
+def _review_reason_metadata(
+    payload: Dict[str, Any],
+    reason_file: str,
+    reason_text: str,
+) -> Tuple[str, str]:
+    explicit_kind = _normalized_reason_kind(payload.get("reason_kind"))
+    explicit_code = _normalized_reason_code(payload.get("reason_code"))
+
+    raw_codes: List[str] = []
+    for key in ("error_code", "last_error_code", "reason"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            code = _normalized_reason_code(value)
+            if code:
+                raw_codes.append(code)
+    reasons = payload.get("reasons")
+    if isinstance(reasons, list):
+        for value in reasons:
+            code = _normalized_reason_code(value)
+            if code:
+                raw_codes.append(code)
+
+    evidence: List[Any] = [explicit_code, *raw_codes]
+    evidence.extend(
+        payload.get(key)
+        for key in ("message", "error")
+        if isinstance(payload.get(key), str)
+    )
+    if isinstance(reasons, list):
+        evidence.extend(value for value in reasons if isinstance(value, str))
+    plan = payload.get("plan")
+    if isinstance(plan, dict) and isinstance(plan.get("problemas"), list):
+        evidence.extend(plan["problemas"])
+    body = _reason_text_body(reason_file, reason_text)
+    if body:
+        evidence.append(body)
+
+    normalized_codes = [explicit_code, *raw_codes]
+    manual_review_wrapper = (
+        "procesamiento_requiere_revision" in normalized_codes
+    )
+    code_kinds = {
+        kind
+        for kind in (_reason_kind_from_code(value) for value in normalized_codes)
+        if kind
+    }
+    strong_code_kinds = code_kinds - {"process", "review"}
+    inferred_kinds = {
+        kind for kind in (_reason_kind_from_text(value) for value in evidence) if kind
+    }
+    if "process" in inferred_kinds and inferred_kinds - {"process", "manual"}:
+        inferred_kinds.discard("process")
+    if "manual" in inferred_kinds and inferred_kinds - {"manual"}:
+        inferred_kinds.discard("manual")
+    if manual_review_wrapper:
+        inferred_kinds.discard("process")
+
+    if explicit_kind:
+        reason_kind = explicit_kind
+    elif "manual" in strong_code_kinds:
+        reason_kind = "manual"
+    elif len(strong_code_kinds) > 1:
+        reason_kind = "mixed"
+    elif strong_code_kinds:
+        reason_kind = next(iter(strong_code_kinds))
+    elif len(inferred_kinds) > 1:
+        reason_kind = "mixed"
+    elif inferred_kinds:
+        reason_kind = next(iter(inferred_kinds))
+    elif manual_review_wrapper:
+        reason_kind = "manual"
+    elif len(code_kinds) > 1:
+        reason_kind = "mixed"
+    elif code_kinds:
+        reason_kind = next(iter(code_kinds))
+    else:
+        reason_kind = _reason_kind_from_filename(reason_file) or "review"
+
+    unique_codes = list(dict.fromkeys(code for code in raw_codes if code))
+    reason_code = explicit_code
+    if not reason_code:
+        if len(unique_codes) > 1:
+            reason_code = "multiple_reasons"
+        elif unique_codes:
+            reason_code = unique_codes[0]
+    if not reason_code:
+        reason_code = {
+            "duplicate": "duplicate",
+            "audio": "audio_invalid",
+            "video": "video_invalid",
+            "subtitle": "subtitle_invalid",
+            "ocr": "subtitle_ocr_failed",
+            "manual": "manual_review",
+            "process": "process_error",
+            "filebot": "filebot_error",
+            "extraction": "extraction_error",
+            "mixed": "multiple_reasons",
+        }.get(reason_kind, "review")
+    return reason_code, reason_kind
+
+
 def _job_contexts(job_ids: set[str]) -> Dict[str, Dict[str, Any]]:
     if not job_ids:
         return {}
@@ -1091,7 +1454,9 @@ def _review_payload(
                 if (series_view or shared_root) and reason_json.is_symlink()
                 else _read_json(reason_json)
             )
-            reason_file = txts[0].name if txts else ""
+            if not isinstance(payload, dict):
+                payload = {}
+            reason_file, reason_path = _review_reason_file(folder, payload, txts)
             item_profile = (
                 "series"
                 if dedicated_series_root
@@ -1102,7 +1467,7 @@ def _review_payload(
                     "folder": folder,
                     "payload": payload,
                     "reason_file": reason_file,
-                    "reason_path": txts[0] if txts else None,
+                    "reason_path": reason_path,
                     "profile": item_profile,
                 }
             )
@@ -1139,6 +1504,11 @@ def _review_payload(
         reason_text = _short_text(reason_path, 2000) if reason_path else ""
         if series_view:
             reason_text = _sanitize_series_text(reason_text)
+        reason_code, reason_kind = _review_reason_metadata(
+            payload,
+            record["reason_file"],
+            reason_text,
+        )
         items.append(
             {
                 "name": folder.name,
@@ -1153,6 +1523,8 @@ def _review_payload(
                 "mtime": _mtime(folder),
                 "reason_file": record["reason_file"],
                 "reason_text": reason_text,
+                "reason_code": reason_code,
+                "reason_kind": reason_kind,
                 "phase": payload.get("phase", ""),
                 "job_id": job_id,
                 "file_count": _count_children(folder),

@@ -2,8 +2,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import stat as stat_module
 import subprocess
+import tempfile
 import time
 import math
 from pathlib import Path
@@ -21,6 +24,12 @@ JUNK_EXTENSIONS = {".url", ".nfo", ".sfv", ".txt"}
 REASON_TEXT_FILES = {
     "Pelicula repetida.txt",
     "Serie repetida.txt",
+    "Audio no valido.txt",
+    "Video no valido.txt",
+    "Subtitulo no convertible.txt",
+    "OCR subtitulo fallido.txt",
+    "Revision de serie.txt",
+    "Error de proceso.txt",
     "Error de extraccion.txt",
     "Error de FileBot.txt",
     "Revision manual.txt",
@@ -1153,22 +1162,155 @@ def write_reason(
     payload: Dict[str, object],
     reason_filename: Optional[str] = None,
     reason_lines: Optional[List[str]] = None,
+    *,
+    expected_directory_identity: Optional[Tuple[int, int]] = None,
 ) -> None:
-    destination.mkdir(parents=True, exist_ok=True)
-    (destination / "reason.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
-    if not reason_filename:
-        return
-    for old_reason in REASON_TEXT_FILES:
+    if expected_directory_identity is None:
+        destination.mkdir(parents=True, exist_ok=True)
+    if reason_filename and (
+        reason_filename in {"", ".", ".."}
+        or "/" in reason_filename
+        or "\\" in reason_filename
+    ):
+        raise ValueError("El nombre del motivo no es un archivo simple")
+    reason_json = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    if os.name != "nt":
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        directory_fd = os.open(destination, flags)
         try:
-            (destination / old_reason).unlink(missing_ok=True)
+            directory_info = os.fstat(directory_fd)
+            actual_identity = (
+                int(directory_info.st_dev),
+                int(directory_info.st_ino),
+            )
+            if not stat_module.S_ISDIR(directory_info.st_mode):
+                raise OSError("El destino del motivo ya no es una carpeta")
+            if (
+                expected_directory_identity is not None
+                and actual_identity != expected_directory_identity
+            ):
+                raise OSError("La carpeta del motivo cambió antes de escribir")
+            _atomic_write_text_at(directory_fd, "reason.json", reason_json)
+            if not reason_filename:
+                return
+            for old_reason in REASON_TEXT_FILES:
+                try:
+                    os.unlink(old_reason, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+            lines = [reason_filename.removesuffix(".txt")]
+            lines.extend(str(line) for line in (reason_lines or []) if str(line).strip())
+            _atomic_write_text_at(
+                directory_fd,
+                reason_filename,
+                "\n".join(lines).strip() + "\n",
+            )
+        finally:
+            os.close(directory_fd)
+        return
+
+    _validate_windows_reason_directory(destination, expected_directory_identity)
+    _atomic_write_text(destination / "reason.json", reason_json)
+    _validate_windows_reason_directory(destination, expected_directory_identity)
+    if reason_filename:
+        for old_reason in REASON_TEXT_FILES:
+            try:
+                (destination / old_reason).unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
+        lines = [reason_filename.removesuffix(".txt")]
+        lines.extend(str(line) for line in (reason_lines or []) if str(line).strip())
+        _atomic_write_text(
+            destination / reason_filename,
+            "\n".join(lines).strip() + "\n",
+        )
+        _validate_windows_reason_directory(destination, expected_directory_identity)
+
+
+def _validate_windows_reason_directory(
+    destination: Path,
+    expected_directory_identity: Optional[Tuple[int, int]],
+) -> None:
+    """Fallback defensivo del host; el runtime Linux usa dirfd fijado."""
+
+    info = destination.lstat()
+    is_junction = getattr(os.path, "isjunction", lambda _path: False)
+    if (
+        not stat_module.S_ISDIR(info.st_mode)
+        or destination.is_symlink()
+        or is_junction(destination)
+    ):
+        raise OSError("El destino del motivo no es una carpeta física")
+    actual_identity = (int(info.st_dev), int(info.st_ino))
+    if (
+        expected_directory_identity is not None
+        and actual_identity != expected_directory_identity
+    ):
+        raise OSError("La carpeta del motivo cambió antes de escribir")
+
+
+def _atomic_write_text_at(directory_fd: int, filename: str, content: str) -> None:
+    """Escribe por dirfd para que renombrar la carpeta no redirija la escritura."""
+
+    descriptor = -1
+    temporary_name = ""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    for _attempt in range(32):
+        temporary_name = f".{filename}.{secrets.token_hex(12)}.tmp"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            break
+        except FileExistsError:
+            continue
+    if descriptor < 0:
+        raise FileExistsError("No se pudo reservar un temporal atómico")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_name:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Sustituye el archivo sin seguir un symlink colocado en el destino."""
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
         except OSError:
             pass
-    lines = [reason_filename.removesuffix(".txt")]
-    lines.extend(str(line) for line in (reason_lines or []) if str(line).strip())
-    (destination / reason_filename).write_text(
-        "\n".join(lines).strip() + "\n",
-        encoding="utf-8",
-    )

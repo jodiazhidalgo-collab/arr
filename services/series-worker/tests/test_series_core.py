@@ -25,11 +25,17 @@ from series_worker.core import (
 )
 from series_worker.heavy_lock import HeavyLockTimeout
 from series_worker.processing import (
+    AudioInvalidError,
     BASE_TOOLS,
     OCR_TOOLS,
     EpisodeProcessingError,
+    OCRSubtitleError,
     ProcessedEpisode,
+    ProcessingError,
     ProcessingResult,
+    ReviewRequiredError,
+    SubtitleNotConvertibleError,
+    VideoInvalidError,
 )
 from series_worker.rules import RulesSnapshot, RulesStore
 
@@ -84,6 +90,14 @@ class FakeProcessor:
             rules_fingerprint=rules_snapshot.fingerprint,
             episodes=tuple(completed),
         )
+
+
+class FailingProcessor:
+    def __init__(self, error):
+        self.error = error
+
+    def process(self, **_kwargs):
+        raise self.error
 
 
 class FakeSidecarProcessor(FakeProcessor):
@@ -285,10 +299,317 @@ def _assert_review_matches_source(layout, payload, result):
     source_root = Path(payload["source_root"])
     if source_root.exists():
         assert not list(source_root.rglob("*"))
-    assert (review_root / "reason.json").is_file()
-    assert (review_root / "Serie repetida.txt").is_file()
-    assert not (review_root / "Revision de serie.txt").exists()
+    reason_path = review_root / "reason.json"
+    assert reason_path.is_file()
+    reason = json.loads(reason_path.read_text("utf-8"))
+    assert reason["schema"] == "series-review-v2"
+    for key in (
+        "reason_code",
+        "reason_kind",
+        "reason_file",
+        "reason_title",
+        "reason_lines",
+    ):
+        assert reason[key] == result[key]
+    markers = {
+        path.name
+        for path in review_root.iterdir()
+        if path.name in core_module._REVIEW_MARKERS
+    }
+    assert markers == {reason["reason_file"]}
+    expected_text = "\n".join(
+        (reason["reason_title"], *reason["reason_lines"])
+    ) + "\n"
+    assert (review_root / reason["reason_file"]).read_text("utf-8") == expected_text
     return review_root
+
+
+@pytest.mark.parametrize(
+    "error_type,raw_prefix,reason_code,reason_kind,reason_file,reason_title,summary",
+    [
+        (
+            AudioInvalidError,
+            "procesamiento_fallido",
+            "series_audio_invalid",
+            "audio",
+            "Audio no valido.txt",
+            "Audio no valido",
+            "El pack no cumple las reglas de audio.",
+        ),
+        (
+            VideoInvalidError,
+            "procesamiento_fallido",
+            "series_video_invalid",
+            "video",
+            "Video no valido.txt",
+            "Video no valido",
+            "El pack no cumple las reglas de vídeo.",
+        ),
+        (
+            SubtitleNotConvertibleError,
+            "procesamiento_fallido",
+            "series_subtitle_not_convertible",
+            "subtitle",
+            "Subtitulo no convertible.txt",
+            "Subtitulo no convertible",
+            "El subtítulo no se puede convertir automáticamente.",
+        ),
+        (
+            OCRSubtitleError,
+            "procesamiento_fallido",
+            "series_ocr_subtitle_failed",
+            "ocr",
+            "OCR subtitulo fallido.txt",
+            "OCR subtitulo fallido",
+            "Ha fallado el OCR del subtítulo.",
+        ),
+        (
+            ReviewRequiredError,
+            "procesamiento_requiere_revision",
+            "series_manual_review",
+            "manual",
+            "Revision de serie.txt",
+            "Revision de serie",
+            "El pack necesita revisión manual antes de publicarse.",
+        ),
+        (
+            ProcessingError,
+            "procesamiento_fallido",
+            "series_process_error",
+            "process",
+            "Error de proceso.txt",
+            "Error de proceso",
+            "El pack no se ha podido procesar de forma segura.",
+        ),
+    ],
+)
+def test_processing_review_v2_matrix_uses_typed_contract_and_exact_marker(
+    layout,
+    error_type,
+    raw_prefix,
+    reason_code,
+    reason_kind,
+    reason_file,
+    reason_title,
+    summary,
+):
+    message = "detalle controlado sin palabras clasificables"
+    payload = _payload(layout)
+    coordinator = _coordinator(
+        layout,
+        processor=FailingProcessor(error_type(message)),
+    )
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    assert result["review_reasons"] == [f"{raw_prefix}:{message}"]
+    assert result["reason_code"] == reason_code
+    assert result["reason_kind"] == reason_kind
+    assert result["reason_file"] == reason_file
+    assert result["reason_title"] == reason_title
+    assert result["reason_lines"] == [summary, message]
+    review = _assert_review_matches_source(layout, payload, result)
+    assert (review / reason_file).read_text("utf-8") == (
+        f"{reason_title}\n{summary}\n{message}\n"
+    )
+    assert (review / "Serie.S01E01.mkv").read_bytes() == b"one"
+
+
+def test_real_library_duplicate_is_the_only_duplicate_family(layout):
+    payload = _payload(layout)
+    existing = layout["tv"] / "Serie/Season 01/Serie.S01E01.mkv"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"already-there")
+    coordinator = _coordinator(layout)
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    assert result["reason_code"] == "series_duplicate"
+    assert result["reason_kind"] == "duplicate"
+    assert result["reason_file"] == "Serie repetida.txt"
+    assert result["reason_lines"] == [
+        "Ya existe en la biblioteca al menos uno de los episodios del pack.",
+        "Episodio ya existente en la biblioteca: Serie/Season 01/Serie.S01E01.mkv",
+    ]
+    _assert_review_matches_source(layout, payload, result)
+    assert existing.read_bytes() == b"already-there"
+
+
+def test_duplicate_episode_inside_pack_is_manual_review_not_series_duplicate(layout):
+    payload = _payload(
+        layout,
+        videos=[
+            ("Serie/Season 01/Serie.S01E01.mkv", b"one"),
+            ("Serie/Season 01/Serie.S01E01.1080p.mkv", b"other"),
+        ],
+    )
+    coordinator = _coordinator(layout)
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    assert any(
+        reason.startswith("episodio_duplicado:")
+        for reason in result["review_reasons"]
+    )
+    assert result["reason_code"] == "series_manual_review"
+    assert result["reason_kind"] == "manual"
+    assert result["reason_file"] == "Revision de serie.txt"
+    assert not (layout["review"] / result["review_path"] / "Serie repetida.txt").exists()
+    _assert_review_matches_source(layout, payload, result)
+
+
+def test_review_v2_is_idempotent_and_reuses_the_same_filesystem_destination(layout):
+    payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
+    coordinator = _coordinator(layout)
+    validated = validate_payload(payload)
+    reserved, record = coordinator._new_reservation(validated)
+    prepared = coordinator._prepare_reserved(reserved, record)
+    reasons = prepared.manifest.review_reasons
+
+    first = core_module._review_pack(prepared, reasons)
+    second = core_module._review_pack(prepared, reasons)
+
+    assert second == first
+    assert [path.name for path in layout["review"].iterdir()] == [
+        "Series sin clasificar"
+    ]
+    _assert_review_matches_source(layout, payload, second)
+
+
+def test_review_v2_rejects_string_instead_of_reason_lines_list(layout):
+    payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
+    coordinator = _coordinator(layout)
+    validated = validate_payload(payload)
+    reserved, record = coordinator._new_reservation(validated)
+    prepared = coordinator._prepare_reserved(reserved, record)
+    reasons = prepared.manifest.review_reasons
+    result = core_module._review_pack(prepared, reasons)
+    destination = layout["review"] / result["review_path"]
+    reason_path = destination / "reason.json"
+    reason = json.loads(reason_path.read_text("utf-8"))
+    reason["reason_lines"] = "esto no es una lista"
+    reason_path.write_text(
+        json.dumps(reason, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(core_module.SeriesWorkerError, match="líneas inválidas"):
+        core_module._review_pack(prepared, reasons)
+
+
+def test_review_v2_rejects_a_reused_destination_changed_to_another_family(layout):
+    payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
+    coordinator = _coordinator(layout)
+    validated = validate_payload(payload)
+    reserved, record = coordinator._new_reservation(validated)
+    prepared = coordinator._prepare_reserved(reserved, record)
+    reasons = prepared.manifest.review_reasons
+    result = core_module._review_pack(prepared, reasons)
+    destination = layout["review"] / result["review_path"]
+    reason_path = destination / "reason.json"
+    reason = json.loads(reason_path.read_text("utf-8"))
+    (destination / reason["reason_file"]).unlink()
+    reason.update(
+        {
+            "reason_code": "series_process_error",
+            "reason_kind": "process",
+            "reason_file": "Error de proceso.txt",
+            "reason_title": "Error de proceso",
+            "reason_lines": [
+                core_module._REVIEW_SUMMARIES["process"],
+                "Detalle alterado de forma coherente.",
+            ],
+        }
+    )
+    reason_path.write_text(
+        json.dumps(reason, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (destination / "Error de proceso.txt").write_text(
+        "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(core_module.SeriesWorkerError, match="no coincide"):
+        core_module._review_pack(prepared, reasons)
+
+    assert not (layout["review"] / "Series sin clasificar (1)").exists()
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        "Error de FileBot.txt",
+        "Error de extraccion.txt",
+        "Pelicula repetida.txt",
+        "Revision manual.txt",
+    ],
+)
+def test_orchestrator_reason_markers_are_reserved_pack_names(layout, reserved_name):
+    payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
+    source = Path(payload["source_root"])
+    (source / reserved_name).write_text("contenido ajeno\n", encoding="utf-8")
+    coordinator = _coordinator(layout)
+
+    coordinator.submit(payload)
+    result = coordinator.wait("job-1").payload["result"]
+
+    assert result["status"] == "failed"
+    assert "nombre reservado" in result["error"]
+    assert (source / reserved_name).read_text("utf-8") == "contenido ajeno\n"
+    assert not list(layout["review"].iterdir())
+
+
+def test_safe_error_hides_complete_internal_paths_with_spaces() -> None:
+    error = RuntimeError(
+        "Falló OCR: Could not parse /tmp/series worker/job/vobsub.idx: "
+        "ffprobe /data/downloads/Codex Probe S01E01.mkv: Invalid data"
+    )
+
+    safe = core_module._safe_error(error)
+
+    assert safe == "Falló OCR: Could not parse <PATH>: ffprobe <PATH>: Invalid data"
+    assert "/tmp/" not in safe
+    assert "/data/" not in safe
+
+
+def test_review_v1_destination_is_read_and_reused_without_numbering(layout):
+    payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
+    coordinator = _coordinator(layout)
+    validated = validate_payload(payload)
+    reserved, record = coordinator._new_reservation(validated)
+    prepared = coordinator._prepare_reserved(reserved, record)
+    reasons = prepared.manifest.review_reasons
+    source, prefix, review_layout = core_module._review_source(prepared)
+    destination = layout["review"] / "Series sin clasificar"
+    legacy_reason = {
+        "schema": "series-review-v1",
+        "profile": "series",
+        "category": "tv",
+        "job_id": "job-1",
+        "manifest_digest": prepared.manifest.digest,
+        "reasons": list(reasons),
+        "review_layout": review_layout,
+        "review_source_prefix": prefix,
+    }
+    (source / "reason.json").write_text(
+        json.dumps(legacy_reason, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    legacy_text = "Serie repetida\n" + "\n".join(reasons) + "\n"
+    (source / "Serie repetida.txt").write_text(legacy_text, encoding="utf-8")
+    shutil.move(str(source), str(destination))
+
+    result = core_module._review_pack(prepared, reasons)
+
+    assert result["review_path"] == "Series sin clasificar"
+    assert "reason_code" not in result
+    assert json.loads((destination / "reason.json").read_text("utf-8")) == legacy_reason
+    assert (destination / "Serie repetida.txt").read_text("utf-8") == legacy_text
+    assert not (layout["review"] / "Series sin clasificar (1)").exists()
 
 
 def test_payload_requires_exact_keys_and_canonical_roots(layout):
@@ -834,10 +1155,10 @@ def test_processing_failure_releases_heavy_lock_before_review_copy(
     original_review = core_module._review_pack
     review_started = threading.Event()
 
-    def checked_review(prepared, reasons):
+    def checked_review(prepared, reasons, **kwargs):
         assert lock_state["held"] is False
         review_started.set()
-        return original_review(prepared, reasons)
+        return original_review(prepared, reasons, **kwargs)
 
     monkeypatch.setattr(core_module, "_review_pack", checked_review)
     coordinator = _coordinator(

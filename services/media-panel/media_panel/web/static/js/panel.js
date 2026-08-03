@@ -441,6 +441,82 @@ function stateTone(state) {
   return "info";
 }
 
+const REVIEW_REASON_PRESENTATIONS = Object.freeze({
+  audio: { label: "Audio no válido", tone: "bad" },
+  video: { label: "Vídeo no válido", tone: "bad" },
+  subtitle: { label: "Subtítulo no convertible", tone: "bad" },
+  ocr: { label: "OCR de subtítulo fallido", tone: "bad" },
+  manual: { label: "Revisión manual", tone: "warn" },
+  process: { label: "Error de proceso", tone: "bad" },
+  filebot: { label: "Error de FileBot", tone: "bad" },
+  extraction: { label: "Error de extracción", tone: "bad" },
+  mixed: { label: "Varios motivos", tone: "bad" },
+  review: { label: "Revisión", tone: "bad" }
+});
+
+const REVIEW_REASON_CODE_PRESENTATIONS = Object.freeze({
+  category_conflict: { label: "Categoría contradictoria", tone: "warn" },
+  identity_suspicious: { label: "Identidad ambigua", tone: "warn" },
+  media_decision_blocked: { label: "Identidad sin confirmar", tone: "warn" },
+  multiple_movie_outputs: { label: "Varias películas detectadas", tone: "warn" },
+  filebot_timeout: { label: "FileBot agotó el tiempo", tone: "bad" },
+  filebot_identity_mismatch: { label: "Identidad distinta en FileBot", tone: "bad" }
+});
+
+function normalizedReviewToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function reviewReasonPresentation(item) {
+  const kind = normalizedReviewToken(item?.reason_kind);
+  const code = normalizedReviewToken(item?.reason_code);
+  const duplicateCodes = new Set([
+    "duplicate",
+    "destination_exists",
+    "destination_exists_before_processing",
+    "colision_existente",
+    "collision_existing"
+  ]);
+  if (kind === "duplicate" || duplicateCodes.has(code)) {
+    return {
+      label: item?.profile === "series" ? "Serie repetida" : "Película repetida",
+      tone: "warn",
+      typed: true
+    };
+  }
+  if (REVIEW_REASON_CODE_PRESENTATIONS[code]) {
+    return { ...REVIEW_REASON_CODE_PRESENTATIONS[code], typed: true };
+  }
+  if (REVIEW_REASON_PRESENTATIONS[kind]) {
+    return { ...REVIEW_REASON_PRESENTATIONS[kind], typed: true };
+  }
+
+  const fallback = String(item?.reason_file || item?.phase || "Revisión")
+    .replace(/\.txt$/i, "")
+    .trim() || "Revisión";
+  const fallbackKey = fallback.toLowerCase();
+  return {
+    label: fallback,
+    tone: fallbackKey.includes("repetida") || fallbackKey.includes("revision") || fallbackKey.includes("revisión") ? "warn" : "bad",
+    typed: false
+  };
+}
+
+function reviewReasonText(item, presentation) {
+  const raw = String(item?.reason_text || "");
+  if (!raw || !presentation?.typed) return raw;
+  const lines = raw.split(/\r?\n/);
+  const marker = String(item?.reason_file || "").replace(/\.txt$/i, "").trim();
+  if (marker && lines[0]?.trim().toLocaleLowerCase("es") === marker.toLocaleLowerCase("es")) {
+    lines[0] = presentation.label;
+  }
+  return lines.join("\n");
+}
+
 async function showHistorial(context) {
   context = ensureViewContext("historial", context);
   setActive("historial");
@@ -491,15 +567,19 @@ async function showRevision(context) {
     <div class="muted">${esc(data.review_dir)}</div>
     ${data.connected === false ? `<div class="locked-notice" role="status"><span class="pill warn">No disponible</span><strong>${esc(data.message || "Motor no conectado")}</strong></div>` : ""}
     <div class="review-list" style="margin-top:12px">
-      ${items.length ? items.map(item => `
-        <article class="review-item">
-          <div class="review-top">
-            <div><b>${esc(item.name)}</b><div class="muted">${esc(item.path)}</div></div>
-            ${pill(item.reason_file || item.phase || "revision", item.reason_file && item.reason_file.toLowerCase().includes("repetida") ? "warn" : "bad")}
-          </div>
-          ${item.reason_text ? `<pre class="pre">${esc(item.reason_text)}</pre>` : ""}
-        </article>
-      `).join("") : `<div class="empty">No hay elementos en revision.</div>`}
+      ${items.length ? items.map(item => {
+        const reason = reviewReasonPresentation(item);
+        const reasonText = reviewReasonText(item, reason);
+        return `
+          <article class="review-item">
+            <div class="review-top">
+              <div><b>${esc(item.name)}</b><div class="muted">${esc(item.path)}</div></div>
+              ${pill(reason.label, reason.tone)}
+            </div>
+            ${reasonText ? `<pre class="pre">${esc(reasonText)}</pre>` : ""}
+          </article>
+        `;
+      }).join("") : `<div class="empty">No hay elementos en revision.</div>`}
     </div>
   </section>`;
   bindAuxiliaryProfileSelector("revision", showRevision);

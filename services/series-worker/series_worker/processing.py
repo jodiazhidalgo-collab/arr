@@ -41,6 +41,9 @@ SRT_TIMING_RE = re.compile(r"\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->")
 class ProcessingError(RuntimeError):
     """El episodio no se puede transformar con seguridad."""
 
+    review_reason_code = "series_process_error"
+    review_reason_kind = "process"
+
 
 class ToolUnavailableError(ProcessingError):
     """Falta una herramienta requerida por la ruta seleccionada."""
@@ -50,10 +53,54 @@ class VerificationError(ProcessingError):
     """La salida provisional no supera la verificación completa."""
 
 
+class AudioInvalidError(ProcessingError):
+    """El episodio no cumple las reglas funcionales de audio."""
+
+    review_reason_code = "series_audio_invalid"
+    review_reason_kind = "audio"
+
+
+class VideoInvalidError(ProcessingError):
+    """El episodio no cumple las reglas funcionales de vídeo."""
+
+    review_reason_code = "series_video_invalid"
+    review_reason_kind = "video"
+
+
+class SubtitleNotConvertibleError(ProcessingError):
+    """El subtítulo no puede convertirse de forma automática."""
+
+    review_reason_code = "series_subtitle_not_convertible"
+    review_reason_kind = "subtitle"
+
+
+class OCRSubtitleError(ProcessingError):
+    """La ruta OCR del subtítulo ha fallado."""
+
+    review_reason_code = "series_ocr_subtitle_failed"
+    review_reason_kind = "ocr"
+
+
 class ReviewRequiredError(ProcessingError):
     """El contenido debe conservarse completo para revisión humana."""
 
     code = "series_review_required"
+    review_reason_code = "series_manual_review"
+    review_reason_kind = "manual"
+
+
+class SubtitleReviewRequiredError(ReviewRequiredError):
+    """El subtítulo no es convertible y exige revisión humana."""
+
+    review_reason_code = "series_subtitle_not_convertible"
+    review_reason_kind = "subtitle"
+
+
+class OCRReviewRequiredError(ReviewRequiredError):
+    """El resultado OCR exige revisión humana."""
+
+    review_reason_code = "series_ocr_subtitle_failed"
+    review_reason_kind = "ocr"
 
 
 class EpisodeProcessingError(ProcessingError):
@@ -69,6 +116,28 @@ class EpisodeProcessingError(ProcessingError):
         super().__init__(message)
         self.entry = entry
         self.partial_results = tuple(partial_results)
+
+
+def processing_review_identity(error: BaseException) -> tuple[str, str]:
+    """Obtiene la categoría estable sin interpretar el texto del error."""
+
+    current: BaseException | None = error
+    seen: set[int] = set()
+    fallback = (
+        ProcessingError.review_reason_code,
+        ProcessingError.review_reason_kind,
+    )
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ProcessingError):
+            identity = (
+                str(current.review_reason_code),
+                str(current.review_reason_kind),
+            )
+            if identity != fallback:
+                return identity
+        current = current.__cause__ or current.__context__
+    return fallback
 
 
 class Runner(Protocol):
@@ -310,7 +379,9 @@ def _select_video_and_audio(
     ]
     expected = int(rules["video"]["pistas_exactas"])
     if len(videos) != expected or not videos:
-        raise ProcessingError(f"Se esperaban {expected} pistas de vídeo y hay {len(videos)}.")
+        raise VideoInvalidError(
+            f"Se esperaban {expected} pistas de vídeo y hay {len(videos)}."
+        )
 
     audio_rules = rules["audio"]
     accepted_audio = {str(value).casefold() for value in audio_rules["idiomas_aceptados"]}
@@ -342,7 +413,9 @@ def _select_video_and_audio(
         )
     )
     if not video_ok:
-        raise ProcessingError("La pista de vídeo no puede etiquetarse como española.")
+        raise VideoInvalidError(
+            "La pista de vídeo no puede etiquetarse como española."
+        )
 
     candidates = list(direct)
     if not candidates and audio_rules["aceptar_indeterminado_si_video_es"]:
@@ -358,7 +431,7 @@ def _select_video_and_audio(
             and (_language(stream) == "" or _language(stream) in conditional)
         ]
     if not candidates:
-        raise ProcessingError("No hay audio español válido.")
+        raise AudioInvalidError("No hay audio español válido.")
 
     codec_priority = audio_rules["codec_prioridad"]
 
@@ -473,7 +546,7 @@ def _select_subtitle(
             image_candidates.append(stream)
             continue
         if codec not in text_codecs:
-            raise ReviewRequiredError(
+            raise SubtitleReviewRequiredError(
                 f"Codec de subtítulo desconocido para automatización: {codec or '-'}"
             )
         index = int(stream["index"])
@@ -522,7 +595,7 @@ def _select_subtitle(
         return None, image_candidates[0]
     if str(subtitle_rules["sin_subtitulos_modo"]).strip().casefold() == "procesar_sin_subtitulos":
         return None, None
-    raise ProcessingError("No hay subtítulo español procesable.")
+    raise SubtitleNotConvertibleError("No hay subtítulo español procesable.")
 
 
 def _safe_output(source_root: Path, target_relpath: str) -> Path:
@@ -545,7 +618,7 @@ def _srt_valid(path: Path) -> bool:
         return False
 
 
-def _ocr_subtitle(
+def _ocr_subtitle_unchecked(
     source: Path,
     stream: dict[str, Any],
     workspace: Path,
@@ -600,8 +673,22 @@ def _ocr_subtitle(
             label="OCR de subtítulo",
         )
     if not _srt_valid(output):
-        raise ProcessingError("OCR no produjo un SRT válido.")
+        raise OCRSubtitleError("OCR no produjo un SRT válido.")
     return output
+
+
+def _ocr_subtitle(
+    source: Path,
+    stream: dict[str, Any],
+    workspace: Path,
+    runner: Runner,
+) -> Path:
+    try:
+        return _ocr_subtitle_unchecked(source, stream, workspace, runner)
+    except OCRSubtitleError:
+        raise
+    except ProcessingError as error:
+        raise OCRSubtitleError(str(error)) from error
 
 
 def analyze_episode(
@@ -621,9 +708,11 @@ def analyze_episode(
     require_tools(active, BASE_TOOLS)
     source_path = Path(source)
     if source_path.suffix.casefold() not in SUPPORTED_INPUTS:
-        raise ProcessingError(f"Formato de entrada no soportado: {source_path.suffix}")
+        raise VideoInvalidError(
+            f"Formato de entrada no soportado: {source_path.suffix}"
+        )
     if source_path.is_symlink() or not source_path.is_file():
-        raise ProcessingError("La entrada no es un archivo físico regular.")
+        raise VideoInvalidError("La entrada no es un archivo físico regular.")
     probe = _probe(source_path, active)
     video, audio, audio_mode = _select_video_and_audio(probe, rules_snapshot.rules)
     subtitle, image_stream = _select_subtitle(
@@ -650,7 +739,9 @@ def analyze_episode(
         elif str(subtitle_rules["sin_subtitulos_modo"]).casefold() == "procesar_sin_subtitulos":
             subtitle = None
         else:
-            raise ReviewRequiredError("El SRT OCR queda fuera de los límites de frases.")
+            raise OCRReviewRequiredError(
+                "El SRT OCR queda fuera de los límites de frases."
+            )
     return EpisodePlan(
         source=source_path,
         output=Path(output),
@@ -854,7 +945,7 @@ def _verify_output(
     }
 
 
-def _export_subtitle(
+def _export_subtitle_unchecked(
     plan: EpisodePlan,
     output: Path,
     rules: dict[str, Any],
@@ -892,6 +983,20 @@ def _export_subtitle(
         return destination, int(destination.stat().st_size), ""
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _export_subtitle(
+    plan: EpisodePlan,
+    output: Path,
+    rules: dict[str, Any],
+    runner: Runner,
+) -> tuple[Path, int, str] | None:
+    try:
+        return _export_subtitle_unchecked(plan, output, rules, runner)
+    except SubtitleNotConvertibleError:
+        raise
+    except ProcessingError as error:
+        raise SubtitleNotConvertibleError(str(error)) from error
 
 
 def _execute_plan(
@@ -1077,8 +1182,11 @@ def process_manifest(
 
 
 __all__ = [
+    "AudioInvalidError",
     "BASE_TOOLS",
     "OCR_TOOLS",
+    "OCRReviewRequiredError",
+    "OCRSubtitleError",
     "EpisodePlan",
     "EpisodeProcessingError",
     "ProcessedEpisode",
@@ -1086,11 +1194,15 @@ __all__ = [
     "ProcessingResult",
     "ReviewRequiredError",
     "SeriesProcessor",
+    "SubtitleNotConvertibleError",
+    "SubtitleReviewRequiredError",
     "SubprocessRunner",
     "ToolUnavailableError",
     "VerificationError",
+    "VideoInvalidError",
     "analyze_episode",
     "missing_tools",
+    "processing_review_identity",
     "unavailable_tools",
     "probe_media",
     "process_manifest",
