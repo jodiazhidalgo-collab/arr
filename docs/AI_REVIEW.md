@@ -14,6 +14,12 @@ Puntos de entrada:
 - Buscador puente: `services/buscador-puente-arr`
 - Panel web: `services/media-panel`
 - Worker media: `services/media-worker`
+- Worker de series: `services/series-worker`
+
+El camino normal de peliculas termina en Media Worker. En modo Series activo,
+FileBot escribe primero en una salida provisional privada del trabajo y Series
+Worker congela reglas y manifiesto, procesa los episodios, verifica la
+publicacion y deja un resultado durable que vuelve a validar el orquestador.
 
 La verdad canonica del motor es:
 
@@ -47,6 +53,18 @@ La fuente principal de estados, tiempos, decisiones y errores debe salir de:
 5. ZIP final `diagnosticos_codex/*.zip`
 
 No se deben inventar fuentes paralelas si esos datos ya pueden derivarse de `job_events`.
+
+## Proteccion del vigilante
+
+Los eventos del filesystem entran en una bandeja acotada y se agrupan por item
+superior. El primer evento util se procesa sin debounce; los eventos repetidos
+de una carpeta no crean trabajo adicional. Si la bandeja alcanza su limite, el
+orquestador solicita una reconciliacion inmediata con filesystem, RDT y qB para
+recuperar cualquier item sin bloquear el flujo normal.
+
+`/health` conserva `queue_size` y expone tambien `watcher_events` con capacidad,
+recibidos, agrupados, desbordados, pendientes, maximo alcanzado y si queda una
+reconciliacion solicitada.
 
 ## Pruebas seguras
 

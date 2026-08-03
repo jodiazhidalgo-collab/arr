@@ -69,7 +69,7 @@ from .name_resolver import (
 )
 from .name_parser import MediaDecision, decide_media
 from .torrent import torrent_info
-from .watchers import EventHandler
+from .watchers import EventHandler, WatcherEventInbox
 
 
 TERMINAL_STATES = {"done", "manual_review", "duplicate", "error_terminal", "discarded"}
@@ -117,6 +117,9 @@ DEFAULT_IGNORED_TV_SUFFIXES: Tuple[str, ...] = ()
 WORKER_STATUS_POLL_SECONDS = 5.0
 WORKER_ACTIVE_MAX_SECONDS = 4 * 60 * 60 + 5 * 60
 MAX_WORKER_RESULT_BYTES = 16 * 1024 * 1024
+WATCHER_EVENT_CAPACITY = 2048
+WATCHER_DRAIN_MAX_EVENTS = 500
+WATCHER_DRAIN_BUDGET_SECONDS = 0.025
 SERIES_PIPELINE_SCHEMA = "arr-series-pipeline-v1"
 SERIES_CANARY_PREFIX = "codex_live_flow_probe_"
 SERIES_PUBLISHED_MANIFEST_SCHEMA = "series-published-manifest-v1"
@@ -168,7 +171,7 @@ class Engine:
             config.series_worker_url,
             config.callback_url,
         )
-        self.events: "queue.Queue[Tuple[str, Path]]" = queue.Queue()
+        self.events = WatcherEventInbox(WATCHER_EVENT_CAPACITY)
         self.observer = Observer()
         self._stable: Dict[str, Tuple[str, float]] = {}
         self._stable_log_at: Dict[str, float] = {}
@@ -812,9 +815,7 @@ class Engine:
             self._heartbeat()
             self._drain_events()
             now = time.time()
-            if now - self._last_reconcile >= self.config.reconcile_seconds:
-                self.reconcile()
-                self._last_reconcile = now
+            self._reconcile_if_due(now)
             self.process_jobs()
             time.sleep(0.5)
 
@@ -847,6 +848,7 @@ class Engine:
                 },
             },
             "queue_size": self.events.qsize(),
+            "watcher_events": self.events.stats(),
         }
 
     def _manifest_summary(self, entries: List[Dict[str, object]]) -> Dict[str, object]:
@@ -1002,23 +1004,40 @@ class Engine:
 
     def _start_watchers(self) -> None:
         watched = [
-            (self.config.watch_inbox, "watch"),
-            (self.config.event_dir, "qbt_event"),
+            (self.config.watch_inbox, "watch", None),
+            (self.config.event_dir, "qbt_event", None),
         ]
-        watched.extend((self.config.complete_root / category, "complete") for category in COMPLETE_CATEGORIES)
-        for path, event_type in watched:
+        watched.extend(
+            (
+                self.config.complete_root / category,
+                "complete",
+                self.config.complete_root / category,
+            )
+            for category in COMPLETE_CATEGORIES
+        )
+        for path, event_type, collapse_root in watched:
             self.observer.schedule(
-                EventHandler(self.events, event_type), str(path), recursive=True
+                EventHandler(
+                    self.events,
+                    event_type,
+                    collapse_root=collapse_root,
+                ),
+                str(path),
+                recursive=True,
             )
         self.observer.start()
 
     def _drain_events(self) -> None:
-        for _ in range(500):
+        deadline = time.monotonic() + WATCHER_DRAIN_BUDGET_SECONDS
+        for index in range(WATCHER_DRAIN_MAX_EVENTS):
+            if index and time.monotonic() >= deadline:
+                return
             try:
-                event_type, path = self.events.get_nowait()
+                event = self.events.get_nowait()
             except queue.Empty:
                 return
             try:
+                event_type, path = event.event_type, event.path
                 if event_type == "watch":
                     self._handle_watch_path(path)
                 elif event_type == "qbt_event":
@@ -1027,6 +1046,17 @@ class Engine:
                     self._handle_complete_path(path)
             except Exception:
                 self.log.exception("Error manejando evento %s: %s", event_type, path)
+            finally:
+                self.events.acknowledge(event)
+
+    def _reconcile_if_due(self, now: float) -> None:
+        ticket = self.events.reconcile_ticket()
+        if not ticket and now - self._last_reconcile < self.config.reconcile_seconds:
+            return
+        self.reconcile()
+        self._last_reconcile = now
+        if ticket:
+            self.events.acknowledge_reconcile(ticket)
 
     def reconcile(self) -> None:
         self._reconcile_watch_inbox()

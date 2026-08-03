@@ -2,17 +2,11 @@
 #  MAPA DEL FLUJO COMPLETO - ARR                          #
 #  TRES CAMINOS: DESCARGA, MEDIA, TRAILER                 #
 # ======================================================= #
-# gluetun 154
-# qbittorrent 198
-# jackett 216
-# flaresolverr 231
-# rdtclient 242
-# arr-orchestrator 257
-# media-worker 312
-# series-worker 347
-# media-panel 377
-# buscador-puente-arr 416
-# compose-backup 462
+# Orden de servicios:
+# gluetun -> qbittorrent / jackett / flaresolverr
+# rdtclient -> media-worker / series-worker
+# arr-orchestrator -> media-panel / buscador-puente-arr
+# compose-backup
 #
 # ======================================================= #
 #  IDEA GENERAL                                           #
@@ -63,7 +57,12 @@
 # 4) Extrae si hay RAR/ZIP.
 # 5) Decide pelicula o serie.
 # 6) Llama a FileBot one-shot.
-# 7) Limpia la entrada de qB/RDT sin borrar media final.
+# 7) Peliculas: FileBot deja una salida privada y
+#    media-worker analiza, procesa, verifica y publica.
+# 8) Series: FileBot deja una salida provisional privada y
+#    series-worker procesa, verifica y publica en TV.
+# 9) arr-orchestrator valida el resultado durable.
+# 10) Limpia la entrada de qB/RDT sin borrar media final.
 #
 # Salidas:
 # - Peliculas: /data/media/movies

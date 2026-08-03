@@ -41,6 +41,7 @@ def test_ai_review_declares_arr_truth_source_and_entrypoints():
         "services/buscador-puente-arr",
         "services/media-panel",
         "services/media-worker",
+        "services/series-worker",
         "config/arr-orchestrator/orchestrator.db",
         "job_events",
         "job_detail()",
@@ -49,6 +50,23 @@ def test_ai_review_declares_arr_truth_source_and_entrypoints():
         "AGENTS.md",
     ):
         assert expected in text
+
+
+def test_real_flow_live_pytest_is_isolated_and_cleaned_inside_container():
+    script = read(
+        ".agents/skills/prueba-flujo-real-arr/scripts/run_real_flow_probe.ps1"
+    )
+
+    for expected in (
+        'LIVE_TEST_ROOT="/tmp/${PROBE_ID}_pytest"',
+        '-e ARR_PYTEST_SESSION_ROOT="$LIVE_TEST_ROOT"',
+        '-e ARR_PYTEST_DATA_DIR="$LIVE_TEST_ROOT/data"',
+        '-e ARR_PYTEST_TEMP_DIR="$LIVE_TEST_ROOT/tmp"',
+        '-e TMPDIR="$LIVE_TEST_ROOT/tmp"',
+        'rm -rf -- "$ARR_PYTEST_SESSION_ROOT"',
+        "trap cleanup_live_pytest EXIT",
+    ):
+        assert expected in script
 
 
 def test_diagnostic_readme_is_bridge_not_parallel_norm():

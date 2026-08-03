@@ -25,6 +25,7 @@ MEDIA_SMOKE_JOB_ID="${PROBE_ID}_media_worker"
 SERIES_SOURCE_NAME="$PROBE_ID"
 SERIES_EXPECTED_KEY="treme"
 SERIES_REVIEW_LABEL="Tremé - S01E03"
+LIVE_TEST_ROOT="/tmp/${PROBE_ID}_pytest"
 echo "ARR_REAL_FLOW_CONTEXT remote_dir=__REMOTE_DIR__ container=__CONTAINER__ worker=__WORKER_CONTAINER__ series_worker=__SERIES_WORKER_CONTAINER__ timeout=__TIMEOUT__"
 sudo docker compose ps __CONTAINER__ media-worker series-worker
 
@@ -32,9 +33,18 @@ set +e
 unit_output="$(sudo docker exec \
   -e RUN_ENGINE_LIVE_TESTS=1 \
   -e RUN_FILEBOT_LIVE_TESTS=1 \
+  -e ARR_PYTEST_SESSION_ROOT="$LIVE_TEST_ROOT" \
+  -e ARR_PYTEST_DATA_DIR="$LIVE_TEST_ROOT/data" \
+  -e ARR_PYTEST_TEMP_DIR="$LIVE_TEST_ROOT/tmp" \
+  -e TMPDIR="$LIVE_TEST_ROOT/tmp" \
   __CONTAINER__ sh -lc '
 set -eu
 cd /opt/arr-orchestrator
+mkdir -p "$ARR_PYTEST_DATA_DIR" "$ARR_PYTEST_TEMP_DIR"
+cleanup_live_pytest() {
+  rm -rf -- "$ARR_PYTEST_SESSION_ROOT"
+}
+trap cleanup_live_pytest EXIT
 python3 - <<'"'"'PY'"'"'
 import os
 from pathlib import Path
@@ -49,6 +59,9 @@ if not os.environ.get("TMDB_API_TOKEN"):
     missing.append("TMDB_API_TOKEN")
 if not Path("/opt/filebot/filebot").exists():
     missing.append("/opt/filebot/filebot")
+for name in ("ARR_PYTEST_SESSION_ROOT", "ARR_PYTEST_DATA_DIR", "ARR_PYTEST_TEMP_DIR"):
+    if not os.environ.get(name):
+        missing.append(name)
 if missing:
     raise SystemExit("LIVE_ENV_MISSING " + ",".join(missing))
 print("LIVE_ENV_OK")
