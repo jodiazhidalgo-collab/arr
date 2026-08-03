@@ -31,7 +31,6 @@ from .filesystem import (
     manifest,
     matching_root,
     media_files,
-    media_worker_source,
     move_extraction_failure_to_review,
     move_into_job,
     move_job_to,
@@ -109,7 +108,7 @@ def _sanitize_extraction_details(job_root: Path, details: Dict[str, object]) -> 
         return value
 
     return sanitize(details)  # type: ignore[return-value]
-COMPLETE_CATEGORIES = ("movies", "tv", "manual", "movies_automatizacion", "trailers_automatizacion")
+COMPLETE_CATEGORIES = ("movies", "tv", "manual", "trailers_automatizacion")
 WATCHER_RULES_SETTING_KEY = "watcher.movies.ignored_suffixes"
 TV_WATCHER_RULES_SETTING_KEY = "watcher.tv.ignored_suffixes"
 DEFAULT_IGNORED_MOVIES_SUFFIXES = (".delay-audio-part",)
@@ -1874,17 +1873,6 @@ class Engine:
                 "manual",
                 "Enviado a revisión manual",
                 stage_path=str(destination),
-            )
-            return
-        if job["category"] == "movies_automatizacion":
-            source_item = media_worker_source(job_root / "original")
-            self.db.transition(
-                str(job["job_id"]),
-                "media_postprocess_ready",
-                "stage",
-                "Pelicula preparada para Media Worker",
-                stage_path=str(job_root),
-                source_path=str(source_item),
             )
             return
         self.db.transition(

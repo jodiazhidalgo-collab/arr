@@ -802,11 +802,6 @@ def _status_payload() -> Dict[str, Any]:
             "review": {"path": str(REVIEW_DIR), "exists": REVIEW_DIR.exists(), "items": _count_children(REVIEW_DIR)},
             "movies_final": {"path": str(MOVIES_ROOT), "exists": MOVIES_ROOT.exists(), "items": _count_children(MOVIES_ROOT)},
             "tv_final": {"path": str(TV_ROOT), "exists": TV_ROOT.exists(), "items": _count_children(TV_ROOT)},
-            "movies_automatizacion": {
-                "path": str(COMPLETE_ROOT / "movies_automatizacion"),
-                "exists": (COMPLETE_ROOT / "movies_automatizacion").exists(),
-                "items": _count_children(COMPLETE_ROOT / "movies_automatizacion"),
-            },
             "trailers_automatizacion": {
                 "path": str(COMPLETE_ROOT / "trailers_automatizacion"),
                 "exists": (COMPLETE_ROOT / "trailers_automatizacion").exists(),

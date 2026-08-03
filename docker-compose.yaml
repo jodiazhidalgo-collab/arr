@@ -69,26 +69,7 @@
 # - Series:    /data/media/tv
 #
 # ======================================================= #
-#  CAMINO 2 - MEDIA AUTOMATIZACION                        #
-#  peliculas ya preparadas para procesado de media         #
-# ======================================================= #
-# Entrada:
-# /data/downloads/torrents/complete/movies_automatizacion
-#
-# Flujo:
-# 1) arr-orchestrator detecta la carpeta.
-# 2) La mueve a taller.
-# 3) La entrega a media-worker.
-# 4) media-worker procesa video, audio, subtitulos,
-#    capitulos y validaciones que correspondan.
-# 5) Si todo va bien, entrega en:
-#    /data/media/movies
-#
-# Si algo no cuadra:
-# /data/media/repetidas_vs_error
-#
-# ======================================================= #
-#  CAMINO 3 - TRAILERS                                    #
+#  CAMINO 2 - TRAILERS                                    #
 #  paquetes de trailer                                    #
 # ======================================================= #
 # Entrada:
@@ -278,7 +259,6 @@ services:
       ARR_RECONCILE_SECONDS: "30"
       ARR_WORKSHOP_ROOT: "/data/downloads/torrents/complete/taller"
       ARR_RDT_FALLBACK_SECONDS: "5400"
-      ARR_MEDIA_AUTOMATION_INBOX: "/data/downloads/torrents/complete/movies_automatizacion"
       ARR_TRAILERS_INBOX: "/data/downloads/torrents/complete/trailers_automatizacion"
       ARR_REVIEW_DIR: "/data/media/repetidas_vs_error"
       ARR_MOVIES_FINAL: "/data/media/movies"

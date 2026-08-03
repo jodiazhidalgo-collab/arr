@@ -16,7 +16,8 @@ Puntos de entrada:
 - Worker media: `services/media-worker`
 - Worker de series: `services/series-worker`
 
-El camino normal de peliculas termina en Media Worker. En modo Series activo,
+La unica entrada automatica de peliculas es `complete/movies`: pasa por taller,
+identidad, FileBot y termina en Media Worker. En modo Series activo,
 FileBot escribe primero en una salida provisional privada del trabajo y Series
 Worker congela reglas y manifiesto, procesa los episodios, verifica la
 publicacion y deja un resultado durable que vuelve a validar el orquestador.

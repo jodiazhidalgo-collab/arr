@@ -14,7 +14,6 @@ def test_series_default_paths_follow_the_configured_isolated_roots() -> None:
         event_dir=Path("/isolated/events"),
         complete_root=Path("/isolated/complete"),
         workshop_root=Path("/isolated/complete/taller"),
-        movies_output=Path("/isolated/complete/movies_automatizacion"),
         movies_final=Path("/isolated/media/movies"),
         tv_output=Path("/isolated/media/tv"),
         trailers_inbox=Path("/isolated/complete/trailers_automatizacion"),

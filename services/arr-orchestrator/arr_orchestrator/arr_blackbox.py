@@ -40,7 +40,6 @@ CONFIG_SNAPSHOT_KEYS = {
     },
     "paths": {
         "workshop": "ARR_WORKSHOP_ROOT",
-        "media_automation_inbox": "ARR_MEDIA_AUTOMATION_INBOX",
         "trailers_inbox": "ARR_TRAILERS_INBOX",
         "review": "ARR_REVIEW_DIR",
         "movies_final": "ARR_MOVIES_FINAL",

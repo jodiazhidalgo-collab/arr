@@ -32,7 +32,6 @@ class Config:
     event_dir: Path
     complete_root: Path
     workshop_root: Path
-    movies_output: Path
     movies_final: Path
     tv_output: Path
     trailers_inbox: Path
@@ -113,10 +112,6 @@ class Config:
                 "ARR_WORKSHOP_ROOT",
                 str(data_root / "downloads/torrents/complete/taller"),
             )),
-            movies_output=Path(os.environ.get(
-                "ARR_MEDIA_AUTOMATION_INBOX",
-                str(data_root / "downloads/torrents/complete/movies_automatizacion"),
-            )),
             movies_final=Path(os.environ.get("ARR_MOVIES_FINAL", str(data_root / "media/movies"))),
             tv_output=Path(os.environ.get("ARR_TV_FINAL", str(data_root / "media/tv"))),
             trailers_inbox=Path(os.environ.get(
@@ -180,7 +175,6 @@ class Config:
             self.event_dir,
             self.workshop_root,
             self.review_dir,
-            self.movies_output,
             self.movies_final,
             self.tv_output,
             self.trailers_inbox,
@@ -190,7 +184,7 @@ class Config:
             self.codex_diag_root,
             self.diagnostics_root,
         ]
-        for category in ("movies", "tv", "manual", "movies_automatizacion", "trailers_automatizacion"):
+        for category in ("movies", "tv", "manual", "trailers_automatizacion"):
             directories.extend(
                 [
                     self.watch_inbox / category,

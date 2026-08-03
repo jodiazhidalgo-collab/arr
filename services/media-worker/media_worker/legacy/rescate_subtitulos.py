@@ -28,7 +28,6 @@ except Exception:
 TALLER = Path(os.environ.get("MEDIA_AUTO_TALLER", "/taller"))
 WORK = TALLER / "work"
 CUARENTENA = TALLER / "cuarentena"
-SOURCE_ROOT = TALLER / "movies_automatizacion"
 REPORTES = Path(os.environ.get("MEDIA_RESCATE_REPORTES", "/reportes"))
 TEMP = Path(os.environ.get("MEDIA_RESCATE_TEMP", "/temp/subtitulos"))
 

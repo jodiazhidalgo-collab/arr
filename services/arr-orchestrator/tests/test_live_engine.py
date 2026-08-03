@@ -48,7 +48,6 @@ class LiveEngineTests(unittest.TestCase):
             event_dir=data / "torrents" / "events" / "inbox" / "qbt",
             complete_root=complete,
             workshop_root=complete / "taller",
-            movies_output=complete / "movies_automatizacion",
             movies_final=data / "media" / "movies",
             tv_output=data / "media" / "tv",
             trailers_inbox=complete / "trailers_automatizacion",

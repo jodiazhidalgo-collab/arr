@@ -32,7 +32,6 @@ class JobAndCodexProfileFilterTests(unittest.TestCase):
             {"job_id": MOVIE_JOB, "category": "movies"},
             {"job_id": SERIES_JOB, "category": "tv"},
             {"job_id": "trailer", "category": "trailers_automatizacion"},
-            {"job_id": "automatic", "category": "movies_automatizacion"},
             {
                 "job_id": "manual-series",
                 "category": "manual",
@@ -46,13 +45,13 @@ class JobAndCodexProfileFilterTests(unittest.TestCase):
 
         self.assertEqual(
             [job["job_id"] for job in movies["jobs"]],
-            [MOVIE_JOB, "trailer", "automatic"],
+            [MOVIE_JOB, "trailer"],
         )
         self.assertEqual(
             [job["job_id"] for job in shows["jobs"]],
             [SERIES_JOB, "manual-series"],
         )
-        self.assertEqual(len(legacy["jobs"]), 5)
+        self.assertEqual(len(legacy["jobs"]), 4)
 
     def test_codex_zips_are_filtered_by_job_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

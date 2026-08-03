@@ -63,7 +63,6 @@ def test_config(root: Path) -> Config:
         event_dir=data / "torrents" / "events" / "inbox" / "qbt",
         complete_root=complete,
         workshop_root=complete / "taller",
-        movies_output=complete / "movies_automatizacion",
         movies_final=data / "media" / "movies",
         tv_output=data / "media" / "tv",
         trailers_inbox=complete / "trailers_automatizacion",
@@ -406,7 +405,6 @@ class CoreTests(unittest.TestCase):
                 complete_root / "movies",
                 complete_root / "tv",
                 complete_root / "manual",
-                complete_root / "movies_automatizacion",
                 complete_root / "trailers_automatizacion",
             ]
             movie = complete_root / "movies" / "Movie" / "video.mkv"
@@ -794,7 +792,6 @@ class CoreTests(unittest.TestCase):
                 Path(updated["source_path"]),
                 job_root / "filebot_output" / "Un padre en apuros (2026)",
             )
-            self.assertNotIn("movies_automatizacion", updated["source_path"])
             command_events = [
                 event for event in detail["timeline"]
                 if event["phase"] == "filebot" and event["event_type"] == "command"
