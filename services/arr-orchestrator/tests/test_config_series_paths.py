@@ -45,5 +45,5 @@ def test_series_default_paths_follow_the_configured_isolated_roots() -> None:
 
     assert config.series_reports_root == Path("/isolated/config/series-worker")
     assert config.series_review_dir == Path(
-        "/isolated/data/media/repetidas_vs_error_series"
+        "/isolated/data/media/repetidas_vs_error"
     )

@@ -24,6 +24,7 @@ PROBE_ID="codex_live_flow_probe_$(date +%Y%m%d_%H%M%S)_$$"
 MEDIA_SMOKE_JOB_ID="${PROBE_ID}_media_worker"
 SERIES_SOURCE_NAME="$PROBE_ID"
 SERIES_EXPECTED_KEY="treme"
+SERIES_REVIEW_LABEL="Tremé - S01E03"
 echo "ARR_REAL_FLOW_CONTEXT remote_dir=__REMOTE_DIR__ container=__CONTAINER__ worker=__WORKER_CONTAINER__ series_worker=__SERIES_WORKER_CONTAINER__ timeout=__TIMEOUT__"
 sudo docker compose ps __CONTAINER__ media-worker series-worker
 
@@ -74,6 +75,7 @@ fi
 
 sudo docker exec \
   -e ARR_SERIES_EXPECTED_KEY="$SERIES_EXPECTED_KEY" \
+  -e ARR_SERIES_REVIEW_LABEL="$SERIES_REVIEW_LABEL" \
   __WORKER_CONTAINER__ python3 - <<'PY'
 import os
 import re
@@ -89,6 +91,9 @@ def engine_series_key(value):
 
 if os.environ.get("ARR_SERIES_EXPECTED_KEY") != "treme":
     raise SystemExit("ARR_SERIES_PROBE_KEY_INVALID")
+review_label = os.environ.get("ARR_SERIES_REVIEW_LABEL", "")
+if review_label != "Trem\u00e9 - S01E03":
+    raise SystemExit("ARR_SERIES_PROBE_REVIEW_LABEL_INVALID")
 library = Path("/data/media/tv")
 if library.is_symlink() or not library.is_dir():
     raise SystemExit("ARR_SERIES_PROBE_LIBRARY_INVALID")
@@ -97,12 +102,23 @@ matches = [entry.name for entry in library.iterdir() if engine_series_key(entry.
 if matches:
     raise SystemExit("ARR_SERIES_PROBE_PREFLIGHT_SERIES_EXISTS")
 print("ARR_SERIES_PROBE_PREFLIGHT_SERIES_ABSENT")
+review_root = Path("/data/media/repetidas_vs_error")
+if review_root.is_symlink() or not review_root.is_dir():
+    raise SystemExit("ARR_SERIES_PROBE_REVIEW_ROOT_INVALID")
+review_name_re = re.compile(rf"{re.escape(review_label)}(?: \([1-9][0-9]*\))?")
+review_matches = [entry.name for entry in review_root.iterdir() if review_name_re.fullmatch(entry.name)]
+if review_matches:
+    raise SystemExit(
+        "ARR_SERIES_PROBE_PREFLIGHT_REVIEW_EXISTS " + ",".join(sorted(review_matches))
+    )
+print("ARR_SERIES_PROBE_PREFLIGHT_REVIEW_ABSENT")
 PY
 
 sudo docker exec \
   -e ARR_SERIES_PROBE_ID="$PROBE_ID" \
   -e ARR_SERIES_SOURCE_NAME="$SERIES_SOURCE_NAME" \
   -e ARR_SERIES_EXPECTED_KEY="$SERIES_EXPECTED_KEY" \
+  -e ARR_SERIES_REVIEW_LABEL="$SERIES_REVIEW_LABEL" \
   __WORKER_CONTAINER__ sh -lc '
 set -eu
 case "$ARR_SERIES_PROBE_ID" in
@@ -110,9 +126,10 @@ case "$ARR_SERIES_PROBE_ID" in
   *) echo "ARR_SERIES_PROBE_ID_INVALID" >&2; exit 82 ;;
 esac
 [ "$ARR_SERIES_EXPECTED_KEY" = "treme" ] || exit 82
+[ "$ARR_SERIES_REVIEW_LABEL" = "Tremé - S01E03" ] || exit 82
 build_root="/data/downloads/torrents/complete/taller/${ARR_SERIES_PROBE_ID}_normal_entry_build"
 probe_root="/data/downloads/torrents/complete/tv/${ARR_SERIES_SOURCE_NAME}"
-review_root="/data/media/repetidas_vs_error_series/${ARR_SERIES_SOURCE_NAME}"
+review_root="/data/media/repetidas_vs_error/${ARR_SERIES_REVIEW_LABEL}"
 for path in "$build_root" "$probe_root" "$review_root"; do
   if [ -e "$path" ] || [ -L "$path" ]; then
     echo "ARR_SERIES_PROBE_PREFLIGHT_PATH_EXISTS $path" >&2
@@ -165,6 +182,7 @@ probe_output="$(sudo docker exec -i \
   -e ARR_MEDIA_SMOKE_JOB_ID="$MEDIA_SMOKE_JOB_ID" \
   -e ARR_SERIES_SOURCE_NAME="$SERIES_SOURCE_NAME" \
   -e ARR_SERIES_EXPECTED_KEY="$SERIES_EXPECTED_KEY" \
+  -e ARR_SERIES_REVIEW_LABEL="$SERIES_REVIEW_LABEL" \
   __CONTAINER__ python3 - <<'PY'
 import hashlib
 import json
@@ -195,6 +213,7 @@ PROBE_ID = os.environ["ARR_REAL_FLOW_PROBE_ID"]
 MEDIA_SMOKE_JOB_ID = os.environ["ARR_MEDIA_SMOKE_JOB_ID"]
 SERIES_SOURCE_NAME = os.environ["ARR_SERIES_SOURCE_NAME"]
 SERIES_EXPECTED_KEY = os.environ["ARR_SERIES_EXPECTED_KEY"]
+SERIES_REVIEW_LABEL = os.environ["ARR_SERIES_REVIEW_LABEL"]
 SERIES_JOB_ID = ""
 DB_PATH = Path("/config/orchestrator.db")
 DIAG_ROOT = Path("/diagnostics/arr")
@@ -204,7 +223,7 @@ MOVIES_PROBE_ROOT = COMPLETE_ROOT / "movies"
 TV_PROBE_ROOT = COMPLETE_ROOT / "tv"
 WORKSHOP_ROOT = COMPLETE_ROOT / "taller"
 REVIEW_ROOT = Path("/data/media/repetidas_vs_error")
-SERIES_REVIEW_ROOT = Path("/data/media/repetidas_vs_error_series")
+SERIES_REVIEW_ROOT = Path("/data/media/repetidas_vs_error")
 MOVIES_FINAL_ROOT = Path("/data/media/movies")
 TV_FINAL_ROOT = Path("/data/media/tv")
 WORKER_REPORT_ROOT = Path("/config/media-worker")
@@ -214,6 +233,7 @@ SERIES_WORKER_BASE_URL = "http://series-worker:8791"
 SERIES_PROBE_SOURCE = TV_PROBE_ROOT / SERIES_SOURCE_NAME
 SERIES_FINAL_ROOT = None
 SERIES_CLEANUP_CONTRACT = None
+SERIES_REVIEW_CLEANUP_CONTRACT = None
 SERIES_GENERATION_RE = re.compile(
     r"(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12})"
 )
@@ -539,8 +559,113 @@ def series_name_key(value):
     )
 
 
+def expected_series_review_name(value):
+    return bool(
+        re.fullmatch(
+            rf"{re.escape(SERIES_REVIEW_LABEL)}(?: \([1-9][0-9]*\))?",
+            str(value or ""),
+        )
+    )
+
+
+def series_review_tree(path):
+    entries = []
+    try:
+        for entry in sorted(path.iterdir(), key=lambda item: item.name):
+            info = entry.lstat()
+            if not stat.S_ISREG(info.st_mode) or entry.is_symlink():
+                return None
+            entries.append({"name": entry.name, "size": info.st_size})
+    except OSError:
+        return None
+    return entries
+
+
+def validate_series_review_cleanup_contract(result, job_id):
+    if result.get("job_id") != job_id or result.get("kind") != "series":
+        return None
+    review_relative = str(result.get("review_path") or "")
+    review_path = SERIES_REVIEW_ROOT / review_relative
+    manifest = result.get("manifest")
+    reasons = result.get("review_reasons")
+    if (
+        Path(review_relative).name != review_relative
+        or not expected_series_review_name(review_relative)
+        or not isinstance(manifest, dict)
+        or manifest.get("schema") != "series-manifest-v1"
+        or series_name_key(manifest.get("series_name")) != SERIES_EXPECTED_KEY
+        or not isinstance(reasons, list)
+        or not reasons
+        or any(not isinstance(reason, str) or not reason for reason in reasons)
+        or result.get("published") != []
+        or review_path.is_symlink()
+        or not review_path.is_dir()
+    ):
+        return None
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or len(entries) != 1:
+        return None
+    entry = entries[0]
+    if (
+        not isinstance(entry, dict)
+        or series_name_key(entry.get("series_name")) != SERIES_EXPECTED_KEY
+        or entry.get("season") != 1
+        or entry.get("episodes") != [3]
+        or not str(entry.get("target_relpath") or "").endswith(" - S01E03.mkv")
+    ):
+        return None
+    try:
+        reason_info = (review_path / "reason.json").lstat()
+        reason = json.loads((review_path / "reason.json").read_text(encoding="utf-8"))
+        marker_info = (review_path / "Serie repetida.txt").lstat()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not stat.S_ISREG(reason_info.st_mode)
+        or (review_path / "reason.json").is_symlink()
+        or not stat.S_ISREG(marker_info.st_mode)
+        or (review_path / "Serie repetida.txt").is_symlink()
+        or not isinstance(reason, dict)
+        or reason.get("schema") != "series-review-v1"
+        or reason.get("profile") != "series"
+        or reason.get("category") != "tv"
+        or reason.get("job_id") != job_id
+        or reason.get("manifest_digest") != manifest.get("digest")
+        or reason.get("reasons") != reasons
+        or reason.get("review_layout") != result.get("review_layout")
+        or str(reason.get("review_source_prefix") or "")
+        != str(result.get("review_source_prefix") or "")
+    ):
+        return None
+    tree = series_review_tree(review_path)
+    if tree is None:
+        return None
+    names = [item["name"] for item in tree]
+    media = [name for name in names if Path(name).suffix.lower() == ".mkv"]
+    subtitles = [name for name in names if Path(name).suffix.lower() == ".srt"]
+    if (
+        len(media) != 1
+        or len(subtitles) != 1
+        or "S01E03" not in media[0]
+        or "S01E03" not in subtitles[0]
+        or set(names) != {media[0], subtitles[0], "Serie repetida.txt", "reason.json"}
+    ):
+        return None
+    return {
+        "job_id": job_id,
+        "status": "review",
+        "review_path": review_relative,
+        "reason": reason,
+        "tree": tree,
+    }
+
+
 def validate_series_cleanup_contract(result, job_id):
-    if not isinstance(result, dict) or result.get("status") != "done":
+    if not isinstance(result, dict):
+        return None
+    if result.get("status") == "review":
+        return validate_series_review_cleanup_contract(result, job_id)
+    if result.get("status") != "done":
         return None
     if result.get("job_id") != job_id or result.get("kind") != "series":
         return None
@@ -614,6 +739,7 @@ def validate_series_cleanup_contract(result, job_id):
         return None
     return {
         "job_id": job_id,
+        "status": "done",
         "series_root": series_root,
         "generation": str(delivery["generation"]),
         "published_manifest": published_manifest,
@@ -691,6 +817,29 @@ def verify_owned_series_root(path, job_id):
     if sorted(set(actual_directories)) != expected_directories:
         return False, "series_tree_directory_mismatch"
     return True, "owned_direct_move_verified"
+
+
+def verify_owned_series_review(path, job_id):
+    contract = SERIES_REVIEW_CLEANUP_CONTRACT
+    if (
+        not isinstance(contract, dict)
+        or contract.get("job_id") != job_id
+        or contract.get("status") != "review"
+        or contract.get("review_path") != path.name
+        or not expected_series_review_name(path.name)
+    ):
+        return False, "missing_series_review_cleanup_contract"
+    if path.is_symlink() or not path.is_dir():
+        return False, "series_review_not_physical_directory"
+    try:
+        reason = json.loads((path / "reason.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False, "series_review_reason_unreadable"
+    if reason != contract.get("reason"):
+        return False, "series_review_reason_changed"
+    if series_review_tree(path) != contract.get("tree"):
+        return False, "series_review_tree_changed"
+    return True, "owned_series_review_verified"
 
 
 def expected_probe_outcome(inspection):
@@ -850,9 +999,12 @@ def assess_cleanup(job):
                 contract = validate_series_cleanup_contract(result, job_id)
                 if contract is None:
                     unsafe.append("series:unexpected_terminal_result")
-                else:
+                elif contract["status"] == "done":
                     assessment["series_root"] = contract["series_root"]
                     assessment["series_cleanup_contract"] = contract
+                else:
+                    assessment["series_review_path"] = contract["review_path"]
+                    assessment["series_review_cleanup_contract"] = contract
         elif state in {"active", "unavailable"}:
             unsafe.append(f"{kind}:{state}")
     if unsafe:
@@ -895,12 +1047,32 @@ def remove_exact_probe_paths(candidates):
             and path.resolve(strict=False) == SERIES_FINAL_ROOT.resolve(strict=False)
             and series_name_key(path.name) == SERIES_EXPECTED_KEY
         )
+        exact_series_review = (
+            job_id == SERIES_JOB_ID
+            and isinstance(SERIES_REVIEW_CLEANUP_CONTRACT, dict)
+            and path.resolve(strict=False)
+            == (
+                SERIES_REVIEW_ROOT
+                / str(SERIES_REVIEW_CLEANUP_CONTRACT.get("review_path") or "")
+            ).resolve(strict=False)
+            and expected_series_review_name(path.name)
+        )
         if exact_series_final:
             verified, reason = verify_owned_series_root(path, job_id)
             if not verified:
                 refused.append({"path": str(path), "reason": reason})
                 continue
-        if PROBE_ID not in path.name and path.name != job_id and not exact_series_final:
+        if exact_series_review:
+            verified, reason = verify_owned_series_review(path, job_id)
+            if not verified:
+                refused.append({"path": str(path), "reason": reason})
+                continue
+        if (
+            PROBE_ID not in path.name
+            and path.name != job_id
+            and not exact_series_final
+            and not exact_series_review
+        ):
             refused.append({"path": str(path), "reason": "not_exact_probe_or_job"})
             continue
         shutil.rmtree(path) if path.is_dir() else path.unlink()
@@ -1074,6 +1246,13 @@ for job in jobs:
         SERIES_FINAL_ROOT = TV_FINAL_ROOT / str(assessment["series_root"])
         SERIES_CLEANUP_CONTRACT = assessment.get("series_cleanup_contract")
         cleanup_candidates.append((str(SERIES_FINAL_ROOT), job_id))
+    if assessment.get("series_review_path"):
+        SERIES_REVIEW_CLEANUP_CONTRACT = assessment.get(
+            "series_review_cleanup_contract"
+        )
+        cleanup_candidates.append(
+            (str(SERIES_REVIEW_ROOT / str(assessment["series_review_path"])), job_id)
+        )
     cleanup_candidates.extend(
         (
             (str(job.get("source_path") or ""), job_id),
@@ -1092,17 +1271,32 @@ for job in jobs:
             }
         )
     if "series" in terminal_kinds and not KEEP_PROBE_FILES:
-        contract = assessment["series_cleanup_contract"]
-        series_cleanup_requests.append(
-            {
-                "job_id": job_id,
-                "terminal_kinds": ["series"],
-                "probe_id": PROBE_ID,
-                "expected_series_key": SERIES_EXPECTED_KEY,
-                "generation": contract["generation"],
-                "published_manifest_digest": contract["published_manifest"]["digest"],
-            }
-        )
+        if assessment.get("series_cleanup_contract"):
+            contract = assessment["series_cleanup_contract"]
+            series_cleanup_requests.append(
+                {
+                    "job_id": job_id,
+                    "terminal_kinds": ["series"],
+                    "probe_id": PROBE_ID,
+                    "expected_series_key": SERIES_EXPECTED_KEY,
+                    "result_status": "done",
+                    "generation": contract["generation"],
+                    "published_manifest_digest": contract["published_manifest"]["digest"],
+                }
+            )
+        elif assessment.get("series_review_cleanup_contract"):
+            contract = assessment["series_review_cleanup_contract"]
+            series_cleanup_requests.append(
+                {
+                    "job_id": job_id,
+                    "terminal_kinds": ["series"],
+                    "probe_id": PROBE_ID,
+                    "expected_series_key": SERIES_EXPECTED_KEY,
+                    "result_status": "review",
+                    "expected_review_label": SERIES_REVIEW_LABEL,
+                    "review_path": contract["review_path"],
+                }
+            )
 
 for source in created:
     matching = [
@@ -1356,20 +1550,36 @@ for item in items:
     job_id = str(item.get("job_id") or "")
     probe_id = str(item.get("probe_id") or "")
     expected_series_key = str(item.get("expected_series_key") or "")
+    result_status = str(item.get("result_status") or "")
     expected_generation = str(item.get("generation") or "")
     expected_manifest_digest = str(item.get("published_manifest_digest") or "")
+    expected_review_label = str(item.get("expected_review_label") or "")
+    expected_review_path = str(item.get("review_path") or "")
     if (
         not JOB_ID_RE.fullmatch(job_id)
         or not probe_id.startswith("codex_live_flow_probe_")
         or item.get("terminal_kinds") != ["series"]
         or expected_series_key != "treme"
-        or not re.fullmatch(
+        or result_status not in {"done", "review"}
+    ):
+        raise SystemExit("ARR_SERIES_CLEANUP_INVALID_TARGET")
+    if result_status == "done" and (
+        not re.fullmatch(
             r"(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12})",
             expected_generation,
         )
         or not re.fullmatch(r"[0-9a-f]{64}", expected_manifest_digest)
     ):
-        raise SystemExit("ARR_SERIES_CLEANUP_INVALID_TARGET")
+        raise SystemExit("ARR_SERIES_CLEANUP_INVALID_DONE_TARGET")
+    if result_status == "review" and (
+        expected_review_label != "Trem\u00e9 - S01E03"
+        or Path(expected_review_path).name != expected_review_path
+        or not re.fullmatch(
+            rf"{re.escape(expected_review_label)}(?: \([1-9][0-9]*\))?",
+            expected_review_path,
+        )
+    ):
+        raise SystemExit("ARR_SERIES_CLEANUP_INVALID_REVIEW_TARGET")
     job_dir = (ROOT / job_id).resolve()
     if job_dir.parent != ROOT or job_dir.name != job_id:
         raise SystemExit("ARR_SERIES_CLEANUP_OUTSIDE_ROOT")
@@ -1383,18 +1593,27 @@ for item in items:
     result = terminal_status(job_id)
     delivery = result.get("delivery")
     published_manifest = result.get("published_manifest")
-    if (
-        result.get("status") != "done"
-        or result.get("series_root") != manifest_series
-        or series_name_key(result.get("series_root")) != expected_series_key
-        or not isinstance(delivery, dict)
-        or delivery.get("mode") != "direct_move"
-        or delivery.get("cleanup_pending") is not False
-        or delivery.get("generation") != expected_generation
-        or not isinstance(published_manifest, dict)
-        or published_manifest.get("digest") != expected_manifest_digest
+    if result_status == "done":
+        if (
+            result.get("status") != "done"
+            or result.get("series_root") != manifest_series
+            or series_name_key(result.get("series_root")) != expected_series_key
+            or not isinstance(delivery, dict)
+            or delivery.get("mode") != "direct_move"
+            or delivery.get("cleanup_pending") is not False
+            or delivery.get("generation") != expected_generation
+            or not isinstance(published_manifest, dict)
+            or published_manifest.get("digest") != expected_manifest_digest
+        ):
+            raise SystemExit("ARR_SERIES_CLEANUP_RESULT_MISMATCH")
+    elif (
+        result.get("status") != "review"
+        or result.get("review_path") != expected_review_path
+        or result.get("published") != []
+        or not isinstance(result.get("review_reasons"), list)
+        or not result.get("review_reasons")
     ):
-        raise SystemExit("ARR_SERIES_CLEANUP_RESULT_MISMATCH")
+        raise SystemExit("ARR_SERIES_CLEANUP_REVIEW_RESULT_MISMATCH")
     shutil.rmtree(job_dir)
     removed.append({"job_id": job_id, "status": "removed_exact_job_dir"})
 

@@ -56,7 +56,7 @@ class LiveEngineTests(unittest.TestCase):
             media_reports_root=self.root / "config" / "media-worker",
             codex_diag_root=self.root / "diagnosticos_codex",
             series_reports_root=self.root / "config" / "series-worker",
-            series_review_dir=data / "media" / "repetidas_vs_error_series",
+            series_review_dir=data / "media" / "series-review-test",
             series_mode="active",
         )
         self.config.ensure_directories()

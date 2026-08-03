@@ -893,8 +893,9 @@ def review_content_signature(
     *,
     whole_tree: bool = False,
     ignored_names: Tuple[str, ...] = (),
+    content_hash: bool = False,
 ) -> List[Tuple[str, int, str]]:
-    """Firma completa del contenido que se preservará en revisión.
+    """Firma ligera del contenido preservado sin volver a leer los vídeos.
 
     ``whole_tree`` se reserva para Series: conserva el taller entero cuando
     FileBot o el worker no permiten demostrar que un pack sea completo.
@@ -924,11 +925,18 @@ def review_content_signature(
     signature: List[Tuple[str, int, str]] = []
     for path in files:
         relative = path.name if source_root.is_file() else path.relative_to(source_root).as_posix()
-        digest = hashlib.sha256()
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        signature.append((relative, path.stat().st_size, digest.hexdigest()))
+        info = path.stat()
+        if content_hash:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            fingerprint = digest.hexdigest()
+        else:
+            fingerprint = hashlib.sha256(
+                f"{info.st_size}\0{info.st_mtime_ns}".encode("utf-8")
+            ).hexdigest()
+        signature.append((relative, info.st_size, fingerprint))
     return signature
 
 
@@ -1021,40 +1029,90 @@ def move_tv_job_to_review(
     parser_rules: Optional[Dict[str, object]] = None,
 ) -> Path:
     source_root = _review_content_root(job_root)
+    allowed_suffixes = MEDIA_EXTENSIONS | SIDECAR_EXTENSIONS
+    try:
+        source_entries = list(source_root.rglob("*")) if source_root.is_dir() else [source_root]
+        if any(
+            entry.is_symlink()
+            or (
+                not entry.is_dir()
+                and (
+                    not entry.is_file()
+                    or entry.suffix.casefold() not in allowed_suffixes
+                )
+            )
+            for entry in source_entries
+        ):
+            return move_job_to(job_root, destination_root, name)
+    except OSError:
+        return move_job_to(job_root, destination_root, name)
     videos = media_files(source_root)
     if not videos:
         return move_job_to(job_root, destination_root, name)
 
     parsed = parse_release_name(name, "tv", rules=parser_rules)
     title = safe_folder_name(parsed.display_title or Path(name).stem or name)
+    ordered_videos = sorted(videos, key=lambda path: str(path).lower())
+    if len(ordered_videos) == 1:
+        folder_name = _tv_review_stem(parsed, ordered_videos[0], 1)
+    else:
+        seasons = {
+            season
+            for video in ordered_videos
+            for season in (
+                parse_release_name(video.name, "tv").season,
+                parsed.season,
+            )
+            if season is not None
+        }
+        if len(seasons) == 1:
+            folder_name = safe_folder_name(
+                f"{title} - Temporada {next(iter(seasons)):02d}"
+            )
+        elif seasons:
+            folder_name = safe_folder_name(
+                f"{title} - Temporadas {min(seasons):02d}-{max(seasons):02d}"
+            )
+        else:
+            folder_name = title
     destination_root.mkdir(parents=True, exist_ok=True)
-    destination = numbered_destination(destination_root / title)
+    destination = numbered_destination(destination_root / folder_name)
     destination.mkdir(parents=True, exist_ok=True)
 
-    review_season = parsed.season if parsed.season is not None else parsed.season_pack
-    season_dir = _tv_review_season_dir(destination, review_season)
-    used_names: set[str] = set()
-    for index, video in enumerate(sorted(videos, key=lambda path: str(path).lower()), start=1):
+    all_sidecars = sorted(
+        path
+        for path in source_root.rglob("*")
+        if path.is_file() and path.suffix.lower() in SIDECAR_EXTENSIONS
+    )
+    used_sidecars: set[Path] = set()
+    for index, video in enumerate(ordered_videos, start=1):
         target_stem = _tv_review_stem(parsed, video, index)
-        target = unique_destination(season_dir / f"{target_stem}{video.suffix}")
+        target = unique_destination(destination / f"{target_stem}{video.suffix}")
         shutil.move(str(video), str(target))
-        used_names.add(video.name)
         for sidecar in _related_sidecars(video):
-            if not sidecar.exists() or sidecar.name in used_names:
+            if not sidecar.exists() or sidecar in used_sidecars:
                 continue
-            shutil.move(str(sidecar), str(unique_destination(season_dir / f"{target_stem}{sidecar.suffix}")))
-            used_names.add(sidecar.name)
+            suffix = (
+                sidecar.name[len(video.stem) :]
+                if sidecar.name.startswith(video.stem)
+                else sidecar.suffix
+            )
+            shutil.move(
+                str(sidecar),
+                str(unique_destination(destination / f"{target_stem}{suffix}")),
+            )
+            used_sidecars.add(sidecar)
+
+    for sidecar in all_sidecars:
+        if sidecar in used_sidecars or not sidecar.exists():
+            continue
+        shutil.move(
+            str(sidecar),
+            str(unique_destination(destination / sidecar.name)),
+        )
 
     shutil.rmtree(job_root, ignore_errors=True)
     return destination
-
-
-def _tv_review_season_dir(destination: Path, season: Optional[int]) -> Path:
-    if season is None:
-        return destination
-    season_dir = destination / f"Season {int(season):02d}"
-    season_dir.mkdir(parents=True, exist_ok=True)
-    return season_dir
 
 
 def _tv_review_stem(parsed, video: Path, index: int) -> str:

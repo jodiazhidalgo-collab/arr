@@ -104,7 +104,7 @@ class ArrBlackboxTests(unittest.TestCase):
             "ARR_MISSING_SOURCE_GRACE_SECONDS": "300",
             "ARR_WORKSHOP_ROOT": "/data/downloads/torrents/complete/taller",
             "ARR_REVIEW_DIR": "/data/media/repetidas_vs_error",
-            "ARR_SERIES_REVIEW_DIR": "/volume1/UGREEN/data/media/repetidas_vs_error_series",
+            "ARR_SERIES_REVIEW_DIR": "/volume1/UGREEN/data/media/repetidas_vs_error",
             "CODEX_DIAG_ROOT": "/diagnosticos_codex",
             "ARR_DIAGNOSTICS_ROOT": "/diagnostics/arr",
             "MEDIA_WORKER_URL": "http://media-worker:8790",
@@ -162,7 +162,7 @@ class ArrBlackboxTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     meta["config_snapshot"]["paths"]["series_review"],
-                    "<DATA_MEDIA>/repetidas_vs_error_series",
+                    "<DATA_MEDIA>/repetidas_vs_error",
                 )
                 self.assertTrue(meta["config_snapshot"]["credential_flags"]["qbt_login_secret_present"])
                 self.assertTrue(meta["config_snapshot"]["credential_flags"]["tmdb_credential_present"])
@@ -510,7 +510,7 @@ class ArrBlackboxTests(unittest.TestCase):
             "ARR_SERIES_MODE": "active",
             "SERIES_WORKER_URL": "http://series-worker:8791",
             "SERIES_WORKER_REPORT_ROOT": "/config/series-worker",
-            "ARR_SERIES_REVIEW_DIR": "/volume1/UGREEN/data/media/repetidas_vs_error_series",
+            "ARR_SERIES_REVIEW_DIR": "/volume1/UGREEN/data/media/repetidas_vs_error",
         }
         with patch.dict("os.environ", env, clear=False):
             with _temporary_directory(ignore_cleanup_errors=True) as temporary:
@@ -576,7 +576,7 @@ class ArrBlackboxTests(unittest.TestCase):
                     {
                         "journal_path": "/config/series-worker/series-job/journal.json",
                         "manifest_path": "/config/series-worker/series-job/manifest.json",
-                        "preserved_path": "/volume1/UGREEN/data/media/repetidas_vs_error_series/Serie Blackbox",
+                        "preserved_path": "/volume1/UGREEN/data/media/repetidas_vs_error/Serie Blackbox",
                         "final_series_dir": "/volume1/UGREEN/data/media/tv/Serie Blackbox",
                     },
                 )

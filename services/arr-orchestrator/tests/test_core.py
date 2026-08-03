@@ -525,16 +525,16 @@ class CoreTests(unittest.TestCase):
                 "Cuarto Milenio [HDTV 1080p][Cap.2139]",
             )
 
-            self.assertEqual(destination.name, "Cuarto Milenio")
+            self.assertEqual(destination.name, "Cuarto Milenio - S21E39")
             self.assertFalse((destination / "original").exists())
-            self.assertTrue((destination / "Season 21" / "Cuarto Milenio - S21E39.mkv").exists())
+            self.assertTrue((destination / "Cuarto Milenio - S21E39.mkv").exists())
             self.assertFalse(job_root.exists())
 
     def test_move_tv_job_to_review_numbers_existing_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             review = root / "review"
-            (review / "Cuarto Milenio").mkdir(parents=True)
+            (review / "Cuarto Milenio - S21E39").mkdir(parents=True)
             job_root = root / "taller" / "job-tv"
             source_dir = job_root / "original" / "Cuarto Milenio [HDTV 1080p][Cap.2139]"
             source_dir.mkdir(parents=True)
@@ -546,8 +546,61 @@ class CoreTests(unittest.TestCase):
                 "Cuarto Milenio [HDTV 1080p][Cap.2139]",
             )
 
-            self.assertEqual(destination.name, "Cuarto Milenio (1)")
-            self.assertTrue((destination / "Season 21" / "Cuarto Milenio - S21E39.mkv").exists())
+            self.assertEqual(destination.name, "Cuarto Milenio - S21E39 (1)")
+            self.assertTrue((destination / "Cuarto Milenio - S21E39.mkv").exists())
+
+    def test_move_tv_job_to_review_keeps_unmatched_subtitle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            job_root = root / "taller" / "job-tv"
+            source_dir = job_root / "series_filebot_output" / "Mi Serie" / "Season 01"
+            source_dir.mkdir(parents=True)
+            (source_dir / "Mi Serie S01E01.mkv").write_bytes(b"episode")
+            (source_dir / "subtitulo_sin_emparejar.es.forced.srt").write_text(
+                "subtitle",
+                encoding="utf-8",
+            )
+
+            destination = move_tv_job_to_review(
+                job_root,
+                review,
+                "Mi Serie S01E01",
+            )
+
+            self.assertEqual(destination.name, "Mi Serie - S01E01")
+            self.assertTrue((destination / "Mi Serie - S01E01.mkv").is_file())
+            self.assertEqual(
+                (destination / "subtitulo_sin_emparejar.es.forced.srt").read_text(
+                    encoding="utf-8"
+                ),
+                "subtitle",
+            )
+            self.assertFalse(job_root.exists())
+
+    def test_move_tv_job_to_review_preserves_unknown_output_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            job_root = root / "taller" / "job-tv"
+            source_dir = job_root / "series_filebot_output" / "Mi Serie" / "Season 01"
+            source_dir.mkdir(parents=True)
+            (source_dir / "Mi Serie S01E01.mkv").write_bytes(b"episode")
+            (source_dir / "subtitulo_original.sup").write_bytes(b"subtitle-image")
+
+            destination = move_tv_job_to_review(
+                job_root,
+                review,
+                "Mi Serie S01E01",
+            )
+
+            self.assertEqual(destination.name, "Mi Serie S01E01")
+            self.assertEqual(
+                next(destination.rglob("*.sup")).read_bytes(),
+                b"subtitle-image",
+            )
+            self.assertEqual(next(destination.rglob("*.mkv")).read_bytes(), b"episode")
+            self.assertFalse(job_root.exists())
 
     def test_tv_duplicate_review_uses_the_jobs_frozen_parser_rules(self) -> None:
         RUNTIME_TEST_ROOT.mkdir(parents=True, exist_ok=True)
@@ -608,10 +661,8 @@ class CoreTests(unittest.TestCase):
             updated = database.get_job(job["job_id"])
             destination = Path(updated["stage_path"])
             self.assertEqual(updated["state"], "duplicate")
-            self.assertEqual(destination.name, "Mi Serie")
-            self.assertTrue(
-                (destination / "Season 03" / "Mi Serie - S03E07.mkv").exists()
-            )
+            self.assertEqual(destination.name, "Mi Serie - S03E07")
+            self.assertTrue((destination / "Mi Serie - S03E07.mkv").exists())
             database.close()
 
     def test_media_worker_source_ignores_technical_original_folder(self) -> None:

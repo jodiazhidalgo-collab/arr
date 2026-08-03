@@ -73,7 +73,8 @@ MANIFEST_FILE = "manifest.json"
 RULES_SNAPSHOT_FILE = "rules_snapshot.json"
 DEFAULT_ALLOWED_ROOT = "/data/downloads/torrents/complete/taller"
 DEFAULT_FINAL_ROOT = "/data/media/tv"
-DEFAULT_REVIEW_ROOT = "/data/media/repetidas_vs_error_series"
+DEFAULT_REVIEW_ROOT = "/data/media/repetidas_vs_error"
+LEGACY_REVIEW_ROOT = "/data/media/repetidas_vs_error_series"
 DEFAULT_REPORT_ROOT = "/config/series-worker"
 DEFAULT_HEALTH_ATOMICITY_CACHE_TTL_SEC = 300.0
 DEFAULT_CALLBACK_ORIGIN = "http://arr-orchestrator:8787"
@@ -234,7 +235,12 @@ def _validated_callback(value: Any, job_id: str) -> str:
     return callback
 
 
-def _validated_payload(payload: Any, *, require_directories: bool) -> ValidatedPayload:
+def _validated_payload(
+    payload: Any,
+    *,
+    require_directories: bool,
+    allow_legacy_review_root: bool = False,
+) -> ValidatedPayload:
     if not isinstance(payload, dict):
         raise RequestValidationError("El payload debe ser un objeto JSON")
     unknown = sorted(set(payload) - PAYLOAD_KEYS)
@@ -284,7 +290,14 @@ def _validated_payload(payload: Any, *, require_directories: bool) -> ValidatedP
         )
     if final_root != _configured_path("SERIES_WORKER_FINAL_ROOT", DEFAULT_FINAL_ROOT):
         raise RequestValidationError("final_root no es la raíz TV canónica")
-    if review_root != _configured_path("SERIES_WORKER_REVIEW_ROOT", DEFAULT_REVIEW_ROOT):
+    configured_review_root = _configured_path(
+        "SERIES_WORKER_REVIEW_ROOT",
+        DEFAULT_REVIEW_ROOT,
+    )
+    legacy_review_root = Path(LEGACY_REVIEW_ROOT).resolve()
+    if review_root != configured_review_root and not (
+        allow_legacy_review_root and review_root == legacy_review_root
+    ):
         raise RequestValidationError("review_root no es la raíz de revisión canónica")
     if reports_root != _configured_reports_root():
         raise RequestValidationError("reports_root no es la raíz de informes canónica")
@@ -778,6 +791,106 @@ def _safe_fragment(value: str) -> str:
     return (re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-") or "job")[:48]
 
 
+def _safe_review_folder_name(value: str) -> str:
+    text = re.sub(r'[\\/:*?"<>|]+', " ", str(value or "")).strip(" .")
+    text = re.sub(r"[\x00-\x1f]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text[:180].rstrip(" .") or "Series sin clasificar"
+
+
+def _review_folder_label(manifest: SeriesManifest) -> str:
+    series_name = str(manifest.series_name or "").strip()
+    entries = tuple(manifest.entries)
+    if (
+        not series_name
+        or not entries
+        or any(entry.series_name != series_name for entry in entries)
+    ):
+        return "Series sin clasificar"
+    if len(entries) == 1:
+        entry = entries[0]
+        episode_code = f"S{entry.season:02d}" + "".join(
+            f"E{episode:02d}" for episode in entry.episodes
+        )
+        return _safe_review_folder_name(f"{series_name} - {episode_code}")
+    seasons = sorted({entry.season for entry in entries})
+    if len(seasons) == 1:
+        pack_label = f"Temporada {seasons[0]:02d}"
+    else:
+        pack_label = f"Temporadas {seasons[0]:02d}-{seasons[-1]:02d}"
+    return _safe_review_folder_name(f"{series_name} - {pack_label}")
+
+
+def _review_source(prepared: PreparedJob) -> tuple[Path, str, str]:
+    """Elige el directorio comun mas cercano sin duplicar Serie/Temporada."""
+
+    manifest = prepared.manifest
+    if manifest.ready and manifest.entries:
+        parent_parts: list[tuple[str, ...]] = []
+        for entry in manifest.entries:
+            parent_parts.append(PurePosixPath(entry.source_relpath).parent.parts)
+            parent_parts.extend(
+                PurePosixPath(sidecar.source_relpath).parent.parts
+                for sidecar in entry.subtitle_sidecars
+            )
+        common = list(parent_parts[0])
+        for parts in parent_parts[1:]:
+            matching = 0
+            for left, right in zip(common, parts):
+                if left != right:
+                    break
+                matching += 1
+            common = common[:matching]
+            if not common:
+                break
+        if common:
+            common = common[:2]
+            prefix = PurePosixPath(*common).as_posix()
+            source = prepared.payload.source_root.joinpath(*common)
+            if source.is_dir() and not source.is_symlink():
+                layout = "season_root" if len(common) >= 2 else "series_root"
+                return source, prefix, layout
+    return prepared.payload.source_root, "", "source_root"
+
+
+def _read_review_reason(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads((path / "reason.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _review_reason_matches(path: Path, expected: dict[str, Any]) -> bool:
+    payload = _read_review_reason(path)
+    return bool(
+        payload is not None
+        and all(payload.get(key) == value for key, value in expected.items())
+    )
+
+
+def _review_destination(
+    review_root: Path,
+    label: str,
+    expected: dict[str, Any],
+) -> tuple[Path, bool]:
+    base = review_root / label
+    for index in range(10000):
+        candidate = base if index == 0 else base.with_name(f"{base.name} ({index})")
+        if candidate.exists() or candidate.is_symlink():
+            if candidate.is_dir() and not candidate.is_symlink() and _review_reason_matches(
+                candidate,
+                expected,
+            ):
+                return candidate, True
+            continue
+        return candidate, False
+    fallback = base.with_name(f"{base.name} ({int(time.time())})")
+    if fallback.exists() or fallback.is_symlink():
+        raise SeriesWorkerError("No hay un nombre libre para la revisión de Series")
+    return fallback, False
+
+
 def _prepared_root(
     job_root: Path,
     series_name: str,
@@ -923,40 +1036,91 @@ def _discard_generated_artifacts(prepared: PreparedJob) -> None:
         )
 
 
-_REVIEW_METADATA = frozenset({"reason.json", "Revision de serie.txt"})
+_REVIEW_METADATA = frozenset(
+    {"reason.json", "Revision de serie.txt", "Serie repetida.txt"}
+)
 
 
 def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, Any]:
     """Mueve el pack completo a revisión una sola vez, igual que películas."""
 
     payload = prepared.payload
-    suffix = prepared.manifest.digest[:12]
-    destination = payload.review_root / f"{_safe_fragment(payload.job_id)}-{suffix}"
-    expected_reason = {
+    match_reason = {
+        "schema": "series-review-v1",
+        "profile": "series",
+        "category": "tv",
         "job_id": payload.job_id,
         "manifest_digest": prepared.manifest.digest,
         "reasons": list(reasons),
     }
-    expected_text = "Revisión de serie\n" + "\n".join(reasons) + "\n"
+    expected_text = "Serie repetida\n" + "\n".join(reasons) + "\n"
+    source, review_source_prefix, review_layout = _review_source(prepared)
+    payload.review_root.mkdir(parents=True, exist_ok=True)
+    label = _review_folder_label(prepared.manifest)
+    destination, already_moved = _review_destination(
+        payload.review_root,
+        label,
+        match_reason,
+    )
+    if already_moved:
+        existing_reason = _read_review_reason(destination) or {}
+        return {
+            "status": "review",
+            "job_id": payload.job_id,
+            "kind": "series",
+            "rules_fingerprint": prepared.rules_snapshot.fingerprint,
+            "manifest": prepared.manifest.to_dict(),
+            "review_path": destination.relative_to(payload.review_root).as_posix(),
+            "review_layout": str(existing_reason.get("review_layout") or review_layout),
+            "review_source_prefix": str(
+                existing_reason.get("review_source_prefix") or review_source_prefix
+            ),
+            "review_reasons": list(reasons),
+            "published": [],
+        }
+    expected_reason = {
+        **match_reason,
+        "review_layout": review_layout,
+        "review_source_prefix": review_source_prefix,
+    }
+    reason_path = source / "reason.json"
+    text_path = source / "Serie repetida.txt"
     for reserved in _REVIEW_METADATA:
-        if (payload.source_root / reserved).exists():
+        reserved_path = source / reserved
+        if not reserved_path.exists():
+            continue
+        own_retry_metadata = (
+            reserved == "reason.json"
+            and _read_review_reason(source) == expected_reason
+        ) or (
+            reserved == "Serie repetida.txt"
+            and reserved_path.is_file()
+            and reserved_path.read_text(encoding="utf-8") == expected_text
+        )
+        if not own_retry_metadata:
             raise SeriesWorkerError(
                 f"El pack usa un nombre reservado para revisión: {reserved}"
             )
-    if destination.exists():
-        raise SeriesWorkerError("Ya existe el destino de revisión de este trabajo")
-    if payload.source_root.is_symlink() or not payload.source_root.is_dir():
+    if source.is_symlink() or not source.is_dir():
         raise SeriesWorkerError("El pack de revisión no es una carpeta física")
-    payload.review_root.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(payload.source_root), str(destination))
-    (destination / "reason.json").write_text(
+    reason_path.write_text(
         json.dumps(expected_reason, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    (destination / "Revision de serie.txt").write_text(
+    text_path.write_text(
         expected_text,
         encoding="utf-8",
     )
+    try:
+        shutil.move(str(source), str(destination))
+    except Exception:
+        reason_path.unlink(missing_ok=True)
+        text_path.unlink(missing_ok=True)
+        raise
+    if payload.source_root.is_dir() and not payload.source_root.is_symlink():
+        remaining = tuple(payload.source_root.rglob("*"))
+        if not any(path.is_file() or path.is_symlink() for path in remaining):
+            shutil.rmtree(payload.source_root, ignore_errors=True)
     return {
         "status": "review",
         "job_id": payload.job_id,
@@ -964,6 +1128,8 @@ def _review_pack(prepared: PreparedJob, reasons: tuple[str, ...]) -> dict[str, A
         "rules_fingerprint": prepared.rules_snapshot.fingerprint,
         "manifest": prepared.manifest.to_dict(),
         "review_path": destination.relative_to(payload.review_root).as_posix(),
+        "review_layout": review_layout,
+        "review_source_prefix": review_source_prefix,
         "review_reasons": list(reasons),
         "published": [],
     }
@@ -1299,6 +1465,7 @@ class SeriesCoordinator:
             persisted_validated = _validated_payload(
                 stored_payload,
                 require_directories=False,
+                allow_legacy_review_root=True,
             )
         except RequestValidationError as error:
             raise ServiceUnavailable("request.json durable contiene rutas no válidas") from error
@@ -1914,7 +2081,11 @@ class SeriesCoordinator:
         return snapshot is not None and snapshot["state"] == "COMMITTED"
 
     def submit(self, raw_payload: Any) -> Submission:
-        replay_validated = _validated_payload(raw_payload, require_directories=False)
+        replay_validated = _validated_payload(
+            raw_payload,
+            require_directories=False,
+            allow_legacy_review_root=True,
+        )
         with self._mutex:
             operational_preflight: dict[str, Any] | None = None
             committed_recovery_only = False
@@ -2506,6 +2677,7 @@ class SeriesCoordinator:
             replay_validated = _validated_payload(
                 stored_payload,
                 require_directories=False,
+                allow_legacy_review_root=True,
             )
         except RequestValidationError as error:
             raise ServiceUnavailable("request.json durable contiene rutas no válidas") from error

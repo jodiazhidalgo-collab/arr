@@ -288,7 +288,7 @@ services:
       MEDIA_WORKER_URL: "http://media-worker:8790"
       SERIES_WORKER_URL: "http://series-worker:8791"
       SERIES_WORKER_REPORT_ROOT: "/config/series-worker"
-      ARR_SERIES_REVIEW_DIR: "/data/media/repetidas_vs_error_series"
+      ARR_SERIES_REVIEW_DIR: "/data/media/repetidas_vs_error"
       QBT_URL: "http://gluetun:8080"
       QBT_USER: "${QBT_USER}"
       QBT_PASSWORD: "${QBT_PASSWORD}"
@@ -374,16 +374,14 @@ services:
       SERIES_WORKER_SEED_RULES_PATH: "/seed/reglas_motor.json"
       SERIES_WORKER_REPORT_ROOT: "/config/series-worker"
       SERIES_WORKER_FINAL_ROOT: "/data/media/tv"
-      SERIES_WORKER_REVIEW_ROOT: "/data/media/repetidas_vs_error_series"
+      SERIES_WORKER_REVIEW_ROOT: "/data/media/repetidas_vs_error"
       SERIES_WORKER_ALLOWED_ROOTS: "/data/downloads/torrents/complete/taller"
       SERIES_WORKER_CALLBACK_ORIGIN: "http://arr-orchestrator:8787"
       SERIES_HEAVY_LOCK_PATH: "/config/worker-locks/media-heavy.lock"
       SERIES_HEAVY_LOCK_TIMEOUT_SEC: "3600"
       SERIES_ATOMIC_PREFLIGHT_LOCK_PATH: "/config/worker-locks/series-atomic-preflight.lock"
     volumes:
-      - ${ARR_DATA_ROOT}/downloads/torrents/complete/taller:/data/downloads/torrents/complete/taller
-      - ${ARR_DATA_ROOT}/media/tv:/data/media/tv
-      - ${ARR_DATA_ROOT}/media/repetidas_vs_error_series:/data/media/repetidas_vs_error_series
+      - ${ARR_DATA_ROOT}:/data
       - ${ARR_ROOT}/config/series-worker:/config/series-worker
       - ${ARR_ROOT}/config/series-rules:/config/series-rules
       - ${ARR_ROOT}/config/worker-locks:/config/worker-locks
@@ -417,6 +415,7 @@ services:
       MEDIA_DEFAULT_RULES_PATH: "/defaults/reglas_motor_default.json"
       MEDIA_REPORT_ROOT: "/config/media-worker"
       MEDIA_REVIEW_DIR: "/data/media/repetidas_vs_error"
+      SERIES_REVIEW_DIR: "/data/media/repetidas_vs_error"
       ARR_COMPLETE_ROOT: "/data/downloads/torrents/complete"
       ARR_MOVIES_ROOT: "/data/media/movies"
       ARR_TV_ROOT: "/data/media/tv"

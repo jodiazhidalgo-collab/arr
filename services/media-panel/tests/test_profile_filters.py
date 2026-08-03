@@ -83,13 +83,55 @@ class JobAndCodexProfileFilterTests(unittest.TestCase):
 
 
 class ReviewProfileFilterTests(unittest.TestCase):
+    def test_job_contexts_stop_immediately_when_jobs_endpoint_is_down(self) -> None:
+        with patch.object(
+            server,
+            "_jobs_payload",
+            return_value={"ok": False, "jobs": [], "error": "down"},
+        ), patch.object(server, "_upstream_json") as upstream:
+            contexts = server._job_contexts({MOVIE_JOB, SERIES_JOB})
+
+        self.assertEqual(contexts, {})
+        upstream.assert_not_called()
+
+    def test_job_contexts_bound_slow_detail_fallbacks(self) -> None:
+        job_ids = {
+            f"0000000{number}-0000-4000-8000-00000000000{number}"
+            for number in range(1, 7)
+        }
+        with patch.object(
+            server,
+            "_jobs_payload",
+            return_value={"ok": True, "jobs": []},
+        ), patch.object(
+            server,
+            "_upstream_json",
+            side_effect=lambda url, timeout: {
+                "job_id": url.rsplit("/", 1)[-1],
+                "category": "tv",
+            },
+        ) as upstream:
+            contexts = server._job_contexts(job_ids)
+
+        self.assertEqual(len(contexts), server.MAX_REVIEW_JOB_DETAIL_LOOKUPS)
+        self.assertEqual(upstream.call_count, server.MAX_REVIEW_JOB_DETAIL_LOOKUPS)
+        self.assertTrue(
+            all(
+                call.kwargs["timeout"] == server.REVIEW_JOB_DETAIL_TIMEOUT_SEC
+                for call in upstream.call_args_list
+            )
+        )
+
     def test_real_movie_and_series_roots_are_strictly_separated(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             movie_root = base / "movie-review"
             series_root = base / "series-review"
             movie = movie_root / "Blade Runner 2049 (2017)"
-            _write_reason(movie, {"job_id": MOVIE_JOB, "phase": "filebot"})
+            _write_reason(
+                movie,
+                {"job_id": MOVIE_JOB, "phase": "filebot", "category": "movies"},
+            )
             (movie / "Blade Runner 2049 (2017).mkv").write_bytes(b"")
 
             series = series_root / "La Agencia"
@@ -119,6 +161,113 @@ class ReviewProfileFilterTests(unittest.TestCase):
             f"{server.SERIES_REVIEW_ALIAS}/La Agencia",
         )
         self.assertTrue(shows["connected"])
+
+    def test_shared_root_keeps_series_and_movies_in_their_own_web_views(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repetidas_vs_error"
+            movie = root / "Blade Runner 2049 (2017)"
+            series = root / "El príncipe de Bel-Air - S01E08"
+            unknown = root / "Antigua sin metadatos"
+            _write_reason(movie, {"job_id": "movie", "profile": "movies"})
+            _write_reason(
+                series,
+                {
+                    "schema": "series-review-v1",
+                    "job_id": "series",
+                    "profile": "series",
+                    "category": "tv",
+                },
+            )
+            (series / "El príncipe de Bel-Air - S01E08.mkv").write_bytes(b"")
+            _write_reason(unknown, {"job_id": "legacy"})
+
+            with patch.object(server, "REVIEW_DIR", root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                root,
+            ), patch.object(server, "_jobs_payload") as jobs:
+                movies = server._review_payload(profile="movies")
+                shows = server._review_payload(profile="series")
+                legacy = server._review_payload()
+
+        jobs.assert_not_called()
+        self.assertEqual(
+            {item["name"] for item in movies["items"]},
+            {movie.name, unknown.name},
+        )
+        self.assertEqual([item["name"] for item in shows["items"]], [series.name])
+        self.assertEqual(
+            {item["name"] for item in legacy["items"]},
+            {movie.name, series.name, unknown.name},
+        )
+        self.assertEqual(shows["review_dir"], server.SERIES_REVIEW_ALIAS)
+        self.assertEqual(movies["review_dir"], server.SERIES_REVIEW_ALIAS)
+        self.assertTrue(
+            all(
+                item["path"].startswith(server.SERIES_REVIEW_ALIAS + "/")
+                for item in movies["items"]
+            )
+        )
+        self.assertEqual(
+            {item["name"]: item["profile"] for item in movies["items"]},
+            {movie.name: "movies", unknown.name: None},
+        )
+
+    def test_shared_root_job_metadata_wins_over_a_misleading_folder_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repetidas_vs_error"
+            folder = root / "Parece película (2026)"
+            _write_reason(folder, {"job_id": SERIES_JOB})
+            jobs_payload = {
+                "ok": True,
+                "jobs": [{"job_id": SERIES_JOB, "category": "tv"}],
+            }
+            with patch.object(server, "REVIEW_DIR", root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                root,
+            ), patch.object(server, "_jobs_payload", return_value=jobs_payload):
+                movies = server._review_payload(profile="movies")
+                shows = server._review_payload(profile="series")
+
+        self.assertEqual(movies["items"], [])
+        self.assertEqual([item["name"] for item in shows["items"]], [folder.name])
+
+    def test_shared_root_legacy_series_marker_survives_invalid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repetidas_vs_error"
+            folder = root / "Serie antigua"
+            folder.mkdir(parents=True)
+            (folder / "reason.json").write_text("{", encoding="utf-8")
+            (folder / "Serie repetida.txt").write_text("Serie repetida", encoding="utf-8")
+            (folder / "Capitulo - S01E02.mkv").write_bytes(b"")
+            with patch.object(server, "REVIEW_DIR", root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                root,
+            ):
+                movies = server._review_payload(profile="movies")
+                shows = server._review_payload(profile="series")
+
+        self.assertEqual(movies["items"], [])
+        self.assertEqual([item["name"] for item in shows["items"]], [folder.name])
+
+    def test_shared_root_movie_title_with_series_word_stays_in_movies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "repetidas_vs_error"
+            folder = root / "A Series of Unfortunate Events (2017)"
+            _write_reason(folder, {"job_id": "legacy"})
+            (folder / "A Series of Unfortunate Events (2017).mkv").write_bytes(b"")
+            with patch.object(server, "REVIEW_DIR", root), patch.object(
+                server,
+                "SERIES_REVIEW_DIR",
+                root,
+            ):
+                movies = server._review_payload(profile="movies")
+                shows = server._review_payload(profile="series")
+
+        self.assertEqual([item["name"] for item in movies["items"]], [folder.name])
+        self.assertEqual(shows["items"], [])
 
     def test_series_review_skips_hidden_tmp_and_symlink_folders(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

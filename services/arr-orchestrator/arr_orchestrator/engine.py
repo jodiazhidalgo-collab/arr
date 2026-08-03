@@ -21,6 +21,9 @@ from .diagnostic_sanitizer import sanitize_for_export
 from .filebot import FileBotRunner
 from .identity.controller import IdentityController
 from .filesystem import (
+    JUNK_EXTENSIONS,
+    MEDIA_EXTENSIONS,
+    SIDECAR_EXTENSIONS,
     ExtractionError,
     clean_junk,
     extract_archives,
@@ -118,6 +121,14 @@ SERIES_PIPELINE_SCHEMA = "arr-series-pipeline-v1"
 SERIES_CANARY_PREFIX = "codex_live_flow_probe_"
 SERIES_PUBLISHED_MANIFEST_SCHEMA = "series-published-manifest-v1"
 SERIES_GENERATION_MARKER = ".series-worker-generation.json"
+SERIES_REVIEW_METADATA_FILES = (
+    "reason.json",
+    "Revision de serie.txt",
+    "Serie repetida.txt",
+)
+SERIES_REVIEW_SIGNATURE_STAT_V1 = "stat-v1"
+SERIES_REVIEW_SIGNATURE_SHA256_V1 = "sha256-v1"
+LEGACY_SERIES_REVIEW_DIRNAME = "repetidas_vs_error_series"
 SERIES_FULL_PIPELINE_STATES = {
     "ready_stage",
     "staging",
@@ -3123,7 +3134,16 @@ class Engine:
                 raise ValueError(
                     "La preservación de Series solo puede mover <taller>/<job_id>"
                 )
-            before = review_content_signature(job_root, whole_tree=whole_job)
+            filebot_output = job_root / "series_filebot_output"
+            clean_review = self._series_clean_review_ready(
+                job_root,
+                filebot_output,
+            )
+            preserve_whole_tree = whole_job and not clean_review
+            before = review_content_signature(
+                job_root,
+                whole_tree=preserve_whole_tree,
+            )
             if not before:
                 raise ValueError("El taller no contiene un pack preservable")
             review_root = self._require_series_physical_path(
@@ -3141,35 +3161,51 @@ class Engine:
             lexical_review_root = Path(os.path.abspath(str(review_root)))
             if resolved_review_root != lexical_review_root:
                 raise ValueError("La raiz de revision de Series atraviesa un enlace simbolico")
-            mover = move_job_to if whole_job else move_job_to_review_clean
-            review = mover(
-                job_root,
-                resolved_review_root,
-                str(job.get("name") or job.get("job_id") or "serie"),
-            )
+            review_name = str(job.get("name") or job.get("job_id") or "serie")
+            if clean_review:
+                review = move_tv_job_to_review(
+                    job_root,
+                    resolved_review_root,
+                    review_name,
+                )
+            else:
+                mover = move_job_to if preserve_whole_tree else move_job_to_review_clean
+                review = mover(job_root, resolved_review_root, review_name)
             self.db.update_job(job_id, stage_path=str(review))
             if review.parent != resolved_review_root or review.is_symlink():
                 raise ValueError("El destino de revision de Series no es canonico")
-            after = review_content_signature(review, whole_tree=whole_job)
-            if before != after:
+            after = review_content_signature(
+                review,
+                whole_tree=preserve_whole_tree,
+            )
+            signatures_match = (
+                sorted((size, fingerprint) for _path, size, fingerprint in before)
+                == sorted((size, fingerprint) for _path, size, fingerprint in after)
+                if clean_review
+                else before == after
+            )
+            if not signatures_match:
                 raise ValueError("La copia de revision no coincide con el pack completo")
             if not self._path_is_inside(review, resolved_review_root):
                 raise ValueError("El destino de revision de Series no es canonico")
             reason = {
+                "profile": "series",
+                "category": "tv",
                 "job_id": str(job["job_id"]),
                 "phase": phase,
                 "reason": error_code,
                 "message": self._safe_worker_error(message),
                 "preserved_files": len(after),
                 "_arr_review_signature": self._series_review_signature_digest(review),
+                "_arr_review_signature_method": SERIES_REVIEW_SIGNATURE_STAT_V1,
                 "timestamp": time.time(),
             }
             write_reason(
                 review,
                 reason,
-                "Revision de serie.txt",
+                "Serie repetida.txt" if clean_review else "Revision de serie.txt",
                 [
-                    "El pack completo se ha conservado en la revision exclusiva de Series.",
+                    "El pack completo se ha conservado en Repetidas / Error.",
                     self._safe_worker_error(message),
                 ],
             )
@@ -3205,9 +3241,9 @@ class Engine:
             write_reason(
                 review,
                 reason,
-                "Revision de serie.txt",
+                "Serie repetida.txt" if clean_review else "Revision de serie.txt",
                 [
-                    "El pack completo se ha conservado en la revision exclusiva de Series.",
+                    "El pack completo se ha conservado en Repetidas / Error.",
                     self._safe_worker_error(message),
                     (
                         "La limpieza de clientes queda pendiente de reintento automatico."
@@ -3236,13 +3272,59 @@ class Engine:
             (
                 "Pack preservado; limpieza de clientes pendiente"
                 if not clients_cleaned
-                else "Pack completo preservado en revision exclusiva de Series"
+                else "Pack completo preservado en Repetidas / Error"
             ),
             stage_path=str(review),
             last_error_code=terminal_code,
             last_error_message=self._safe_worker_error(message),
             result_json=json.dumps(reason, ensure_ascii=False),
         )
+        return True
+
+    @classmethod
+    def _series_clean_review_ready(
+        cls,
+        job_root: Path,
+        filebot_output: Path,
+    ) -> bool:
+        """Usa el formato humano solo si FileBot contiene todo lo preservable."""
+
+        if (
+            not filebot_output.is_dir()
+            or filebot_output.is_symlink()
+            or not media_files(filebot_output)
+        ):
+            return False
+        relevant_suffixes = MEDIA_EXTENSIONS | SIDECAR_EXTENSIONS
+        try:
+            for path in filebot_output.rglob("*"):
+                if path.is_symlink():
+                    return False
+                if path.is_dir():
+                    continue
+                if not path.is_file() or path.suffix.casefold() not in relevant_suffixes:
+                    return False
+        except OSError:
+            return False
+        for folder_name in ("filebot_input", "extracted", "original"):
+            root = job_root / folder_name
+            if not root.exists():
+                continue
+            if root.is_symlink() or not root.is_dir():
+                return False
+            for path in root.rglob("*"):
+                try:
+                    if path.is_symlink():
+                        return False
+                    if path.is_dir():
+                        continue
+                    if not path.is_file():
+                        return False
+                    suffix = path.suffix.casefold()
+                    if suffix not in JUNK_EXTENSIONS:
+                        return False
+                except OSError:
+                    return False
         return True
 
     def _defer_identity(
@@ -3719,6 +3801,70 @@ class Engine:
             raise ValueError(f"{label} queda fuera de su raíz autorizada") from error
         return cls._require_series_physical_path(lexical, label)
 
+    def _series_review_root_for_job(
+        self,
+        job_id: str,
+        candidate: Optional[Path] = None,
+    ) -> Path:
+        """Mantiene recuperables únicamente los jobs persistidos con la raíz antigua."""
+
+        current_root = self._require_series_physical_path(
+            self.config.series_review_dir,
+            "revisión de Series",
+        )
+        if candidate is not None:
+            lexical_candidate = Path(os.path.abspath(str(candidate)))
+            try:
+                lexical_candidate.relative_to(current_root)
+                return current_root
+            except ValueError:
+                pass
+        request_path = self.config.series_reports_root / job_id / "request.json"
+        try:
+            request_path = self._require_series_lexical_path(
+                request_path,
+                self.config.series_reports_root,
+                "request durable de Series",
+            )
+            request_stat = request_path.lstat()
+            if (
+                not stat.S_ISREG(request_stat.st_mode)
+                or request_stat.st_size > MAX_WORKER_RESULT_BYTES
+            ):
+                return current_root
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            payload = request.get("payload") if isinstance(request, dict) else None
+            if (
+                not isinstance(payload, dict)
+                or str(payload.get("job_id") or "") != job_id
+            ):
+                return current_root
+            requested_root = Path(
+                os.path.abspath(str(payload.get("review_root") or ""))
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return current_root
+
+        legacy_root = Path(
+            os.path.abspath(
+                str(
+                    self.config.data_root
+                    / "media"
+                    / LEGACY_SERIES_REVIEW_DIRNAME
+                )
+            )
+        )
+        if requested_root != legacy_root:
+            return current_root
+        try:
+            legacy_root = self._require_series_physical_path(
+                legacy_root,
+                "revisión histórica de Series",
+            )
+        except ValueError:
+            return current_root
+        return legacy_root if legacy_root.is_dir() else current_root
+
     def _series_worker_command_preview(
         self,
         job: Dict[str, object],
@@ -3910,6 +4056,7 @@ class Engine:
         *,
         verify_source: bool = True,
         ignored_root_names: Tuple[str, ...] = (),
+        source_path_prefix: Optional[PurePosixPath] = None,
     ) -> Tuple[Dict[str, object], List[PurePosixPath]]:
         manifest_payload = result.get("manifest")
         if not isinstance(manifest_payload, dict):
@@ -3965,6 +4112,19 @@ class Engine:
         seen_sources = set()
         seen_targets = set()
         declared_files = set()
+
+        def review_relative(path: PurePosixPath) -> PurePosixPath:
+            if source_path_prefix is None:
+                return path
+            prefix_parts = source_path_prefix.parts
+            if (
+                not prefix_parts
+                or len(path.parts) <= len(prefix_parts)
+                or path.parts[: len(prefix_parts)] != prefix_parts
+            ):
+                raise ValueError("La revisión no coincide con la raíz del pack")
+            return PurePosixPath(*path.parts[len(prefix_parts) :])
+
         for entry in entries:
             if not isinstance(entry, dict) or set(entry) != expected_entry_keys:
                 raise ValueError("El manifiesto de Series contiene una entrada inválida")
@@ -4022,7 +4182,8 @@ class Engine:
             ):
                 raise ValueError("El manifiesto no coincide con el episodio de entrada")
             if verify_source:
-                source_file = source_root.joinpath(*source.parts)
+                physical_source = review_relative(source)
+                source_file = source_root.joinpath(*physical_source.parts)
                 try:
                     source_stat = source_file.lstat()
                 except OSError as error:
@@ -4034,7 +4195,7 @@ class Engine:
                     or source_stat.st_mtime_ns != mtime_ns
                 ):
                     raise ValueError("El manifiesto no coincide con el episodio de entrada")
-            declared_files.add(source.as_posix())
+            declared_files.add(review_relative(source).as_posix())
             sidecars = entry.get("subtitle_sidecars")
             if not isinstance(sidecars, list):
                 raise ValueError("El manifiesto de Series no conserva sus subtítulos")
@@ -4060,7 +4221,8 @@ class Engine:
                 ):
                     raise ValueError("El manifiesto no coincide con el subtítulo externo")
                 if verify_source:
-                    sidecar_file = source_root.joinpath(*sidecar_relative.parts)
+                    physical_sidecar = review_relative(sidecar_relative)
+                    sidecar_file = source_root.joinpath(*physical_sidecar.parts)
                     try:
                         sidecar_stat = sidecar_file.lstat()
                     except OSError as error:
@@ -4072,7 +4234,7 @@ class Engine:
                         or sidecar_stat.st_mtime_ns != sidecar_mtime
                     ):
                         raise ValueError("El manifiesto no coincide con el subtítulo externo")
-                declared_files.add(sidecar_relative.as_posix())
+                declared_files.add(review_relative(sidecar_relative).as_posix())
             targets.append(target)
 
         canonical_manifest = json.dumps(
@@ -4267,17 +4429,18 @@ class Engine:
             )
             return None
         if status == "review":
+            review_root = self._series_review_root_for_job(job_id)
             review_relative = self._safe_series_relative(
                 result.get("review_path"), "review_path"
             )
             review = self._require_series_lexical_path(
-                self.config.series_review_dir.joinpath(*review_relative.parts),
-                self.config.series_review_dir,
+                review_root.joinpath(*review_relative.parts),
+                review_root,
                 "revisión durable de Series",
             )
             if (
                 not review.is_dir()
-                or not self._path_is_inside(review, self.config.series_review_dir)
+                or not self._path_is_inside(review, review_root)
             ):
                 raise ValueError("La revisión de Series no conserva un destino válido")
             try:
@@ -4291,11 +4454,47 @@ class Engine:
                 != str(manifest_payload.get("digest") or "")
             ):
                 raise ValueError("La revisión de Series no coincide con el trabajo")
+            review_layout = str(result.get("review_layout") or "source_root")
+            prefix_value = str(result.get("review_source_prefix") or "")
+            if review_layout not in {"source_root", "series_root", "season_root"}:
+                raise ValueError("La revisión de Series declara una estructura desconocida")
+            source_prefix: Optional[PurePosixPath] = None
+            if review_layout == "source_root":
+                if prefix_value:
+                    raise ValueError("La revisión completa no puede recortar su raíz")
+            else:
+                source_prefix = self._safe_series_relative(
+                    prefix_value,
+                    "review_source_prefix",
+                )
+                series_name = str(manifest_payload.get("series_name") or "")
+                expected_parts = 1 if review_layout == "series_root" else 2
+                if (
+                    len(source_prefix.parts) != expected_parts
+                    or source_prefix.parts[0] != series_name
+                ):
+                    raise ValueError("La raíz limpia de revisión no coincide con la serie")
+            if reason.get("schema") == "series-review-v1":
+                if (
+                    reason.get("profile") != "series"
+                    or reason.get("category") != "tv"
+                    or reason.get("review_layout") != review_layout
+                    or str(reason.get("review_source_prefix") or "") != prefix_value
+                ):
+                    raise ValueError("Los metadatos de revisión de Series no son coherentes")
+                marker = review / "Serie repetida.txt"
+                try:
+                    marker_stat = marker.lstat()
+                except OSError as error:
+                    raise ValueError("La revisión no conserva Serie repetida.txt") from error
+                if not stat.S_ISREG(marker_stat.st_mode):
+                    raise ValueError("Serie repetida.txt no es un archivo regular")
             self._validate_series_manifest(
                 result,
                 review,
                 verify_source=True,
-                ignored_root_names=("reason.json", "Revision de serie.txt"),
+                ignored_root_names=SERIES_REVIEW_METADATA_FILES,
+                source_path_prefix=source_prefix,
             )
             return review
         return None
@@ -4447,6 +4646,7 @@ class Engine:
         result = {
             **result,
             "_arr_review_signature": self._series_review_signature_digest(review),
+            "_arr_review_signature_method": SERIES_REVIEW_SIGNATURE_STAT_V1,
         }
         current = self.db.transition(
             job_id,
@@ -4463,12 +4663,22 @@ class Engine:
         self._run_series_review_cleanup(current)
 
     @staticmethod
-    def _series_review_signature_digest(review: Path) -> str:
-        signature = review_content_signature(
-            review,
-            whole_tree=True,
-            ignored_names=("reason.json", "Revision de serie.txt"),
-        )
+    def _series_review_signature_digest(
+        review: Path,
+        method: str = SERIES_REVIEW_SIGNATURE_STAT_V1,
+    ) -> str:
+        if method not in {
+            SERIES_REVIEW_SIGNATURE_STAT_V1,
+            SERIES_REVIEW_SIGNATURE_SHA256_V1,
+        }:
+            raise ValueError("La firma durable de revisión usa un método desconocido")
+        signature_options: Dict[str, object] = {
+            "whole_tree": True,
+            "ignored_names": SERIES_REVIEW_METADATA_FILES,
+        }
+        if method == SERIES_REVIEW_SIGNATURE_SHA256_V1:
+            signature_options["content_hash"] = True
+        signature = review_content_signature(review, **signature_options)
         if not signature:
             raise ValueError("La revisión de Series no contiene material verificable")
         encoded = json.dumps(
@@ -4480,10 +4690,12 @@ class Engine:
 
     def _run_series_review_cleanup(self, job: Dict[str, object]) -> None:
         job_id = str(job["job_id"])
+        requested_review = Path(str(job.get("stage_path") or ""))
+        review_root = self._series_review_root_for_job(job_id, requested_review)
         try:
             review = self._require_series_lexical_path(
-                Path(str(job.get("stage_path") or "")),
-                self.config.series_review_dir,
+                requested_review,
+                review_root,
                 "revisión pendiente de Series",
             )
         except (OSError, ValueError) as error:
@@ -4491,12 +4703,12 @@ class Engine:
             return
         if (
             not review.is_dir()
-            or not self._path_is_inside(review, self.config.series_review_dir)
+            or not self._path_is_inside(review, review_root)
         ):
             self._record_series_wait(
                 job,
                 "review_cleanup_invalid",
-                "La copia verificada de Series ya no esta en su raiz exclusiva",
+                "La copia verificada de Series ya no está en Repetidas / Error",
             )
             return
         try:
@@ -4506,8 +4718,15 @@ class Engine:
         if not isinstance(result, dict):
             result = {}
         expected_signature = str(result.get("_arr_review_signature") or "")
+        signature_method = str(
+            result.get("_arr_review_signature_method")
+            or SERIES_REVIEW_SIGNATURE_SHA256_V1
+        )
         try:
-            actual_signature = self._series_review_signature_digest(review)
+            actual_signature = self._series_review_signature_digest(
+                review,
+                signature_method,
+            )
         except (OSError, TypeError, ValueError) as error:
             self._record_series_wait(job, "review_integrity_failed", error)
             return
@@ -4515,14 +4734,14 @@ class Engine:
         if not expected_signature and job_root.is_dir() and not job_root.is_symlink():
             source_root = job_root / "series_filebot_output"
             try:
-                source_signature = review_content_signature(
-                    source_root,
-                    whole_tree=True,
-                )
+                compare_options: Dict[str, object] = {"whole_tree": True}
+                if signature_method == SERIES_REVIEW_SIGNATURE_SHA256_V1:
+                    compare_options["content_hash"] = True
+                source_signature = review_content_signature(source_root, **compare_options)
                 review_signature = review_content_signature(
                     review,
-                    whole_tree=True,
-                    ignored_names=("reason.json", "Revision de serie.txt"),
+                    ignored_names=SERIES_REVIEW_METADATA_FILES,
+                    **compare_options,
                 )
             except (OSError, ValueError) as error:
                 self._record_series_wait(job, "review_integrity_failed", error)
@@ -4536,6 +4755,7 @@ class Engine:
                 return
             expected_signature = actual_signature
             result["_arr_review_signature"] = expected_signature
+            result["_arr_review_signature_method"] = signature_method
             job = self.db.update_job(
                 job_id,
                 result_json=json.dumps(result, ensure_ascii=False),
@@ -4579,7 +4799,7 @@ class Engine:
             job_id,
             "manual_review",
             "series_review",
-            "Pack completo preservado en revisión exclusiva de Series",
+            "Pack completo preservado en Repetidas / Error",
             stage_path=str(review),
             last_error_code="series_review",
             last_error_message="; ".join(
@@ -5471,12 +5691,17 @@ class Engine:
     ) -> Dict[str, object]:
         review, reason = self._load_series_review_cleanup_state(job)
         reason["clients_cleanup_pending"] = False
+        reason_file = (
+            "Serie repetida.txt"
+            if reason.get("schema") == "series-review-v1"
+            else "Revision de serie.txt"
+        )
         write_reason(
             review,
             reason,
-            "Revision de serie.txt",
+            reason_file,
             [
-                "El pack completo se ha conservado en la revision exclusiva de Series.",
+                "El pack completo se ha conservado en Repetidas / Error.",
                 self._safe_worker_error(reason.get("message") or ""),
                 "Las entradas de clientes se han limpiado sin borrar archivos.",
             ],
@@ -5488,12 +5713,17 @@ class Engine:
         job: Dict[str, object],
     ) -> Tuple[Path, Dict[str, object]]:
         job_id = str(job["job_id"])
+        requested_review = Path(str(job.get("stage_path") or ""))
+        configured_review_root = self._series_review_root_for_job(
+            job_id,
+            requested_review,
+        )
         review_root = self._require_series_physical_path(
-            self.config.series_review_dir,
+            configured_review_root,
             "raíz de revisión de Series",
         ).resolve(strict=True)
         review = self._require_series_lexical_path(
-            Path(str(job.get("stage_path") or "")),
+            requested_review,
             review_root,
             "revisión pendiente de limpieza",
         )
@@ -5508,9 +5738,14 @@ class Engine:
         if not isinstance(reason, dict) or str(reason.get("job_id") or "") != job_id:
             raise ValueError("El motivo de revisión no pertenece al trabajo de Series")
         expected_signature = str(reason.get("_arr_review_signature") or "")
+        signature_method = str(
+            reason.get("_arr_review_signature_method")
+            or SERIES_REVIEW_SIGNATURE_SHA256_V1
+        )
         if (
             not expected_signature
-            or self._series_review_signature_digest(review) != expected_signature
+            or self._series_review_signature_digest(review, signature_method)
+            != expected_signature
         ):
             raise ValueError("La revisión preservada de Series cambió desde su confirmación")
         return review, reason

@@ -76,7 +76,7 @@ class Config:
             object.__setattr__(
                 self,
                 "series_review_dir",
-                self.data_root / "media" / "repetidas_vs_error_series",
+                self.data_root / "media" / "repetidas_vs_error",
             )
 
     @property
@@ -164,7 +164,7 @@ class Config:
             series_review_dir=Path(
                 os.environ.get(
                     "ARR_SERIES_REVIEW_DIR",
-                    str(data_root / "media/repetidas_vs_error_series"),
+                    str(data_root / "media/repetidas_vs_error"),
                 )
             ),
             series_mode=_series_mode(os.environ.get("ARR_SERIES_MODE", "legacy")),

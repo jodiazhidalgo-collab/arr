@@ -54,7 +54,7 @@ class SeriesWorkerClientTests(unittest.TestCase):
             Path("/data/downloads/torrents/complete/taller/job-1"),
             Path("/data/downloads/torrents/complete/taller/job-1/series_filebot_output"),
             Path("/data/media/tv"),
-            Path("/data/media/repetidas_vs_error_series"),
+            Path("/data/media/repetidas_vs_error"),
             Path("/config/series-worker"),
         )
 

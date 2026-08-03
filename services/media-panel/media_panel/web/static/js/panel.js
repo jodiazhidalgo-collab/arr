@@ -487,7 +487,7 @@ async function showRevision(context) {
   const items = data.items || [];
   app.innerHTML = `<section class="panel">
     ${renderAuxiliaryProfileSelector("revision", profile)}
-    <h2>${profile === "series" ? "repetidas_vs_error_series" : "repetidas_vs_error"}</h2>
+    <h2>repetidas_vs_error</h2>
     <div class="muted">${esc(data.review_dir)}</div>
     ${data.connected === false ? `<div class="locked-notice" role="status"><span class="pill warn">No disponible</span><strong>${esc(data.message || "Motor no conectado")}</strong></div>` : ""}
     <div class="review-list" style="margin-top:12px">

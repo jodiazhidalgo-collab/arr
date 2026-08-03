@@ -282,9 +282,12 @@ def _tree_contents(root, *, ignore_root_names=frozenset()):
 def _assert_review_matches_source(layout, payload, result):
     review_root = layout["review"] / result["review_path"]
     assert review_root.is_dir()
-    assert not Path(payload["source_root"]).exists()
+    source_root = Path(payload["source_root"])
+    if source_root.exists():
+        assert not list(source_root.rglob("*"))
     assert (review_root / "reason.json").is_file()
-    assert (review_root / "Revision de serie.txt").is_file()
+    assert (review_root / "Serie repetida.txt").is_file()
+    assert not (review_root / "Revision de serie.txt").exists()
     return review_root
 
 
@@ -800,8 +803,8 @@ def test_second_episode_failure_reviews_complete_pack_without_publishing(
     assert not (layout["tv"] / "Serie").exists()
     review = _assert_review_matches_source(layout, payload, result)
     assert _tree_contents(review, ignore_root_names=core_module._REVIEW_METADATA) == {
-        "Serie/Season 01/Serie.S01E01.mkv": b"one",
-        "Serie/Season 01/Serie.S01E02.mkv": b"two",
+        "Serie.S01E01.mkv": b"one",
+        "Serie.S01E02.mkv": b"two",
     }
     assert callbacks[-1] == (
         "series_review",
@@ -889,7 +892,9 @@ def test_enospc_on_second_episode_never_publishes_and_preserves_complete_pack(
     assert not (layout["tv"] / "Serie").exists()
     assert not list(layout["tv"].glob(".*series-worker*"))
     review = _assert_review_matches_source(layout, payload, result)
-    assert _tree_contents(review, ignore_root_names=core_module._REVIEW_METADATA) == source_before
+    assert _tree_contents(review, ignore_root_names=core_module._REVIEW_METADATA) == {
+        Path(path).name: content for path, content in source_before.items()
+    }
     snapshot = json.loads(
         (layout["reports"] / "job-1/journal.json").read_text("utf-8")
     )
@@ -1334,6 +1339,64 @@ def test_terminal_replay_survives_source_cleanup_and_new_global_rules(layout):
         )
 
 
+def test_terminal_job_with_legacy_review_root_survives_shared_root_migration(
+    layout,
+    monkeypatch,
+):
+    legacy_review = layout["root"] / "legacy-series-review"
+    legacy_review.mkdir()
+    monkeypatch.setattr(core_module, "LEGACY_REVIEW_ROOT", str(legacy_review))
+    monkeypatch.setenv("SERIES_WORKER_REVIEW_ROOT", str(legacy_review))
+    payload = {
+        **_payload(layout),
+        "review_root": str(legacy_review),
+    }
+    first = _coordinator(layout)
+    first.submit(payload)
+    terminal = first.wait("job-1")
+    assert terminal.http_status == 200
+
+    monkeypatch.setenv("SERIES_WORKER_REVIEW_ROOT", str(layout["review"]))
+    restarted = _coordinator(layout)
+
+    assert restarted.status("job-1").payload == terminal.payload
+    assert restarted.submit(payload).payload == terminal.payload
+
+    fresh_legacy_payload = {
+        **_payload(layout, job_id="job-2"),
+        "review_root": str(legacy_review),
+    }
+    with pytest.raises(RequestValidationError, match="revisión canónica"):
+        restarted.submit(fresh_legacy_payload)
+    assert not (layout["reports"] / "job-2/request.json").exists()
+
+
+def test_reserved_job_with_legacy_review_root_resumes_after_shared_root_migration(
+    layout,
+    monkeypatch,
+):
+    legacy_review = layout["root"] / "legacy-series-review"
+    legacy_review.mkdir()
+    monkeypatch.setattr(core_module, "LEGACY_REVIEW_ROOT", str(legacy_review))
+    monkeypatch.setenv("SERIES_WORKER_REVIEW_ROOT", str(legacy_review))
+    payload = {
+        **_payload(layout),
+        "review_root": str(legacy_review),
+    }
+    first = _coordinator(layout)
+    first._new_reservation(validate_payload(payload))
+
+    monkeypatch.setenv("SERIES_WORKER_REVIEW_ROOT", str(layout["review"]))
+    restarted = _coordinator(layout)
+    resumed = restarted.status("job-1")
+    terminal = restarted.wait("job-1")
+
+    assert resumed.http_status == 202
+    assert resumed.payload["status"] in {"accepted", "active"}
+    assert terminal.http_status == 200
+    assert terminal.payload["result"]["status"] == "done"
+
+
 @pytest.mark.parametrize("artifact", ["rules_snapshot.json", "manifest.json"])
 def test_tampered_durable_snapshot_or_manifest_fails_closed(layout, artifact):
     payload = _payload(layout)
@@ -1612,7 +1675,7 @@ def test_existing_episode_moves_new_pack_to_review_without_touching_library(layo
     assert not source.exists()
     assert existing.is_file()
     review = layout["review"] / result["review_path"]
-    assert (review / "Serie/Season 01/Serie.S01E01.mkv").is_file()
+    assert (review / "Serie.S01E01.mkv").is_file()
     assert not list(layout["tv"].glob(".*series-worker*"))
 
 
@@ -1665,19 +1728,69 @@ def test_review_moves_pack_once_without_hidden_staging(layout, monkeypatch):
 
 def test_review_never_overwrites_existing_job_destination(layout):
     payload = _payload(layout, videos=[("Serie/bonus.mkv", b"bonus")])
-    coordinator = _coordinator(layout)
-    prepared, existed, _record = coordinator._candidate(validate_payload(payload))
-    assert existed is False
-    destination = layout["review"] / f"job-1-{prepared.manifest.digest[:12]}"
+    destination = layout["review"] / "Series sin clasificar"
     destination.mkdir()
     (destination / "foreign.bin").write_bytes(b"keep")
+    coordinator = _coordinator(layout)
 
     coordinator.submit(payload)
     result = coordinator.wait("job-1").payload["result"]
 
-    assert result["status"] == "failed"
-    assert (Path(payload["source_root"]) / "Serie/bonus.mkv").read_bytes() == b"bonus"
+    assert result["status"] == "review"
+    assert result["review_path"] == "Series sin clasificar (1)"
+    assert (
+        layout["review"] / result["review_path"] / "Serie/bonus.mkv"
+    ).read_bytes() == b"bonus"
     assert (destination / "foreign.bin").read_bytes() == b"keep"
+
+
+def test_single_episode_review_uses_clean_human_layout_and_numbering(layout):
+    relative = (
+        "El príncipe de Bel-Air/Season 01/"
+        "El príncipe de Bel-Air - S01E08.mkv"
+    )
+    sidecar = (
+        "El príncipe de Bel-Air/Season 01/"
+        "El príncipe de Bel-Air - S01E08.es.forced.srt"
+    )
+    final = layout["tv"] / relative
+    final.parent.mkdir(parents=True)
+    final.write_bytes(b"existing")
+    coordinator = _coordinator(layout)
+
+    first_payload = _payload(
+        layout,
+        job_id="job-1",
+        videos=[(relative, b"new-one")],
+        sidecars=[(sidecar, "1\n00:00:00,000 --> 00:00:01,000\nHola\n")],
+    )
+    coordinator.submit(first_payload)
+    first = coordinator.wait("job-1").payload["result"]
+
+    second_payload = _payload(
+        layout,
+        job_id="job-2",
+        videos=[(relative, b"new-two")],
+        sidecars=[(sidecar, "1\n00:00:00,000 --> 00:00:01,000\nHola\n")],
+    )
+    coordinator.submit(second_payload)
+    second = coordinator.wait("job-2").payload["result"]
+
+    assert first["review_path"] == "El príncipe de Bel-Air - S01E08"
+    assert second["review_path"] == "El príncipe de Bel-Air - S01E08 (1)"
+    for result in (first, second):
+        review = layout["review"] / result["review_path"]
+        assert {path.name for path in review.iterdir()} == {
+            "El príncipe de Bel-Air - S01E08.mkv",
+            "El príncipe de Bel-Air - S01E08.es.forced.srt",
+            "Serie repetida.txt",
+            "reason.json",
+        }
+        reason = json.loads((review / "reason.json").read_text("utf-8"))
+        assert reason["profile"] == "series"
+        assert reason["category"] == "tv"
+        assert reason["review_layout"] == "season_root"
+        assert reason["review_source_prefix"] == "El príncipe de Bel-Air/Season 01"
 
 
 def test_health_checks_destination_without_running_atomic_probe(layout):

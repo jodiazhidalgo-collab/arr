@@ -15,7 +15,12 @@ import pytest
 from arr_orchestrator.config import Config
 from arr_orchestrator.db import Database
 import arr_orchestrator.engine as engine_module
-from arr_orchestrator.engine import Engine, WORKER_ACTIVE_MAX_SECONDS
+from arr_orchestrator.engine import (
+    Engine,
+    SERIES_REVIEW_SIGNATURE_SHA256_V1,
+    SERIES_REVIEW_SIGNATURE_STAT_V1,
+    WORKER_ACTIVE_MAX_SECONDS,
+)
 from arr_orchestrator.filesystem import ExtractionError, review_content_signature
 from arr_orchestrator.series_worker import (
     SeriesWorkerBusy,
@@ -76,7 +81,7 @@ def _config(root: Path, series_mode: str = "active") -> Config:
         resolver_retry_seconds=60,
         series_worker_url="http://series-worker:8791",
         series_reports_root=root / "config" / "series-worker",
-        series_review_dir=data / "media" / "repetidas_vs_error_series",
+        series_review_dir=data / "media" / "series-review-test",
         series_mode=series_mode,
     )
 
@@ -640,7 +645,7 @@ def test_not_found_retries_only_the_idempotent_worker_post(tmp_path: Path) -> No
         database.close()
 
 
-def test_conflict_preserves_whole_job_in_series_review(tmp_path: Path) -> None:
+def test_conflict_uses_clean_human_series_review_layout(tmp_path: Path) -> None:
     engine, database = _engine(tmp_path)
     try:
         job, job_root, _, _ = _series_job(engine, database)
@@ -661,8 +666,14 @@ def test_conflict_preserves_whole_job_in_series_review(tmp_path: Path) -> None:
         review = Path(updated["stage_path"])
         assert updated["state"] == "manual_review"
         assert review.parent == engine.config.series_review_dir
-        assert (review / "series_filebot_output" / "Mi Serie" / "Season 01").is_dir()
-        assert (review / "original" / "readme.nfo").read_text(encoding="utf-8") == "keep"
+        assert review.name == "Mi Serie - S01E01"
+        assert (review / "Mi Serie - S01E01.mkv").read_bytes() == b"episode-one"
+        assert (review / "Serie repetida.txt").is_file()
+        reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert reason["profile"] == "series"
+        assert reason["category"] == "tv"
+        assert reason["reason"] == "job_conflict"
+        assert not any(review.rglob("*.nfo"))
         assert not job_root.exists()
     finally:
         database.close()
@@ -760,6 +771,261 @@ def test_verified_worker_review_allows_client_and_workshop_cleanup(tmp_path: Pat
         assert not any(engine.config.tv_output.iterdir())
     finally:
         database.close()
+
+
+def test_clean_worker_review_is_validated_inside_the_shared_review_root(
+    tmp_path: Path,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        engine.config = replace(
+            engine.config,
+            series_review_dir=engine.config.review_dir,
+        )
+        job, _job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        review = engine.config.review_dir / "Mi Serie - S01E01"
+        shutil.move(str(episode.parent), str(review))
+        reason = {
+            "schema": "series-review-v1",
+            "profile": "series",
+            "category": "tv",
+            "job_id": str(job["job_id"]),
+            "manifest_digest": str(manifest["digest"]),
+            "reasons": ["colision_existente"],
+            "review_layout": "season_root",
+            "review_source_prefix": "Mi Serie/Season 01",
+        }
+        (review / "reason.json").write_text(
+            json.dumps(reason, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (review / "Serie repetida.txt").write_text(
+            "Serie repetida\ncolision_existente\n",
+            encoding="utf-8",
+        )
+        result = {
+            "status": "review",
+            "job_id": str(job["job_id"]),
+            "kind": "series",
+            "rules_fingerprint": RULES_FINGERPRINT,
+            "manifest": manifest,
+            "review_path": review.name,
+            "review_layout": "season_root",
+            "review_source_prefix": "Mi Serie/Season 01",
+            "review_reasons": ["colision_existente"],
+            "published": [],
+        }
+
+        validated = engine._validate_series_worker_result(job, result)
+
+        assert validated == review
+        assert {path.name for path in review.iterdir()} == {
+            "Mi Serie S01E01.mkv",
+            "Serie repetida.txt",
+            "reason.json",
+        }
+    finally:
+        database.close()
+
+
+def test_historical_worker_review_uses_legacy_root_only_with_durable_request(
+    tmp_path: Path,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, source_root, episode = _series_job(engine, database)
+        manifest = _manifest(episode, source_root)
+        legacy_root = engine.config.data_root / "media" / "repetidas_vs_error_series"
+        legacy_root.mkdir(parents=True)
+        review = legacy_root / "Mi Serie - S01E01"
+        shutil.move(str(episode.parent), str(review))
+        reason = {
+            "schema": "series-review-v1",
+            "profile": "series",
+            "category": "tv",
+            "job_id": str(job["job_id"]),
+            "manifest_digest": str(manifest["digest"]),
+            "reasons": ["colision_existente"],
+            "review_layout": "season_root",
+            "review_source_prefix": "Mi Serie/Season 01",
+        }
+        (review / "reason.json").write_text(
+            json.dumps(reason, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        (review / "Serie repetida.txt").write_text("Serie repetida\n", encoding="utf-8")
+        result = {
+            "status": "review",
+            "job_id": str(job["job_id"]),
+            "kind": "series",
+            "rules_fingerprint": RULES_FINGERPRINT,
+            "manifest": manifest,
+            "review_path": review.name,
+            "review_layout": "season_root",
+            "review_source_prefix": "Mi Serie/Season 01",
+            "review_reasons": ["colision_existente"],
+            "published": [],
+        }
+
+        with pytest.raises(ValueError, match="destino válido"):
+            engine._validate_series_worker_result(job, result)
+
+        request_dir = engine.config.series_reports_root / str(job["job_id"])
+        request_dir.mkdir(parents=True)
+        (request_dir / "request.json").write_text(
+            json.dumps(
+                {
+                    "payload": {
+                        "job_id": str(job["job_id"]),
+                        "review_root": str(legacy_root),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert engine._validate_series_worker_result(job, result) == review
+        current_review = engine.config.series_review_dir / "fallback-current"
+        current_review.mkdir()
+        assert (
+            engine._series_review_root_for_job(
+                str(job["job_id"]),
+                current_review,
+            )
+            == engine.config.series_review_dir
+        )
+    finally:
+        database.close()
+
+
+def test_orchestrator_fallback_uses_the_same_clean_series_review_layout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        engine.config = replace(
+            engine.config,
+            series_review_dir=engine.config.review_dir,
+        )
+        job, job_root, _source_root, episode = _series_job(engine, database)
+        episode.with_name(f"{episode.stem}.es.forced.srt").write_text(
+            "subtitle",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: True)
+
+        preserved = engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_worker_unavailable",
+            "fallo controlado",
+        )
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        assert preserved is True
+        assert updated["state"] == "manual_review"
+        assert review.parent == engine.config.review_dir
+        assert review.name == "Mi Serie - S01E01"
+        assert {path.name for path in review.iterdir()} == {
+            "Mi Serie - S01E01.mkv",
+            "Mi Serie - S01E01.es.forced.srt",
+            "Serie repetida.txt",
+            "reason.json",
+        }
+        assert (review / "Mi Serie - S01E01.es.forced.srt").read_text(
+            encoding="utf-8"
+        ) == "subtitle"
+        reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
+        assert reason["profile"] == "series"
+        assert reason["category"] == "tv"
+        assert not job_root.exists()
+    finally:
+        database.close()
+
+
+def test_orchestrator_fallback_preserves_whole_tree_for_unknown_output_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, source_root, _episode = _series_job(engine, database)
+        unknown = source_root / "Mi Serie" / "Season 01" / "subtitulo_original.sup"
+        unknown.write_bytes(b"subtitle-image")
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: True)
+
+        assert engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_worker_unavailable",
+            "fallo controlado",
+        )
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        assert review.parent == engine.config.series_review_dir
+        assert next(review.rglob("*.sup")).read_bytes() == b"subtitle-image"
+        assert next(review.rglob("*.mkv")).read_bytes() == b"episode-one"
+        assert (review / "series_filebot_output").is_dir()
+        assert not job_root.exists()
+    finally:
+        database.close()
+
+
+def test_orchestrator_fallback_preserves_unknown_file_outside_filebot_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, _source_root, _episode = _series_job(engine, database)
+        unknown = job_root / "original" / "subtitulo_original.sup"
+        unknown.parent.mkdir()
+        unknown.write_bytes(b"subtitle-image")
+        monkeypatch.setattr(engine, "_cleanup_clients", lambda *_args, **_kwargs: True)
+
+        assert engine._preserve_series_job_for_review(
+            job,
+            job_root,
+            "series_worker_unavailable",
+            "fallo controlado",
+        )
+
+        updated = database.get_job(str(job["job_id"]))
+        review = Path(str(updated["stage_path"]))
+        assert next(review.rglob("*.sup")).read_bytes() == b"subtitle-image"
+        assert next(review.rglob("*.mkv")).read_bytes() == b"episode-one"
+        assert (review / "original").is_dir()
+        assert not job_root.exists()
+    finally:
+        database.close()
+
+
+def test_review_signature_never_reads_the_video_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    review = tmp_path / "review"
+    review.mkdir()
+    video = review / "Serie - S01E01.mkv"
+    video.write_bytes(b"video")
+
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("la firma no debe leer el vídeo")
+        ),
+    )
+
+    signature = review_content_signature(review, whole_tree=True)
+
+    assert len(signature) == 1
+    assert signature[0][0] == video.name
+    assert signature[0][1] == video.stat().st_size
 
 
 @pytest.mark.parametrize("worker_status", ["active", "recoverable"])
@@ -2009,6 +2275,7 @@ def test_series_review_cleanup_recovers_after_workshop_was_already_removed(
                     "status": "review",
                     "review_reasons": ["test"],
                     "_arr_review_signature": review_signature,
+                    "_arr_review_signature_method": SERIES_REVIEW_SIGNATURE_STAT_V1,
                 }
             ),
         )
@@ -2037,6 +2304,7 @@ def test_review_cleanup_revalidates_copy_before_clients_and_workshop(
             "status": "review",
             "review_reasons": ["test"],
             "_arr_review_signature": engine._series_review_signature_digest(review),
+            "_arr_review_signature_method": SERIES_REVIEW_SIGNATURE_STAT_V1,
         }
         pending = database.transition(
             str(job["job_id"]),
@@ -2072,6 +2340,81 @@ def test_review_cleanup_revalidates_copy_before_clients_and_workshop(
         assert updated["last_error_code"] == "series_worker_review_integrity_failed"
         assert cleanup_calls == [True]
         assert job_root.is_dir()
+    finally:
+        database.close()
+
+
+def test_series_review_cleanup_accepts_legacy_sha256_signature(
+    tmp_path: Path,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, job_root, _, _ = _series_job(engine, database)
+        review = engine.config.series_review_dir / "legacy-verified-review"
+        review.mkdir()
+        (review / "episode.mkv").write_bytes(b"preserved")
+        legacy_signature = engine._series_review_signature_digest(
+            review,
+            SERIES_REVIEW_SIGNATURE_SHA256_V1,
+        )
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision verificada antigua",
+            stage_path=str(review),
+            result_json=json.dumps(
+                {
+                    "status": "review",
+                    "review_reasons": ["legacy"],
+                    "_arr_review_signature": legacy_signature,
+                }
+            ),
+        )
+        shutil.rmtree(job_root)
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        assert updated["state"] == "manual_review"
+        assert Path(str(updated["stage_path"])) == review
+    finally:
+        database.close()
+
+
+def test_legacy_review_without_signature_compares_content_not_mtime(
+    tmp_path: Path,
+) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        job, _job_root, source_root, source_episode = _series_job(engine, database)
+        review = engine.config.series_review_dir / "legacy-unsigned-review"
+        shutil.copytree(source_root, review)
+        review_episode = next(review.rglob("*.mkv"))
+        os.utime(
+            review_episode,
+            ns=(source_episode.stat().st_atime_ns, source_episode.stat().st_mtime_ns + 1),
+        )
+        pending = database.transition(
+            str(job["job_id"]),
+            "series_review_cleanup",
+            "series_review",
+            "Revision antigua sin firma",
+            stage_path=str(review),
+            result_json=json.dumps(
+                {
+                    "status": "review",
+                    "review_reasons": ["legacy-unsigned"],
+                }
+            ),
+        )
+
+        engine._run_series_review_cleanup(pending)
+
+        updated = database.get_job(str(job["job_id"]))
+        result = json.loads(str(updated["result_json"]))
+        assert updated["state"] == "manual_review"
+        assert result["_arr_review_signature_method"] == SERIES_REVIEW_SIGNATURE_SHA256_V1
     finally:
         database.close()
 

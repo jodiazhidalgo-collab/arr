@@ -157,7 +157,7 @@ def _payload(job_id="job-1"):
         "job_root": "/data/downloads/torrents/complete/taller/" + job_id,
         "source_root": "/data/downloads/torrents/complete/taller/" + job_id + "/series_filebot_output",
         "final_root": "/data/media/tv",
-        "review_root": "/data/media/repetidas_vs_error_series",
+        "review_root": "/data/media/repetidas_vs_error",
         "reports_root": "/config/series-worker",
         "callback_url": "",
     }

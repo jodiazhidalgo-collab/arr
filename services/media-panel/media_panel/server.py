@@ -24,12 +24,14 @@ DEFAULT_RULES_PATH = Path(os.environ.get("MEDIA_DEFAULT_RULES_PATH", "/defaults/
 REPORT_ROOT = Path(os.environ.get("MEDIA_REPORT_ROOT", "/config/media-worker"))
 REVIEW_DIR = Path(os.environ.get("MEDIA_REVIEW_DIR", "/data/media/repetidas_vs_error"))
 SERIES_REPORT_ROOT = Path("/config/series-worker")
-SERIES_REVIEW_DIR = Path("/data/media/repetidas_vs_error_series")
+SERIES_REVIEW_DIR = Path(
+    os.environ.get("SERIES_REVIEW_DIR", "/data/media/repetidas_vs_error")
+)
 SERIES_RULES_PATH = Path(
     os.environ.get("SERIES_RULES_PATH", "/config/series-rules/reglas_series.json")
 )
 SERIES_REPORT_ALIAS = "<CONFIG>/series-worker"
-SERIES_REVIEW_ALIAS = "<DATA_MEDIA>/repetidas_vs_error_series"
+SERIES_REVIEW_ALIAS = "<DATA_MEDIA>/repetidas_vs_error"
 SERIES_RULES_ALIAS = "<CONFIG>/series-rules/reglas_series.json"
 COMPLETE_ROOT = Path(os.environ.get("ARR_COMPLETE_ROOT", "/data/downloads/torrents/complete"))
 MOVIES_ROOT = Path(os.environ.get("ARR_MOVIES_ROOT", "/data/media/movies"))
@@ -54,12 +56,18 @@ SERIES_EVIDENCE_RE = re.compile(
     r"(?:^|[^a-z0-9])(?:s\d{1,2}e\d{1,3}|season\s*\d+|temporada\s*\d+|series?)(?:[^a-z0-9]|$)",
     re.IGNORECASE,
 )
+SERIES_EPISODE_EVIDENCE_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:s\d{1,2}e\d{1,3}|season\s*\d+|temporada\s*\d+)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
 MOVIE_EVIDENCE_RE = re.compile(
     r"(?:^|[^a-z0-9])(?:pel[ií]cula|movies?|trailers?|(?:19|20)\d{2})(?:[^a-z0-9]|$)",
     re.IGNORECASE,
 )
 MAX_PROFILE_EVIDENCE_PATHS = 200
 MAX_REPORT_METADATA_BYTES = 512 * 1024
+MAX_REVIEW_JOB_DETAIL_LOOKUPS = 4
+REVIEW_JOB_DETAIL_TIMEOUT_SEC = 2
 SERIES_JOB_DIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SERIES_TECHNICAL_REPORT_FILES = frozenset(
     {
@@ -904,14 +912,21 @@ def _profile_from_metadata(value: object) -> Optional[str]:
 
 
 def _profile_from_text_evidence(text: str) -> Optional[str]:
-    if SERIES_EVIDENCE_RE.search(text):
+    if SERIES_EPISODE_EVIDENCE_RE.search(text):
         return "series"
     if MOVIE_EVIDENCE_RE.search(text):
         return "movies"
+    if SERIES_EVIDENCE_RE.search(text):
+        return "series"
     return None
 
 
 def _review_structure_profile(folder: Path, reason_file: str) -> Optional[str]:
+    reason_label = reason_file.casefold()
+    if "serie" in reason_label:
+        return "series"
+    if any(label in reason_label for label in ("pelicula", "película", "movie", "trailer")):
+        return "movies"
     evidence = [folder.name, reason_file]
     try:
         for index, child in enumerate(folder.rglob("*")):
@@ -940,14 +955,33 @@ def _review_item_profile(
 def _job_contexts(job_ids: set[str]) -> Dict[str, Dict[str, Any]]:
     if not job_ids:
         return {}
-    jobs = _jobs_payload().get("jobs", [])
-    if not isinstance(jobs, list):
+    jobs_response = _jobs_payload()
+    if not jobs_response.get("ok"):
         return {}
-    return {
+    jobs = jobs_response.get("jobs", [])
+    if not isinstance(jobs, list):
+        jobs = []
+    contexts = {
         str(job.get("job_id")): job
         for job in jobs
         if isinstance(job, dict) and str(job.get("job_id") or "") in job_ids
     }
+    unresolved = sorted(job_ids - set(contexts))[:MAX_REVIEW_JOB_DETAIL_LOOKUPS]
+    for job_id in unresolved:
+        detail = _upstream_json(
+            f"{ORCH_URL}/jobs/{urllib.parse.quote(job_id)}",
+            timeout=REVIEW_JOB_DETAIL_TIMEOUT_SEC,
+        )
+        if isinstance(detail, dict) and _profile_from_metadata(detail) is not None:
+            contexts[job_id] = detail
+    return contexts
+
+
+def _shared_review_root() -> bool:
+    try:
+        return REVIEW_DIR.samefile(SERIES_REVIEW_DIR)
+    except OSError:
+        return REVIEW_DIR.resolve(strict=False) == SERIES_REVIEW_DIR.resolve(strict=False)
 
 
 def _job_id_from_path(path: Path) -> str:
@@ -1029,15 +1063,17 @@ def _review_payload(
     limit: int = 80,
     profile: Optional[str] = None,
 ) -> Dict[str, Any]:
-    series_owned = profile == "series"
-    review_root = SERIES_REVIEW_DIR if series_owned else REVIEW_DIR
+    series_view = profile == "series"
+    review_root = SERIES_REVIEW_DIR if series_view else REVIEW_DIR
+    shared_root = _shared_review_root()
+    dedicated_series_root = series_view and not shared_root
     root_connected = review_root.is_dir() and (
-        not series_owned or not review_root.is_symlink()
+        not series_view or not review_root.is_symlink()
     )
     records: List[Dict[str, Any]] = []
     if root_connected:
         for folder in sorted(review_root.iterdir(), key=_mtime, reverse=True):
-            if series_owned:
+            if series_view or shared_root:
                 folder_name = folder.name.lower()
                 if (
                     folder.name.startswith(".")
@@ -1052,23 +1088,19 @@ def _review_payload(
             txts = sorted(
                 path
                 for path in folder.glob("*.txt")
-                if not series_owned or not path.is_symlink()
+                if not (series_view or shared_root) or not path.is_symlink()
             )
             reason_json = folder / "reason.json"
             payload = (
                 {}
-                if series_owned and reason_json.is_symlink()
+                if (series_view or shared_root) and reason_json.is_symlink()
                 else _read_json(reason_json)
             )
             reason_file = txts[0].name if txts else ""
             item_profile = (
                 "series"
-                if series_owned
-                else _review_item_profile(
-                    payload,
-                    reason_file,
-                    folder=folder,
-                )
+                if dedicated_series_root
+                else _review_item_profile(payload, reason_file)
             )
             records.append(
                 {
@@ -1087,7 +1119,7 @@ def _review_payload(
     }
     contexts = (
         _job_contexts(unresolved_job_ids)
-        if profile is not None and not series_owned
+        if profile is not None and not dedicated_series_root
         else {}
     )
     items: List[Dict[str, Any]] = []
@@ -1099,15 +1131,18 @@ def _review_payload(
         job_id = str(payload.get("job_id") or "")
         item_profile = (
             "series"
-            if series_owned
+            if dedicated_series_root
             else record["profile"]
             or _profile_from_metadata(contexts.get(job_id))
+            or _review_structure_profile(folder, record["reason_file"])
         )
-        if not series_owned and profile is not None and item_profile not in {None, profile}:
+        if series_view and item_profile != "series":
+            continue
+        if profile == "movies" and item_profile == "series":
             continue
         reason_path = record["reason_path"]
         reason_text = _short_text(reason_path, 2000) if reason_path else ""
-        if series_owned:
+        if series_view:
             reason_text = _sanitize_series_text(reason_text)
         items.append(
             {
@@ -1117,7 +1152,7 @@ def _review_payload(
                         SERIES_REVIEW_ALIAS,
                         folder.relative_to(review_root),
                     )
-                    if series_owned
+                    if series_view or shared_root
                     else str(folder)
                 ),
                 "mtime": _mtime(folder),
@@ -1132,12 +1167,16 @@ def _review_payload(
         )
     result: Dict[str, Any] = {
         "ok": True,
-        "review_dir": SERIES_REVIEW_ALIAS if series_owned else str(REVIEW_DIR),
+        "review_dir": (
+            SERIES_REVIEW_ALIAS
+            if series_view or shared_root
+            else str(REVIEW_DIR)
+        ),
         "items": items,
     }
     if profile is not None:
         result["profile"] = profile
-    if series_owned:
+    if series_view:
         result["connected"] = root_connected
         if not root_connected:
             result["message"] = SERIES_NOT_CONNECTED_MESSAGE
