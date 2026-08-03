@@ -4,8 +4,12 @@ import importlib
 import logging
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import uuid
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -15,21 +19,25 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 ORCHESTRATOR_DIR = PROJECT_ROOT / "services" / "arr-orchestrator"
 BUSCADOR_DIR = PROJECT_ROOT / "services" / "buscador-puente-arr"
 PYTEST_SESSION_TOKEN = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
-PYTEST_TEMP_DIR = (
-    PROJECT_ROOT / "_codex_runtime" / "tmp" / f"pytest-{PYTEST_SESSION_TOKEN}"
+PYTEST_LOCAL_ROOT = Path(
+    os.environ.get(
+        "ARR_PYTEST_LOCAL_ROOT",
+        str(Path(tempfile.gettempdir()) / "arr-pytest"),
+    )
 )
-PYTEST_DATA_DIR = (
-    PROJECT_ROOT
-    / "_codex_runtime"
-    / "test-data"
-    / f"pytest-session-{PYTEST_SESSION_TOKEN}"
+PYTEST_SESSION_ROOT = PYTEST_LOCAL_ROOT / f"pytest-{PYTEST_SESSION_TOKEN}"
+PYTEST_TEMP_DIR = PYTEST_SESSION_ROOT / "tmp"
+PYTEST_DATA_DIR = PYTEST_SESSION_ROOT / "test-data"
+PYTEST_FAILURE_DIR = (
+    PROJECT_ROOT / "_codex_runtime" / "artifacts" / "pytest-failures"
 )
+PYTEST_FAILURE_KEEP = 5
 ARR_DATA_DIR = PYTEST_DATA_DIR / "arr"
 BUSCADOR_DATA_DIR = PYTEST_DATA_DIR / "buscador"
 
 
-def _remove_pytest_session_data() -> None:
-    session_root = PYTEST_DATA_DIR.resolve()
+def _close_pytest_session_handlers() -> None:
+    session_root = PYTEST_SESSION_ROOT.resolve()
     for logger_object in tuple(logging.Logger.manager.loggerDict.values()):
         if not isinstance(logger_object, logging.Logger):
             continue
@@ -43,18 +51,89 @@ def _remove_pytest_session_data() -> None:
                 continue
             logger_object.removeHandler(handler)
             handler.close()
-    shutil.rmtree(PYTEST_DATA_DIR, ignore_errors=True)
+
+
+def _archive_failed_session(
+    session_root: Path = PYTEST_SESSION_ROOT,
+    failure_dir: Path = PYTEST_FAILURE_DIR,
+    keep: int = PYTEST_FAILURE_KEEP,
+) -> Path | None:
+    if not session_root.exists():
+        return None
+    failure_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = failure_dir / (
+        f"pytest-failure-{time.strftime('%Y%m%d_%H%M%S')}-{time.time_ns()}-"
+        f"{PYTEST_SESSION_TOKEN}.zip"
+    )
+    temporary_archive = archive_path.with_suffix(".tmp")
+    with zipfile.ZipFile(
+        temporary_archive,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=1,
+    ) as archive:
+        for path in sorted(session_root.rglob("*")):
+            relative = path.relative_to(session_root).as_posix()
+            if path.is_dir():
+                archive.writestr(f"{relative}/", b"")
+            elif path.is_file():
+                archive.write(path, relative)
+    with zipfile.ZipFile(temporary_archive, "r") as archive:
+        if archive.testzip() is not None:
+            raise RuntimeError("El ZIP de evidencia pytest no es valido")
+    temporary_archive.replace(archive_path)
+    failure_zips = sorted(
+        failure_dir.glob("pytest-failure-*.zip"),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    for old_archive in failure_zips[max(1, keep) :]:
+        old_archive.unlink(missing_ok=True)
+    return archive_path
+
+
+def _schedule_session_cleanup(session_root: Path = PYTEST_SESSION_ROOT) -> None:
+    cleanup_code = (
+        "import pathlib, shutil, sys, time; "
+        "root = pathlib.Path(sys.argv[1]); "
+        "time.sleep(1); "
+        "[(shutil.rmtree(root, ignore_errors=True), time.sleep(1)) "
+        "for _ in range(60) if root.exists()]"
+    )
+    options = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        options["creationflags"] = (
+            subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        )
+    else:
+        options["start_new_session"] = True
+    subprocess.Popen(
+        [sys.executable, "-B", "-c", cleanup_code, str(session_root)],
+        **options,
+    )
 
 
 def pytest_sessionfinish(session, exitstatus) -> None:
-    if exitstatus == pytest.ExitCode.OK:
-        _remove_pytest_session_data()
-        shutil.rmtree(PYTEST_TEMP_DIR, ignore_errors=True)
+    _close_pytest_session_handlers()
+    try:
+        if exitstatus != pytest.ExitCode.OK:
+            _archive_failed_session()
+    finally:
+        shutil.rmtree(PYTEST_SESSION_ROOT, ignore_errors=True)
+        if PYTEST_SESSION_ROOT.exists():
+            _schedule_session_cleanup()
 
 
 def pytest_configure(config) -> None:
-    """Aísla tmp_path por proceso para permitir revisiones simultáneas."""
+    """Aísla cada sesión en el disco local, fuera del recurso SMB."""
 
+    PYTEST_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    tempfile.tempdir = str(PYTEST_TEMP_DIR)
     config.option.basetemp = str(PYTEST_TEMP_DIR)
 
 
@@ -70,6 +149,9 @@ def _setdefault_path(name: str, path: Path) -> None:
 
 
 os.environ.setdefault("ARR_MODE", "dry-run")
+os.environ["ARR_PYTEST_SESSION_ROOT"] = str(PYTEST_SESSION_ROOT)
+os.environ["ARR_PYTEST_TEMP_DIR"] = str(PYTEST_TEMP_DIR)
+os.environ["ARR_PYTEST_DATA_DIR"] = str(PYTEST_DATA_DIR)
 _setdefault_path("ARR_CONFIG_DIR", ARR_DATA_DIR / "config")
 _setdefault_path("ARR_DATA_ROOT", ARR_DATA_DIR / "data")
 _setdefault_path("CODEX_DIAG_ROOT", ARR_DATA_DIR / "diagnosticos_codex")

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import threading
@@ -46,7 +47,7 @@ from arr_orchestrator.name_resolver import ResolvedIdentity, ResolverUnavailable
 from arr_orchestrator.name_resolver import ResolverAmbiguous
 
 
-RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
+RUNTIME_TEST_ROOT = Path(os.environ["ARR_PYTEST_DATA_DIR"])
 
 
 def test_config(root: Path) -> Config:

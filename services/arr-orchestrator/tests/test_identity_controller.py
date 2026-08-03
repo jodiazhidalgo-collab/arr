@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ from arr_orchestrator.identity.defaults import (
 from arr_orchestrator.identity.fingerprint import identity_fingerprint
 
 
-RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
+RUNTIME_TEST_ROOT = Path(os.environ["ARR_PYTEST_DATA_DIR"])
 
 
 def _config(**overrides):

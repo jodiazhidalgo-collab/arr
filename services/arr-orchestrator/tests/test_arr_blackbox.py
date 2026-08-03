@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -21,12 +22,7 @@ EXPECTED_READ_ORDER = [
     "related_files.json",
     "meta.json",
 ]
-RUNTIME_TMP_ROOT = (
-    Path(__file__).resolve().parents[3]
-    / "_codex_runtime"
-    / "tmp"
-    / "test_arr_blackbox"
-)
+RUNTIME_TMP_ROOT = Path(os.environ["ARR_PYTEST_TEMP_DIR"]) / "test_arr_blackbox"
 
 
 def _temporary_directory(**kwargs):

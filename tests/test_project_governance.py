@@ -84,7 +84,9 @@ def test_git_hooks_and_ci_are_present():
     codeowners = read(".github/CODEOWNERS")
 
     assert "git diff --cached --check" in hook
-    assert "compileall -q conftest.py services tests" in hook
+    assert "PYTHON_SYNTAX_OK" in hook
+    assert "compileall" not in hook
+    assert "-p no:cacheprovider" in hook
     assert "node --check services/media-panel/media_panel/web/static/js/panel.js" in hook
     assert "pytest" in hook
     assert "requirements-dev.txt" in workflow
@@ -100,6 +102,20 @@ def test_git_hooks_and_ci_are_present():
     assert "actions/setup-node@v6" in workflow
     assert "actions/upload-artifact@v7" in workflow
     assert "@jodiazhidalgo-collab" in codeowners
+
+
+def test_git_close_is_fast_and_cleanup_never_scans_the_whole_repo():
+    close_script = read(".agents/skills/cerrar-git-arr/scripts/close_git.ps1")
+    cleaner = read(".agents/skills/limpiar-residuos-arr/scripts/clean_residues.ps1")
+    agents = read("AGENTS.md")
+
+    assert "CLEAN_SKIPPED_FAST_CLOSE" in close_script
+    assert "if ($Clean -or $DryRunClean)" in close_script
+    assert "Get-ChildItem -Path $Root -Recurse" not in cleaner
+    assert 'foreach ($legacyRuntime in @("tmp", "test-data"))' in cleaner
+    assert "pytest_failure_keep_latest" in cleaner
+    assert "%TEMP%\\arr-pytest" in agents
+    assert "Nunca se barre todo el repositorio en cada commit" in agents
 
 
 def test_review_docs_match_the_validation_contract():

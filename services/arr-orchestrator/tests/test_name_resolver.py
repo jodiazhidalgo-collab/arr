@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ from arr_orchestrator.name_resolver import (
 )
 
 
-RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
+RUNTIME_TEST_ROOT = Path(os.environ["ARR_PYTEST_DATA_DIR"])
 
 
 class FakeResponse:

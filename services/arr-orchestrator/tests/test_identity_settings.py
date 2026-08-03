@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import threading
 import unittest
 from pathlib import Path
@@ -22,7 +23,7 @@ from arr_orchestrator.identity.resolver_defaults import (
 )
 
 
-RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
+RUNTIME_TEST_ROOT = Path(os.environ["ARR_PYTEST_DATA_DIR"])
 
 
 def _leaf_paths(value, prefix=""):

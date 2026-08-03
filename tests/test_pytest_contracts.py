@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import configparser
 import json
+import shutil
+import zipfile
 from pathlib import Path
+
+import conftest as root_conftest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +34,34 @@ def test_pytest_root_configuration_matches_arr_layout():
     conftest = (PROJECT_ROOT / "conftest.py").read_text(encoding="utf-8")
     assert "PYTEST_SESSION_TOKEN" in conftest
     assert "config.option.basetemp = str(PYTEST_TEMP_DIR)" in conftest
+    assert "PYTEST_FAILURE_KEEP = 5" in conftest
+    assert "shutil.rmtree(PYTEST_SESSION_ROOT" in conftest
+
+
+def test_pytest_runtime_is_local_and_failed_sessions_keep_only_five_zips(tmp_path):
+    assert root_conftest.PYTEST_LOCAL_ROOT.name == "arr-pytest"
+    assert PROJECT_ROOT not in root_conftest.PYTEST_SESSION_ROOT.parents
+    assert root_conftest.PYTEST_FAILURE_DIR == (
+        PROJECT_ROOT / "_codex_runtime" / "artifacts" / "pytest-failures"
+    )
+
+    source = tmp_path / "source"
+    failure_dir = tmp_path / "failures"
+    for index in range(7):
+        source.mkdir(parents=True)
+        (source / f"fallo-{index}.txt").write_text("fallo", encoding="utf-8")
+        archive_path = root_conftest._archive_failed_session(
+            source,
+            failure_dir,
+            keep=5,
+        )
+        assert archive_path is not None
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            assert archive.testzip() is None
+        shutil.rmtree(source)
+
+    archives = sorted(failure_dir.glob("pytest-failure-*.zip"))
+    assert len(archives) == 5
 
 
 def test_requirements_dev_documents_service_scoped_dependencies():

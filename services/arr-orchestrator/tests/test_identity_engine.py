@@ -1,5 +1,6 @@
 import copy
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -12,7 +13,7 @@ from arr_orchestrator.identity.fingerprint import identity_fingerprint
 from test_core import test_config
 
 
-RUNTIME_TEST_ROOT = Path(__file__).resolve().parents[3] / "_codex_runtime" / "test-data"
+RUNTIME_TEST_ROOT = Path(os.environ["ARR_PYTEST_DATA_DIR"])
 
 
 class IdentityEngineIntegrationTests(unittest.TestCase):

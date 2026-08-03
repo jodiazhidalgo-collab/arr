@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 set -eu
+export PYTHONDONTWRITEBYTECODE=1
 
 echo "ARR pre-commit: git diff --check"
 git diff --cached --check
@@ -14,8 +15,8 @@ else
   PYTHON_BIN="python"
 fi
 
-echo "ARR pre-commit: compileall"
-"$PYTHON_BIN" -m compileall -q conftest.py services tests
+echo "ARR pre-commit: sintaxis Python sin caches"
+"$PYTHON_BIN" -c "from pathlib import Path; files=[Path('conftest.py'), *Path('services').rglob('*.py'), *Path('tests').rglob('*.py')]; [compile(path.read_bytes(), str(path), 'exec') for path in files]; print(f'PYTHON_SYNTAX_OK {len(files)}')"
 
 if ! command -v node >/dev/null 2>&1; then
   echo "ARR pre-commit: node no esta disponible para validar panel.js" >&2
@@ -29,7 +30,7 @@ git ls-files '*.js' | while IFS= read -r JS_FILE; do
 done
 
 echo "ARR pre-commit: contratos rapidos"
-"$PYTHON_BIN" -m pytest -q \
+"$PYTHON_BIN" -m pytest -q -p no:cacheprovider \
   tests/test_project_governance.py \
   tests/test_pytest_contracts.py \
   services/arr-orchestrator/tests/test_arr_blackbox.py \

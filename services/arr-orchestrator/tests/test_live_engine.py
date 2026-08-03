@@ -17,7 +17,7 @@ from arr_orchestrator.engine import Engine
 class LiveEngineTests(unittest.TestCase):
     def setUp(self):
         candidates = [
-            Path(__file__).resolve().parents[3] / "_codex_runtime" / "tmp",
+            Path(os.environ["ARR_PYTEST_TEMP_DIR"]),
             Path(tempfile.gettempdir()) / "_codex_runtime" / "tmp",
         ]
         self.temporary = None
@@ -33,7 +33,7 @@ class LiveEngineTests(unittest.TestCase):
             except OSError:
                 continue
         if self.temporary is None:
-            self.fail("No existe una ubicación escribible para _codex_runtime/tmp")
+            self.fail("No existe una ubicación temporal local escribible")
         self.root = Path(self.temporary.name)
         base = Config.from_env()
         data = self.root / "data"
