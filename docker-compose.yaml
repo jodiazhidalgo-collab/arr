@@ -230,6 +230,7 @@ services:
     volumes:
       - ${ARR_ROOT}/config/rdtclient:/data/db
       - ${ARR_DATA_ROOT}/downloads/torrents/complete:/data/downloads
+      - ${ARR_DATA_ROOT}/media/Hospital:/data/downloads/Hospital
     ports:
       - "6500:6500"
     restart: unless-stopped

@@ -171,6 +171,12 @@ SERIES_REVIEW_REASON_SPECS = {
         "La extracción del pack no se pudo completar correctamente.",
     ),
 }
+
+
+def _is_hospital_category(value: object) -> bool:
+    return str(value or "").strip().casefold() == "hospital"
+
+
 SERIES_WORKER_REVIEW_CODES_V2 = {
     "duplicate": "series_duplicate",
     "audio": "series_audio_invalid",
@@ -1146,6 +1152,8 @@ class Engine:
             return
         self.dependencies["qbittorrent"] = "ok"
         for torrent in torrents:
+            if _is_hospital_category(torrent.get("category")):
+                continue
             infohash = str(torrent.get("hash") or "").lower()
             content_path = Path(str(torrent.get("content_path") or ""))
             if not infohash or not content_path.exists():
@@ -1355,12 +1363,20 @@ class Engine:
             for line in content.splitlines()
             if "=" in line
         )
+        if _is_hospital_category(fields.get("category")):
+            self.log.info("Evento qB ignorado por categoría Hospital: %s", path.name)
+            path.unlink(missing_ok=True)
+            return
         infohash = fields.get("hash", "").strip().lower()
         if len(infohash) < 32:
             self.log.warning("Evento qB inválido: %s -> %r", path, infohash)
             return
         torrent = self.qbt.torrent(infohash)
         if not torrent:
+            return
+        if _is_hospital_category(torrent.get("category")):
+            self.log.info("Evento qB ignorado por categoría Hospital: %s", path.name)
+            path.unlink(missing_ok=True)
             return
         progress = float(torrent.get("progress") or 0)
         completion_on = int(torrent.get("completion_on") or 0)

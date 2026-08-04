@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -337,6 +338,149 @@ class CoreTests(unittest.TestCase):
                 any(event["phase"] == "qbt" for event in database.job_detail(job["job_id"])["timeline"])
             )
             database.close()
+
+    def test_reconcile_qbt_ignores_hospital_without_creating_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            content = config.complete_root / "movies" / "Hospital" / "archivo.mkv"
+            content.parent.mkdir(parents=True)
+            content.write_bytes(b"hospital")
+
+            class FakeQbt:
+                def torrents(self, _torrent_filter):
+                    return [
+                        {
+                            "hash": "c" * 40,
+                            "category": "hOsPiTaL",
+                            "name": "Hospital",
+                            "content_path": str(content),
+                            "added_on": 123,
+                        }
+                    ]
+
+            engine.qbt = FakeQbt()
+            engine._reconcile_qbt()
+
+            self.assertEqual(database.latest_jobs(), [])
+            database.close()
+
+    def test_qbt_event_declared_hospital_is_deleted_before_query(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            infohash = "d" * 40
+            event_path = config.event_dir / "hospital.event"
+            event_path.write_text(
+                f"hash={infohash}\ncategory=HoSpItAl\n",
+                encoding="utf-8",
+            )
+            engine.qbt = Mock()
+            engine.qbt.torrent.side_effect = AssertionError("qB no debe consultarse")
+
+            engine._handle_qbt_event(event_path)
+
+            engine.qbt.torrent.assert_not_called()
+            self.assertFalse(event_path.exists())
+            self.assertEqual(database.latest_jobs(), [])
+            database.close()
+
+    def test_qbt_event_from_hospital_torrent_is_deleted_without_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            infohash = "e" * 40
+            event_path = config.event_dir / "legacy-hospital.event"
+            event_path.write_text(f"hash={infohash}\n", encoding="utf-8")
+
+            class FakeQbt:
+                def torrent(self, _infohash):
+                    return {
+                        "hash": infohash,
+                        "category": "HOSPITAL",
+                        "name": "Hospital",
+                        "content_path": "/data/downloads/Hospital/archivo.mkv",
+                        "progress": 1,
+                        "completion_on": 123,
+                    }
+
+            engine.qbt = FakeQbt()
+            engine._handle_qbt_event(event_path)
+
+            self.assertFalse(event_path.exists())
+            self.assertEqual(database.latest_jobs(), [])
+            database.close()
+
+    def test_qbt_complete_hook_filters_hospital_and_keeps_legacy_calls(self) -> None:
+        shell = shutil.which("sh")
+        if shell is None and os.name == "nt":
+            git_shell = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/sh.exe"
+            if git_shell.is_file():
+                shell = str(git_shell)
+        if shell is None:
+            self.skipTest("No hay shell POSIX para probar el hook")
+
+        hook = Path(__file__).resolve().parents[1] / "hooks" / "qbt-complete.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            hospital_dir = root / "hospital-events"
+            hospital_env = os.environ.copy()
+            hospital_env["ARR_EVENT_DIR"] = hospital_dir.as_posix()
+            subprocess.run(
+                [shell, hook.as_posix(), "f" * 40, "hOsPiTaL"],
+                check=True,
+                env=hospital_env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertFalse(hospital_dir.exists())
+
+            normal_dir = root / "normal-events"
+            normal_env = os.environ.copy()
+            normal_env["ARR_EVENT_DIR"] = normal_dir.as_posix()
+            subprocess.run(
+                [shell, hook.as_posix(), "a" * 40, "movies"],
+                check=True,
+                env=normal_env,
+                capture_output=True,
+                text=True,
+            )
+            normal_events = list(normal_dir.glob("*.event"))
+            self.assertEqual(len(normal_events), 1)
+            self.assertEqual(
+                normal_events[0].read_text(encoding="utf-8"),
+                f"hash={'a' * 40}\ncategory=movies\n",
+            )
+            self.assertFalse(any(path.suffix == ".tmp" for path in normal_dir.iterdir()))
+
+            legacy_dir = root / "legacy-events"
+            legacy_env = os.environ.copy()
+            legacy_env["ARR_EVENT_DIR"] = legacy_dir.as_posix()
+            subprocess.run(
+                [shell, hook.as_posix(), "b" * 40],
+                check=True,
+                env=legacy_env,
+                capture_output=True,
+                text=True,
+            )
+            legacy_events = list(legacy_dir.glob("*.event"))
+            self.assertEqual(len(legacy_events), 1)
+            self.assertEqual(
+                legacy_events[0].read_text(encoding="utf-8"),
+                f"hash={'b' * 40}\ncategory=\n",
+            )
 
     def test_qbt_event_uses_top_level_folder_as_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
