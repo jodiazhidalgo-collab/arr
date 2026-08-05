@@ -48,7 +48,7 @@ def main() -> int:
     health = start_health_server(
         port=config.health_port,
         status_provider=engine.status,
-        jobs_provider=lambda: database.latest_jobs(100),
+        jobs_provider=lambda: database.jobs_for_api(100),
         job_provider=database.job_detail,
         event_recorder=database.add_event,
         follow_provider=follow,

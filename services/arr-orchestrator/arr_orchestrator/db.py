@@ -11,6 +11,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY,
     source_uid TEXT UNIQUE NOT NULL,
+    parent_job_id TEXT,
+    batch_index INTEGER,
+    batch_total INTEGER,
     infohash TEXT,
     origin TEXT NOT NULL,
     category TEXT NOT NULL,
@@ -40,7 +43,6 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_infohash ON jobs(infohash);
 CREATE INDEX IF NOT EXISTS idx_jobs_source_path ON jobs(source_path);
-
 CREATE TABLE IF NOT EXISTS job_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -86,6 +88,9 @@ RUNNING_STATES = {
     "series_review_cleanup",
     "trailer_running",
     "verifying_output",
+    "batch_child_staging",
+    "batch_preparing",
+    "batch_waiting_children",
 }
 FINISHED_STATES = {
     "ready_stage",
@@ -95,7 +100,9 @@ FINISHED_STATES = {
     "series_postprocess_ready",
     "trailer_ready",
     "ready_cleanup",
+    "batch_cleanup_ready",
     "done",
+    "done_with_warnings",
 }
 ERROR_STATES = {"manual_review", "error_terminal"}
 SKIPPED_STATES = {"duplicate", "discarded", "dry_run_ready"}
@@ -158,6 +165,13 @@ class Database:
         self._ensure_column("jobs", "source_meta_json", "TEXT")
         self._ensure_column("jobs", "identity_json", "TEXT")
         self._ensure_column("jobs", "identity_retry_at", "REAL")
+        self._ensure_column("jobs", "parent_job_id", "TEXT")
+        self._ensure_column("jobs", "batch_index", "INTEGER")
+        self._ensure_column("jobs", "batch_total", "INTEGER")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_parent_job_id "
+            "ON jobs(parent_job_id, batch_index)"
+        )
         connection.commit()
 
     def _ensure_column(self, table: str, column: str, sql_type: str) -> None:
@@ -469,7 +483,8 @@ class Database:
             SELECT * FROM jobs
             WHERE lower(infohash)=lower(?)
               AND state NOT IN (
-                'done', 'manual_review', 'duplicate', 'error_terminal', 'discarded'
+                'done', 'done_with_warnings', 'manual_review', 'duplicate',
+                'error_terminal', 'discarded'
               )
             ORDER BY created_at DESC
             LIMIT 1
@@ -483,7 +498,8 @@ class Database:
             """
             SELECT * FROM jobs
             WHERE source_path=? AND state NOT IN (
-                'done', 'manual_review', 'duplicate', 'error_terminal', 'discarded'
+                'done', 'done_with_warnings', 'manual_review', 'duplicate',
+                'error_terminal', 'discarded'
             )
             ORDER BY created_at
             LIMIT 1
@@ -547,6 +563,65 @@ class Database:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def children_for_parent(self, parent_job_id: str) -> List[Dict[str, Any]]:
+        rows = self.connect().execute(
+            """
+            SELECT * FROM jobs
+            WHERE parent_job_id=?
+            ORDER BY COALESCE(batch_index, 0), created_at, job_id
+            """,
+            (parent_job_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def jobs_for_api(self, limit: int = 100) -> List[Dict[str, Any]]:
+        return [self._job_api_payload(job) for job in self.latest_jobs(limit)]
+
+    def _job_api_payload(self, job: Mapping[str, Any]) -> Dict[str, Any]:
+        payload = dict(job)
+        source_meta = _load_json(payload.get("source_meta_json"))
+        batch_meta = source_meta.get("batch") if isinstance(source_meta, dict) else None
+        parent_job_id = str(payload.get("parent_job_id") or "")
+        role = (
+            str(batch_meta.get("role") or "")
+            if isinstance(batch_meta, dict)
+            else ""
+        )
+        if not role:
+            role = "child" if parent_job_id else "none"
+        batch: Dict[str, Any] = {
+            "role": role,
+            "parent_job_id": parent_job_id or None,
+            "index": int(payload.get("batch_index") or 0),
+            "total": int(payload.get("batch_total") or 0),
+        }
+        if role == "parent":
+            children = self.children_for_parent(str(payload.get("job_id") or ""))
+            planned_total = max(
+                len(children),
+                int(payload.get("batch_total") or 0),
+                int(batch_meta.get("total") or 0) if isinstance(batch_meta, dict) else 0,
+            )
+            terminal = {
+                "done",
+                "done_with_warnings",
+                "manual_review",
+                "duplicate",
+                "error_terminal",
+                "discarded",
+            }
+            issues = {"done_with_warnings", "manual_review", "duplicate", "error_terminal"}
+            batch.update(
+                {
+                    "total": planned_total,
+                    "completed": sum(str(child.get("state") or "") in terminal for child in children),
+                    "succeeded": sum(str(child.get("state") or "") == "done" for child in children),
+                    "issues": sum(str(child.get("state") or "") in issues for child in children),
+                }
+            )
+        payload["batch"] = batch
+        return payload
+
     def events_for_job(self, job_id: str, limit: int = 200) -> List[Dict[str, Any]]:
         rows = self.connect().execute(
             "SELECT * FROM job_events WHERE job_id=? ORDER BY event_id DESC LIMIT ?",
@@ -599,12 +674,12 @@ class Database:
         identity = _load_json(job.get("identity_json"))
         for payload in (result, source_meta, identity):
             _collect_report_paths(payload, reports, seen_reports)
-        job_payload = dict(job)
+        job_payload = self._job_api_payload(job)
         job_payload.pop("result_json", None)
         job_payload.pop("source_meta_json", None)
         job_payload.pop("identity_json", None)
 
-        return {
+        detail = {
             "ok": True,
             "job": job_payload,
             "result_summary": _result_summary(result),
@@ -619,6 +694,15 @@ class Database:
             "errors": _job_errors(job, events),
             "reports": reports,
         }
+        children = self.children_for_parent(job_id)
+        if children:
+            detail["children"] = [self._job_api_payload(child) for child in children]
+        parent_job_id = str(job.get("parent_job_id") or "")
+        if parent_job_id:
+            parent = self.get_job(parent_job_id)
+            if parent:
+                detail["parent"] = self._job_api_payload(parent)
+        return detail
 
     def get_resolver_cache(self, cache_key: str) -> Optional[Dict[str, Any]]:
         now = time.time()

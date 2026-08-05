@@ -306,6 +306,76 @@ h3 {
   color: var(--muted);
 }
 
+.batch-parent-row td {
+  border-bottom: 0;
+}
+
+.batch-source-name,
+.batch-progress,
+.batch-child-incident {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.batch-detail-row td {
+  padding-top: 0;
+}
+
+.batch-details {
+  border: 1px solid rgba(56, 189, 248, .2);
+  border-radius: 8px;
+  background: rgba(8, 15, 29, .5);
+  padding: 8px 10px;
+}
+
+.batch-details summary {
+  color: #7dd3fc;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.batch-details ol {
+  display: grid;
+  gap: 7px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.batch-child {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, .78);
+}
+
+.batch-child.has-incident {
+  border-left: 3px solid #f59e0b;
+}
+
+.batch-child-position {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.batch-child-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.batch-child-incident {
+  grid-column: 2 / -1;
+  margin-top: 0;
+  color: #fde68a;
+}
+
 .rules-editor-locked {
   opacity: .76;
 }
@@ -662,6 +732,21 @@ textarea {
     max-width: 100%;
     white-space: normal;
     overflow-wrap: anywhere;
+  }
+  .jobs-table .batch-detail-row td {
+    display: block;
+    padding: 0 0 10px;
+  }
+  .jobs-table .batch-detail-row td::before {
+    content: none;
+  }
+  .batch-child {
+    grid-template-columns: 24px minmax(0, 1fr);
+  }
+  .batch-child .pill,
+  .batch-child-incident {
+    grid-column: 2;
+    justify-self: start;
   }
   .report-row > *,
   .report-actions {

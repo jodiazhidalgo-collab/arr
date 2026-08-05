@@ -358,6 +358,40 @@ def _duration(probe: dict[str, Any]) -> float:
         return 0.0
 
 
+def _stream_duration(stream: dict[str, Any]) -> float:
+    for value in (stream.get("duration"), (stream.get("tags") or {}).get("DURATION")):
+        if value in (None, ""):
+            continue
+        try:
+            if isinstance(value, str) and ":" in value:
+                hours, minutes, seconds = value.split(":", 2)
+                return max(
+                    0.0,
+                    (float(hours) * 3600) + (float(minutes) * 60) + float(seconds),
+                )
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+    try:
+        numerator, denominator = str(stream.get("time_base") or "").split("/", 1)
+        return max(
+            0.0,
+            float(stream.get("duration_ts") or 0)
+            * (float(numerator) / float(denominator)),
+        )
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _selected_av_duration(
+    probe: dict[str, Any],
+    video: dict[str, Any],
+    audio: dict[str, Any],
+) -> float:
+    selected = [value for value in (_stream_duration(video), _stream_duration(audio)) if value > 0]
+    return max(selected) if selected else _duration(probe)
+
+
 def _disposition(enabled_default: bool, enabled_forced: bool) -> str:
     values = []
     if enabled_default:
@@ -750,7 +784,7 @@ def analyze_episode(
         subtitle=subtitle,
         audio_mode=audio_mode,
         rules_fingerprint=rules_snapshot.fingerprint,
-        duration=_duration(probe),
+        duration=_selected_av_duration(probe, video, audio),
     )
 
 
@@ -927,7 +961,7 @@ def _verify_output(
         raise VerificationError("La pista de audio final no está etiquetada en español.")
     if subtitles and _language(subtitles[0]) not in {"es", "spa"}:
         raise VerificationError("El subtítulo final no está etiquetado en español.")
-    output_duration = _duration(probe)
+    output_duration = _selected_av_duration(probe, videos[0], audios[0])
     if output_duration <= 0:
         raise VerificationError("La salida no tiene duración válida.")
     tolerance = max(2.0, plan.duration * 0.01)

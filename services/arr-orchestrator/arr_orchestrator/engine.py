@@ -13,6 +13,20 @@ from typing import Dict, List, Optional, Tuple
 
 from watchdog.observers import Observer
 
+from .batch_coordinator import (
+    batch_counts,
+    child_source_meta,
+    narrowed_identity,
+    validate_episode_intent,
+)
+from .batch_preparer import (
+    BATCH_SCHEMA,
+    BatchPlan,
+    BatchPreparationError,
+    child_source_uid,
+    clean_and_plan_batch,
+    materialize_item,
+)
 from .clients import QbitLikeClient
 from .config import Config
 from .codex_diagnostics import create_codex_diagnostic
@@ -32,7 +46,6 @@ from .filesystem import (
     REASON_TEXT_FILES,
     SIDECAR_EXTENSIONS,
     ExtractionError,
-    clean_junk,
     extract_archives,
     full_bluray_folders,
     manifest,
@@ -78,7 +91,14 @@ from .torrent import torrent_info
 from .watchers import EventHandler, WatcherEventInbox
 
 
-TERMINAL_STATES = {"done", "manual_review", "duplicate", "error_terminal", "discarded"}
+TERMINAL_STATES = {
+    "done",
+    "done_with_warnings",
+    "manual_review",
+    "duplicate",
+    "error_terminal",
+    "discarded",
+}
 PROCESSABLE_STATES = {
     "waiting_stable",
     "ready_stage",
@@ -98,6 +118,9 @@ PROCESSABLE_STATES = {
     "trailer_running",
     "verifying_output",
     "ready_cleanup",
+    "batch_preparing",
+    "batch_waiting_children",
+    "batch_cleanup_ready",
 }
 
 
@@ -1915,6 +1938,15 @@ class Engine:
     def _process_job(self, job: Dict[str, object]) -> None:
         source_value = str(job.get("source_path") or "").strip()
         source_path = Path(source_value) if source_value else None
+        if job["state"] == "batch_preparing":
+            self._run_batch_prepare(job)
+            return
+        if job["state"] == "batch_waiting_children":
+            self._reconcile_batch_parent(job)
+            return
+        if job["state"] == "batch_cleanup_ready":
+            self._run_batch_cleanup(job)
+            return
         if job["state"] == "staging" and job.get("category") in {"movies", "tv"}:
             self._recover_staging_job(job, phase="stage")
             job = self.db.get_job(str(job["job_id"]))
@@ -2196,6 +2228,291 @@ class Engine:
             last_error_message="Se conserva todo para revision sin bloquear la cola",
         )
 
+    def _batch_plan_for_job(self, job: Dict[str, object]) -> Optional[BatchPlan]:
+        batch = self._source_meta(job).get("batch")
+        if not isinstance(batch, dict) or batch.get("role") != "parent":
+            return None
+        payload = batch.get("plan")
+        if not isinstance(payload, dict):
+            return None
+        return BatchPlan.from_dict(payload)
+
+    def _persist_parent_batch_plan(
+        self,
+        job: Dict[str, object],
+        plan: BatchPlan,
+        *,
+        status: str,
+    ) -> Dict[str, object]:
+        current = self.db.get_job(str(job["job_id"])) or job
+        source_meta = self._source_meta(current)
+        previous = source_meta.get("batch")
+        previous_batch = dict(previous) if isinstance(previous, dict) else {}
+        source_meta["batch"] = {
+            **previous_batch,
+            "schema": BATCH_SCHEMA,
+            "role": "parent",
+            "status": status,
+            "plan_digest": plan.digest,
+            "total": len(plan.items),
+            "plan": plan.to_dict(),
+        }
+        return self.db.update_job(
+            str(job["job_id"]),
+            source_meta_json=json.dumps(source_meta, ensure_ascii=False, sort_keys=True),
+            batch_index=0,
+            batch_total=len(plan.items),
+        )
+
+    def _enrich_series_batch_plan(
+        self,
+        plan: BatchPlan,
+        identity: ResolvedIdentity,
+        identity_rules: Dict[str, object],
+    ) -> BatchPlan:
+        parser_rules = (
+            identity_rules.get("parser")
+            if isinstance(identity_rules.get("parser"), dict)
+            else None
+        )
+        resolver_rules = (
+            identity_rules.get("resolver")
+            if isinstance(identity_rules.get("resolver"), dict)
+            else {}
+        )
+        tv_rules = (
+            resolver_rules.get("tv")
+            if isinstance(resolver_rules.get("tv"), dict)
+            else {}
+        )
+        resolver_intents = self._resolved_episode_intents(identity)
+        root = Path(plan.input_root)
+        for item in plan.items:
+            paths = [root.joinpath(*PurePosixPath(value).parts) for value in item.sources]
+            intents, unclassified = self._series_episode_intents(
+                paths,
+                parser_rules=parser_rules,
+                resolver_intents=resolver_intents,
+            )
+            item.episode_intent = intents[0] if len(intents) == 1 and not unclassified else None
+            validation, reason = validate_episode_intent(
+                identity,
+                item.episode_intent,
+                tv_rules,
+            )
+            item.episode_validation = validation
+            item.episode_reason = reason
+        return plan.finalize()
+
+    def _run_batch_prepare(self, job: Dict[str, object]) -> None:
+        plan = self._batch_plan_for_job(job)
+        if plan is None or not plan.should_split:
+            raise BatchPreparationError("El padre no contiene un plan de lote divisible")
+        parent_id = str(job["job_id"])
+        parent_root = Path(str(job.get("stage_path") or ""))
+        expected_parent = self.config.workshop_root / parent_id
+        if Path(os.path.abspath(str(parent_root))) != Path(os.path.abspath(str(expected_parent))):
+            raise BatchPreparationError("El taller del padre no coincide con <taller>/<job_id>")
+        input_root = Path(plan.input_root)
+        try:
+            Path(os.path.abspath(str(input_root))).relative_to(
+                Path(os.path.abspath(str(parent_root)))
+            )
+        except ValueError as error:
+            raise BatchPreparationError("La entrada del lote queda fuera del taller padre") from error
+
+        parent_meta = self._source_meta(job)
+        parent_pipeline = parent_meta.get("series_pipeline")
+        configured_mode = (
+            str(parent_pipeline.get("configured_mode") or "")
+            if isinstance(parent_pipeline, dict)
+            else None
+        )
+        parent_identity: Optional[ResolvedIdentity] = None
+        if str(job.get("category") or "") == "tv":
+            raw_identity = job.get("identity_json")
+            try:
+                identity_payload = json.loads(str(raw_identity or "{}"))
+                parent_identity = ResolvedIdentity.from_dict(identity_payload)
+            except (TypeError, ValueError, json.JSONDecodeError, KeyError) as error:
+                raise BatchPreparationError(
+                    "El lote de Series no conserva la identidad TMDb del padre"
+                ) from error
+
+        for item in plan.items:
+            inherit_identity = parent_identity is not None
+            child_identity: Optional[ResolvedIdentity] = None
+            if parent_identity is not None:
+                if item.episode_intent is not None:
+                    child_identity = narrowed_identity(
+                        parent_identity,
+                        item.episode_intent,
+                        item.episode_validation,
+                    )
+                else:
+                    payload = parent_identity.to_dict()
+                    payload.update(
+                        {
+                            "source": "batch_parent",
+                            "season": None,
+                            "episodes": [],
+                            "episode_intents": [],
+                            "decision_status": "ACCEPTED_FALLBACK",
+                        }
+                    )
+                    child_identity = ResolvedIdentity.from_dict(payload)
+
+            meta = child_source_meta(
+                parent_meta,
+                parent_job_id=parent_id,
+                item_key=item.key,
+                index=item.index,
+                total=item.total,
+                episode_validation=item.episode_validation,
+                episode_reason=item.episode_reason,
+                inherit_identity=inherit_identity,
+            )
+            meta["series_pipeline"] = self._new_series_pipeline_snapshot(
+                str(job.get("category") or ""),
+                item.name,
+                configured_mode=configured_mode,
+            )
+            child = self.db.create_job(
+                child_source_uid(parent_id, item),
+                "batch",
+                str(job.get("category") or ""),
+                item.name,
+                state="batch_child_staging",
+                parent_job_id=parent_id,
+                batch_index=item.index,
+                batch_total=item.total,
+                source_path=str(input_root.joinpath(*PurePosixPath(item.sources[0]).parts)),
+                source_meta_json=json.dumps(meta, ensure_ascii=False, sort_keys=True),
+                identity_json=(
+                    json.dumps(child_identity.to_dict(), ensure_ascii=False)
+                    if child_identity is not None
+                    else None
+                ),
+            )
+            child_id = str(child["job_id"])
+            child_root = self.config.workshop_root / child_id
+            child = self.db.update_job(child_id, stage_path=str(child_root))
+            if str(child.get("state") or "") != "batch_child_staging":
+                continue
+            materialized = materialize_item(item, input_root, child_root)
+            child = self.db.update_job(
+                child_id,
+                source_path=str(materialized),
+                stage_path=str(child_root),
+            )
+            self.db.add_event(
+                child_id,
+                "batch",
+                "decision",
+                f"Vídeo {item.index} de {item.total} preparado de forma independiente",
+                {
+                    "parent_job_id": parent_id,
+                    "position": item.index,
+                    "total": item.total,
+                    "episode_validation": item.episode_validation,
+                    "episode_reason": item.episode_reason,
+                },
+            )
+            if item.episode_validation == "DISAGREE":
+                self._preserve_series_job_for_review(
+                    child,
+                    child_root,
+                    "series_episode_not_found",
+                    "El episodio solicitado no existe según los datos completos de TMDb",
+                    phase="identity",
+                )
+                continue
+            self.db.transition(
+                child_id,
+                "ready_filebot",
+                "batch",
+                f"Vídeo {item.index} de {item.total} listo para procesar",
+            )
+
+        self._persist_parent_batch_plan(job, plan, status="waiting_children")
+        self.db.transition(
+            parent_id,
+            "batch_waiting_children",
+            "batch",
+            f"Lote detectado · {len(plan.items)} vídeos",
+            source_path=str(input_root),
+            last_error_code=None,
+            last_error_message=None,
+        )
+
+    def _reconcile_batch_parent(self, job: Dict[str, object]) -> None:
+        parent_id = str(job["job_id"])
+        children = self.db.children_for_parent(parent_id)
+        counts = batch_counts(children)
+        if counts["total"] == 0:
+            return
+        source_meta = self._source_meta(job)
+        batch = source_meta.get("batch")
+        if not isinstance(batch, dict):
+            raise BatchPreparationError("Los metadatos del padre no contienen el lote")
+        previous = batch.get("last_counts")
+        if previous != counts:
+            batch["last_counts"] = counts
+            source_meta["batch"] = batch
+            self.db.update_job(
+                parent_id,
+                source_meta_json=json.dumps(source_meta, ensure_ascii=False, sort_keys=True),
+            )
+            self.db.add_event(
+                parent_id,
+                "batch",
+                "decision",
+                f"Lote: {counts['completed']} de {counts['total']} vídeos terminados",
+                counts,
+            )
+        if counts["completed"] == counts["total"]:
+            self.db.transition(
+                parent_id,
+                "batch_cleanup_ready",
+                "batch",
+                "Todos los hijos terminaron; limpieza única del lote preparada",
+            )
+
+    def _run_batch_cleanup(self, job: Dict[str, object]) -> None:
+        children = self.db.children_for_parent(str(job["job_id"]))
+        counts = batch_counts(children)
+        if not children or counts["completed"] != counts["total"]:
+            self.db.transition(
+                str(job["job_id"]),
+                "batch_waiting_children",
+                "batch",
+                "La limpieza espera a que terminen todos los hijos",
+            )
+            return
+        if not self._cleanup_clients(job, strict=True):
+            return
+        job_root = Path(str(job.get("stage_path") or ""))
+        expected_root = self.config.workshop_root / str(job["job_id"])
+        if Path(os.path.abspath(str(job_root))) != Path(os.path.abspath(str(expected_root))):
+            raise BatchPreparationError("La limpieza del lote no apunta a su taller")
+        if job_root.exists():
+            shutil.rmtree(job_root)
+        terminal = "done_with_warnings" if counts["issues"] else "done"
+        message = (
+            f"Terminado con {counts['issues']} incidencia"
+            if counts["issues"] == 1
+            else f"Terminado con {counts['issues']} incidencias"
+            if counts["issues"]
+            else "Lote terminado correctamente"
+        )
+        self.db.transition(
+            str(job["job_id"]),
+            terminal,
+            "cleanup",
+            message,
+            result_json=json.dumps({"batch": counts}, ensure_ascii=False),
+        )
+
     def _run_extract(self, job: Dict[str, object]) -> None:
         job_root = Path(str(job["stage_path"]))
         job_id = str(job["job_id"])
@@ -2249,7 +2566,13 @@ class Engine:
             )
         try:
             input_root = extract_archives(job_root, event_callback=record_extract_event)
-            clean_junk(input_root)
+            plan = clean_and_plan_batch(input_root, str(job.get("category") or ""))
+            if not plan.items:
+                raise ExtractionError(
+                    "extract_no_media",
+                    "la limpieza terminó sin dejar vídeos procesables",
+                    input_root=str(input_root),
+                )
         except ExtractionError as error:
             self._finish_extraction_failure(
                 job,
@@ -2267,6 +2590,37 @@ class Engine:
                 ),
                 series_selected=series_selected,
             )
+            return
+        self.db.add_event(
+            job_id,
+            "extract",
+            "decision",
+            "Extracción y limpieza completadas en un único recorrido",
+            {
+                "videos": len(plan.items),
+                "discarded": len(plan.discarded),
+                "removed_non_video": plan.removed_non_video,
+                "batch_digest": plan.digest,
+            },
+        )
+        if plan.should_split:
+            self._persist_parent_batch_plan(job, plan, status="prepared")
+            if str(job.get("category") or "") == "movies":
+                self.db.transition(
+                    job_id,
+                    "batch_preparing",
+                    "batch",
+                    f"Lote de películas detectado · {len(plan.items)} vídeos",
+                    source_path=str(input_root),
+                )
+            else:
+                self.db.transition(
+                    job_id,
+                    "ready_filebot",
+                    "extract",
+                    "Lote de Series limpio; identidad común pendiente",
+                    source_path=str(input_root),
+                )
             return
         self.db.transition(
             job_id,
@@ -2382,10 +2736,15 @@ class Engine:
                     phase="filebot",
                 )
                 return
-        input_root = prepare_filebot_input(
-            source_path,
-            job_root,
-            str(job.get("name") or ""),
+        stored_parent_batch_plan = self._batch_plan_for_job(job)
+        input_root = (
+            source_path
+            if series_selected and stored_parent_batch_plan is not None
+            else prepare_filebot_input(
+                source_path,
+                job_root,
+                str(job.get("name") or ""),
+            )
         )
         if series_selected:
             try:
@@ -2454,6 +2813,13 @@ class Engine:
         series_expected_bound_intents: List[
             Tuple[int, int, int, str, Tuple[object, ...]]
         ] = []
+        batch_meta = self._source_meta(job).get("batch")
+        inherited_batch_identity = bool(
+            isinstance(batch_meta, dict)
+            and batch_meta.get("role") == "child"
+            and batch_meta.get("inherit_identity")
+        )
+        parent_batch_plan = stored_parent_batch_plan
         media_decision = self._media_decision_for_job(job, input_root, identity_rules)
         self.db.add_event(
             str(job["job_id"]),
@@ -2519,17 +2885,38 @@ class Engine:
             self._send_media_decision_review(job, job_root, media_decision)
             return
         try:
-            if not bool(getattr(self.name_resolver, "enabled", False)):
-                raise ResolverUnavailable(
-                    "TMDB_API_TOKEN no configurado",
-                    {
-                        "status": "RETRY_PROVIDER",
-                        "reason_code": "tmdb_token_missing",
-                        "retryable": True,
+            if inherited_batch_identity:
+                raw_identity = job.get("identity_json")
+                payload = json.loads(str(raw_identity or "{}"))
+                identity = ResolvedIdentity.from_dict(payload)
+                resolver_trace = {
+                    "decision": {
+                        "status": identity.decision_status or "ACCEPTED_FALLBACK",
+                        "accepted": True,
+                        "retryable": False,
+                        "fallback_reason": "batch_parent_identity",
                     },
-                )
-            identity = self.name_resolver.resolve(job, input_root)
-            resolver_trace = self._resolver_trace_snapshot()
+                    "inherited_from_parent": str(job.get("parent_job_id") or ""),
+                }
+            else:
+                if not bool(getattr(self.name_resolver, "enabled", False)):
+                    raise ResolverUnavailable(
+                        "TMDB_API_TOKEN no configurado",
+                        {
+                            "status": "RETRY_PROVIDER",
+                            "reason_code": "tmdb_token_missing",
+                            "retryable": True,
+                        },
+                    )
+                if series_selected and parent_batch_plan is not None:
+                    identity = self.name_resolver.resolve(
+                        job,
+                        input_root,
+                        defer_episode_conflicts=True,
+                    )
+                else:
+                    identity = self.name_resolver.resolve(job, input_root)
+                resolver_trace = self._resolver_trace_snapshot()
             identity_decision = self._identity_decision_for_result(
                 identity,
                 resolver_trace,
@@ -2632,8 +3019,28 @@ class Engine:
             ),
             identity_event,
         )
+        if series_selected and parent_batch_plan is not None:
+            enriched_plan = self._enrich_series_batch_plan(
+                parent_batch_plan,
+                identity,
+                identity_rules,
+            )
+            self._persist_parent_batch_plan(job, enriched_plan, status="identity_resolved")
+            self.db.transition(
+                str(job["job_id"]),
+                "batch_preparing",
+                "batch",
+                f"Identidad TMDb común resuelta; preparando {len(enriched_plan.items)} vídeos",
+                source_path=str(input_root),
+            )
+            return
         if series_selected:
             input_media = media_files(input_root)
+            allow_unknown_batch_episode = bool(
+                inherited_batch_identity
+                and isinstance(batch_meta, dict)
+                and str(batch_meta.get("episode_validation") or "") == "UNKNOWN"
+            )
             parser_rules = (
                 identity_rules.get("parser")
                 if isinstance(identity_rules.get("parser"), dict)
@@ -2650,7 +3057,10 @@ class Engine:
             series_expected_episode_codes = self._series_intent_codes(
                 series_expected_episode_intents
             )
-            if not input_media or unclassified_input or not series_expected_episode_intents:
+            if not input_media or (
+                (unclassified_input or not series_expected_episode_intents)
+                and not allow_unknown_batch_episode
+            ):
                 details = ", ".join(unclassified_input[:8]) or "sin intencion de episodio"
                 self._preserve_series_job_for_review(
                     job,
@@ -4915,6 +5325,8 @@ class Engine:
         observed: Tuple[object, ...],
     ) -> bool:
         if expected == observed:
+            return True
+        if expected and expected[0] == "unknown":
             return True
         if expected and expected[0] == "absolute" and observed and observed[0] == "episodes":
             codes = list(observed[1]) if len(observed) > 1 else []

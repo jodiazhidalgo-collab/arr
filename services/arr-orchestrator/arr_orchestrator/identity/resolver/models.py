@@ -85,6 +85,9 @@ class ResolvedIdentity:
     original_language: str = ""
     season: Optional[int] = None
     episodes: List[int] = field(default_factory=list)
+    season_count: Optional[int] = None
+    season_episode_counts: Dict[int, int] = field(default_factory=dict)
+    known_episodes: Dict[int, List[int]] = field(default_factory=dict)
     resolver_algorithm_version: str = ""
     decision_status: str = ""
     coverage_limited: bool = False
@@ -116,6 +119,15 @@ class ResolvedIdentity:
             source=str(payload.get("source") or "cache"),
             season=_optional_int(payload.get("season")),
             episodes=[int(value) for value in payload.get("episodes") or []],
+            season_count=_optional_int(payload.get("season_count")),
+            season_episode_counts={
+                int(key): int(value)
+                for key, value in dict(payload.get("season_episode_counts") or {}).items()
+            },
+            known_episodes={
+                int(key): [int(value) for value in values or []]
+                for key, values in dict(payload.get("known_episodes") or {}).items()
+            },
             resolver_algorithm_version=str(
                 payload.get("resolver_algorithm_version") or ""
             ),

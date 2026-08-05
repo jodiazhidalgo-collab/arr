@@ -711,16 +711,14 @@ def validate_series_cleanup_contract(result, job_id):
         or entry.get("season") != 1
         or entry.get("episodes") != [3]
         or not str(entry.get("target_relpath") or "").endswith(" - S01E03.mkv")
-        or not isinstance(sidecars, list)
-        or len(sidecars) != 1
-        or not str(sidecars[0].get("source_relpath") or "").lower().endswith(".srt")
+        or sidecars != []
     ):
         return None
     if (
         not isinstance(published_manifest, dict)
         or published_manifest.get("schema") != "series-published-manifest-v1"
         or not isinstance(published_manifest.get("entries"), list)
-        or len(published_manifest["entries"]) != 2
+        or len(published_manifest["entries"]) != 1
     ):
         return None
     published_entries = published_manifest["entries"]
@@ -741,7 +739,7 @@ def validate_series_cleanup_contract(result, job_id):
         ):
             return None
         suffixes.append(Path(path).suffix.lower())
-    if sorted(suffixes) != [".mkv", ".srt"]:
+    if suffixes != [".mkv"]:
         return None
     encoded = json.dumps(
         published_entries, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -862,8 +860,8 @@ def expected_probe_outcome(inspection):
     phases = set(inspection.get("phases") or [])
     event_types = set(inspection.get("event_types") or [])
     if category == "movies":
-        expected_state = "manual_review"
-        expected_error = "no_candidates"
+        expected_state = "error_terminal"
+        expected_error = "media_review"
         required_phases = {
             "received",
             "stable_wait",
@@ -871,8 +869,12 @@ def expected_probe_outcome(inspection):
             "extract",
             "settings",
             "identity",
+            "filebot",
+            "verify",
+            "media",
+            "media_analysis",
         }
-        required_event_types = {"started", "finished", "decision", "error"}
+        required_event_types = {"started", "finished", "decision", "command", "error"}
     elif category == "tv":
         expected_state = "done"
         expected_error = ""
@@ -1070,6 +1072,21 @@ def remove_exact_probe_paths(candidates):
             ).resolve(strict=False)
             and expected_series_review_name(path.name)
         )
+        exact_movie_review = False
+        if path.parent.resolve(strict=False) == REVIEW_ROOT.resolve(strict=False):
+            reason_path = path / "reason.json"
+            try:
+                reason_info = reason_path.lstat()
+                reason_payload = json.loads(reason_path.read_text(encoding="utf-8"))
+                exact_movie_review = bool(
+                    stat.S_ISREG(reason_info.st_mode)
+                    and not reason_path.is_symlink()
+                    and str(reason_payload.get("job_id") or "") == job_id
+                    and str(reason_payload.get("phase") or "")
+                    in {"media", "media_analysis", "media_core"}
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                exact_movie_review = False
         if exact_series_final:
             verified, reason = verify_owned_series_root(path, job_id)
             if not verified:
@@ -1085,6 +1102,7 @@ def remove_exact_probe_paths(candidates):
             and path.name != job_id
             and not exact_series_final
             and not exact_series_review
+            and not exact_movie_review
         ):
             refused.append({"path": str(path), "reason": "not_exact_probe_or_job"})
             continue
@@ -1220,7 +1238,12 @@ created = [
     }
 ]
 for category, root, suffix, filename in (
-    ("movies", MOVIES_PROBE_ROOT, "pelicula", f"{PROBE_ID}_pelicula_2026.mkv"),
+    (
+        "movies",
+        MOVIES_PROBE_ROOT,
+        "pelicula",
+        f"{PROBE_ID}_Big Buck Bunny (2008) tmdb-10378.mkv",
+    ),
 ):
     folder = root / f"{PROBE_ID}_{suffix}"
     folder.mkdir(parents=True, exist_ok=False)

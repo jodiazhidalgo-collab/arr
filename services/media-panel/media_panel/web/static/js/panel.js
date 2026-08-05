@@ -4,6 +4,8 @@ const tabs = [...document.querySelectorAll(".tabs button")];
 
 const PANEL_ROUTE_STORAGE_KEY = "arr-media-panel-route";
 const LEGACY_RULE_SECTION_STORAGE_KEY = "arr-media-panel-rule-section";
+const PANEL_SCROLL_STORAGE_PREFIX = "arr-media-panel-scroll";
+const BATCH_OPEN_STORAGE_PREFIX = "arr-media-panel-batch-open";
 let viewEpoch = 0;
 const auxiliaryProfiles = {
   historial: storageGet("arr-media-panel-historial-profile", "movies") === "series" ? "series" : "movies",
@@ -367,6 +369,20 @@ function formatTime(ts) {
   return new Date(ts * 1000).toLocaleString("es-ES");
 }
 
+function panelScrollKey(view = routeKeyFromHash()) {
+  const suffix = view === "historial" ? `-${auxiliaryProfiles.historial}` : "";
+  return `${PANEL_SCROLL_STORAGE_PREFIX}-${view}${suffix}`;
+}
+
+function restorePanelScroll(view) {
+  const top = Math.max(0, Number(storageGet(panelScrollKey(view), "0")) || 0);
+  requestAnimationFrame(() => requestAnimationFrame(() => window.scrollTo({ top, left: 0, behavior: "auto" })));
+}
+
+function batchOpenKey(jobId) {
+  return `${BATCH_OPEN_STORAGE_PREFIX}-${jobId}`;
+}
+
 function setActive(view) {
   tabs.forEach(btn => btn.classList.toggle("active", btn.dataset.view === view));
 }
@@ -382,7 +398,7 @@ async function showMotor(context) {
   const workerOk = status.media_worker?.status === "ok";
   const deps = status.orchestrator?.dependencies || {};
   const services = status.services || {};
-  const latest = (jobs.jobs || []).slice(0, 8);
+  const latest = groupedJobs(jobs.jobs || []).slice(0, 8);
   app.innerHTML = `
     <section class="grid">
       ${serviceStatusCard("Orquestador", services.orchestrator, orchOk)}
@@ -404,6 +420,8 @@ async function showMotor(context) {
       <h2>Ultimos trabajos</h2>
       ${jobsTable(latest)}
     </section>`;
+  bindBatchDetails();
+  restorePanelScroll("motor");
 }
 
 function serviceStatusCard(label, service, legacyOk = false) {
@@ -417,25 +435,104 @@ function jobsTable(jobs, options = {}) {
   const actions = options.actions !== false;
   return `<table class="table jobs-table">
     <thead><tr><th>Nombre</th><th>Categoria</th><th>Estado</th><th>Actualizado</th>${actions ? "<th>Diagnostico</th>" : ""}</tr></thead>
-    <tbody>${jobs.map(job => `<tr>
-      <td data-label="Nombre">${esc(job.name)}</td>
-      <td data-label="Categoría">${esc(job.category)}</td>
-      <td data-label="Estado">${pill(stateLabel(job.state), stateTone(job.state))}</td>
-      <td data-label="Actualizado">${esc(formatTime(job.updated_at))}</td>
-      ${actions ? `<td data-label="Diagnóstico"><button class="btn ghost small" data-codex-job="${esc(job.job_id)}">Informe Codex</button></td>` : ""}
-    </tr>`).join("")}</tbody>
+    <tbody>${jobs.map(job => jobRows(job, actions)).join("")}</tbody>
   </table>`;
+}
+
+function groupedJobs(jobs) {
+  const parentIds = new Set(
+    jobs.filter(job => job?.batch?.role === "parent").map(job => String(job.job_id || ""))
+  );
+  const children = new Map();
+  jobs.forEach(job => {
+    const parentId = String(job?.batch?.parent_job_id || job?.parent_job_id || "");
+    if (!parentId) return;
+    if (!children.has(parentId)) children.set(parentId, []);
+    children.get(parentId).push(job);
+  });
+  return jobs
+    .filter(job => {
+      const parentId = String(job?.batch?.parent_job_id || job?.parent_job_id || "");
+      return !parentId || !parentIds.has(parentId);
+    })
+    .map(job => ({
+      ...job,
+      _batchChildren: (children.get(String(job.job_id || "")) || [])
+        .sort((left, right) => Number(left?.batch?.index || 0) - Number(right?.batch?.index || 0))
+    }));
+}
+
+function batchSummary(job) {
+  const batch = job?.batch || {};
+  if (batch.role !== "parent") return "";
+  const children = job._batchChildren || [];
+  const total = Number(batch.total || children.length || 0);
+  const terminal = new Set(["done", "done_with_warnings", "manual_review", "duplicate", "error_terminal", "discarded"]);
+  const active = children.find(child => !terminal.has(String(child.state || "")));
+  if (job.state === "done_with_warnings") return `Terminado con ${Number(batch.issues || 0)} incidencia${Number(batch.issues || 0) === 1 ? "" : "s"}`;
+  if (job.state === "done") return "Lote terminado";
+  if (active) return `Procesando capítulo ${Number(active?.batch?.index || 0)} de ${total}`;
+  return `${Number(batch.completed || 0)} de ${total} terminados`;
+}
+
+function jobRows(job, actions) {
+  const isParent = job?.batch?.role === "parent";
+  const total = Number(job?.batch?.total || job?._batchChildren?.length || 0);
+  const summary = batchSummary(job);
+  const main = `<tr class="${isParent ? "batch-parent-row" : ""}">
+    <td data-label="Nombre">
+      ${isParent ? `<strong>Lote detectado · ${total} vídeos</strong><span class="batch-source-name">${esc(job.name)}</span>` : esc(job.name)}
+    </td>
+    <td data-label="Categoría">${esc(job.category)}</td>
+    <td data-label="Estado">${pill(stateLabel(job.state), stateTone(job.state))}${summary ? `<span class="batch-progress">${esc(summary)}</span>` : ""}</td>
+    <td data-label="Actualizado">${esc(formatTime(job.updated_at))}</td>
+    ${actions ? `<td data-label="Diagnóstico"><button class="btn ghost small" data-codex-job="${esc(job.job_id)}">Informe Codex</button></td>` : ""}
+  </tr>`;
+  if (!isParent) return main;
+  const children = job._batchChildren || [];
+  const open = storageGet(batchOpenKey(job.job_id), "0") === "1" ? " open" : "";
+  const childRows = children.length
+    ? children.map(child => {
+        const incident = child.last_error_message || child.last_error_code || "";
+        return `<li class="batch-child ${incident ? "has-incident" : ""}">
+          <span class="batch-child-position">${Number(child?.batch?.index || 0)}.</span>
+          <span class="batch-child-name">${esc(child.name)}</span>
+          ${pill(stateLabel(child.state), stateTone(child.state))}
+          ${incident ? `<span class="batch-child-incident">${esc(incident)}</span>` : ""}
+        </li>`;
+      }).join("")
+    : `<li class="batch-child muted">Preparando los vídeos del lote…</li>`;
+  return `${main}<tr class="batch-detail-row"><td colspan="${actions ? 5 : 4}">
+    <details class="batch-details" data-batch-details="${esc(job.job_id)}"${open}>
+      <summary>Ver capítulos e incidencias</summary>
+      <ol>${childRows}</ol>
+    </details>
+  </td></tr>`;
+}
+
+function bindBatchDetails() {
+  document.querySelectorAll("[data-batch-details]").forEach(details => {
+    details.addEventListener("toggle", () => {
+      storageSet(batchOpenKey(details.dataset.batchDetails), details.open ? "1" : "0");
+    });
+  });
 }
 
 function stateLabel(state) {
   return {
     ready_stage: "listo para taller",
-    staging: "en taller"
+    staging: "en taller",
+    batch_child_staging: "preparando vídeo",
+    batch_preparing: "separando lote",
+    batch_waiting_children: "procesando lote",
+    batch_cleanup_ready: "limpieza final",
+    done_with_warnings: "terminado con incidencias"
   }[state] || state;
 }
 
 function stateTone(state) {
   if (state === "done") return "ok";
+  if (state === "done_with_warnings") return "warn";
   if (["duplicate", "manual_review"].includes(state)) return "warn";
   if (String(state || "").includes("error")) return "bad";
   return "info";
@@ -525,13 +622,15 @@ async function showHistorial(context) {
   app.innerHTML = `<section class="panel">Cargando historial de ${profile === "series" ? "series" : "películas"}...</section>`;
   const data = await api(`/api/jobs?profile=${encodeURIComponent(profile)}`);
   if (!isCurrentViewContext(context)) return;
-  const jobs = data.jobs || [];
+  const jobs = groupedJobs(data.jobs || []);
   app.innerHTML = `<section class="panel">
     ${renderAuxiliaryProfileSelector("historial", profile)}
     <h2>Trabajos recientes · ${profile === "series" ? "Series" : "Películas"}</h2>
     ${jobsTable(jobs)}
   </section>`;
+  bindBatchDetails();
   bindAuxiliaryProfileSelector("historial", showHistorial);
+  restorePanelScroll("historial");
 }
 
 function renderAuxiliaryProfileSelector(view, profile) {
@@ -1197,5 +1296,18 @@ window.addEventListener("beforeunload", event => {
   event.preventDefault();
   event.returnValue = "";
 });
+
+let panelScrollFrame = null;
+window.addEventListener("scroll", () => {
+  const view = routeKeyFromHash();
+  if (!["motor", "historial"].includes(view) || panelScrollFrame !== null) return;
+  panelScrollFrame = requestAnimationFrame(() => {
+    panelScrollFrame = null;
+    storageSet(
+      panelScrollKey(view),
+      String(Math.max(0, Math.round(Number(window.scrollY || document.documentElement?.scrollTop || 0))))
+    );
+  });
+}, { passive: true });
 
 dispatchRoute();

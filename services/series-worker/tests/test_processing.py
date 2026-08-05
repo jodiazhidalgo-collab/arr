@@ -719,6 +719,25 @@ def test_real_ffmpeg_fixture_is_probed_and_planned(tmp_path: Path) -> None:
     assert plan.duration > 0
 
 
+def test_episode_duration_uses_selected_tracks_not_global_container(tmp_path: Path) -> None:
+    source = tmp_path / "Juego.de.Tronos.S07E01.mkv"
+    source.write_bytes(b"episode")
+    probe = _stream_probe()
+    probe["format"]["duration"] = "9912.000"
+    probe["streams"][0]["duration"] = "3588.500"
+    probe["streams"][1]["duration"] = "3587.900"
+    runner = FakeRunner({source.name: probe})
+
+    plan = analyze_episode(
+        source,
+        tmp_path / "out.mkv",
+        _snapshot(tmp_path),
+        runner,
+    )
+
+    assert plan.duration == pytest.approx(3588.5)
+
+
 @pytest.mark.skipif(
     any(not shutil.which(tool) for tool in ("ffmpeg", "ffprobe", "mkvpropedit")),
     reason="Toolchain audiovisual completa no disponible",

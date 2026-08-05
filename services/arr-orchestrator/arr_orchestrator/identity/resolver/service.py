@@ -121,6 +121,8 @@ class NameResolver:
         job: Dict[str, object],
         input_root: Path,
         rules_snapshot: Optional[Dict[str, object]] = None,
+        *,
+        defer_episode_conflicts: bool = False,
     ) -> ResolvedIdentity:
         self._trace = {
             "queries": [],
@@ -188,6 +190,8 @@ class NameResolver:
                 if self._preview_mode
                 else collect_file_episode_intents(input_root, rules)
             )
+            if defer_episode_conflicts:
+                guessed["_defer_episode_conflicts"] = True
         query = str(guessed.get("title") or "").strip()
         if not query:
             reason = "empty_title"
@@ -440,6 +444,12 @@ class NameResolver:
                 for item in guessed.get("_episode_intents") or []
                 if isinstance(item, dict)
             ],
+            season_count=selected.season_count,
+            season_episode_counts=dict(selected.season_episode_counts),
+            known_episodes={
+                int(season): list(episodes)
+                for season, episodes in selected.known_episodes.items()
+            },
         )
         if (
             cache_enabled

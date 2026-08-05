@@ -231,6 +231,7 @@ def _compare_tv(
     runtime_evidence: Sequence[Dict[str, object]],
 ) -> None:
     rules = policy.get("tv") if isinstance(policy.get("tv"), dict) else {}
+    defer_episode_conflicts = bool(guessed.get("_defer_episode_conflicts", False))
     guessed_year = as_int(guessed.get("year"))
     tv_year_state = _year_state(
         guessed_year, [candidate.year] if candidate.year else [], 1
@@ -377,11 +378,12 @@ def _compare_tv(
         "episode",
         episode_family_state,
         {"intents": intents[:20], "subchecks": subchecks},
-        hard=episode_family_state == DISAGREE,
+        hard=episode_family_state == DISAGREE and not defer_episode_conflicts,
     )
-    for reason in hard_reasons:
-        if reason not in candidate.elimination_reasons:
-            candidate.elimination_reasons.append(reason)
+    if not defer_episode_conflicts:
+        for reason in hard_reasons:
+            if reason not in candidate.elimination_reasons:
+                candidate.elimination_reasons.append(reason)
 
     observed = _tv_runtime_values(intents, runtime_evidence)
     expected = candidate.episode_runtime_minutes

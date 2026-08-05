@@ -68,6 +68,21 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             server.Handler.do_GET(handler)
         send.assert_called_once_with(200, favicon.read_bytes(), "image/x-icon")
 
+    def test_batches_are_grouped_with_human_progress_and_persistent_view(self) -> None:
+        for marker in (
+            "function groupedJobs(jobs)",
+            "Lote detectado · ${total} vídeos",
+            "Procesando capítulo ${Number(active?.batch?.index || 0)} de ${total}",
+            "Ver capítulos e incidencias",
+            "function bindBatchDetails()",
+            "restorePanelScroll(\"motor\")",
+            "restorePanelScroll(\"historial\")",
+            "arr-media-panel-batch-open",
+        ):
+            self.assertIn(marker, self.panel)
+        self.assertIn(".batch-child.has-incident", self.panel_styles)
+        self.assertIn("overflow-wrap: anywhere", self.panel_styles)
+
     def test_top_tab_and_modular_assets_are_loaded_in_order(self) -> None:
         navigation = (
             ('data-view="identidad"', "Identidad ARR"),
