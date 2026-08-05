@@ -317,9 +317,7 @@ def _assert_review_matches_source(layout, payload, result):
         if path.name in core_module._REVIEW_MARKERS
     }
     assert markers == {reason["reason_file"]}
-    expected_text = "\n".join(
-        (reason["reason_title"], *reason["reason_lines"])
-    ) + "\n"
+    expected_text = "\n".join(reason["reason_lines"]) + "\n"
     assert (review_root / reason["reason_file"]).read_text("utf-8") == expected_text
     return review_root
 
@@ -411,7 +409,7 @@ def test_processing_review_v2_matrix_uses_typed_contract_and_exact_marker(
     assert result["reason_lines"] == [summary, message]
     review = _assert_review_matches_source(layout, payload, result)
     assert (review / reason_file).read_text("utf-8") == (
-        f"{reason_title}\n{summary}\n{message}\n"
+        f"{summary}\n{message}\n"
     )
     assert (review / "Serie.S01E01.mkv").read_bytes() == b"one"
 
@@ -529,7 +527,7 @@ def test_review_v2_rejects_a_reused_destination_changed_to_another_family(layout
         encoding="utf-8",
     )
     (destination / "Error de proceso.txt").write_text(
-        "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n",
+        "\n".join(reason["reason_lines"]) + "\n",
         encoding="utf-8",
     )
 

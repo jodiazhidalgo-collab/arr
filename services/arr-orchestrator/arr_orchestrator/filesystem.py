@@ -1199,8 +1199,7 @@ def write_reason(
                     os.unlink(old_reason, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
-            lines = [reason_filename.removesuffix(".txt")]
-            lines.extend(str(line) for line in (reason_lines or []) if str(line).strip())
+            lines = [str(line) for line in (reason_lines or []) if str(line).strip()]
             _atomic_write_text_at(
                 directory_fd,
                 reason_filename,
@@ -1219,8 +1218,7 @@ def write_reason(
                 (destination / old_reason).unlink(missing_ok=True)
             except FileNotFoundError:
                 pass
-        lines = [reason_filename.removesuffix(".txt")]
-        lines.extend(str(line) for line in (reason_lines or []) if str(line).strip())
+        lines = [str(line) for line in (reason_lines or []) if str(line).strip()]
         _atomic_write_text(
             destination / reason_filename,
             "\n".join(lines).strip() + "\n",

@@ -63,8 +63,7 @@ def _move_to_review(
         destination.mkdir(parents=True, exist_ok=True)
     payload = {**payload, "review_path": str(destination), "reason_file": reason_file}
     _write_json(destination / "reason.json", payload)
-    reason_text = [reason_file.removesuffix(".txt")]
-    reason_text.extend(str(line) for line in lines if str(line).strip())
+    reason_text = [str(line) for line in lines if str(line).strip()]
     (destination / reason_file).write_text("\n".join(reason_text).strip() + "\n", encoding="utf-8")
     return {
         "status": "review",

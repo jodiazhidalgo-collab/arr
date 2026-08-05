@@ -1060,7 +1060,7 @@ class _ReviewContract:
         }
 
     def text(self) -> str:
-        return "\n".join((self.reason_title, *self.reason_lines)) + "\n"
+        return "\n".join(self.reason_lines) + "\n"
 
 
 _REVIEW_TYPES = {

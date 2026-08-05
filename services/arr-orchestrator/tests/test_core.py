@@ -847,8 +847,7 @@ class CoreTests(unittest.TestCase):
             )
             self.assertTrue((destination / "reason.json").exists())
             text = (destination / "Pelicula repetida.txt").read_text(encoding="utf-8")
-            self.assertIn("Pelicula repetida", text)
-            self.assertIn("destino ya existe", text)
+            self.assertEqual(text, "FileBot indica que el destino ya existe.\n")
 
     def test_move_job_to_uses_human_review_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

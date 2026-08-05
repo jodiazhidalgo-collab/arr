@@ -4348,7 +4348,7 @@ class Engine:
                 raise ValueError("La revisión v2 no conserva su marcador humano") from error
             if not stat.S_ISREG(marker_stat.st_mode):
                 raise ValueError("El marcador v2 no es un archivo regular")
-            expected_content = "\n".join([reason_title, *reason_lines]) + "\n"
+            expected_content = "\n".join(reason_lines) + "\n"
             try:
                 actual_content = marker.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as error:

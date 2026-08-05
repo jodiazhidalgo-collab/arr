@@ -344,7 +344,7 @@ def _review_result_v2(
         encoding="utf-8",
     )
     (review / reason_file).write_text(
-        "\n".join([reason_title, *reason_lines]) + "\n",
+        "\n".join(reason_lines) + "\n",
         encoding="utf-8",
     )
     return {
@@ -948,7 +948,7 @@ def test_verified_worker_review_allows_client_and_workshop_cleanup(tmp_path: Pat
         reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
         assert reason["clients_cleanup_pending"] is False
         assert (review / "Revision de serie.txt").read_text(encoding="utf-8") == (
-            "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n"
+            "\n".join(reason["reason_lines"]) + "\n"
         )
         detail = database.job_detail(str(job["job_id"]))
         assert any(
@@ -1081,7 +1081,7 @@ def test_series_review_v2_accepts_every_worker_reason_family(
         reason_file = str(result["reason_file"])
         assert (review / reason_file).read_text(encoding="utf-8") == (
             "\n".join(
-                [str(result["reason_title"]), *list(result["reason_lines"])]
+                list(result["reason_lines"])
             )
             + "\n"
         )
@@ -1355,7 +1355,7 @@ def test_orchestrator_fallback_uses_the_same_clean_series_review_layout(
         assert reason["reason_kind"] == "process"
         assert reason["reason_file"] == "Error de proceso.txt"
         assert (review / reason["reason_file"]).read_text(encoding="utf-8") == (
-            "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n"
+            "\n".join(reason["reason_lines"]) + "\n"
         )
         assert reason["profile"] == "series"
         assert reason["category"] == "tv"
@@ -1421,7 +1421,7 @@ def test_orchestrator_fallback_reason_matrix_is_semantic(
         } == {reason_file}
         marker_content = (review / reason_file).read_text(encoding="utf-8")
         assert marker_content == (
-            "\n".join([reason["reason_title"], *reason["reason_lines"]]) + "\n"
+            "\n".join(reason["reason_lines"]) + "\n"
         )
         assert "Código técnico:" not in marker_content
         assert not job_root.exists()
