@@ -4554,14 +4554,14 @@ class Engine:
     def _series_episode_codes(path: Path) -> set[Tuple[int, int]]:
         codes: set[Tuple[int, int]] = set()
         for match in re.finditer(
-            r"(?i)(?<![a-z0-9])s(\d{1,3})(e\d{1,4}(?:(?:[ ._-]*e|[ ._-]+)\d{1,4})*)",
+            r"(?i)(?<![a-z0-9])s(\d{1,3})(e\d{1,4}(?:(?:[ ._-]*e|[ ._]*-[ ._]*(?:e[ ._]*)?)\d{1,4})*)",
             path.name,
         ):
             season = int(match.group(1))
             episodes = Engine._episode_cluster_numbers(match.group(2))
             codes.update((season, episode) for episode in episodes)
         for match in re.finditer(
-            r"(?i)(?<!\d)(\d{1,3})x(\d{1,4}(?:(?:x|[ ._-]+)\d{1,4})*)(?!\d)",
+            r"(?i)(?<!\d)(\d{1,3})x(\d{1,4}(?:(?:x|[ ._]*-[ ._]*)\d{1,4})*)(?!\d)",
             path.name,
         ):
             season = int(match.group(1))

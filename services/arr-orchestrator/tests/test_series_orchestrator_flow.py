@@ -4019,9 +4019,15 @@ def test_new_profile_snapshot_cannot_fall_back_when_series_route_is_missing(
         (["Mi Serie S01E01-E03.mkv"], {(1, 1), (1, 2), (1, 3)}),
         (["Mi Serie S01E01-E03E05.mkv"], {(1, 1), (1, 2), (1, 3), (1, 5)}),
         (["Mi Serie S01E01E02.mkv"], {(1, 1), (1, 2)}),
+        (
+            ["Juego.De.Tronos.S04E01 1080p. BluRayRIP SPANiSH.1080p.mkv"],
+            {(4, 1)},
+        ),
+        (["Mi Serie S02E03.2160p.mkv"], {(2, 3)}),
         (["Mi Serie 1x01-03.mkv"], {(1, 1), (1, 2), (1, 3)}),
         (["Mi Serie 1x01-03x05.mkv"], {(1, 1), (1, 2), (1, 3), (1, 5)}),
         (["Mi Serie 1x01x02.mkv"], {(1, 1), (1, 2)}),
+        (["Mi Serie 1x04 720p.mkv"], {(1, 4)}),
         (["Mi Serie S00E01.mkv"], {(0, 1)}),
         (
             ["Mi Serie S01E01.mkv", "Mi Serie S02E03.mkv"],
@@ -4091,6 +4097,58 @@ def test_series_episode_intents_preserve_every_file_in_a_pack() -> None:
         (2, 2),
         (2, 3),
     }
+
+
+def test_game_of_thrones_1080p_pack_matches_resolver_episode_intents() -> None:
+    names = [
+        f"Juego.De.Tronos.S04E{episode:02d} 1080p. "
+        "BluRayRIP SPANiSH.1080p [www.newpct1.com].mkv"
+        for episode in range(1, 11)
+    ]
+    local_intents, unclassified = Engine._series_episode_intents(
+        [Path(name) for name in names]
+    )
+    resolver_intents = [
+        {
+            "source": name,
+            "season": 4,
+            "episodes": [episode],
+            "absolute_episode": None,
+            "is_season_pack": False,
+        }
+        for episode, name in enumerate(names, start=1)
+    ]
+    identity = ResolvedIdentity(
+        media_type="tv",
+        tmdb_id=1399,
+        title="Juego de tronos",
+        original_title="Game of Thrones",
+        year=2011,
+        aliases=["Juego de tronos", "Game of Thrones"],
+        score=100,
+        margin=50,
+        query="Juego de Tronos",
+        guess={},
+        source="test",
+        season=4,
+        episodes=list(range(1, 11)),
+        resolver_algorithm_version="phased-er-v2",
+        decision_status="ACCEPTED_CONFIDENT",
+        episode_intents=resolver_intents,
+    )
+
+    assert unclassified == []
+    assert Engine._series_intent_codes(local_intents) == {
+        (4, episode) for episode in range(1, 11)
+    }
+    assert (
+        Engine._series_identity_input_conflict(
+            identity,
+            local_intents,
+            resolver_intents,
+        )
+        is None
+    )
 
 
 def test_aggregate_validation_keeps_physical_binding_and_accepts_absolute_mapping() -> None:
