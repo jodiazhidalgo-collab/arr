@@ -1097,7 +1097,7 @@ function exactCanonicalRoute(hash) {
   return null;
 }
 
-function canonicalRouteFromHash(hash = location.hash) {
+function canonicalRouteFromHash(hash = location.hash, { useStored = true } = {}) {
   const exact = exactCanonicalRoute(hash);
   if (exact) return exact;
 
@@ -1132,12 +1132,12 @@ function canonicalRouteFromHash(hash = location.hash) {
     return { view, section, watcherProfile, hash: ruleRouteHash(view, section, watcherProfile), partial: true };
   }
 
-  const storedHash = storageGet(PANEL_ROUTE_STORAGE_KEY, "");
-  const stored = exactCanonicalRoute(storedHash);
-  if (stored) return stored;
-  if (storedHash === "#ajustes/vigilantes") {
-    const watcherProfile = readStoredWatcherProfile();
-    return { view: "ajustes", section: "vigilantes", watcherProfile, hash: ruleRouteHash("ajustes", "vigilantes", watcherProfile), legacy: true };
+  if (useStored) {
+    const storedHash = storageGet(PANEL_ROUTE_STORAGE_KEY, "");
+    if (storedHash && storedHash !== hash) {
+      const stored = canonicalRouteFromHash(storedHash, { useStored: false });
+      if (!stored.fallback) return { ...stored, stored: true };
+    }
   }
   return { view: "identidad", profile: "common", section: "parser", hash: "#identidad/comun/parser", fallback: true };
 }

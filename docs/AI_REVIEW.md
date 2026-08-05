@@ -57,62 +57,38 @@ No se deben inventar fuentes paralelas si esos datos ya pueden derivarse de `job
 
 ## Identidad TMDb y evidencia de titulo
 
-El parser conserva `title_candidates` por compatibilidad y añade
-`title_evidence`, donde cada titulo lleva `value`, `role`, `source` y
-`group_id`. Los roles separan titulo primario, alternativo, compuesto,
-derivado de serie y alias configurado. Marcadores editoriales como
-`Extended Edition` se eliminan como descriptor: no se convierten en un titulo
-alternativo ni pueden activar un fallback, tampoco al reconstruir snapshots
-legacy.
+El motor activo es `phased-er-v2`: descubre candidatos, los enriquece, elimina
+contradicciones materiales, compara familias de evidencia y decide. No usa
+pesos, score minimo, margen ni preferencia por antiguedad. Cada familia
+(`title`, `year`, `runtime` y `episode`) produce una sola conclusion `AGREE`,
+`DISAGREE` o `UNKNOWN`; la ausencia de un dato nunca se convierte en conflicto.
 
-El resolver separa puntuacion y elegibilidad. Un candidato puede sumar puntos
-por similitud sin quedar autorizado para decidir. En entradas con varios
-titulos se aplican estas barreras:
+La seleccion restante es determinista: ano explicito exacto, mas evidencias
+independientes concordantes, menos contradicciones, popularidad TMDb, votos,
+estreno mas reciente y TMDb ID menor. Una ambiguedad normal se acepta como
+`ACCEPTED_FALLBACK` y conserva alternativas visibles. Solo una contradiccion
+dura produce `BLOCKED_HARD`; un fallo parcial o total de TMDb produce
+`RETRY_PROVIDER` y nunca se cachea.
 
-- La corroboracion exige coincidencia exacta normalizada de las dos mitades del mismo grupo.
-- Un alias configurado exacto conserva autoridad explicita salvo que contradiga un ano presente en la entrada.
-- Un titulo primario rival solo cuenta como confirmacion si su coincidencia es exacta.
-- Un alternativo aislado solo puede ganar como fallback estricto si es unico, tiene el ano exacto y, en TV, la temporada solicitada existe.
-- `allow_omitted_part_number` conserva puntos y `matching_rules`, pero nunca cuenta como coincidencia exacta de identidad, corroboracion ni fallback; esa diferencia queda visible en `title_matches.identity_exact`.
-- Conflictos de evidencia, seleccion incompleta o temporada imposible pasan a revision; TV no los oculta continuando por la senal local.
-- IDs directos y reglas forzadas conservan sus validaciones y bypass configurados.
+La cobertura amplia permite hasta 12 variantes, 60 IDs unicos, lotes de 8 y
+40 peticiones de detalle dentro de un presupuesto comun de 20 segundos. Llegar
+a un tope interno marca `coverage_limited=true` y acepta la opcion plausible
+mas probable. Las peliculas comparan la cronologia completa de estrenos y la
+duracion local; Series conserva una `EpisodeIntent` por cada archivo fisico y
+comprueba temporadas, episodios, absolutos, especiales, dobles y packs.
 
-Las consultas usan estrategia `phased_round_robin`: primero reparten el
-presupuesto entre evidencia primaria, compuesta y alternativa, y despues
-relajan ano o idioma. El limite duro es 8 busquedas y 3 fichas detalladas. Los
-candidatos de procedencia fuerte se reservan antes de rellenar huecos con
-resultados solo alternativos. Si quedan rivales fuertes o exactos fuera del
-limite, o falla una ficha detallada, `selection_uncertain` bloquea cualquier
-conclusion que dependa de una falsa unicidad. La excepcion segura es una ficha
-ya detallada que confirma exactamente todos los titulos atomicos del mismo
-grupo: esa corroboracion tiene prioridad si los unicos rivales omitidos son
-solo alternativos, no fallo ningun detalle y no existe un alias configurado
-valido.
+Toda identidad aceptada entrega su TMDb ID explicito a FileBot. La cache usa
+`resolver_cache_version=4` y las decisiones nuevas registran
+`resolver_algorithm_version=phased-er-v2`. Common, Movies y TV se guardan en
+ambitos v2 separados; al crear el trabajo se compone y congela la politica
+efectiva con revisiones y huellas. Las configuraciones antiguas se migran una
+sola vez y no pueden volver a ejecutar el motor anterior. Los diagnosticos
+historicos siguen siendo legibles de forma pasiva.
 
-Si la propia ficha TMDb devuelve `Exterior (Interior)` y confirma por separado
-el titulo interior, el resolver puede extraer el exterior para comparar ambos
-atomos. No se hace la inferencia inversa: el literal compuesto aislado no basta
-y un calificador interior nunca se convierte en titulo por esta via.
-
-En una entrada realmente multiatomica, si la primera consulta principal
-devuelve de forma exacta el titulo alternativo, el resolver puede adelantar una
-sola ficha para comprobar sus alias. Ese intento se descuenta del mismo limite
-de 3, se reutiliza al final y nunca se ejecuta para titulos simples. Un fallo o
-un presupuesto agotado marca detalle incompleto y fuerza revision.
-`search_strategy` deja esta ruta auditable mediante `early_detail_attempted`,
-`early_detail_reused`, `detail_requests` y, cuando corresponda,
-`detail_incomplete`.
-
-La cache usa `resolver_cache_version=3` y cada identidad nueva registra
-`resolver_algorithm_version=title-evidence-v1`. La preview y el evento
-existente de fase `identity` (emitido como `resolved` y normalizado a
-`decision`) exponen la decision, elegibilidad y procedencia saneadas.
-`search_provenance` no conserva la consulta cruda; los detalles humanos siguen
-pasando por el saneador antes de llegar a `job_events` o al Informe Codex.
-Cuando la barrera de evidencia bloquea la identidad, preview y API conservan
-el estado compatible `REJECTED` en el nivel superior y en `decision.status`.
-La causa nueva queda diferenciada mediante `eligibility_blocked` y
-`eligibility_reason`, sin reclasificarla despues como score o margen.
+La preview y los eventos de `job_events` exponen `decision.status`, candidato
+elegido, alternativas, evidencias, contadores de fases y cobertura saneada. El
+campo HTTP `ok` solo indica que la peticion se proceso; la decision funcional
+siempre se interpreta mediante `decision.status`.
 
 Pruebas focales desde `services/arr-orchestrator`:
 

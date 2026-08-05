@@ -9,6 +9,7 @@
     const category = state.testCategories[section];
     const activeTest = state.activeTest;
     const testing = Boolean(activeTest);
+    const locked = Boolean(state.resetting);
     const testingHere = activeTest?.section === section;
     const categoryOptions = state.profile === "common"
       ? `${parser ? `<option value="auto" ${category === "auto" ? "selected" : ""}>Automática</option>` : ""}
@@ -24,10 +25,10 @@
       </div>
       <div class="identity-test-form">
         <label class="identity-sr-only" for="identity-test-name">Nombre a probar</label>
-        <input id="identity-test-name" type="text" value="${ui.esc(state.testNames[section])}" placeholder="Escribe aquí el nombre sucio completo" autocomplete="off" spellcheck="false">
+        <input id="identity-test-name" type="text" value="${ui.esc(state.testNames[section])}" placeholder="Escribe aquí el nombre sucio completo" autocomplete="off" spellcheck="false" ${locked ? "disabled" : ""}>
         <label class="identity-sr-only" for="identity-test-category">Categoría</label>
-        <select id="identity-test-category">${categoryOptions}</select>
-        <button type="button" class="btn primary" id="identity-test-button" ${testing ? "disabled" : ""}>${testingHere ? "Probando…" : testing ? "Prueba en curso…" : "Probar título"}</button>
+        <select id="identity-test-category" ${locked ? "disabled" : ""}>${categoryOptions}</select>
+        <button type="button" class="btn primary" id="identity-test-button" ${testing || locked ? "disabled" : ""}>${locked ? "Restablecimiento en curso…" : testingHere ? "Probando…" : testing ? "Prueba en curso…" : "Probar título"}</button>
       </div>
       <div id="identity-test-result">${testingHere ? `<div class="identity-test-loading">Analizando el título…</div>` : ui.renderTestResult(section, state.lastResult[section], state.testContext[section])}</div>
     </section>`;
@@ -40,6 +41,7 @@
     if (!name || !category || !button) return;
     const state = ui.state;
     const profile = state.profile;
+    if (state.resetting) return;
     const section = state.section;
     name.addEventListener("input", () => {
       state.testNames[section] = name.value;
@@ -67,6 +69,10 @@
   ui.runTitleTest = async function () {
     const state = ui.state;
     const profile = state.profile;
+    if (state.resetting) {
+      ui.status("Espera a que termine el restablecimiento antes de probar.", "info", profile);
+      return;
+    }
     if (state.activeTest) {
       ui.status("Ya hay una prueba de título en curso. Espera a que termine.", "info", profile);
       const activeButton = document.getElementById("identity-test-button");
@@ -129,14 +135,16 @@
         const currentBox = document.getElementById("identity-test-result");
         if (currentBox) currentBox.innerHTML = ui.renderTestResult(section, result, context);
         ui.bindCandidateActions();
-        const resolverAnnouncement = section === "resolver"
-          ? ui.resolverPresentation(result, ui.resolverCandidates(result)).title
-          : "";
+        const resolverPresentation = section === "resolver" ? ui.resolverPresentation(result) : null;
+        const resolverAnnouncement = resolverPresentation?.title || "";
+        const resolverAccepted = resolverPresentation?.tone === "ok";
         ui.status(
-          `${resolverAnnouncement ? `${resolverAnnouncement}. ` : ""}${result.ok === false
-            ? "Prueba terminada con una incidencia. No se ha guardado ni movido ningún archivo."
-            : "Prueba terminada. No se ha guardado ni movido ningún archivo."}`,
-          result.ok === false ? "warn" : "ok",
+          `${resolverAnnouncement ? `${resolverAnnouncement}. ` : ""}${section === "resolver" && !resolverAccepted
+            ? "Prueba terminada sin aceptar una identidad. No se ha guardado ni movido ningún archivo."
+            : result.ok === false
+              ? "Prueba terminada con una incidencia. No se ha guardado ni movido ningún archivo."
+              : "Prueba terminada. No se ha guardado ni movido ningún archivo."}`,
+          section === "resolver" ? resolverPresentation.tone : result.ok === false ? "warn" : "ok",
           profile
         );
       }
@@ -148,9 +156,7 @@
         message: String(error?.message || "No se pudo completar la petición."),
         decision: {
           status: "REQUEST_ERROR",
-          accepted: false,
-          has_scoring: false,
-          bypass: false
+          accepted: false
         }
       } : null;
       const failureContext = resolverFailure ? Object.freeze({
@@ -214,8 +220,13 @@
       ${steps ? `<div class="identity-table-wrap"><table class="table identity-trace"><thead><tr><th scope="col">Regla</th><th scope="col">Antes</th><th scope="col">Después</th></tr></thead><tbody>${steps}</tbody></table></div>` : ""}`;
   };
 
-  ui.addCandidateRule = function (dataset) {
+  ui.addCandidateRule = async function (dataset) {
     const state = ui.state;
+    const sourceProfile = state.profile;
+    if (state.readOnly || state.resetting) {
+      ui.status(state.resetting ? "Espera a que termine el restablecimiento." : "Este documento histórico es de solo lectura.", "warn");
+      return;
+    }
     const context = state.testContext.resolver;
     if (!context || Number(dataset.testRequestId) !== Number(context.requestId)) {
       ui.status("Esta prueba ya no es válida. Vuelve a pulsar Probar título.", "warn");
@@ -241,7 +252,28 @@
     const path = dataset.candidateAction === "alias"
       ? `resolver.aliases.${category}`
       : `resolver.forced_matches.${category}`;
-    const list = ui.getPath(state.draft, path) || [];
+    let commonState = ui.states.common;
+    if (!commonState?.draft || !commonState.document) {
+      await ui.loadRules({ profile: "common" });
+      commonState = ui.states.common;
+    }
+    if (!commonState?.draft || !commonState.document) {
+      ui.status("No se pudo cargar la configuración Común; no se ha añadido ninguna regla.", "bad", sourceProfile);
+      return;
+    }
+    if (state.testContext.resolver !== context || Number(dataset.testRequestId) !== Number(context.requestId)) {
+      ui.status("Esta prueba ya no es válida. Vuelve a pulsar Probar título.", "warn", sourceProfile);
+      return;
+    }
+    if (commonState.readOnly || commonState.resetting) {
+      ui.status("La configuración Común no se puede editar ahora mismo.", "warn", sourceProfile);
+      return;
+    }
+    let list = ui.getPath(commonState.draft, path);
+    if (!Array.isArray(list)) {
+      list = [];
+      ui.setPath(commonState.draft, path, list);
+    }
     const value = dataset.candidateAction === "alias"
       ? `${parserTitle} | ${candidateTitle}`
       : category === "tv" && !parserYear
@@ -249,16 +281,24 @@
         : `${parserTitle} | ${parserYear} | ${tmdbId}`;
     const existingIndex = list.indexOf(value);
     if (existingIndex >= 0) {
-      ui.status("Esa regla ya existe en el borrador.", "info");
-      document.querySelector(`[data-list-path="${path}"][data-list-index="${existingIndex}"]`)?.focus();
+      ui.status("Esa regla ya existe en el borrador Común.", "info", sourceProfile);
+      if (ui.isProfileActive("common")) {
+        document.querySelector(`[data-list-path="${path}"][data-list-index="${existingIndex}"]`)?.focus();
+      }
       return;
     }
     const newIndex = list.length;
     list.push(value);
-    ui.markDirty();
-    ui.render();
-    ui.status(`${dataset.candidateAction === "alias" ? "Alias" : "Coincidencia forzada"} añadida al formulario. Falta guardar.`, "warn");
-    document.querySelector(`[data-list-path="${path}"][data-list-index="${newIndex}"]`)?.focus();
+    ui.markDirty("common");
+    const ruleLabel = dataset.candidateAction === "alias" ? "Alias" : "Coincidencia forzada";
+    ui.status(`${ruleLabel} añadida al borrador Común. Falta guardar.`, "warn", "common");
+    if (sourceProfile !== "common") {
+      ui.status(`${ruleLabel} añadida en Común. Entra en Común y pulsa Guardar.`, "warn", sourceProfile);
+    }
+    if (ui.isProfileActive("common")) {
+      ui.render();
+      document.querySelector(`[data-list-path="${path}"][data-list-index="${newIndex}"]`)?.focus();
+    }
   };
 
   ui.compactValue = function (value) {

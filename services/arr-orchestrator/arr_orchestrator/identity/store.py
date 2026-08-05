@@ -13,11 +13,15 @@ from typing import Dict, List, Optional, Protocol
 from .defaults import (
     IDENTITY_HISTORY_LIMIT,
     IDENTITY_SCHEMA_VERSION,
-    IDENTITY_SETTING_KEY,
     factory_identity_rules,
+    identity_profile_setting_key,
 )
-from .fingerprint import identity_fingerprint
 from .schema import identity_settings_schema
+from .scopes import (
+    identity_scope_fingerprint,
+    normalize_scoped_identity_rules,
+    scope_identity_rules,
+)
 from .validation import IdentityRulesValidationError, normalize_identity_rules
 from .validation.common import choice, exact_keys, expect_object, integer, text
 
@@ -73,7 +77,7 @@ def _normalize_history(value: object, limit: int) -> List[Dict[str, object]]:
                 "action": choice(
                     entry.get("action"),
                     f"identity.pipeline.history[{index}].action",
-                    ("save", "reset"),
+                    ("save", "reset", "migrate"),
                 ),
             }
         )
@@ -112,10 +116,10 @@ class IdentitySettingsStore:
         logger: Optional[logging.Logger] = None,
         history_limit: int = IDENTITY_HISTORY_LIMIT,
         resolver_http_timeout_ms: int = 2500,
-        resolver_total_budget_ms: int = 5000,
+        resolver_total_budget_ms: int = 20_000,
         resolver_retry_seconds: int = 60,
         profile: str = "common",
-        setting_key: str = IDENTITY_SETTING_KEY,
+        setting_key: str = identity_profile_setting_key("common"),
     ) -> None:
         if (
             isinstance(history_limit, bool)
@@ -128,8 +132,10 @@ class IdentitySettingsStore:
         self._lock = threading.RLock()
         self._history_limit = history_limit
         self._profile = str(profile or "common")
-        self._setting_key = str(setting_key or IDENTITY_SETTING_KEY)
-        self._defaults = normalize_identity_rules(
+        self._setting_key = str(
+            setting_key or identity_profile_setting_key("common")
+        )
+        self._full_defaults = normalize_identity_rules(
             factory_identity_rules(
                 default_language,
                 default_region,
@@ -138,12 +144,14 @@ class IdentitySettingsStore:
                 resolver_retry_seconds,
             )
         )
+        self._defaults = scope_identity_rules(self._full_defaults, self._profile)
         self._rules = copy.deepcopy(self._defaults)
         self._revision = 0
         self._saved_at: Optional[str] = None
         self._history: List[Dict[str, object]] = []
         self._stored_raw: Optional[str] = None
         self._stored_is_canonical = True
+        self._stored_error: Optional[str] = None
         self._load_locked(self._database.get_setting(self._setting_key))
 
     def _load_locked(self, raw: Optional[str]) -> None:
@@ -154,23 +162,19 @@ class IdentitySettingsStore:
             self._saved_at = None
             self._history = []
             self._stored_is_canonical = True
+            self._stored_error = None
             return
         try:
             payload = json.loads(raw)
             envelope = expect_object(payload, "identity.pipeline")
             if "rules" not in envelope:
-                # Compatibilidad defensiva con una primera escritura de reglas puras.
-                self._rules = normalize_identity_rules(envelope)
-                self._revision = 1
-                self._saved_at = None
-                self._history = []
-                self._stored_is_canonical = False
-                return
-            exact_keys(
-                envelope,
-                {"rules", "revision", "saved_at", "history"},
-                "identity.pipeline",
-            )
+                raise IdentityRulesValidationError(
+                    "identity.pipeline.v2 requiere un sobre versionado con rules."
+                )
+            if set(envelope) != {"rules", "revision", "saved_at", "history"}:
+                raise IdentityRulesValidationError(
+                    "identity.pipeline contiene campos incompletos o desconocidos."
+                )
             revision = envelope.get("revision")
             if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
                 raise IdentityRulesValidationError(
@@ -181,13 +185,18 @@ class IdentitySettingsStore:
                 raise IdentityRulesValidationError(
                     "identity.pipeline.saved_at no es valido."
                 )
-            self._rules = normalize_identity_rules(envelope.get("rules"))
+            self._rules = normalize_scoped_identity_rules(
+                envelope.get("rules"),
+                self._profile,
+                full_defaults=self._full_defaults,
+            )
             self._revision = revision
             self._saved_at = saved_at
             self._history = _normalize_history(
                 envelope.get("history"), self._history_limit
             )
             self._stored_is_canonical = True
+            self._stored_error = None
         except (
             IdentityRulesValidationError,
             json.JSONDecodeError,
@@ -203,6 +212,7 @@ class IdentitySettingsStore:
             self._saved_at = None
             self._history = []
             self._stored_is_canonical = False
+            self._stored_error = str(error)
 
     def _refresh_locked(self, *, force: bool = False) -> None:
         raw = self._database.get_setting(self._setting_key)
@@ -227,16 +237,18 @@ class IdentitySettingsStore:
             "ok": ok,
             "rules": copy.deepcopy(self._rules),
             "defaults": copy.deepcopy(self._defaults),
-            "schema": identity_settings_schema(),
+            "schema": identity_settings_schema(self._profile),
             "revision": self._revision,
             "saved_at": self._saved_at,
-            "fingerprint": identity_fingerprint(self._rules),
+            "fingerprint": identity_scope_fingerprint(self._rules, self._profile),
             "history": copy.deepcopy(self._history),
             "history_limit": self._history_limit,
             "cache_status": self._cache_status(),
             "rules_path": f"settings/{self._setting_key}",
             "setting_key": self._setting_key,
             "profile": self._profile,
+            "schema_version": IDENTITY_SCHEMA_VERSION,
+            "export_format": "arr-identity-export-v2",
             "repair_required": not self._stored_is_canonical,
         }
 
@@ -250,18 +262,80 @@ class IdentitySettingsStore:
         """Copia de reglas normalizadas sin consultar SQLite."""
 
         with self._lock:
+            self._ensure_executable_locked()
             return copy.deepcopy(self._rules)
 
     def job_snapshot(self) -> Dict[str, object]:
         """Reglas, revision y huella capturadas bajo un unico lock."""
 
         with self._lock:
+            self._ensure_executable_locked()
             return {
                 "rules": copy.deepcopy(self._rules),
                 "revision": self._revision,
                 "saved_at": self._saved_at,
-                "fingerprint": identity_fingerprint(self._rules),
+                "fingerprint": identity_scope_fingerprint(self._rules, self._profile),
             }
+
+    def job_snapshot_from_raw(self, raw: Optional[str]) -> Dict[str, object]:
+        """Decodifica un valor obtenido junto a otros en un snapshot DB atomico."""
+
+        with self._lock:
+            if raw is None:
+                raise IdentityRulesValidationError(
+                    f"{self._setting_key} no existe; no se puede crear un snapshot ejecutable."
+                )
+            try:
+                payload = json.loads(raw)
+                envelope = expect_object(payload, "identity.pipeline")
+                if set(envelope) != {"rules", "revision", "saved_at", "history"}:
+                    raise IdentityRulesValidationError(
+                        "identity.pipeline contiene campos incompletos o desconocidos."
+                    )
+                rules = normalize_scoped_identity_rules(
+                    envelope.get("rules"),
+                    self._profile,
+                    full_defaults=self._full_defaults,
+                )
+                raw_revision = envelope.get("revision")
+                if (
+                    isinstance(raw_revision, bool)
+                    or not isinstance(raw_revision, int)
+                    or raw_revision < 0
+                ):
+                    raise IdentityRulesValidationError(
+                        "identity.pipeline.revision no es valida."
+                    )
+                revision = raw_revision
+                saved_at = envelope.get("saved_at")
+                if saved_at is not None and not isinstance(saved_at, str):
+                    raise IdentityRulesValidationError(
+                        "identity.pipeline.saved_at no es valido."
+                    )
+                _normalize_history(envelope.get("history"), self._history_limit)
+            except (
+                IdentityRulesValidationError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise IdentityRulesValidationError(
+                    f"{self._setting_key} no es ejecutable: {error}"
+                ) from error
+            return {
+                "rules": rules,
+                "revision": revision,
+                "saved_at": saved_at,
+                "fingerprint": identity_scope_fingerprint(rules, self._profile),
+            }
+
+    def _ensure_executable_locked(self) -> None:
+        if self._stored_raw is None or self._stored_is_canonical:
+            return
+        raise IdentityRulesValidationError(
+            f"{self._setting_key} no es ejecutable: "
+            f"{self._stored_error or 'requiere reparacion explicita.'}"
+        )
 
     def _conflict_locked(self, expected_revision: int) -> Dict[str, object]:
         result = self._response_locked(ok=False)
@@ -307,7 +381,7 @@ class IdentitySettingsStore:
 
         revision = self._revision + 1
         saved_at = _utc_now()
-        fingerprint = identity_fingerprint(normalized)
+        fingerprint = identity_scope_fingerprint(normalized, self._profile)
         history = [
             *self._history,
             {
@@ -317,13 +391,14 @@ class IdentitySettingsStore:
                 "action": action,
             },
         ][-self._history_limit :]
+        envelope: Dict[str, object] = {
+            "rules": normalized,
+            "revision": revision,
+            "saved_at": saved_at,
+            "history": history,
+        }
         serialized = json.dumps(
-            {
-                "rules": normalized,
-                "revision": revision,
-                "saved_at": saved_at,
-                "history": history,
-            },
+            envelope,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -350,6 +425,7 @@ class IdentitySettingsStore:
         self._history = history
         self._stored_raw = serialized
         self._stored_is_canonical = True
+        self._stored_error = None
         result = self._response_locked()
         result.update({"saved": True, "action": action})
         return result
@@ -364,7 +440,11 @@ class IdentitySettingsStore:
                 0,
                 2_147_483_647,
             )
-            normalized = normalize_identity_rules(request.get("rules"))
+            normalized = normalize_scoped_identity_rules(
+                request.get("rules"),
+                self._profile,
+                full_defaults=self._full_defaults,
+            )
         except IdentityRulesValidationError as error:
             with self._lock:
                 result = self._response_locked(ok=False)
@@ -392,33 +472,6 @@ class IdentitySettingsStore:
             return self._write_locked(
                 copy.deepcopy(self._defaults), expected_revision, "reset"
             )
-
-    def migrate_legacy_if_absent(self, rules: object) -> Dict[str, object]:
-        """Inicializa desde FileBot solo cuando la clave nunca fue persistida.
-
-        Un valor existente, aunque sea invalido o de un esquema futuro, queda
-        intacto para que solo una accion explicita de reparacion pueda
-        sustituirlo. El CAS por valor exacto protege tambien la carrera entre
-        el chequeo de ausencia y la escritura real de produccion.
-        """
-
-        try:
-            normalized = normalize_identity_rules(rules)
-        except IdentityRulesValidationError as error:
-            with self._lock:
-                result = self._response_locked(ok=False)
-            result.update({"error": "invalid_rules", "message": str(error)})
-            return result
-
-        with self._lock:
-            self._refresh_locked()
-            if self._stored_raw is not None:
-                result = self._response_locked()
-                result.update({"saved": False, "migrated": False, "action": "save"})
-                return result
-            result = self._write_locked(normalized, 0, "save")
-            result["migrated"] = bool(result.get("saved"))
-            return result
 
     def clear_cache(self) -> Dict[str, object]:
         """Vacia solo la cache del resolver; no altera reglas ni revision."""

@@ -23,6 +23,8 @@ def identity(media_type: str = "movie") -> ResolvedIdentity:
         source="test",
         season=1 if media_type == "tv" else None,
         episodes=[1] if media_type == "tv" else [],
+        resolver_algorithm_version="phased-er-v2",
+        decision_status="ACCEPTED_CONFIDENT",
     )
 
 
@@ -60,7 +62,6 @@ class FileBotCommandTests(unittest.TestCase):
                     "move",
                     "--conflict",
                     "skip",
-                    "-non-strict",
                     "--format",
                     MOVIE_FORMAT,
                 ],
@@ -99,68 +100,54 @@ class FileBotCommandTests(unittest.TestCase):
                     "move",
                     "--conflict",
                     "skip",
-                    "-non-strict",
                     "--format",
                     TV_FORMAT,
                 ],
             )
 
-    def test_legacy_movie_and_tv_commands_are_fixed(self) -> None:
+    def test_filebot_refuses_to_run_without_an_accepted_tmdb_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             input_root = root / "input"
             output_root = root / "output"
             runner = FileBotRunner("/opt/filebot/filebot", root)
 
-            common = [
-                "/opt/filebot/filebot",
-                "-no-xattr",
-                "-script",
-                "fn:amc",
-                str(input_root),
-                "--log-file",
-            ]
-            common_tail = [
-                "--output",
-                str(output_root),
-                "--action",
-                "move",
-                "--conflict",
-                "skip",
-                "-non-strict",
-                "--lang",
-                "es",
-                "--def",
-                "clean=y",
-                "music=n",
-                "artwork=n",
-                "excludeList=/dev/null",
-            ]
-            movie = runner.preview_command(
-                "legacy-movie", "movies", input_root, output_root
-            )["argv"]
-            tv = runner.preview_command(
-                "legacy-tv", "tv", input_root, output_root
-            )["argv"]
+            with self.assertRaisesRegex(ValueError, "identidad TMDb aceptada"):
+                runner.preview_command("without-identity", "movies", input_root, output_root)
+            with self.assertRaisesRegex(ValueError, "identidad TMDb aceptada"):
+                runner.run("without-identity", "tv", input_root, output_root)
 
-            self.assertEqual(
-                movie,
-                common
-                + [str(root / "filebot-legacy-movie.log")]
-                + common_tail
-                + ["ut_label=movie", f"movieFormat={MOVIE_FORMAT}"],
-            )
-            self.assertEqual(
-                tv,
-                common
-                + [str(root / "filebot-legacy-tv.log")]
-                + common_tail
-                + [
-                    "ut_label=TV",
-                    "minLengthMS=300000",
-                    f"seriesFormat={TV_FORMAT}",
-                ],
-            )
+            self.assertFalse(hasattr(runner, "_legacy_amc_command"))
+
+    def test_filebot_refuses_blank_or_blocked_v2_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = FileBotRunner("filebot", root)
+            blank = identity()
+            blank.decision_status = ""
+            blocked = identity("tv")
+            blocked.decision_status = "BLOCKED_HARD"
+
+            with self.assertRaisesRegex(ValueError, "decision v2 aceptada"):
+                runner.preview_command(
+                    "blank", "movies", root / "in-m", root / "out-m", blank
+                )
+            with self.assertRaisesRegex(ValueError, "decision v2 aceptada"):
+                runner.preview_command(
+                    "blocked", "tv", root / "in-t", root / "out-t", blocked
+                )
+
+    def test_filebot_refuses_a_historical_resolver_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runner = FileBotRunner("filebot", root)
+            historical = identity()
+            historical.resolver_algorithm_version = "title-evidence-v1"
+
+            with self.assertRaisesRegex(ValueError, "phased-er-v2"):
+                runner.preview_command(
+                    "historical", "movies", root / "in", root / "out", historical
+                )
 
     def test_guided_locale_does_not_change_fixed_formats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -183,10 +170,6 @@ class FileBotCommandTests(unittest.TestCase):
             tv = runner.preview_command(
                 "tv", "tv", root / "in-t", root / "out-t", identity("tv")
             )
-            legacy = runner.preview_command(
-                "legacy", "tv", root / "in-l", root / "out-l"
-            )
-
             movie_argv = movie["argv"]
             tv_argv = tv["argv"]
             self.assertEqual(movie_argv[movie_argv.index("--lang") + 1], "fr")
@@ -200,8 +183,8 @@ class FileBotCommandTests(unittest.TestCase):
             self.assertEqual(movie["rules"]["format"], MOVIE_FORMAT)
             self.assertEqual(tv["rules"]["language"], "en-US")
             self.assertEqual(tv["rules"]["format"], TV_FORMAT)
-            self.assertEqual(legacy["rules"]["language"], "es")
-            self.assertEqual(legacy["rules"]["format"], TV_FORMAT)
+            self.assertEqual(movie["tmdb_id"], 11687)
+            self.assertEqual(tv["tmdb_id"], 1396)
 
     def test_timeout_is_returned_as_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

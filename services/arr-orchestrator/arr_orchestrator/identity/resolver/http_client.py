@@ -30,7 +30,7 @@ def get_json(
         "params": {
             key: value
             for key, value in params.items()
-            if key in {"query", "language", "region", "year", "first_air_date_year"}
+            if key in {"query", "language", "region", "year", "first_air_date_year", "page"}
         },
         "timeout_seconds": round(timeout, 3),
     }
@@ -52,8 +52,13 @@ def get_json(
     trace_entry["status_code"] = int(response.status_code)
     if response.status_code == 429 or response.status_code >= 500:
         raise ResolverUnavailable(f"TMDb respondio HTTP {response.status_code}")
+    if response.status_code == 404:
+        raise ResolutionError(
+            "TMDb no encontro el recurso solicitado",
+            {"http_status": 404, "not_found": True},
+        )
     if response.status_code >= 400:
-        raise ResolutionError(f"TMDb rechazo la consulta: HTTP {response.status_code}")
+        raise ResolverUnavailable(f"TMDb rechazo temporalmente la consulta: HTTP {response.status_code}")
     try:
         return dict(response.json())
     except (TypeError, ValueError) as error:

@@ -66,6 +66,7 @@ class FileBotRunner:
         output_root: Path,
         identity: Optional[ResolvedIdentity] = None,
     ) -> Dict[str, object]:
+        identity = self._require_guided_identity(category, identity)
         preview = self.preview_command(job_id, category, input_path, output_root, identity)
         log_file = Path(str(preview["log_file"]))
         command = list(preview["argv"])
@@ -127,8 +128,8 @@ class FileBotRunner:
             "stdout_tail": combined[-6000:],
             "log_file": str(log_file),
             "raw_log_truncated": raw_log_truncated,
-            "identity": identity.to_dict() if identity else None,
-            "mode": "guided" if identity else "legacy_amc",
+            "identity": identity.to_dict(),
+            "mode": "guided",
             "command_preview": preview,
         }
         result_file = self.log_dir / f"filebot-{job_id}.json"
@@ -146,63 +147,45 @@ class FileBotRunner:
         output_root: Path,
         identity: Optional[ResolvedIdentity] = None,
     ) -> Dict[str, object]:
+        identity = self._require_guided_identity(category, identity)
         log_file = self.log_dir / f"filebot-{job_id}.log"
-        command = (
-            self._guided_command(category, input_path, output_root, log_file, identity)
-            if identity
-            else self._legacy_amc_command(category, input_path, output_root, log_file)
-        )
+        command = self._guided_command(category, input_path, output_root, log_file, identity)
         return {
             "argv": command,
-            "mode": "guided" if identity else "legacy_amc",
+            "mode": "guided",
             "cwd": str(input_path),
             "log_file": str(log_file),
             "timeout_sec": FILEBOT_TIMEOUT_SECONDS,
-            "rules": self._command_rules_summary(category, guided=identity is not None),
+            "rules": self._command_rules_summary(category),
+            "tmdb_id": identity.tmdb_id,
         }
 
-    def _legacy_amc_command(
-        self, category: str, input_path: Path, output_root: Path, log_file: Path
-    ) -> List[str]:
-        command: List[str] = [
-            self.binary,
-            "-no-xattr",
-            "-script",
-            "fn:amc",
-            str(input_path),
-            "--log-file",
-            str(log_file),
-            "--output",
-            str(output_root),
-            "--action",
-            "move",
-            "--conflict",
-            "skip",
-            "-non-strict",
-            "--lang",
-            "es",
-            "--def",
-            "clean=y",
-            "music=n",
-            "artwork=n",
-            "excludeList=/dev/null",
-        ]
-        if category == "movies":
-            command.extend(
-                [
-                    "ut_label=movie",
-                    f"movieFormat={MOVIE_FORMAT}",
-                ]
+    @staticmethod
+    def _require_guided_identity(
+        category: str,
+        identity: Optional[ResolvedIdentity],
+    ) -> ResolvedIdentity:
+        if identity is None:
+            raise ValueError(
+                "FileBot requiere una identidad TMDb aceptada; AMC sin identidad esta desactivado"
             )
-        elif category == "tv":
-            command.extend(
-                [
-                    "ut_label=TV",
-                    "minLengthMS=300000",
-                    f"seriesFormat={TV_FORMAT}",
-                ]
+        expected_media_type = "movie" if category == "movies" else "tv" if category == "tv" else ""
+        if not expected_media_type or identity.media_type != expected_media_type:
+            raise ValueError("La identidad TMDb no coincide con la categoria de FileBot")
+        if int(identity.tmdb_id) <= 0:
+            raise ValueError("La identidad TMDb no contiene un identificador valido")
+        if str(identity.resolver_algorithm_version or "") != "phased-er-v2":
+            raise ValueError(
+                "FileBot solo puede ejecutar identidades creadas por phased-er-v2"
             )
-        return command
+        if str(identity.decision_status or "").upper() not in {
+            "ACCEPTED_CONFIDENT",
+            "ACCEPTED_FALLBACK",
+        }:
+            raise ValueError(
+                "FileBot requiere una decision v2 aceptada de forma explicita"
+            )
+        return identity
 
     def _guided_command(
         self,
@@ -234,7 +217,6 @@ class FileBotRunner:
             "move",
             "--conflict",
             "skip",
-            "-non-strict",
             "--format",
             output_format,
         ]
@@ -254,17 +236,15 @@ class FileBotRunner:
     def _guided_language(self, category: str) -> str:
         return _filebot_language(self._guided_locale(category))
 
-    def _command_rules_summary(
-        self, category: str, *, guided: bool = False
-    ) -> Dict[str, object]:
-        language = self._guided_locale(category) if guided else "es"
+    def _command_rules_summary(self, category: str) -> Dict[str, object]:
+        language = self._guided_locale(category)
         return {
             "language": language,
             "format": MOVIE_FORMAT if category == "movies" else TV_FORMAT,
             "safety": {
                 "action": "move",
                 "conflict": "skip",
-                "strictness": "non-strict",
+                "identity": "tmdb-id-required",
             },
         }
 

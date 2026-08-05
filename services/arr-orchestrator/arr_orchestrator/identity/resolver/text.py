@@ -1,4 +1,4 @@
-"""Normalizacion textual compartida por busqueda, puntuacion y validacion."""
+"""Normalizacion textual compartida por busqueda, comparacion y validacion."""
 
 import json
 import re

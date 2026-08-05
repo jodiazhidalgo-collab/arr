@@ -58,8 +58,8 @@ class LiveResolverTests(unittest.TestCase):
         self.assertEqual(identity.episodes, [1])
 
     def test_real_tmdb_cache_is_immediate(self):
-        input_root = self.input_file("Cenicienta.2015.2160p.mkv")
-        job = {"category": "movies", "name": "Cenicienta.2015.2160p"}
+        input_root = self.input_file("Cenicienta.2015.tmdb150689.2160p.mkv")
+        job = {"category": "movies", "name": "Cenicienta.2015.tmdb150689.2160p"}
         first = self.resolver.resolve(job, input_root)
         started = time.monotonic()
 

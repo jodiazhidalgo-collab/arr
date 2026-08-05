@@ -1,6 +1,6 @@
 FROM jlesage/filebot:latest
 
-RUN apk add --no-cache python3 py3-pip
+RUN apk add --no-cache python3 py3-pip ffmpeg
 
 WORKDIR /opt/arr-orchestrator
 

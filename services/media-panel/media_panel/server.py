@@ -1990,6 +1990,7 @@ class Handler(BaseHTTPRequestHandler):
             profile, separator, action_name = suffix.partition("/")
             profile_actions = {
                 "": IDENTITY_PROXY.save_rules,
+                "validate": IDENTITY_PROXY.validate_rules,
                 "reset": IDENTITY_PROXY.reset_rules,
                 "cache/clear": IDENTITY_PROXY.clear_cache,
                 "test-parser": IDENTITY_PROXY.test_parser,

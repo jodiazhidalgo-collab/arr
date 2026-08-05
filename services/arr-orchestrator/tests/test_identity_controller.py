@@ -11,12 +11,9 @@ from unittest.mock import patch
 from arr_orchestrator.db import Database
 from arr_orchestrator.identity.controller import IdentityController
 from arr_orchestrator.identity.defaults import (
-    IDENTITY_PROFILES,
-    IDENTITY_SETTING_KEY,
-    factory_identity_rules,
     identity_profile_setting_key,
 )
-from arr_orchestrator.identity.fingerprint import identity_fingerprint
+from arr_orchestrator.identity.validation import IdentityRulesValidationError
 from arr_orchestrator.name_resolver import ResolverAmbiguous
 
 
@@ -87,9 +84,10 @@ class IdentityControllerTests(unittest.TestCase):
             {"name": "Blade.Runner.1982.1080p.mkv", "category": "movies"}
         )
 
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], "TMDB_UNAVAILABLE")
-        self.assertEqual(result["decision"]["status"], "TMDB_UNAVAILABLE")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "RETRY_PROVIDER")
+        self.assertEqual(result["decision"]["status"], "RETRY_PROVIDER")
+        self.assertFalse(result["decision"]["accepted"])
         self.assertFalse(result["decision"]["has_scoring"])
         self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
 
@@ -97,28 +95,33 @@ class IdentityControllerTests(unittest.TestCase):
         controller = IdentityController(_config(), self.database)
         preview = {
             "ok": True,
-            "status": "ACCEPTED",
-            "resolver_algorithm_version": "title-evidence-v1",
+            "status": "ACCEPTED_FALLBACK",
+            "resolver_algorithm_version": "phased-er-v2",
             "decision": {
-                "status": "ACCEPTED",
-                "resolver_algorithm_version": "title-evidence-v1",
-                "eligibility_reason": "corroborated_titles",
-                "eligible_candidate_count": 1,
-                "eligibility_blocked": False,
-                "strict_alternate_fallback": {"applied": False},
+                "status": "ACCEPTED_FALLBACK",
+                "accepted": True,
+                "confidence": "probable",
+                "fallback_reason": "ambiguity",
+                "coverage_limited": False,
+                "selected": {"tmdb_id": 1317149, "title": "I Swear"},
+                "alternatives": [{"tmdb_id": 1317149, "title": "I Swear"}],
+                "evidence": [],
+                "phase_counts": {
+                    "discovered": 1,
+                    "enriched": 1,
+                    "eliminated": 0,
+                    "plausible": 1,
+                },
+                "has_scoring": False,
+                "resolver_algorithm_version": "phased-er-v2",
             },
             "candidates": [
                 {
                     "tmdb_id": 1317149,
-                    "eligible": True,
-                    "eligibility_reasons": ["corroborated_titles"],
-                    "title_match_level": "corroborated",
-                    "title_matches": [],
+                    "title": "I Swear",
                     "search_provenance": {
                         "sources": ["alternate"],
                         "phases": ["alternate"],
-                        "exact_sources": ["alternate"],
-                        "exact_phases": ["alternate"],
                         "hits": 1,
                     },
                 }
@@ -145,37 +148,45 @@ class IdentityControllerTests(unittest.TestCase):
             result["candidates"][0]["search_provenance"],
         )
 
-    def test_resolver_tester_keeps_panel_rejected_status_and_eligibility_reason(self) -> None:
+    def test_resolver_tester_keeps_blocked_status_and_reason(self) -> None:
         controller = IdentityController(_config(), self.database)
-        reason = "title_evidence_unconfirmed"
+        reason = "hard_conflict"
 
-        def reject_eligibility(resolver, *_args, **_kwargs):
+        def reject_candidate(resolver, *_args, **_kwargs):
             resolver._trace = {
                 "queries": [],
                 "candidates": [
                     {
                         "tmdb_id": 300,
-                        "eligible": False,
-                        "eligibility_reasons": [f"excluded:{reason}"],
+                        "eliminated": True,
+                        "elimination_reasons": [reason],
                     }
                 ],
                 "cache_hit": False,
                 "decision": {
-                    "status": "REJECTED",
+                    "status": "BLOCKED_HARD",
                     "accepted": False,
-                    "has_scoring": True,
-                    "resolver_algorithm_version": "title-evidence-v1",
-                    "eligibility_reason": reason,
-                    "eligible_candidate_count": 0,
-                    "eligibility_blocked": True,
-                    "strict_alternate_fallback": {"applied": False},
+                    "has_scoring": False,
+                    "resolver_algorithm_version": "phased-er-v2",
+                    "fallback_reason": reason,
+                    "coverage_limited": False,
+                    "selected": None,
+                    "alternatives": [],
+                    "evidence": [],
+                    "phase_counts": {
+                        "discovered": 1,
+                        "enriched": 1,
+                        "eliminated": 1,
+                        "plausible": 0,
+                    },
                 },
             }
             raise ResolverAmbiguous(
-                "La identidad no supera la barrera de evidencia",
+                "La identidad presenta un conflicto duro",
                 {
                     "reason_code": reason,
-                    "resolver_algorithm_version": "title-evidence-v1",
+                    "status": "BLOCKED_HARD",
+                    "resolver_algorithm_version": "phased-er-v2",
                 },
             )
 
@@ -183,7 +194,7 @@ class IdentityControllerTests(unittest.TestCase):
             type(controller.resolver),
             "resolve",
             autospec=True,
-            side_effect=reject_eligibility,
+            side_effect=reject_candidate,
         ):
             result = controller.test_resolver(
                 {
@@ -195,17 +206,17 @@ class IdentityControllerTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(result["status"], "REJECTED")
-        self.assertEqual(result["decision"]["status"], "REJECTED")
-        self.assertEqual(result["decision"]["eligibility_reason"], reason)
-        self.assertTrue(result["decision"]["eligibility_blocked"])
+        self.assertEqual(result["status"], "BLOCKED_HARD")
+        self.assertEqual(result["decision"]["status"], "BLOCKED_HARD")
+        self.assertEqual(result["decision"]["fallback_reason"], reason)
+        self.assertFalse(result["decision"]["accepted"])
         self.assertEqual(result["details"]["reason_code"], reason)
         self.assertEqual(result["profile"], "common")
 
     def test_resolver_tester_returns_human_contract_for_invalid_draft(self) -> None:
         controller = IdentityController(_config(), self.database)
         draft = controller.payload()["rules"]
-        draft["resolver"]["acceptance"]["min_margin"] = "no-es-un-numero"
+        draft["resolver"]["coverage"]["max_candidates"] = "no-es-un-entero"
 
         result = controller.test_resolver(
             {
@@ -242,7 +253,7 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(payload["revision"], 0)
         self.assertEqual(payload["rules"]["resolver"]["http"]["timeout_ms"], 1300)
         self.assertEqual(
-            payload["rules"]["resolver"]["http"]["total_budget_ms"],
+            payload["rules"]["resolver"]["coverage"]["total_budget_ms"],
             7200,
         )
         self.assertEqual(
@@ -283,76 +294,47 @@ class IdentityControllerTests(unittest.TestCase):
             json.loads(self.database.get_setting("filebot.rules"))["revision"], 7
         )
 
-    def test_legacy_pipeline_is_cloned_once_and_profiles_are_independent(self) -> None:
-        legacy_rules = factory_identity_rules()
-        legacy_raw = json.dumps(
-            {
-                "rules": legacy_rules,
-                "revision": 4,
-                "saved_at": "2026-07-30T12:00:00Z",
-                "history": [
-                    {
-                        "revision": 4,
-                        "saved_at": "2026-07-30T12:00:00Z",
-                        "fingerprint": identity_fingerprint(legacy_rules),
-                        "action": "save",
-                    }
-                ],
-            },
-            ensure_ascii=False,
+    def test_existing_v2_corruption_is_visible_and_not_reseeded(self) -> None:
+        IdentityController(_config(), self.database)
+        untouched_common = self.database.get_setting(
+            identity_profile_setting_key("common")
         )
-        self.database.set_setting(IDENTITY_SETTING_KEY, legacy_raw)
+        corrupt_raw = json.dumps({"rules": {}})
+        self.database.set_setting(identity_profile_setting_key("movies"), corrupt_raw)
 
         controller = IdentityController(_config(), self.database)
 
-        self.assertEqual(self.database.get_setting(IDENTITY_SETTING_KEY), legacy_raw)
-        for profile in IDENTITY_PROFILES:
-            self.assertEqual(
-                self.database.get_setting(identity_profile_setting_key(profile)),
-                legacy_raw,
-            )
-            payload = controller.payload(profile)
-            self.assertEqual(payload["profile"], profile)
-            self.assertEqual(payload["revision"], 4)
+        self.assertTrue(controller.stores["movies"].payload()["repair_required"])
+        with self.assertRaises(IdentityRulesValidationError):
+            controller.payload("movies")
 
-        movie_rules = controller.payload("movies")["rules"]
-        movie_rules["resolver"]["acceptance"]["min_score"] = 61
-        saved = controller.update(
-            {"rules": movie_rules, "expected_revision": 4}, "movies"
+        self.assertEqual(
+            self.database.get_setting(identity_profile_setting_key("movies")),
+            corrupt_raw,
+        )
+        self.assertEqual(
+            self.database.get_setting(identity_profile_setting_key("common")),
+            untouched_common,
         )
 
-        self.assertTrue(saved["ok"])
-        self.assertEqual(saved["revision"], 5)
-        self.assertEqual(saved["profile"], "movies")
-        self.assertEqual(controller.payload("common")["revision"], 4)
-        self.assertEqual(controller.payload("tv")["revision"], 4)
-        self.assertEqual(
-            controller.payload("tv")["rules"]["resolver"]["acceptance"][
-                "min_score"
-            ],
-            75,
+    def test_partial_v2_scopes_stop_startup_instead_of_being_completed(self) -> None:
+        self.database.set_setting(identity_profile_setting_key("common"), "{}")
+
+        with self.assertRaisesRegex(RuntimeError, "identity.pipeline.v2 parcial"):
+            IdentityController(_config(), self.database)
+
+        self.assertIsNone(
+            self.database.get_setting(identity_profile_setting_key("movies"))
         )
-        self.assertNotEqual(
-            controller.payload("movies")["fingerprint"],
-            controller.payload("tv")["fingerprint"],
-        )
-        tv_rules = controller.payload("tv")["rules"]
-        tv_rules["resolver"]["acceptance"]["min_margin"] = 13
-        tv_saved = controller.update(
-            {"rules": tv_rules, "expected_revision": 4}, "tv"
-        )
-        self.assertTrue(tv_saved["ok"])
-        self.assertEqual(tv_saved["revision"], 5)
-        self.assertEqual(controller.payload("common")["revision"], 4)
-        self.assertEqual(
-            [entry["revision"] for entry in controller.payload("movies")["history"]],
-            [4, 5],
-        )
-        self.assertEqual(
-            [entry["revision"] for entry in controller.payload("tv")["history"]],
-            [4, 5],
-        )
-        self.assertEqual(self.database.get_setting(IDENTITY_SETTING_KEY), legacy_raw)
+        self.assertIsNone(self.database.get_setting(identity_profile_setting_key("tv")))
+
+    def test_fresh_v2_seed_invalidates_preexisting_resolver_cache(self) -> None:
+        self.database.set_resolver_cache("legacy-entry", "movie", "{}", 3600)
+        self.assertEqual(self.database.resolver_cache_stats()["total"], 1)
+
+        IdentityController(_config(), self.database)
+
+        self.assertEqual(self.database.resolver_cache_stats()["total"], 0)
 
     def test_category_snapshot_selects_profile_and_old_job_keeps_snapshot(self) -> None:
         controller = IdentityController(_config(), self.database)
@@ -362,7 +344,7 @@ class IdentityControllerTests(unittest.TestCase):
             "source_meta_json": json.dumps({"identity_rules": old_snapshot}),
         }
         movie_rules = controller.payload("movies")["rules"]
-        movie_rules["resolver"]["acceptance"]["min_score"] = 62
+        movie_rules["resolver"]["movies"]["runtime_tolerance_minutes"] = 12
         saved = controller.update(
             {"rules": movie_rules, "expected_revision": 0}, "movies"
         )
@@ -374,7 +356,8 @@ class IdentityControllerTests(unittest.TestCase):
         self.assertEqual(restored["source"], "job_snapshot")
         self.assertEqual(restored["profile"], "movies")
         self.assertEqual(
-            restored["rules"]["resolver"]["acceptance"]["min_score"], 75
+            restored["rules"]["resolver"]["movies"]["runtime_tolerance_minutes"],
+            10,
         )
         self.assertEqual(new_movie["revision"], saved["revision"])
         self.assertEqual(new_movie["profile"], "movies")
@@ -385,7 +368,7 @@ class IdentityControllerTests(unittest.TestCase):
         controller = IdentityController(_config(), self.database)
         before = controller.job_snapshot()
         changed = controller.payload()["rules"]
-        changed["resolver"]["acceptance"]["min_score"] = 60
+        changed["resolver"]["coverage"]["max_candidates"] = 55
         saved = controller.update({"rules": changed, "expected_revision": 0})
         self.assertTrue(saved["ok"])
 
@@ -396,33 +379,33 @@ class IdentityControllerTests(unittest.TestCase):
 
         self.assertEqual(restored["revision"], 0)
         self.assertEqual(
-            restored["rules"]["resolver"]["acceptance"]["min_score"], 75
+            restored["rules"]["resolver"]["coverage"]["max_candidates"], 60
         )
         self.assertEqual(
-            controller.payload()["rules"]["resolver"]["acceptance"]["min_score"],
-            60,
+            controller.payload()["rules"]["resolver"]["coverage"][
+                "max_candidates"
+            ],
+            55,
         )
 
-    def test_legacy_v1_job_snapshot_keeps_old_behavior_and_coherent_fingerprint(self) -> None:
+    def test_legacy_v1_job_snapshot_is_historical_and_not_executable(self) -> None:
         controller = IdentityController(_config(), self.database)
         legacy_rules = copy.deepcopy(controller.payload()["rules"])
-        del legacy_rules["resolver"]["original_language_preference"]
-        for key in (
-            "video_extensions",
-            "video_markers",
-            "non_video_markers",
-            "season_number_words",
-        ):
-            del legacy_rules["parser"][key]
-        del legacy_rules["parser"]["normalization"][
-            "movie_without_year_from_video"
+        legacy_rules["schema_version"] = 1
+        legacy_rules["resolver"]["locales"]["movies"]["language"] = "en-GB"
+        legacy_rules["resolver"]["aliases"]["movies"] = [
+            "La oficina | The Office"
         ]
-        del legacy_rules["parser"]["normalization"]["allow_tv_year_range"]
-        for key in ("series_sxe", "explicit_season", "season_pack"):
-            del legacy_rules["parser"]["patterns"][key]
-        del legacy_rules["resolver"]["acceptance"][
-            "prefer_oldest_exact_title_without_year"
-        ]
+        legacy_rules["resolver"]["original_language_preference"] = {
+            "enabled": True,
+            "language": "en",
+        }
+        legacy_rules["resolver"]["scoring"] = {"title_exact": 50}
+        legacy_rules["resolver"]["acceptance"] = {
+            "min_score": 75,
+            "min_margin": 10,
+            "prefer_oldest_exact_title_without_year": True,
+        }
         stale_fingerprint = "sha256:" + ("a" * 64)
         old_job = {
             "source_meta_json": json.dumps(
@@ -437,37 +420,12 @@ class IdentityControllerTests(unittest.TestCase):
             )
         }
 
-        restored = controller.rules_for_job(old_job)
+        with self.assertRaisesRegex(
+            IdentityRulesValidationError, "no es ejecutable por phased-er-v2"
+        ):
+            controller.rules_for_job(old_job)
 
-        self.assertEqual(restored["revision"], 4)
-        self.assertEqual(
-            restored["rules"]["resolver"]["original_language_preference"],
-            {"enabled": False, "language": "en"},
-        )
-        self.assertEqual(restored["rules"]["parser"]["video_extensions"], [])
-        self.assertEqual(restored["rules"]["parser"]["video_markers"], [])
-        self.assertEqual(restored["rules"]["parser"]["non_video_markers"], [])
-        self.assertEqual(restored["rules"]["parser"]["season_number_words"], [])
-        self.assertFalse(
-            restored["rules"]["parser"]["normalization"][
-                "movie_without_year_from_video"
-            ]
-        )
-        self.assertFalse(
-            restored["rules"]["parser"]["normalization"]["allow_tv_year_range"]
-        )
-        self.assertFalse(
-            restored["rules"]["resolver"]["acceptance"][
-                "prefer_oldest_exact_title_without_year"
-            ]
-        )
-        self.assert_legacy_tv_regex_semantics(restored["rules"])
-        self.assertNotEqual(restored["fingerprint"], stale_fingerprint)
-        self.assertEqual(
-            restored["fingerprint"], identity_fingerprint(restored["rules"])
-        )
-
-    def test_legacy_filebot_job_snapshot_remains_read_only_compatible(self) -> None:
+    def test_legacy_filebot_job_snapshot_is_historical_and_not_executable(self) -> None:
         controller = IdentityController(_config(), self.database)
         old_job = {
             "source_meta_json": json.dumps(
@@ -487,30 +445,10 @@ class IdentityControllerTests(unittest.TestCase):
             )
         }
 
-        restored = controller.rules_for_job(old_job)
-
-        self.assertEqual(restored["source"], "legacy_filebot_snapshot")
-        self.assertEqual(restored["revision"], 2)
-        self.assertEqual(
-            restored["rules"]["resolver"]["locales"]["movies"],
-            {"language": "es-ES", "region": "ES"},
-        )
-        self.assertFalse(
-            restored["rules"]["resolver"]["original_language_preference"]["enabled"]
-        )
-        self.assertEqual(restored["rules"]["parser"]["video_extensions"], [])
-        self.assertEqual(restored["rules"]["parser"]["video_markers"], [])
-        self.assertEqual(restored["rules"]["parser"]["non_video_markers"], [])
-        self.assertEqual(restored["rules"]["parser"]["season_number_words"], [])
-        self.assertFalse(
-            restored["rules"]["resolver"]["acceptance"][
-                "prefer_oldest_exact_title_without_year"
-            ]
-        )
-        self.assert_legacy_tv_regex_semantics(restored["rules"])
-        self.assertEqual(
-            restored["fingerprint"], identity_fingerprint(restored["rules"])
-        )
+        with self.assertRaisesRegex(
+            IdentityRulesValidationError, "historico.*no puede ejecutar"
+        ):
+            controller.rules_for_job(old_job)
 
 
 if __name__ == "__main__":

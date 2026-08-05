@@ -114,6 +114,9 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn('window.addEventListener("beforeunload"', self.view)
         self.assertIn("confirmDraftLoss", self.view)
         self.assertIn("arr-identity-open-${ui.activeProfile}-${section}", self.controls)
+        self.assertIn("arr-identity-scroll-${profile}-${section}", self.view)
+        self.assertIn("ui.storeScrollPosition", self.view)
+        self.assertIn("ui.restoreScrollPosition", self.view)
         self.assertIn("ui.states", self.utils)
         self.assertIn("requestEpoch", self.utils)
         self.assertIn("ui.storageGet", self.controls)
@@ -121,8 +124,137 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertNotIn("localStorage.setItem", self.controls)
 
     def test_common_profile_is_explicitly_marked_as_shared(self) -> None:
-        self.assertIn("Afecta a ambos", self.view)
+        self.assertIn("Compartido: afecta realmente a Películas y Series", self.view)
         self.assertIn('state.profile === "common"', self.view)
+        self.assertIn('profile !== "common" && section === "parser"', self.view)
+        self.assertIn("profileControl(profile, path)", self.view)
+
+    def test_v2_profile_filter_routes_and_scroll_are_kept_exactly(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const values = new Map();
+            let restored = null;
+            global.location = { hash: "#identidad/peliculas/parser" };
+            global.history = { replaceState: () => {} };
+            global.localStorage = {
+              getItem: key => values.has(key) ? values.get(key) : null,
+              setItem: (key, value) => values.set(key, String(value))
+            };
+            global.document = {
+              documentElement: { scrollTop: 0 },
+              getElementById: () => null,
+              querySelectorAll: () => []
+            };
+            global.window = {
+              scrollY: 321,
+              addEventListener: () => {},
+              requestAnimationFrame: callback => { callback(); return 1; },
+              scrollTo: options => { restored = options; },
+              confirm: () => true
+            };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            const controls = [
+              "resolver.algorithm.mode",
+              "resolver.coverage.max_candidates",
+              "resolver.locales.movies.language",
+              "resolver.aliases.movies",
+              "resolver.forced_matches.movies",
+              "resolver.movies.year.required",
+              "resolver.locales.tv.language",
+              "resolver.aliases.tv",
+              "resolver.forced_matches.tv",
+              "resolver.tv.season.required"
+            ].map(path => ({ path, type: "toggle", label: path }));
+            const documentState = {
+              schema: {
+                parser: { title: "Parser", groups: [{ id: "parser", controls: [{ path: "parser.extensions" }] }] },
+                resolver: { title: "Resolver", groups: [{ id: "resolver", controls }] }
+              }
+            };
+            const paths = profile => ui.sectionSchemaForProfile(documentState, "resolver", profile)
+              .groups.flatMap(group => group.controls.map(control => control.path));
+            const common = paths("common");
+            const movies = paths("movies");
+            const tv = paths("tv");
+            const exact = (actual, expected, label) => {
+              if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+                throw new Error(`${label}: ${JSON.stringify(actual)}`);
+              }
+            };
+            exact(common, [
+              "resolver.algorithm.mode", "resolver.coverage.max_candidates",
+              "resolver.locales.movies.language", "resolver.aliases.movies",
+              "resolver.forced_matches.movies", "resolver.locales.tv.language",
+              "resolver.aliases.tv", "resolver.forced_matches.tv"
+            ], "common");
+            exact(movies, ["resolver.movies.year.required"], "movies");
+            exact(tv, ["resolver.tv.season.required"], "tv");
+            if (ui.sectionSchemaForProfile(documentState, "parser", "movies").groups.length) {
+              throw new Error("Parser apareció fuera de Común");
+            }
+            const target = ui.resolveTarget(location.hash);
+            if (target.hash !== "#identidad/peliculas/resolver" || target.section !== "resolver") {
+              throw new Error(`Ruta específica no canonizada: ${JSON.stringify(target)}`);
+            }
+            ui.renderedIdentityRoute = { profile: "common", section: "resolver" };
+            ui.storeScrollPosition();
+            if (values.get("arr-identity-scroll-common-resolver") !== "321") {
+              throw new Error("Scroll no persistido por perfil y sección");
+            }
+            values.set("arr-identity-scroll-common-resolver", "456");
+            ui.restoreScrollPosition("common", "resolver");
+            if (restored?.top !== 456 || restored?.left !== 0) {
+              throw new Error(`Scroll no restaurado: ${JSON.stringify(restored)}`);
+            }
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "view.js",
+        )
+
+    def test_open_group_ids_migrate_from_v1_to_the_active_v2_scope(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const values = new Map([
+              ["arr-identity-open-common-resolver", JSON.stringify(["resolver_search", "resolver_acceptance"])],
+              ["arr-identity-open-movies-resolver", JSON.stringify(["resolver_scoring"])],
+              ["arr-identity-open-tv-resolver", JSON.stringify([])]
+            ]);
+            global.location = { hash: "#identidad/comun/resolver" };
+            global.localStorage = {
+              getItem: key => values.has(key) ? values.get(key) : null,
+              setItem: (key, value) => values.set(key, String(value))
+            };
+            global.window = {};
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            ui.setActiveProfile("common");
+            if (!ui.groupIsOpen("resolver", "resolver_coverage", false)
+                || !ui.groupIsOpen("resolver", "resolver_adjudication", false)) {
+              throw new Error("Los grupos abiertos de Common no migraron");
+            }
+            const common = JSON.parse(values.get("arr-identity-open-common-resolver"));
+            if (common.includes("resolver_search") || !common.includes("resolver_coverage")) {
+              throw new Error(`Persistencia Common no canonizada: ${JSON.stringify(common)}`);
+            }
+            ui.setActiveProfile("movies");
+            if (!ui.groupIsOpen("resolver", "resolver_movies", false)) {
+              throw new Error("El grupo de Películas no heredó el estado abierto");
+            }
+            ui.setActiveProfile("tv");
+            if (ui.groupIsOpen("resolver", "resolver_tv", true)) {
+              throw new Error("Una lista antigua vacía no debe abrir el grupo de Series");
+            }
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "controls.js",
+        )
 
     def test_watcher_deep_links_are_distinct_and_old_alias_migrates(self) -> None:
         run_node_contract(
@@ -148,7 +280,9 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             global.window = {
               ArrIdentityUI: {
                 identityRouteFromHash: () => null,
-                resolveTarget: () => null,
+                resolveTarget: hash => hash === "#limpieza-arr/resolver"
+                  ? { profile: "common", section: "resolver", hash: "#identidad/comun/resolver", legacy: true }
+                  : null,
                 show: async () => {}
               },
               addEventListener: () => {}
@@ -156,12 +290,19 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             const source = fs.readFileSync(process.argv[1], "utf8")
               .replace(/\ndispatchRoute\(\);\s*$/, "");
             vm.runInThisContext(source + `
+              const storedWatcher = canonicalRouteFromHash("#desconocido");
+              values.set("arr-media-panel-route", "#reglas/trailers");
+              const storedRules = canonicalRouteFromHash("#desconocido");
+              values.set("arr-media-panel-route", "#limpieza-arr/resolver");
+              const storedIdentity = canonicalRouteFromHash("#desconocido");
               globalThis.__watcherRoutes = {
                 movies: exactCanonicalRoute("#ajustes/vigilante-peliculas"),
                 series: exactCanonicalRoute("#ajustes/vigilante-series"),
                 alias: canonicalRouteFromHash("#ajustes/vigilantes"),
                 partial: canonicalRouteFromHash("#ajustes"),
-                stored: canonicalRouteFromHash("#desconocido")
+                storedWatcher,
+                storedRules,
+                storedIdentity
               };
             `);
             const watcherResults = global.__watcherRoutes;
@@ -174,7 +315,13 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             requireRoute(watcherResults.series, "#ajustes/vigilante-series", "tv");
             requireRoute(watcherResults.alias, "#ajustes/vigilante-series", "tv");
             requireRoute(watcherResults.partial, "#ajustes/vigilante-series", "tv");
-            requireRoute(watcherResults.stored, "#ajustes/vigilante-series", "tv");
+            requireRoute(watcherResults.storedWatcher, "#ajustes/vigilante-series", "tv");
+            if (watcherResults.storedRules.hash !== "#ajustes/trailers") {
+              throw new Error(`Ruta #reglas almacenada no migrada: ${JSON.stringify(watcherResults.storedRules)}`);
+            }
+            if (watcherResults.storedIdentity.hash !== "#identidad/comun/resolver") {
+              throw new Error(`Ruta #limpieza-arr almacenada no migrada: ${JSON.stringify(watcherResults.storedIdentity)}`);
+            }
             """,
             self.web / "static" / "js" / "panel.js",
         )
@@ -199,14 +346,23 @@ class IdentityUiStaticContractTests(unittest.TestCase):
               calls.push(path);
               return new Promise(resolve => { resolvers[path] = resolve; });
             };
-            const payload = (profile, marker) => ({
-              ok: true,
-              profile,
-              revision: 1,
-              rules: { parser: { marker }, resolver: {} },
-              defaults: { parser: {}, resolver: {} },
-              schema: { parser: { groups: [] }, resolver: { groups: [] } }
-            });
+            const payload = (profile, marker) => {
+              const common = profile === "common";
+              return {
+                ok: true,
+                profile,
+                revision: 1,
+                rules: common
+                  ? { schema_version: 2, parser: { marker }, resolver: {} }
+                  : { schema_version: 2, resolver: { [profile]: { marker } } },
+                defaults: common
+                  ? { schema_version: 2, parser: {}, resolver: {} }
+                  : { schema_version: 2, resolver: { [profile]: {} } },
+                schema: common
+                  ? { parser: { groups: [] }, resolver: { groups: [] } }
+                  : { resolver: { groups: [] } }
+              };
+            };
             const renders = [];
             ui.render = () => { renders.push(ui.activeProfile); };
 
@@ -222,7 +378,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
               await commonRequest;
               if (calls.join("|") !== "/api/identity-rules/common|/api/identity-rules/movies") throw new Error(`Rutas mezcladas: ${calls}`);
               if (ui.states.common.draft.parser.marker !== "COMMON") throw new Error("Common perdió su documento");
-              if (ui.states.movies.draft.parser.marker !== "MOVIES") throw new Error("Movies perdió su documento");
+              if (ui.states.movies.draft.resolver.movies.marker !== "MOVIES") throw new Error("Movies perdió su documento");
               if (ui.activeProfile !== "movies") throw new Error("La respuesta tardía cambió el perfil");
               if (renders.join("|") !== "movies") throw new Error(`La respuesta tardía repintó: ${renders}`);
             })().catch(error => {
@@ -238,18 +394,261 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn('const API_ROOT = "/api/identity-rules";', self.view)
         self.assertIn('`${API_ROOT}/${profile}`', self.view)
         self.assertIn("expected_revision: Number(state.document.revision || 0)", self.view)
-        self.assertIn("state.draft = ui.clone(state.document.defaults);", self.view)
-        self.assertIn("Pulsa Guardar para aplicarlos", self.view)
+        self.assertIn('`${API_ROOT}/${profile}/reset`', self.view)
+        self.assertIn('body: JSON.stringify({ expected_revision:', self.view)
+        self.assertIn("Valores de fábrica restablecidos y activos", self.view)
         self.assertIn("const MAX_IMPORT_BYTES = 4 * 1024 * 1024;", self.view)
         self.assertIn("El JSON supera el límite de 4 MB", self.view)
+        self.assertIn('const EXPORT_FORMAT = "arr-identity-export-v2";', self.view)
+        self.assertIn("parsed.format !== EXPORT_FORMAT", self.view)
+        self.assertIn("parsed.profile !== profile", self.view)
+        self.assertIn("parsed.schema_version !== ACTIVE_SCHEMA_VERSION", self.view)
+        self.assertIn("rules.schema_version !== ACTIVE_SCHEMA_VERSION", self.view)
+        self.assertIn("base_revision: state.document.revision", self.view)
+        self.assertIn("base_fingerprint: state.document.fingerprint", self.view)
+        self.assertIn('`${API_ROOT}/${profile}/validate`', self.view)
+        self.assertIn("validImportValidation(validated, profile)", self.view)
         self.assertIn("`${API_ROOT}/${profile}/cache/clear`", self.view)
         self.assertIn("Tu borrador se conserva", self.view)
         self.assertIn("payload.repair_required", self.view)
-        self.assertIn("Boolean(state.document.repair_required)", self.view)
         self.assertIn("validRulesDocument(payload, profile)", self.view)
         self.assertIn("validCachePayload(payload)", self.view)
         self.assertIn("ui.isProfileActive(profile)", self.view)
         self.assertIn('body: "{}"', self.view)
+
+    def test_reset_uses_real_endpoint_and_import_validates_v2_before_apply(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const values = new Map();
+            const statusBox = { className: "", textContent: "" };
+            const resetButton = { disabled: false, textContent: "", focus: () => {} };
+            global.location = { hash: "#identidad/comun/resolver" };
+            global.history = { replaceState: () => {} };
+            global.localStorage = {
+              getItem: key => values.has(key) ? values.get(key) : null,
+              setItem: (key, value) => values.set(key, String(value))
+            };
+            global.document = {
+              documentElement: { scrollTop: 0 },
+              getElementById: id => id === "identity-status" ? statusBox : id === "identity-reset" ? resetButton : null,
+              querySelectorAll: () => []
+            };
+            global.window = {
+              scrollY: 0,
+              addEventListener: () => {},
+              scrollTo: () => {},
+              confirm: () => true
+            };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            ui.setActiveProfile("common");
+            const state = ui.state;
+            const rules = marker => ({ schema_version: 2, parser: { marker }, resolver: {} });
+            const payload = (revision, marker) => ({
+              ok: true,
+              profile: "common",
+              revision,
+              rules: rules(marker),
+              defaults: rules("DEFAULT"),
+              schema: { parser: { groups: [] }, resolver: { groups: [] } }
+            });
+            state.document = payload(4, "ACTIVE");
+            state.draft = rules("BORRADOR");
+            state.dirty = true;
+            state.section = "resolver";
+            let renders = 0;
+            ui.render = () => { renders += 1; };
+            const calls = [];
+            ui.api = async (path, options) => {
+              const body = JSON.parse(options.body);
+              calls.push({ path, body });
+              if (path === "/api/identity-rules/common/validate") {
+                return {
+                  ok: true,
+                  format: "arr-identity-export-v2",
+                  schema_version: 2,
+                  profile: "common",
+                  rules: body.rules,
+                  fingerprint: `sha256:${"1".repeat(64)}`,
+                  effective_fingerprint: `sha256:${"2".repeat(64)}`
+                };
+              }
+              return payload(5, "RESET");
+            };
+
+            (async () => {
+              await ui.resetRules();
+              if (calls.length !== 1 || calls[0].path !== "/api/identity-rules/common/reset") {
+                throw new Error(`Reset no usó endpoint real: ${JSON.stringify(calls)}`);
+              }
+              if (calls[0].body.expected_revision !== 4) throw new Error("Reset sin CAS");
+              if (state.document.revision !== 5 || state.draft.parser.marker !== "RESET" || state.dirty) {
+                throw new Error("Reset no aplicó la respuesta del motor");
+              }
+              if (!state.notice.message.includes("activos en el motor") || state.notice.tone !== "ok") {
+                throw new Error("Reset no confirmó el resultado útil");
+              }
+
+              const importFile = parsed => ({ size: 100, text: async () => JSON.stringify(parsed) });
+              const input = { dataset: { profile: "common" }, files: [], value: "selected" };
+              const apply = async parsed => {
+                input.files = [importFile(parsed)];
+                await ui.importRules({ currentTarget: input });
+              };
+              const baseline = JSON.stringify(state.draft);
+              await apply({ format: "otro", profile: "common", schema_version: 2, rules: rules("MAL") });
+              if (JSON.stringify(state.draft) !== baseline) throw new Error("Se aplicó formato inválido");
+              await apply({ format: "arr-identity-export-v2", profile: "tv", schema_version: 2, rules: rules("MAL") });
+              if (JSON.stringify(state.draft) !== baseline) throw new Error("Se aplicó perfil incorrecto");
+              await apply({ format: "arr-identity-export-v2", profile: "common", schema_version: 1, rules: rules("MAL") });
+              if (JSON.stringify(state.draft) !== baseline) throw new Error("Se aplicó esquema incorrecto");
+              await apply({
+                format: "arr-identity-export-v2",
+                profile: "common",
+                schema_version: 2,
+                rules: rules("IMPORTADO")
+              });
+              if (state.draft.parser.marker !== "IMPORTADO" || !state.dirty) {
+                throw new Error("La importación v2 válida no se aplicó");
+              }
+              if (calls.length !== 2 || calls[1].path !== "/api/identity-rules/common/validate") {
+                throw new Error(`La importación no fue validada por el motor: ${JSON.stringify(calls)}`);
+              }
+              if (!state.notice.message.includes("validado")) throw new Error("La importación válida no se confirmó");
+              const acceptedDraft = JSON.stringify(state.draft);
+              ui.api = async () => { throw new Error("Reglas incompatibles"); };
+              await apply({
+                format: "arr-identity-export-v2",
+                profile: "common",
+                schema_version: 2,
+                rules: rules("NO-DEBE-ENTRAR")
+              });
+              if (JSON.stringify(state.draft) !== acceptedDraft) {
+                throw new Error("Se aplicó el borrador antes de la validación del motor");
+              }
+              if (!state.notice.message.includes("No se pudo importar")) {
+                throw new Error("El rechazo del motor no se explicó");
+              }
+              if (renders < 3) throw new Error("La vista no se actualizó");
+            })().catch(error => {
+              console.error(error.stack || error);
+              process.exitCode = 1;
+            });
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "view.js",
+        )
+
+    def test_reset_always_confirms_locks_and_restores_after_deferred_error(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            let confirmResult = false;
+            let confirmCalls = 0;
+            let focusCalls = 0;
+            let importClicks = 0;
+            const statusBox = { className: "", textContent: "" };
+            const resetButton = { focus: () => { focusCalls += 1; } };
+            const importInput = { click: () => { importClicks += 1; } };
+            global.location = { hash: "#identidad/comun/resolver" };
+            global.history = { replaceState: () => {} };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            global.document = {
+              documentElement: { scrollTop: 0 },
+              getElementById: id => ({
+                "identity-status": statusBox,
+                "identity-reset": resetButton,
+                "identity-import-file": importInput
+              }[id] || null),
+              querySelectorAll: () => []
+            };
+            global.window = {
+              scrollY: 0,
+              addEventListener: () => {},
+              scrollTo: () => {},
+              confirm: () => { confirmCalls += 1; return confirmResult; }
+            };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[3], "utf8"));
+            const ui = window.ArrIdentityUI;
+            ui.setActiveProfile("common");
+            const state = ui.state;
+            const rules = marker => ({ schema_version: 2, parser: { marker }, resolver: {} });
+            const documentBefore = {
+              ok: true,
+              profile: "common",
+              revision: 8,
+              rules: rules("ACTIVO"),
+              defaults: rules("DEFAULT"),
+              schema: { parser: { groups: [] }, resolver: { groups: [] } }
+            };
+            const draftBefore = rules("BORRADOR");
+            state.document = documentBefore;
+            state.draft = draftBefore;
+            state.dirty = false;
+            state.section = "resolver";
+            const renderStates = [];
+            ui.render = () => { renderStates.push(state.resetting); };
+            let requestCalls = 0;
+            let rejectReset;
+            ui.api = () => {
+              requestCalls += 1;
+              return new Promise((_resolve, reject) => { rejectReset = reject; });
+            };
+
+            (async () => {
+              await ui.resetRules();
+              if (confirmCalls !== 1 || requestCalls !== 0) {
+                throw new Error("Reset limpio no confirmó o envió pese a cancelar");
+              }
+              confirmResult = true;
+              const pending = ui.resetRules();
+              await Promise.resolve();
+              if (!state.resetting || requestCalls !== 1 || renderStates.at(-1) !== true) {
+                throw new Error("El reset diferido no mantuvo el bloqueo");
+              }
+              const editable = ui.renderControl({
+                path: "parser.marker", type: "text", label: "Marca", help: ""
+              });
+              if (!editable.includes("disabled")) throw new Error("Los controles siguieron editables durante reset");
+              ui.markDirty();
+              if (state.dirty) throw new Error("Un control mutó el borrador durante reset");
+              await ui.saveRules();
+              ui.openImport();
+              if (requestCalls !== 1 || importClicks !== 0) {
+                throw new Error("Guardar o importar se ejecutó durante reset");
+              }
+              const conflict = new Error("conflict");
+              conflict.status = 409;
+              conflict.payload = { error: "revision_conflict" };
+              rejectReset(conflict);
+              await pending;
+              if (state.resetting || renderStates.at(-1) !== false) {
+                throw new Error("Finally no desbloqueó y repintó la vista");
+              }
+              if (state.document !== documentBefore || state.draft !== draftBefore || state.dirty) {
+                throw new Error("El error de reset no restauró el estado exacto");
+              }
+              if (state.notice.tone !== "bad" || !state.notice.message.includes("Otra ventana")) {
+                throw new Error("El conflicto no quedó visible tras el rerender final");
+              }
+              if (focusCalls !== 1 || confirmCalls !== 2) {
+                throw new Error("Reset no restauró foco o no confirmó siempre");
+              }
+            })().catch(error => {
+              console.error(error.stack || error);
+              process.exitCode = 1;
+            });
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "controls.js",
+            self.web / "static" / "js" / "limpieza-arr" / "view.js",
+        )
 
     def test_save_cursor_waits_only_during_a_real_save(self) -> None:
         self.assertIn(
@@ -288,29 +687,86 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.controls)
 
+    def test_real_ordered_tags_fixture_is_readonly_and_never_stringified(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            global.window = {};
+            global.location = { hash: "#identidad/comun/resolver" };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            global.document = { getElementById: () => null, querySelectorAll: () => [] };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            const path = "resolver.adjudication.tie_breakers";
+            const ordered = ["year", "agreements", "disagreements", "popularity", "votes", "newest_year", "lower_tmdb_id"];
+            ui.state.draft = {
+              resolver: { adjudication: { tie_breakers: [...ordered] } }
+            };
+            ui.state.document = {
+              defaults: { resolver: { adjudication: { tie_breakers: [...ordered] } } }
+            };
+            const control = {
+              path,
+              type: "ordered_tags",
+              label: "Desempates",
+              help: "Orden canónico de desempate.",
+              readonly: true
+            };
+            const before = JSON.stringify(ui.state.draft);
+            const html = ui.renderControl(control);
+            if (!html.includes("identity-readonly-list") || !html.includes("<ol")) {
+              throw new Error("ordered_tags no se mostró como lista ordenada");
+            }
+            for (const item of ordered) {
+              if (!html.includes(`<li>${item}</li>`)) throw new Error(`Falta ${item}`);
+            }
+            for (const forbidden of ["<input", "<select", "data-identity-path", "data-reset-control", 'value="year,']) {
+              if (html.includes(forbidden)) throw new Error(`El readonly quedó editable o serializado: ${forbidden}`);
+            }
+            if (JSON.stringify(ui.state.draft) !== before || !Array.isArray(ui.getPath(ui.state.draft, path))) {
+              throw new Error("ordered_tags se convirtió en string al renderizar");
+            }
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "controls.js",
+        )
+        self.assertIn(
+            "filter(control => !ui.controlIsReadOnly(control))",
+            self.controls,
+        )
+
     def test_title_testers_use_unsaved_draft_and_human_resolver_contract(self) -> None:
         self.assertIn("const submittedRules = ui.clone(state.draft);", self.testers)
         self.assertIn("rules: submittedRules", self.testers)
         self.assertIn("${ui.identityApiRoot(profile)}/test-${section}", self.testers)
         self.assertIn("Probar título", self.testers)
         self.assertIn("error?.payload", self.testers)
-        self.assertNotIn("% del umbral", self.testers)
-        self.assertNotIn("candidate.reasons", self.testers)
-        self.assertNotIn("identity-decision", self.testers)
         self.assertIn('data-candidate-action="alias"', self.resolver_result)
         self.assertIn('data-candidate-action="forced"', self.resolver_result)
-        self.assertIn("item?.path", self.resolver_result)
-        self.assertIn("resolverControlLabels", self.resolver_result)
-        self.assertIn("Configurado", self.resolver_result)
-        self.assertIn("Aplicado", self.resolver_result)
-        self.assertIn("Ventaja sobre el segundo", self.resolver_result)
+        self.assertIn("ACCEPTED_CONFIDENT", self.resolver_result)
+        self.assertIn("ACCEPTED_FALLBACK", self.resolver_result)
+        self.assertIn("RETRY_PROVIDER", self.resolver_result)
+        self.assertIn("BLOCKED_HARD", self.resolver_result)
+        self.assertIn("AGREE", self.resolver_result)
+        self.assertIn("DISAGREE", self.resolver_result)
+        self.assertIn("UNKNOWN", self.resolver_result)
+        self.assertIn("coverage_limited", self.resolver_result)
+        self.assertIn("decision.phase_counts", self.resolver_result)
+        self.assertIn('value("discovered")', self.resolver_result)
+        self.assertIn('value("enriched")', self.resolver_result)
+        self.assertIn('value("plausible")', self.resolver_result)
+        self.assertIn('value("eliminated")', self.resolver_result)
+        self.assertNotIn("No existe un segundo candidato", self.resolver_result)
+        self.assertNotIn("puntos", self.resolver_result.lower())
         self.assertIn("Diagnóstico técnico", self.resolver_result)
         self.assertIn("ui.bindCandidateActions();", self.testers)
         self.assertIn("if (state.activeTest)", self.testers)
         self.assertNotIn('id="identity-test-result" aria-live', self.testers)
         self.assertIn('role="status" aria-live="polite"', self.view)
 
-    def test_resolver_renderer_covers_all_human_result_families(self) -> None:
+    def test_resolver_v2_renders_decisions_evidence_funnel_and_alternatives(self) -> None:
         run_node_contract(
             r"""
             const fs = require("fs");
@@ -321,184 +777,173 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
             vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
             const ui = window.ArrIdentityUI;
-            ui.state.document = { schema: { resolver: { groups: [{ controls: [
-              { path: "resolver.scoring.title_exact", label: "Titulo exacto" },
-              { path: "resolver.scoring.title_similarity_max", label: "Similitud de titulo" },
-              { path: "resolver.scoring.season_invalid", label: "Temporada imposible" },
-              { path: "resolver.acceptance.min_score", label: "Puntuacion minima" },
-              { path: "resolver.acceptance.min_margin", label: "Margen minimo" }
-            ] }] } } };
-            const context = { requestId: 7, category: "movies", parserTitle: "Titulo", parserYear: "2024" };
-            const candidate = {
-              tmdb_id: 10, title: "Titulo <seguro>", original_title: "Original", year: 2024, score: 55,
-              matching_rules: [
-                { path: "resolver.title_matching.roman_arabic_equivalence", detail: "III = 3" },
-                { path: "resolver.title_matching.allow_omitted_part_number", detail: "Numero de saga omitido" },
-                { path: "resolver.title_matching.score_parser_candidates", detail: "Titulo auxiliar del parser: Titulo <auxiliar>" }
-              ],
-              breakdown: [
-                { key: "title_exact", path: "resolver.scoring.title_exact", configured: 35, applied: 35 },
-                { key: "title_similarity_max", path: "resolver.scoring.title_similarity_max", configured: 20, applied: 20 }
-              ]
-            };
-            const decision = (status, values = {}) => ({
-              status, accepted: status === "ACCEPTED", has_scoring: true, bypass: false,
-              score: 55, second_score: 20, min_score: 75, score_passed: false,
-              margin: 35, min_margin: 12, margin_passed: true, source: "search", ...values
-            });
+            ui.state.readOnly = false;
+            const context = { requestId: 7, category: "movies", parserTitle: "Alien", parserYear: "1979" };
             const render = payload => ui.renderResolverResult(payload, context);
-            const requireText = (html, text) => { if (!html.includes(text)) throw new Error(`Falta ${text}`); };
-            const rejectText = (html, text) => { if (html.includes(text)) throw new Error(`Sobra ${text}`); };
+            const requireText = (html, value) => {
+              if (!html.includes(value)) throw new Error(`Falta ${value}`);
+            };
+            const rejectText = (html, value) => {
+              if (html.includes(value)) throw new Error(`Sobra ${value}`);
+            };
 
-            const accepted = render({
-              status: "ACCEPTED", ok: true,
-              decision: decision("ACCEPTED", { score: 55, min_score: 50, score_passed: true, margin: 35, margin_passed: true }),
-              candidates: [candidate],
-              queries: [
-                { endpoint: "/search/movie", params: { query: "Titulo", language: "es-ES", year: 2024 }, status_code: 200 },
-                { endpoint: "/movie/10", params: { language: "es-ES" }, status_code: 200 }
-              ]
-            });
-            ["ACEPTADA", "único candidato", "CUMPLIDA", "Titulo exacto", "Configurado", "Aplicado", "+35", "Segundo candidato", "No existe", "Reglas aplicadas", "Equivalencia romana aplicada: III = 3", "Número de saga omitido aceptado", "Título auxiliar utilizado: Titulo &lt;auxiliar&gt;", "2 consultas · 2 correctas", "Buscar película", "Idioma es-ES · Año 2024", "Correcta"].forEach(text => requireText(accepted, text));
-            rejectText(accepted, "Ventaja sobre el segundo");
-            rejectText(accepted, "RESUELTO POR IDIOMA");
-            rejectText(accepted, "grupo ambiguo");
-            rejectText(accepted, "% del umbral");
-            rejectText(accepted, "HTTP 200");
-            rejectText(accepted, "<seguro>");
-            rejectText(accepted, "Titulo <auxiliar>");
-            requireText(accepted, "Titulo &lt;seguro&gt;");
+            const confidentPayload = {
+              ok: true,
+              decision: {
+                status: "ACCEPTED_CONFIDENT",
+                accepted: true,
+                selected: { tmdb_id: 348, media_type: "movie", title: "Alien", year: 1979 },
+                evidence: [
+                  { tmdb_id: 348, families: [
+                    { family: "title", verdict: "AGREE", detail: "Título exacto" },
+                    { family: "year", verdict: "AGREE", detail: { expected: 1979, candidate: [1979] } },
+                    { family: "title", verdict: "DISAGREE", detail: "duplicada" }
+                  ] },
+                  { tmdb_id: 8077, families: [{ family: "title", verdict: "DISAGREE" }] }
+                ],
+                phase_counts: { discovered: 12, enriched: 6, plausible: 2, eliminated: 10 },
+                counters: { discovered: 99, enriched: 99, plausible: 99, eliminated: 99 },
+                alternatives: [
+                  { tmdb_id: 348, media_type: "movie", title: "Alien", year: 1979 },
+                  {
+                    tmdb_id: 8077, media_type: "movie", title: "Alien³", year: 1992,
+                    eliminated: true, elimination_reasons: ["year_conflict"],
+                    evidence: [{ family: "year", verdict: "DISAGREE" }]
+                  }
+                ],
+                coverage_limited: false
+              },
+              queries: [{ endpoint: "/search/movie", params: { query: "Alien" }, status_code: 200 }]
+            };
+            const confident = render(confidentPayload);
+            ["Aceptada", "IDENTIDAD ELEGIDA", "Alien", "Coincide", "Esperado: 1979", "TMDb: 1979", "Descubiertos", "12", "Enriquecidos", "6", "Plausibles", "2", "Eliminados", "10", "Alternativas", "Alien³", "Eliminada", "Contradicciones", "El año no coincide.", "1 consulta · 1 correcta"].forEach(value => requireText(confident, value));
+            if (ui.resolverEvidence(confidentPayload).length !== 2) throw new Error("La familia duplicada no se consolidó");
+            rejectText(confident, "duplicada");
+            rejectText(confident, "Cobertura limitada");
+            rejectText(confident.toLowerCase(), "puntos");
+            rejectText(confident, "Segundo candidato");
+            rejectText(confident, ">AGREE<");
+            rejectText(confident, ">99<");
+            rejectText(confident, "year_conflict");
+            rejectText(confident, '{"expected"');
+            const aliasActions = (confident.match(/data-candidate-action="alias"/g) || []).length;
+            const forcedActions = (confident.match(/data-candidate-action="forced"/g) || []).length;
+            if (aliasActions !== 2 || forcedActions !== 2) {
+              throw new Error(`El seleccionado perdió acciones: alias=${aliasActions}, forced=${forcedActions}`);
+            }
+            if (!confident.includes('data-tmdb-id="348"')) throw new Error("Las acciones no pertenecen al seleccionado");
+            const ids = [...confident.matchAll(/(?:^|\s)id="([^"]+)"/g)].map(match => match[1]);
+            if (new Set(ids).size !== ids.length) throw new Error(`IDs HTML duplicados: ${ids.join(",")}`);
 
-            const withoutRules = ui.renderResolverCandidate(
-              { ...candidate, matching_rules: [] }, 0, context
-            );
-            rejectText(withoutRules, "Reglas aplicadas");
-
-            const acceptedByLanguage = render({
-              status: "ACCEPTED", ok: true,
-              decision: decision("ACCEPTED", {
-                score: 125, min_score: 75, score_passed: true,
-                second_score: 125, has_second_candidate: true,
-                margin: 0, min_margin: 12, margin_passed: false,
-                original_language_preference: {
-                  applied: true, enabled: true, language: "en", selected_original_language: "en"
-                }
-              }),
-              candidates: [
-                { ...candidate, title: "¡Canta!", original_title: "Sing", original_language: "en", score: 125 },
-                { ...candidate, tmdb_id: 11, title: "Canta", original_title: "Mindenki", original_language: "hu", score: 125 }
-              ]
-            });
-            ["ACEPTADA", "idioma original inglés", "grupo ambiguo", "RESUELTO POR IDIOMA"].forEach(text => requireText(acceptedByLanguage, text));
-            rejectText(acceptedByLanguage, "RECHAZADA POR EMPATE");
-
-            const acceptedByOldest = render({
-              status: "ACCEPTED", ok: true,
-              decision: decision("ACCEPTED", {
-                score: 125, min_score: 75, score_passed: true,
-                second_score: 125, has_second_candidate: true,
-                margin: 0, min_margin: 12, margin_passed: false,
-                oldest_exact_title_preference: {
-                  applied: true, enabled: true, selected_year: 1979,
-                  reason_code: "oldest_exact_title_without_year"
-                }
-              }),
-              candidates: [
-                { ...candidate, year: 1979, score: 125 },
-                { ...candidate, tmdb_id: 11, year: 2024, score: 125 }
-              ]
-            });
-            ["ACEPTADA", "año 1979 es el más antiguo", "RESUELTO POR MÁS ANTIGUA"].forEach(text => requireText(acceptedByOldest, text));
-            rejectText(acceptedByOldest, "RECHAZADA POR EMPATE");
-
-            const acceptedByBoth = render({
-              status: "ACCEPTED", ok: true,
-              decision: decision("ACCEPTED", {
-                score: 125, min_score: 75, score_passed: true,
-                second_score: 125, has_second_candidate: true,
-                margin: 0, min_margin: 12, margin_passed: false,
-                original_language_preference: {
-                  applied: true, enabled: true, language: "en", selected_original_language: "en"
+            const fallback = render({
+              ok: true,
+              decision: {
+                status: "ACCEPTED_FALLBACK",
+                accepted: true,
+                selected: { tmdb_id: 1399, media_type: "tv", title: "Juego de tronos", year: 2011 },
+                evidence: {
+                  title: { verdict: "AGREE", detail: "Coincide" },
+                  season: { verdict: "UNKNOWN", detail: "TMDb incompleto" }
                 },
-                oldest_exact_title_preference: {
-                  applied: true, enabled: true, selected_year: 1979,
-                  reason_code: "oldest_exact_title_without_year"
-                }
-              }),
-              candidates: [candidate, { ...candidate, tmdb_id: 11 }]
+                counters: {
+                  candidates_discovered: 60,
+                  candidates_enriched: 8,
+                  candidates_plausible: 3,
+                  candidates_eliminated: 57
+                },
+                fallback_reason: "coverage_limited",
+                coverage_limited: true,
+                alternatives: [{ tmdb_id: 1399, media_type: "tv", title: "Juego de tronos", year: 2011 }]
+              }
             });
-            ["idioma original inglés", "RESUELTO POR IDIOMA"].forEach(text => requireText(acceptedByBoth, text));
-            rejectText(acceptedByBoth, "RESUELTO POR MÁS ANTIGUA");
-            rejectText(acceptedByBoth, "año 1979 es el más antiguo");
+            ["Aceptada eligiendo la más probable", "Se alcanzó el límite de cobertura", "No disponible", "Cobertura limitada", "60", "57"].forEach(value => requireText(fallback, value));
 
-            const tie = render({
-              status: "REJECTED_MARGIN", ok: true,
-              decision: decision("REJECTED_MARGIN", { score: 125, score_passed: true, second_score: 125, has_second_candidate: true, margin: 0, margin_passed: false }),
-              candidates: [{ ...candidate, score: 125 }, { ...candidate, tmdb_id: 11, score: 125 }]
-            });
-            ["RECHAZADA POR EMPATE", "misma puntuación", "NO CUMPLIDO"].forEach(text => requireText(tie, text));
-            rejectText(tie, "REJECTED_MARGIN");
+            const retryPayload = { ok: true, decision: { status: "RETRY_PROVIDER", accepted: false } };
+            const retry = render(retryPayload);
+            requireText(retry, "Pendiente por TMDb");
+            if (ui.resolverPresentation(retryPayload).tone !== "warn") throw new Error("RETRY_PROVIDER no usa aviso");
 
-            const singleMargin = render({
-              status: "REJECTED_MARGIN",
-              decision: decision("REJECTED_MARGIN", { score: 10, min_score: 0, score_passed: true, second_score: 0, has_second_candidate: false, margin: 10, min_margin: 12, margin_passed: false }),
-              candidates: [{ ...candidate, score: 10 }]
-            });
-            ["RECHAZADA POR MARGEN", "No existe un segundo candidato", "Segundo candidato", "No existe"].forEach(text => requireText(singleMargin, text));
-            rejectText(singleMargin, "sobre el segundo");
+            const blockedPayload = {
+              ok: true,
+              decision: {
+                status: "BLOCKED_HARD",
+                accepted: false,
+                reason_message: "El año contradice la ficha.",
+                evidence: [{ family: "year", verdict: "DISAGREE" }]
+              }
+            };
+            const blocked = render(blockedPayload);
+            ["Bloqueada por contradicción", "No coincide", "El año contradice la ficha."].forEach(value => requireText(blocked, value));
+            if (ui.resolverPresentation(blockedPayload).tone !== "bad") throw new Error("ok:true pintó verde una decisión bloqueada");
 
-            const both = render({ status: "REJECTED_SCORE", decision: decision("REJECTED_SCORE", { margin: 0, margin_passed: false }), candidates: [candidate] });
-            requireText(both, "RECHAZADA POR PUNTUACIÓN Y MARGEN");
-
-            const bypass = render({
+            const historical = render({
+              ok: true,
               status: "ACCEPTED",
-              decision: decision("ACCEPTED", { bypass: true, source: "forced_match" }),
-              candidates: [candidate],
-              queries: [{ endpoint: "/movie/10", status_code: 200 }]
+              decision: { status: "ACCEPTED", accepted: true },
+              candidates: [{ tmdb_id: 10, title: "Histórica", year: 1980, score: 55, breakdown: [{ applied: 55 }] }]
             });
-            ["coincidencia forzada validada", "NO APLICA", "1 consulta · 1 correcta"].forEach(text => requireText(bypass, text));
-            rejectText(bypass, "1 consultas");
+            ["Aceptada", "resultado histórico", "Histórica"].forEach(value => requireText(historical, value));
+            rejectText(historical, "55 puntos");
+            rejectText(historical, "Segundo candidato");
 
-            const season = render({
-              status: "REJECTED_SCORE",
-              decision: decision("REJECTED_SCORE"),
-              candidates: [{ ...candidate, breakdown: [{ key: "season_invalid", path: "resolver.scoring.season_invalid", configured: -100, applied: -100 }] }]
+            const escaped = render({
+              ok: false,
+              decision: { status: "BLOCKED_HARD", accepted: false, reason_message: "Dato <inseguro>" }
             });
-            ["Temporada imposible", "-100"].forEach(text => requireText(season, text));
+            requireText(escaped, "Dato &lt;inseguro&gt;");
+            rejectText(escaped, "Dato <inseguro>");
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "resolver-result.js",
+        )
 
-            const noCandidates = render({ status: "NO_CANDIDATES", decision: { status: "NO_CANDIDATES", has_scoring: false }, candidates: [] });
-            requireText(noCandidates, "SIN CANDIDATOS");
-            rejectText(noCandidates, "Puntuación obtenida");
-
-            for (const [status, title] of [
-              ["REJECTED", "IDENTIDAD NO SEGURA"],
-              ["INVALID_RULES", "CONFIGURACIÓN NO VÁLIDA"],
-              ["PARSER_ERROR", "ERROR DEL PARSER"],
-              ["TMDB_UNAVAILABLE", "TMDB NO DISPONIBLE"],
-              ["TMDB_ERROR", "CONSULTA TMDB RECHAZADA"],
-              ["ORCHESTRATOR_UNAVAILABLE", "MOTOR NO DISPONIBLE"],
-              ["INVALID_UPSTREAM_RESPONSE", "RESPUESTA DEL MOTOR NO VÁLIDA"],
-              ["REQUEST_ERROR", "PRUEBA NO COMPLETADA"]
-            ]) {
-              const html = render({ status, decision: { status, has_scoring: false } });
-              requireText(html, title);
-              rejectText(html, "Puntuación obtenida");
+    def test_legacy_resolver_renderer_covers_all_human_result_families(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            global.window = {};
+            global.location = { hash: "#identidad/comun/resolver" };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            ui.state.readOnly = true;
+            const context = { requestId: 3, category: "movies", parserTitle: "Historica", parserYear: "1980" };
+            const render = payload => ui.renderResolverResult(payload, context);
+            const accepted = render({
+              ok: true,
+              status: "ACCEPTED",
+              decision: { status: "ACCEPTED", accepted: true },
+              candidates: [{
+                tmdb_id: 10,
+                media_type: "movie",
+                title: "Histórica",
+                year: 1980,
+                score: 55,
+                breakdown: [{ applied: 55 }]
+              }]
+            });
+            if (!accepted.includes("Aceptada") || !accepted.includes("resultado histórico") || !accepted.includes("Histórica")) {
+              throw new Error("El resultado ACCEPTED histórico dejó de ser legible");
             }
-            for (const [reason_code, title] of [
-              ["category_conflict", "CATEGORÍA CONTRADICTORIA"],
-              ["category_not_resolvable", "CATEGORÍA NO RESOLUBLE"],
-              ["empty_title", "TÍTULO NO IDENTIFICADO"],
-              ["forced_target_invalid", "TMDB FORZADO NO VÁLIDO"],
-              ["forced_type_mismatch", "TIPO FORZADO INCORRECTO"],
-              ["forced_title_mismatch", "TÍTULO FORZADO INCORRECTO"],
-              ["forced_year_mismatch", "AÑO FORZADO INCORRECTO"]
-            ]) {
-              requireText(render({ status: "REJECTED", details: { reason_code }, decision: { status: "REJECTED", has_scoring: false } }), title);
+            for (const forbidden of ["55 puntos", "Segundo candidato", "Puntuación obtenida"]) {
+              if (accepted.includes(forbidden)) throw new Error(`Reapareció UI v1: ${forbidden}`);
             }
-            const invalid = render({ status: "INVALID_RULES", message: "Peso <incorrecto>", decision: { status: "INVALID_RULES", has_scoring: false } });
-            requireText(invalid, "Motivo concreto:");
-            requireText(invalid, "Peso &lt;incorrecto&gt;");
-            rejectText(invalid, "Peso <incorrecto>");
+            for (const status of ["REJECTED", "REJECTED_SCORE", "REJECTED_MARGIN"]) {
+              const html = render({ ok: true, decision: { status, accepted: false } });
+              if (!html.includes("Bloqueada (resultado histórico)")) {
+                throw new Error(`No se mostró el bloqueo histórico ${status}`);
+              }
+            }
+            const escaped = render({
+              ok: false,
+              decision: { status: "REQUEST_ERROR", accepted: false },
+              message: "Fallo <histórico>"
+            });
+            if (!escaped.includes("Fallo &lt;histórico&gt;") || escaped.includes("Fallo <histórico>")) {
+              throw new Error("La causa histórica no se escapó");
+            }
             """,
             self.web / "static" / "js" / "limpieza-arr" / "utils.js",
             self.web / "static" / "js" / "limpieza-arr" / "resolver-result.js",
@@ -516,6 +961,78 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("No se puede forzar una película sin año", self.testers)
         self.assertNotIn("const raw = ui.state.testNames.resolver", self.testers)
         self.assertNotIn("`${dataset.title}", self.testers)
+
+    def test_candidate_actions_always_edit_the_loaded_common_draft(self) -> None:
+        run_node_contract(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const statusBox = { className: "", textContent: "" };
+            global.location = { hash: "#identidad/peliculas/resolver" };
+            global.localStorage = { getItem: () => null, setItem: () => {} };
+            global.document = {
+              getElementById: id => id === "identity-status" ? statusBox : null,
+              querySelector: () => null,
+              querySelectorAll: () => []
+            };
+            global.window = {};
+            vm.runInThisContext(fs.readFileSync(process.argv[1], "utf8"));
+            vm.runInThisContext(fs.readFileSync(process.argv[2], "utf8"));
+            const ui = window.ArrIdentityUI;
+            ui.setActiveProfile("movies");
+            const movieState = ui.state;
+            movieState.document = { rules: { resolver: { movies: {} } } };
+            movieState.draft = { resolver: { movies: {} } };
+            const context = Object.freeze({ requestId: 9, category: "movies", parserTitle: "Obsession", parserYear: "2025" });
+            movieState.testContext.resolver = context;
+            let commonLoads = 0;
+            let renders = 0;
+            ui.render = () => { renders += 1; };
+            ui.loadRules = async ({ profile }) => {
+              if (profile !== "common") throw new Error("Se cargó un perfil incorrecto");
+              commonLoads += 1;
+              ui.states.common.document = { rules: {} };
+              ui.states.common.draft = {
+                resolver: {
+                  aliases: { movies: [], tv: [] },
+                  forced_matches: { movies: [], tv: [] }
+                }
+              };
+            };
+
+            (async () => {
+              await ui.addCandidateRule({
+                candidateAction: "alias", testRequestId: "9", candidateTitle: "Obsesión", tmdbId: "1436161"
+              });
+              const common = ui.states.common;
+              if (commonLoads !== 1 || common.draft.resolver.aliases.movies[0] !== "Obsession | Obsesión") {
+                throw new Error(`El alias no llegó a Common: ${JSON.stringify(common.draft)}`);
+              }
+              if (ui.getPath(movieState.draft, "resolver.aliases.movies") !== undefined || movieState.dirty) {
+                throw new Error("La acción ensució el scope Películas");
+              }
+              if (!common.dirty || !statusBox.textContent.includes("Entra en Común y pulsa Guardar")) {
+                throw new Error("No se informó dónde guardar la regla común");
+              }
+              await ui.addCandidateRule({
+                candidateAction: "alias", testRequestId: "9", candidateTitle: "Obsesión", tmdbId: "1436161"
+              });
+              if (common.draft.resolver.aliases.movies.length !== 1) throw new Error("El alias se duplicó");
+              await ui.addCandidateRule({
+                candidateAction: "forced", testRequestId: "9", candidateTitle: "Obsesión", tmdbId: "1436161"
+              });
+              if (common.draft.resolver.forced_matches.movies[0] !== "Obsession | 2025 | 1436161") {
+                throw new Error("El forzado no llegó a Common");
+              }
+              if (renders !== 0) throw new Error("Editar Common repintó la pestaña Películas");
+            })().catch(error => {
+              console.error(error.stack || error);
+              process.exitCode = 1;
+            });
+            """,
+            self.web / "static" / "js" / "limpieza-arr" / "utils.js",
+            self.web / "static" / "js" / "limpieza-arr" / "testers.js",
+        )
 
     def test_resolver_transport_failure_uses_the_human_result_flow(self) -> None:
         run_node_contract(
@@ -553,21 +1070,35 @@ class IdentityUiStaticContractTests(unittest.TestCase):
             (async () => {
               await ui.runTitleTest();
               if (ui.state.lastResult.resolver?.status !== "REQUEST_ERROR") throw new Error("No se conservó el estado humano");
-              if (!resultBox.innerHTML.includes("PRUEBA NO COMPLETADA")) throw new Error("No se pintó el resultado humano");
+              if (!resultBox.innerHTML.includes("Prueba no completada")) throw new Error("No se pintó el resultado humano");
               if (!resultBox.innerHTML.includes("Red &lt;cortada&gt;")) throw new Error("No se mostró o escapó la causa");
               if (resultBox.innerHTML.includes("Error de prueba")) throw new Error("Reapareció el renderer antiguo");
               if (!statusBox.textContent.includes("PRUEBA NO COMPLETADA")) throw new Error("El resultado no se anunció");
               if (ui.state.activeTest !== null || button.disabled) throw new Error("La prueba no liberó el bloqueo");
               ui.api = async () => ({
                 ok: true,
-                status: "ACCEPTED",
-                decision: { status: "ACCEPTED", accepted: true, has_scoring: false, bypass: true, source: "tmdb_id" },
+                status: "ACCEPTED_CONFIDENT",
+                decision: {
+                  status: "ACCEPTED_CONFIDENT",
+                  accepted: true,
+                  selected: { tmdb_id: 1, media_type: "movie", title: "Titulo", year: 2024 }
+                },
                 candidates: [],
                 parser_test: { result: { title: "Titulo", year: 2024, category: "movies" } }
               });
               await ui.runTitleTest();
-              if (!statusBox.textContent.includes("ACEPTADA")) throw new Error("La decisión correcta no se anunció");
+              if (!statusBox.textContent.includes("Aceptada")) throw new Error("La decisión correcta no se anunció");
               if (ui.state.activeTest !== null || button.disabled) throw new Error("La segunda prueba no liberó el bloqueo");
+              ui.api = async () => ({
+                ok: true,
+                decision: { status: "BLOCKED_HARD", accepted: false },
+                parser_test: { result: { title: "Titulo", year: 2024, category: "movies" } }
+              });
+              await ui.runTitleTest();
+              if (!statusBox.textContent.includes("Bloqueada por contradicción")) throw new Error("La decisión bloqueada no se anunció");
+              if (!statusBox.className.includes("bad") || statusBox.className.includes(" ok")) {
+                throw new Error(`ok:true pintó verde una decisión bloqueada: ${statusBox.className}`);
+              }
             })().catch(error => {
               console.error(error.stack || error);
               process.exitCode = 1;
@@ -585,7 +1116,7 @@ class IdentityUiStaticContractTests(unittest.TestCase):
         self.assertIn("ui.focusListPosition", self.controls)
         self.assertIn("ui.focusControl", self.controls)
         self.assertIn("ui.focusGroupReset", self.controls)
-        self.assertIn('document.getElementById("identity-reset")?.focus()', self.view)
+        self.assertIn('button?.focus()', self.view)
         self.assertIn('for="identity-test-name"', self.testers)
         self.assertIn('for="identity-test-category"', self.testers)
         self.assertIn('role="tabpanel"', self.view)

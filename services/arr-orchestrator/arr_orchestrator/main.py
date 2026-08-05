@@ -57,6 +57,7 @@ def main() -> int:
         watcher_rules_updater=engine.update_watcher_rules,
         identity_rules_provider=engine.identity_rules,
         identity_rules_updater=engine.update_identity_rules,
+        identity_rules_validator=engine.validate_identity_rules,
         identity_rules_resetter=engine.reset_identity_rules,
         identity_cache_clearer=engine.clear_identity_cache,
         identity_parser_tester=engine.test_identity_parser,

@@ -3,6 +3,12 @@ from pathlib import Path
 from arr_orchestrator.config import Config
 
 
+def test_resolver_default_budget_matches_phased_v2(monkeypatch) -> None:
+    monkeypatch.delenv("ARR_RESOLVER_TOTAL_BUDGET_MS", raising=False)
+
+    assert Config.from_env().resolver_total_budget_ms == 20_000
+
+
 def test_series_default_paths_follow_the_configured_isolated_roots() -> None:
     config = Config(
         mode="dry-run",

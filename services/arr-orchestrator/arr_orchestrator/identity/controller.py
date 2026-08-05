@@ -14,9 +14,15 @@ from ..name_parser import MediaDecision, decide_media, test_parser_title
 from ..name_resolver import NameResolver
 from .defaults import (
     IDENTITY_PROFILES,
-    IDENTITY_SETTING_KEY,
+    IDENTITY_PROFILE_SETTING_KEYS,
     factory_identity_rules,
     identity_profile_setting_key,
+)
+from .scopes import (
+    compose_identity_scopes,
+    identity_scope_fingerprint,
+    normalize_scoped_identity_rules,
+    scope_identity_rules,
 )
 from .settings import (
     IdentityRulesValidationError,
@@ -24,13 +30,6 @@ from .settings import (
     identity_fingerprint,
     normalize_identity_rules,
 )
-
-
-_HISTORICAL_TV_PATTERNS = {
-    "series_sxe": r"(?i)\bS0?(\d{1,2})\s*E0?(\d{1,3})(?:\s*(?:-|_|E)\s*0?(\d{1,3}))?\b",
-    "explicit_season": r"(?i)\b(?:temporada|season)\s*0?(\d{1,2})\b",
-    "season_pack": r"(?i)(?:^|\s)T0?(\d{1,2})(?:\b|[- ]|$)",
-}
 
 
 class IdentityController:
@@ -47,7 +46,7 @@ class IdentityController:
             getattr(config, "resolver_http_timeout_ms", 2500)
         )
         resolver_total_budget_ms = int(
-            getattr(config, "resolver_total_budget_ms", 5000)
+            getattr(config, "resolver_total_budget_ms", 20_000)
         )
         resolver_retry_seconds = int(
             getattr(config, "resolver_retry_seconds", 60)
@@ -60,6 +59,7 @@ class IdentityController:
             resolver_retry_seconds,
         )
         _seed_profile_settings(database, defaults)
+        self.database = database
         self.stores = {
             profile: IdentitySettingsStore(
                 database,
@@ -74,14 +74,12 @@ class IdentityController:
             )
             for profile in IDENTITY_PROFILES
         }
-        # Alias conservado para consumidores antiguos: siempre representa common.
-        self.store = self.stores["common"]
         self.resolver = NameResolver(
             str(getattr(config, "tmdb_api_token", "")),
             str(getattr(config, "resolver_language", "es-ES")),
             str(getattr(config, "resolver_region", "ES")),
             int(getattr(config, "resolver_http_timeout_ms", 2500)),
-            int(getattr(config, "resolver_total_budget_ms", 5000)),
+            int(getattr(config, "resolver_total_budget_ms", 20_000)),
             database,
             self.log,
         )
@@ -91,17 +89,26 @@ class IdentityController:
         return self.resolver.enabled
 
     def payload(self, profile: str = "common") -> Dict[str, object]:
-        return self._store(profile).payload()
+        normalized = _identity_profile(profile)
+        return self._with_effective_metadata(
+            self.stores[normalized].payload(), normalized
+        )
 
     def update(
         self, payload: Dict[str, object], profile: str = "common"
     ) -> Dict[str, object]:
-        return self._store(profile).update(payload)
+        normalized = _identity_profile(profile)
+        return self._with_effective_metadata(
+            self.stores[normalized].update(payload), normalized
+        )
 
     def reset(
         self, payload: Dict[str, object], profile: str = "common"
     ) -> Dict[str, object]:
-        return self._store(profile).reset(payload)
+        normalized = _identity_profile(profile)
+        return self._with_effective_metadata(
+            self.stores[normalized].reset(payload), normalized
+        )
 
     def clear_cache(self, profile: str = "common") -> Dict[str, object]:
         normalized_profile = _identity_profile(profile)
@@ -111,6 +118,8 @@ class IdentityController:
 
     def job_snapshot(self, profile: str = "common") -> Dict[str, object]:
         normalized_profile = _identity_profile(profile)
+        if normalized_profile in {"movies", "tv"}:
+            return self.job_snapshot_for_category(normalized_profile)
         result = self.stores[normalized_profile].job_snapshot()
         result["profile"] = normalized_profile
         return result
@@ -121,45 +130,81 @@ class IdentityController:
         return self.job_snapshot("common")
 
     def job_snapshot_for_category(self, category: object) -> Dict[str, object]:
-        return self.job_snapshot(_profile_for_category(category))
+        profile = _profile_for_category(category)
+        if profile == "common":
+            return self.job_snapshot("common")
+        keys = [
+            identity_profile_setting_key("common"),
+            identity_profile_setting_key(profile),
+        ]
+        reader = getattr(self.database, "get_settings", None)
+        if callable(reader):
+            stored = reader(keys)
+            common = self.stores["common"].job_snapshot_from_raw(stored.get(keys[0]))
+            category_snapshot = self.stores[profile].job_snapshot_from_raw(
+                stored.get(keys[1])
+            )
+        else:
+            common = self.stores["common"].job_snapshot()
+            category_snapshot = self.stores[profile].job_snapshot()
+        return _compose_profile_snapshots(common, category_snapshot, profile)
 
     def _store(self, profile: str) -> IdentitySettingsStore:
         return self.stores[_identity_profile(profile)]
+
+    def _with_effective_metadata(
+        self, result: Dict[str, object], profile: str
+    ) -> Dict[str, object]:
+        payload = dict(result)
+        effective = (
+            self.job_snapshot_for_category(profile)
+            if profile in {"movies", "tv"}
+            else self.job_snapshot("common")
+        )
+        payload["effective_fingerprint"] = effective.get("fingerprint")
+        payload["effective_revisions"] = copy.deepcopy(
+            effective.get("revisions")
+            or {"common": int(effective.get("revision") or 0)}
+        )
+        return payload
 
     def rules_for_job(self, job: Dict[str, object]) -> Dict[str, object]:
         meta = _source_meta(job.get("source_meta_json"))
         stored = meta.get("identity_rules")
         if isinstance(stored, dict) and isinstance(stored.get("rules"), dict):
             try:
-                rules = _normalize_job_identity_rules(stored["rules"])
-                return {
+                snapshot_profile = _snapshot_profile(stored, job)
+                rules = _normalize_job_identity_rules(
+                    stored["rules"], snapshot_profile
+                )
+                result = {
                     "rules": rules,
                     "revision": int(stored.get("revision") or 0),
                     "saved_at": stored.get("saved_at"),
-                    "fingerprint": identity_fingerprint(rules),
-                    "profile": _snapshot_profile(stored, job),
+                    "fingerprint": _job_rules_fingerprint(
+                        rules, snapshot_profile
+                    ),
+                    "profile": snapshot_profile,
                     "source": "job_snapshot",
                 }
-            except (IdentityRulesValidationError, TypeError, ValueError):
-                self.log.warning("Snapshot identity_rules invalido en job; se usa fallback seguro")
+                for key in ("revisions", "fingerprints", "combined_fingerprint"):
+                    if isinstance(stored.get(key), dict) or isinstance(stored.get(key), str):
+                        result[key] = copy.deepcopy(stored[key])
+                return result
+            except (IdentityRulesValidationError, TypeError, ValueError) as error:
+                raise IdentityRulesValidationError(
+                    "El snapshot de identidad del trabajo no es ejecutable por phased-er-v2."
+                ) from error
 
         legacy = meta.get("filebot_rules")
         if isinstance(legacy, dict) and isinstance(legacy.get("rules"), dict):
-            defaults = copy.deepcopy(self.store.payload()["defaults"])
-            _disable_new_identity_behaviors(defaults, only_when_missing=False)
-            migrated = _merge_legacy_filebot(defaults, legacy["rules"])
-            return {
-                "rules": migrated,
-                "revision": int(legacy.get("revision") or 0),
-                "saved_at": legacy.get("saved_at"),
-                "fingerprint": identity_fingerprint(migrated),
-                "profile": _profile_for_category(job.get("category")),
-                "source": "legacy_filebot_snapshot",
-            }
+            raise IdentityRulesValidationError(
+                "El snapshot FileBot heredado es historico y no puede ejecutar decisiones v1."
+            )
 
-        current = self.job_snapshot_for_category(job.get("category"))
-        current["source"] = "current_fallback"
-        return current
+        raise IdentityRulesValidationError(
+            "El trabajo no contiene la politica de identidad v2 congelada."
+        )
 
     def configure_for_job(self, job: Dict[str, object]) -> Dict[str, object]:
         context = self.rules_for_job(job)
@@ -175,7 +220,7 @@ class IdentityController:
         active_rules = (
             rules
             if isinstance(rules, dict)
-            else self.stores[_profile_for_category(category)].snapshot()
+            else self.job_snapshot_for_category(category)["rules"]
         )
         parser_rules = active_rules.get("parser") if isinstance(active_rules.get("parser"), dict) else None
         decisions = [
@@ -295,11 +340,51 @@ class IdentityController:
             raise IdentityRulesValidationError("category debe ser movies, tv o auto.")
         explicit_category = "" if category == "auto" else category
         supplied = payload.get("rules")
-        rules = (
-            normalize_identity_rules(supplied)
-            if supplied is not None
-            else self.stores[profile].snapshot()
-        )
+        if supplied is None:
+            rules = (
+                self.job_snapshot_for_category(category)["rules"]
+                if category in {"movies", "tv"}
+                else self.stores["common"].snapshot()
+            )
+        else:
+            if category in {"movies", "tv"}:
+                if profile == "common":
+                    normalized_supplied = normalize_scoped_identity_rules(
+                        supplied,
+                        "common",
+                        full_defaults=self.stores["common"]._full_defaults,
+                    )
+                    common_snapshot = {
+                        "rules": normalized_supplied,
+                        "revision": 0,
+                        "fingerprint": identity_scope_fingerprint(
+                            normalized_supplied, "common"
+                        ),
+                    }
+                    category_snapshot = self.stores[category].job_snapshot()
+                else:
+                    normalized_supplied = normalize_scoped_identity_rules(
+                        supplied,
+                        profile,
+                        full_defaults=self.stores[profile]._full_defaults,
+                    )
+                    common_snapshot = self.stores["common"].job_snapshot()
+                    category_snapshot = {
+                        "rules": normalized_supplied,
+                        "revision": 0,
+                        "fingerprint": identity_scope_fingerprint(
+                            normalized_supplied, profile
+                        ),
+                    }
+                rules = _compose_profile_snapshots(
+                    common_snapshot, category_snapshot, category
+                )["rules"]
+            else:
+                rules = normalize_scoped_identity_rules(
+                    supplied,
+                    "common",
+                    full_defaults=self.stores["common"]._full_defaults,
+                )
         return name, explicit_category, rules
 
 
@@ -325,15 +410,30 @@ def _snapshot_profile(
 
 
 def _seed_profile_settings(database: object, defaults: Dict[str, object]) -> None:
-    """Clona una sola vez legacy/defaults sin tocar nunca ``identity.pipeline``."""
+    """Si la instalacion es nueva, crea juntos los tres scopes v2.
 
-    reader = getattr(database, "get_setting")
-    legacy_raw = reader(IDENTITY_SETTING_KEY)
-    seed_raw = legacy_raw
-    if seed_raw is None:
-        seed_raw = json.dumps(
+    No lee, convierte ni ejecuta configuracion v1. Una instalacion parcial se
+    detiene para evitar completar silenciosamente una politica incompleta.
+    """
+
+    keys = tuple(IDENTITY_PROFILE_SETTING_KEYS.values())
+    reader = getattr(database, "get_settings", None)
+    writer = getattr(database, "compare_and_set_settings", None)
+    if not callable(reader) or not callable(writer):
+        raise RuntimeError("La base de datos no admite settings v2 atomicos.")
+    current = reader(keys)
+    present = [current.get(key) is not None for key in keys]
+    if all(present):
+        return
+    if any(present):
+        raise RuntimeError(
+            "Configuracion identity.pipeline.v2 parcial: deben existir common, movies y tv."
+        )
+    documents = {}
+    for profile, key in IDENTITY_PROFILE_SETTING_KEYS.items():
+        documents[key] = json.dumps(
             {
-                "rules": defaults,
+                "rules": scope_identity_rules(defaults, profile),
                 "revision": 0,
                 "saved_at": None,
                 "history": [],
@@ -342,98 +442,69 @@ def _seed_profile_settings(database: object, defaults: Dict[str, object]) -> Non
             sort_keys=True,
             separators=(",", ":"),
         )
-    exact_writer = getattr(database, "compare_and_set_setting_value", None)
-    writer = getattr(database, "set_setting")
-    for profile in IDENTITY_PROFILES:
-        setting_key = identity_profile_setting_key(profile)
-        if reader(setting_key) is not None:
-            continue
-        if callable(exact_writer):
-            exact_writer(setting_key, None, seed_raw)
-        elif reader(setting_key) is None:
-            writer(setting_key, seed_raw)
+    if writer(
+        {key: None for key in keys},
+        documents,
+        clear_resolver_cache=True,
+    ):
+        return
+    refreshed = reader(keys)
+    if not all(refreshed.get(key) is not None for key in keys):
+        raise RuntimeError("No se pudieron crear atomicamente los scopes de identidad v2.")
 
-def _merge_legacy_filebot(
-    identity_rules: Dict[str, object], legacy_rules: Dict[str, object]
+
+def _compose_profile_snapshots(
+    common: Dict[str, object],
+    category_snapshot: Dict[str, object],
+    profile: str,
 ) -> Dict[str, object]:
-    rules = copy.deepcopy(identity_rules)
-    resolver = rules.get("resolver")
-    if not isinstance(resolver, dict):
-        return rules
-    locales = resolver.get("locales")
-    aliases = resolver.get("aliases")
-    forced = resolver.get("forced_matches")
-    if not all(isinstance(value, dict) for value in (locales, aliases, forced)):
-        return rules
-    for category in ("movies", "tv"):
-        legacy_category = legacy_rules.get(category)
-        if not isinstance(legacy_category, dict):
-            continue
-        locale = locales.get(category)  # type: ignore[union-attr]
-        if isinstance(locale, dict):
-            if legacy_category.get("language"):
-                locale["language"] = legacy_category["language"]
-            if category == "movies" and legacy_category.get("region"):
-                locale["region"] = legacy_category["region"]
-        if isinstance(legacy_category.get("query_aliases"), list):
-            aliases[category] = copy.deepcopy(legacy_category["query_aliases"])  # type: ignore[index]
-        if isinstance(legacy_category.get("forced_matches"), list):
-            forced[category] = copy.deepcopy(legacy_category["forced_matches"])  # type: ignore[index]
-    return normalize_identity_rules(rules)
+    """Compila Common + override de categoria sin heredar copias redundantes."""
 
+    normalized = compose_identity_scopes(
+        common.get("rules"),
+        category_snapshot.get("rules"),
+        profile,
+    )
+    common_revision = int(common.get("revision") or 0)
+    category_revision = int(category_snapshot.get("revision") or 0)
+    fingerprints = {
+        "common": str(
+            common.get("fingerprint")
+            or identity_scope_fingerprint(common["rules"], "common")
+        ),
+        profile: str(
+            category_snapshot.get("fingerprint")
+            or identity_scope_fingerprint(category_snapshot["rules"], profile)
+        ),
+    }
+    combined_fingerprint = identity_fingerprint(normalized)
+    return {
+        "rules": normalized,
+        "revision": category_revision,
+        "revisions": {"common": common_revision, profile: category_revision},
+        "saved_at": category_snapshot.get("saved_at") or common.get("saved_at"),
+        "fingerprint": combined_fingerprint,
+        "combined_fingerprint": combined_fingerprint,
+        "fingerprints": fingerprints,
+        "profile": profile,
+    }
 
-def _normalize_job_identity_rules(value: Dict[str, object]) -> Dict[str, object]:
-    """Normaliza snapshots antiguos sin cambiar la decision que capturaron."""
+def _normalize_job_identity_rules(
+    value: Dict[str, object], profile: str
+) -> Dict[str, object]:
+    """Acepta solo snapshots v2; los v1 quedan como historico pasivo."""
 
     rules = copy.deepcopy(value)
-    _disable_new_identity_behaviors(rules, only_when_missing=True)
-    return normalize_identity_rules(rules)
-
-
-def _disable_new_identity_behaviors(
-    rules: Dict[str, object], *, only_when_missing: bool
-) -> None:
-    """Conserva la semantica de snapshots y configuraciones heredadas."""
-
-    parser = rules.get("parser")
-    if isinstance(parser, dict):
-        for key in (
-            "video_extensions",
-            "video_markers",
-            "non_video_markers",
-            "season_number_words",
-        ):
-            if not only_when_missing or key not in parser:
-                parser[key] = []
-        normalization = parser.get("normalization")
-        if isinstance(normalization, dict):
-            for key in (
-                "movie_without_year_from_video",
-                "allow_tv_year_range",
-            ):
-                if not only_when_missing or key not in normalization:
-                    normalization[key] = False
-        patterns = parser.get("patterns")
-        if isinstance(patterns, dict):
-            for key, historical_pattern in _HISTORICAL_TV_PATTERNS.items():
-                if not only_when_missing or key not in patterns:
-                    patterns[key] = historical_pattern
-
-    resolver = rules.get("resolver")
-    if not isinstance(resolver, dict):
-        return
-    if not only_when_missing or "original_language_preference" not in resolver:
-        resolver["original_language_preference"] = {
-            "enabled": False,
-            "language": "en",
-        }
-    acceptance = resolver.get("acceptance")
-    if isinstance(acceptance, dict) and (
-        not only_when_missing
-        or "prefer_oldest_exact_title_without_year" not in acceptance
-    ):
-        acceptance["prefer_oldest_exact_title_without_year"] = False
-
+    if rules.get("schema_version") != 2:
+        raise IdentityRulesValidationError(
+            "El snapshot de identidad no usa schema_version 2."
+        )
+    try:
+        return normalize_identity_rules(rules)
+    except IdentityRulesValidationError:
+        if profile != "common":
+            raise
+        return normalize_scoped_identity_rules(rules, "common")
 
 def _source_meta(value: object) -> Dict[str, object]:
     if isinstance(value, dict):
@@ -453,6 +524,13 @@ def _parser_status(result: Dict[str, object]) -> str:
     if result.get("category") == "manual":
         return "MANUAL"
     return "CLEAN"
+
+
+def _job_rules_fingerprint(rules: Dict[str, object], profile: str) -> str:
+    try:
+        return identity_fingerprint(rules)
+    except IdentityRulesValidationError:
+        return identity_scope_fingerprint(rules, profile)
 
 
 def _test_decision(status: str) -> Dict[str, object]:

@@ -94,6 +94,7 @@ class IdentityProxyTests(unittest.TestCase):
         payload = {"rules": {"schema_version": 1}, "expected_revision": 2}
         cases = (
             ("common", "save_rules", "", "/settings/identity/common"),
+            ("movies", "validate_rules", "validate", "/settings/identity/movies/validate"),
             ("movies", "reset_rules", "reset", "/settings/identity/movies/reset"),
             ("tv", "clear_cache", "cache", "/settings/identity/tv/cache/clear"),
             ("movies", "test_parser", "parser", "/settings/identity/movies/test-parser"),
@@ -170,12 +171,13 @@ class IdentityProxyTests(unittest.TestCase):
 
     def test_resolver_timeout_follows_draft_budget_with_margin_and_cap(self) -> None:
         cases = (
-            ({"resolver": {"http": {"total_budget_ms": 5_000}}}, 10.0),
-            ({"resolver": {"http": {"total_budget_ms": 120_000}}}, 125.0),
-            ({"resolver": {"http": {"total_budget_ms": 300_000}}}, 305.0),
-            ({"resolver": {"http": {"total_budget_ms": 999_999}}}, 305.0),
-            ({"resolver": {"http": {"total_budget_ms": "invalid"}}}, 305.0),
-            ({"resolver": {"http": {}}}, 305.0),
+            ({"resolver": {"coverage": {"total_budget_ms": 5_000}}}, 10.0),
+            ({"resolver": {"coverage": {"total_budget_ms": 120_000}}}, 125.0),
+            ({"resolver": {"coverage": {"total_budget_ms": 300_000}}}, 305.0),
+            ({"resolver": {"coverage": {"total_budget_ms": 999_999}}}, 305.0),
+            ({"resolver": {"coverage": {"total_budget_ms": "invalid"}}}, 305.0),
+            ({"resolver": {"coverage": {}}}, 305.0),
+            ({"resolver": {"http": {"total_budget_ms": 5_000}}}, 305.0),
             ({}, 305.0),
             (None, 305.0),
         )
@@ -239,6 +241,7 @@ class IdentityPanelHandlerTests(unittest.TestCase):
     def test_profile_cache_and_test_actions_forward_profile(self) -> None:
         payload = {"name": "Dark.S01E01", "category": "tv"}
         actions = (
+            ("/validate", "validate_rules"),
             ("/cache/clear", "clear_cache"),
             ("/test-parser", "test_parser"),
             ("/test-resolver", "test_resolver"),

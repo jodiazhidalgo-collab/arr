@@ -17,6 +17,8 @@
       dirty: false,
       loading: false,
       saving: false,
+      resetting: false,
+      readOnly: false,
       cacheClearing: false,
       requestEpoch: 0,
       saveEpoch: 0,
@@ -230,11 +232,14 @@
     return true;
   };
 
-  ui.markDirty = function () {
-    const state = ui.state;
+  ui.markDirty = function (profile = ui.activeProfile) {
+    const state = ui.states[profile];
+    if (!state) return;
+    if (state.readOnly || state.resetting) return;
     state.dirty = true;
     ui.invalidateAllTestResults({ profile: state.profile });
     ui.status("Cambios sin guardar.", "warn", state.profile);
+    if (!ui.isProfileActive(state.profile)) return;
     const save = document.getElementById("identity-save");
     if (save) save.disabled = false;
   };

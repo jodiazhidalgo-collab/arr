@@ -7,7 +7,6 @@ from .defaults import (
     IDENTITY_PROFILE_SETTING_KEYS,
     IDENTITY_RULES_PATH,
     IDENTITY_SCHEMA_VERSION,
-    IDENTITY_SETTING_KEY,
     factory_identity_rules,
     identity_profile_setting_key,
 )
@@ -26,7 +25,6 @@ __all__ = [
     "IDENTITY_PROFILE_SETTING_KEYS",
     "IDENTITY_RULES_PATH",
     "IDENTITY_SCHEMA_VERSION",
-    "IDENTITY_SETTING_KEY",
     "IdentityRulesValidationError",
     "IdentitySettingsStore",
     "factory_identity_rules",

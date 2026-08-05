@@ -25,9 +25,9 @@ def _resolver_proxy_timeout(payload: Dict[str, object]) -> float:
     if isinstance(rules, dict):
         resolver = rules.get("resolver")
         if isinstance(resolver, dict):
-            http = resolver.get("http")
-            if isinstance(http, dict):
-                budget = http.get("total_budget_ms", budget)
+            coverage = resolver.get("coverage")
+            if isinstance(coverage, dict):
+                budget = coverage.get("total_budget_ms", budget)
     try:
         numeric_budget = float(budget)
     except (TypeError, ValueError):
@@ -74,6 +74,15 @@ class IdentityProxy:
         profile: Optional[str] = None,
     ) -> Tuple[int, Dict[str, object]]:
         return self._request(self._settings_path(profile), payload, 25)
+
+    def validate_rules(
+        self,
+        payload: Dict[str, object],
+        profile: str,
+    ) -> Tuple[int, Dict[str, object]]:
+        return self._request(
+            self._settings_path(profile, "validate"), payload, 25
+        )
 
     def reset_rules(
         self,

@@ -12,16 +12,16 @@ import re
 from typing import Dict
 
 from .parser_rules import factory_parser_rules
-from .resolver_defaults import DEFAULT_SERIES_CANDIDATES, DEFAULT_TITLE_MATCHING
+from .resolver_defaults import DEFAULT_TITLE_MATCHING
 
 
-IDENTITY_SETTING_KEY = "identity.pipeline"
-IDENTITY_RULES_PATH = f"settings/{IDENTITY_SETTING_KEY}"
+IDENTITY_V2_SETTING_KEY = "identity.pipeline.v2"
+IDENTITY_RULES_PATH = f"settings/{IDENTITY_V2_SETTING_KEY}"
 IDENTITY_PROFILES = ("common", "movies", "tv")
 IDENTITY_PROFILE_SETTING_KEYS = {
-    profile: f"{IDENTITY_SETTING_KEY}.{profile}" for profile in IDENTITY_PROFILES
+    profile: f"{IDENTITY_V2_SETTING_KEY}.{profile}" for profile in IDENTITY_PROFILES
 }
-IDENTITY_SCHEMA_VERSION = 1
+IDENTITY_SCHEMA_VERSION = 2
 IDENTITY_HISTORY_LIMIT = 12
 
 
@@ -41,15 +41,12 @@ _REGION_RE = re.compile(r"^[A-Za-z]{2}$")
 _IDENTITY_RULES_TEMPLATE: Dict[str, object] = {
     "schema_version": IDENTITY_SCHEMA_VERSION,
     "resolver": {
+        "algorithm": "phased-er-v2",
         "locales": {
             "movies": {"language": "es-ES", "region": "ES"},
             "tv": {"language": "es-ES"},
             "fallback_language": "en-US",
             "use_fallback": True,
-        },
-        "original_language_preference": {
-            "enabled": True,
-            "language": "en",
         },
         "aliases": {"movies": [], "tv": []},
         "forced_matches": {"movies": [], "tv": []},
@@ -60,14 +57,6 @@ _IDENTITY_RULES_TEMPLATE: Dict[str, object] = {
             "max_media_files": 20,
             "sort_largest_first": True,
         },
-        "guess_selection": {
-            "base": 100,
-            "index_penalty": 1,
-            "year_bonus": 20,
-            "season_bonus": 15,
-            "parser_high_bonus": 10,
-        },
-        "series_candidates": copy.deepcopy(DEFAULT_SERIES_CANDIDATES),
         "query_variants": {
             "with_year": True,
             "without_year": True,
@@ -77,53 +66,51 @@ _IDENTITY_RULES_TEMPLATE: Dict[str, object] = {
             "use_spanish_correction": True,
         },
         "title_matching": copy.deepcopy(DEFAULT_TITLE_MATCHING),
-        "search_limits": {
-            "max_searches": 8,
-            "results_per_search": 10,
-            "detail_candidates": 3,
-            "initial_candidates": 2,
-            "include_exact_year_candidate": True,
+        "coverage": {
+            "max_searches": 12,
+            "max_candidates": 60,
+            "batch_size": 8,
+            "max_details": 40,
+            "total_budget_ms": 20_000,
         },
-        "scoring": {
-            "direct_identity": 200,
-            "title_exact": 35,
-            "title_similarity_max": 20,
-            "token_overlap_max": 5,
-            "spanish_correction": 20,
-            "parser_exact": 20,
-            "parser_near": 12,
-            "parser_near_min": 0.86,
-            "configured_alias": 30,
-            "year_exact": 20,
-            "year_near": 8,
+        "adjudication": {
+            "mode": "most_probable",
+            "tie_breakers": [
+                "explicit_year",
+                "agreements",
+                "disagreements",
+                "popularity",
+                "vote_count",
+                "newest_year",
+                "lowest_tmdb_id",
+            ],
+        },
+        "movies": {
             "year_tolerance": 1,
-            "year_contradiction": -25,
-            "missing_movie_year": -18,
-            "category": 10,
-            "origin_evidence": 15,
-            "season_valid": 20,
-            "season_invalid": -100,
+            "use_release_timeline": True,
+            "hard_year_conflict": True,
+            "runtime_tolerance_minutes": 10,
+            "runtime_tolerance_percent": 15,
+            "short_runtime_minutes": 40,
+            "feature_runtime_minutes": 60,
         },
-        "acceptance": {
-            "min_score": 75,
-            "min_margin": 12,
-            "early_stop_score": 75,
-            "early_stop_margin": 12,
-            "early_stop_require_exact_movie_year": True,
-            "direct_ids_bypass": True,
-            "forced_bypass": True,
-            "prefer_oldest_exact_title_without_year": True,
+        "tv": {
+            "validate_season": True,
+            "validate_episode": True,
+            "allow_absolute_episode": True,
+            "allow_specials": True,
+            "allow_season_packs": True,
+            "allow_multi_episode": True,
+            "runtime_tolerance_minutes": 8,
+            "runtime_tolerance_percent": 25,
         },
-        "forced_validation": {
-            "min_title_similarity": 0.92,
-            "require_year": True,
-        },
-        "http": {"timeout_ms": 2500, "total_budget_ms": 5000},
+        "http": {"timeout_ms": 2500},
         "retry": {
             "base_seconds": 60,
             "multiplier": 2,
             "max_exponent": 3,
             "max_seconds": 300,
+            "max_attempts": 3,
         },
         "cache": {
             "enabled": True,
@@ -155,7 +142,7 @@ def factory_identity_rules(
     default_language: str = "es-ES",
     default_region: str = "ES",
     resolver_http_timeout_ms: int = 2500,
-    resolver_total_budget_ms: int = 5000,
+    resolver_total_budget_ms: int = 20_000,
     resolver_retry_seconds: int = 60,
 ) -> Dict[str, object]:
     """Crea los defaults completos adaptados a la configuracion de runtime."""
@@ -195,7 +182,7 @@ def factory_identity_rules(
     )
     resolver = rules["resolver"]  # type: ignore[index]
     resolver["http"]["timeout_ms"] = timeout_ms  # type: ignore[index]
-    resolver["http"]["total_budget_ms"] = total_budget_ms  # type: ignore[index]
+    resolver["coverage"]["total_budget_ms"] = total_budget_ms  # type: ignore[index]
     resolver["retry"]["base_seconds"] = retry_seconds  # type: ignore[index]
     resolver["retry"]["max_seconds"] = max(  # type: ignore[index]
         int(resolver["retry"]["max_seconds"]),  # type: ignore[index]

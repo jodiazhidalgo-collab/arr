@@ -199,6 +199,10 @@ def aliases(value: object, label: str) -> List[str]:
         source, destination = parts
         key = source.casefold()
         destination_key = destination.casefold()
+        # Los autoalias no aportan evidencia independiente y en v1 podian
+        # inflar artificialmente la corroboracion del mismo titulo.
+        if key == destination_key:
+            continue
         if key in seen and seen[key] != destination_key:
             raise IdentityRulesValidationError(
                 f"{label}[{index}] contradice otro alias con el mismo origen."

@@ -26,9 +26,11 @@ from arr_orchestrator.engine import (
 )
 from arr_orchestrator.filesystem import (
     ExtractionError,
+    media_files,
     review_content_signature,
     write_reason,
 )
+from arr_orchestrator.name_resolver import ResolvedIdentity
 from arr_orchestrator.series_worker import (
     SeriesWorkerBusy,
     SeriesWorkerConflict,
@@ -97,7 +99,60 @@ def _engine(root: Path, series_mode: str = "active") -> tuple[Engine, Database]:
     config.ensure_directories()
     database = Database(root / "orchestrator.db")
     database.initialize()
-    return Engine(config, database), database
+    engine = Engine(config, database)
+    engine.name_resolver = _AcceptedSeriesResolver()
+    return engine, database
+
+
+class _AcceptedSeriesResolver:
+    enabled = True
+
+    def __init__(self) -> None:
+        self._trace: dict[str, object] = {}
+
+    def resolve(self, job: dict[str, object], input_root: Path) -> ResolvedIdentity:
+        paths = media_files(input_root)
+        intents, _unclassified = Engine._series_episode_intents(paths)
+        first = intents[0] if len(intents) == 1 else {}
+        self._trace = {
+            "decision": {
+                "status": "ACCEPTED_CONFIDENT",
+                "accepted": True,
+                "retryable": False,
+                "selected_tmdb_id": 12345,
+                "selected": {
+                    "tmdb_id": 12345,
+                    "media_type": "tv",
+                    "title": "Mi Serie",
+                    "year": 2024,
+                },
+            }
+        }
+        return ResolvedIdentity(
+            media_type="tv",
+            tmdb_id=12345,
+            title="Mi Serie",
+            original_title="Mi Serie",
+            year=2024,
+            aliases=["Mi Serie"],
+            score=100,
+            margin=50,
+            query=str(job.get("name") or "Mi Serie"),
+            guess={},
+            source="test",
+            season=first.get("season") if isinstance(first, dict) else None,
+            episodes=list(first.get("episodes") or []) if isinstance(first, dict) else [],
+            resolver_algorithm_version="phased-er-v2",
+            decision_status="ACCEPTED_CONFIDENT",
+            episode_intents=intents,
+        )
+
+    def trace_snapshot(self) -> dict[str, object]:
+        return self._trace
+
+    @staticmethod
+    def output_matches(_identity: ResolvedIdentity, _names: list[str]) -> bool:
+        return True
 
 
 def _wait_state(database: Database, job_id: str, expected: str, timeout: float = 5.0):
@@ -3229,6 +3284,49 @@ def test_full_series_queue_stages_only_one_of_twenty_jobs(tmp_path: Path) -> Non
         database.close()
 
 
+def test_exhausted_identity_retry_does_not_block_next_series(tmp_path: Path) -> None:
+    engine, database = _engine(tmp_path)
+    try:
+        pending_name = "Serie Pendiente S01E01.mkv"
+        pending_source = engine.config.complete_root / "tv" / pending_name
+        pending_source.parent.mkdir(parents=True, exist_ok=True)
+        pending_source.write_bytes(b"pending")
+        pending = database.create_job(
+            "queue:identity-provider-pending",
+            "fs",
+            "tv",
+            pending_name,
+            state="identity_retry",
+            source_path=str(pending_source),
+            identity_retry_at=None,
+            retry_filebot=3,
+            source_meta_json=engine._new_job_source_meta_json(
+                category="tv",
+                name=pending_name,
+            ),
+        )
+        next_name = "Serie Siguiente S01E02.mkv"
+        next_source = engine.config.complete_root / "tv" / next_name
+        next_source.write_bytes(b"next")
+        following = database.create_job(
+            "queue:after-identity-provider-pending",
+            "fs",
+            "tv",
+            next_name,
+            state="ready_stage",
+            source_path=str(next_source),
+            source_meta_json=engine._new_job_source_meta_json(
+                category="tv",
+                name=next_name,
+            ),
+        )
+        assert engine._series_full_pipeline_owner() == str(following["job_id"])
+        assert not engine._series_waits_for_full_pipeline(following)
+        assert database.get_job(str(pending["job_id"]))["state"] == "identity_retry"
+    finally:
+        database.close()
+
+
 def test_series_review_cleanup_recovers_after_workshop_was_already_removed(
     tmp_path: Path,
 ) -> None:
@@ -3952,6 +4050,126 @@ def test_series_episode_groups_preserve_physical_file_cardinality() -> None:
     }
     assert separate != combined
     assert separate_unknown == combined_unknown == []
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_signature"),
+    [
+        ("Mi Serie [Cap.201].mkv", ("episodes", ((2, 1),))),
+        ("Mi Serie Capitulo 14.mkv", ("absolute", 14)),
+        ("Mi Serie S00E03.mkv", ("episodes", ((0, 3),))),
+        ("Mi Serie Especial 2.mkv", ("episodes", ((0, 2),))),
+        ("Mi Serie T06 completa.mkv", ("season_pack", 6)),
+        ("Mi Serie S01E01E02.mkv", ("episodes", ((1, 1), (1, 2)))),
+    ],
+)
+def test_series_episode_intents_cover_supported_tv_shapes(
+    name: str,
+    expected_signature: tuple[object, ...],
+) -> None:
+    intents, unclassified = Engine._series_episode_intents([Path(name)])
+
+    assert unclassified == []
+    assert len(intents) == 1
+    assert Engine._episode_intent_signature(intents[0]) == expected_signature
+
+
+def test_series_episode_intents_preserve_every_file_in_a_pack() -> None:
+    paths = [
+        Path("Mi Serie [Cap.201].mkv"),
+        Path("Mi Serie S02E02E03.mkv"),
+        Path("Mi Serie Especial 4.mkv"),
+    ]
+
+    intents, unclassified = Engine._series_episode_intents(paths)
+
+    assert unclassified == []
+    assert [str(item["source"]) for item in intents] == [path.name for path in paths]
+    assert Engine._series_intent_codes(intents) == {
+        (0, 4),
+        (2, 1),
+        (2, 2),
+        (2, 3),
+    }
+
+
+def test_aggregate_validation_keeps_physical_binding_and_accepts_absolute_mapping() -> None:
+    assert Engine._series_episode_intents_compatible(
+        ("absolute", 14),
+        ("episodes", ((3, 14),)),
+    )
+    assert not Engine._series_episode_intents_compatible(
+        ("episodes", ((1, 1),)),
+        ("episodes", ((1, 2),)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("input_name", "output_name"),
+    [
+        ("Mi Serie [Cap.201].mkv", "Mi Serie - S02E01.mkv"),
+        ("Mi Serie Capitulo 14.mkv", "Mi Serie - S03E14.mkv"),
+        ("Mi Serie Especial 2.mkv", "Mi Serie - S00E02.mkv"),
+        ("Mi Serie T06 completa.mkv", "Mi Serie - S06E01.mkv"),
+        ("Mi Serie S01E01E02.mkv", "Mi Serie - S01E01E02.mkv"),
+    ],
+)
+def test_series_shape_is_validated_as_a_per_file_intent_through_filebot(
+    tmp_path: Path,
+    input_name: str,
+    output_name: str,
+) -> None:
+    engine, database = _engine(tmp_path, "active")
+    try:
+        job = database.create_job(
+            f"filebot:intent:{input_name}",
+            "fs",
+            "tv",
+            input_name,
+            state="ready_filebot",
+            source_meta_json=engine._new_job_source_meta_json(
+                category="tv",
+                name=input_name,
+            ),
+        )
+        job_root = engine.config.workshop_root / str(job["job_id"])
+        original = job_root / "original"
+        original.mkdir(parents=True)
+        (original / input_name).write_bytes(b"episode")
+        job = database.update_job(
+            str(job["job_id"]),
+            stage_path=str(job_root),
+            source_path=str(original),
+        )
+
+        class ShapeFileBot:
+            def configure_identity_rules(self, _rules):
+                pass
+
+            def run(self, _job_id, _category, input_root, output_root, identity):
+                assert identity.tmdb_id == 12345
+                source = next(Path(input_root).rglob("*.mkv"))
+                destination = Path(output_root) / "Mi Serie" / "Season" / output_name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(destination))
+                return {
+                    "exit_code": 0,
+                    "moves": [{"source": str(source), "destination": str(destination)}],
+                    "output_media": [str(destination)],
+                    "duplicate": False,
+                    "stdout_tail": "ok",
+                }
+
+        engine.filebot = ShapeFileBot()
+        engine._run_filebot(job)
+
+        updated = database.get_job(job["job_id"])
+        assert updated["state"] == "series_postprocess_ready"
+        assert Path(updated["source_path"]).joinpath(
+            "Mi Serie", "Season", output_name
+        ).exists()
+    finally:
+        database.close()
 
 
 def test_filebot_leftover_subtitle_preserves_whole_pack(tmp_path: Path) -> None:

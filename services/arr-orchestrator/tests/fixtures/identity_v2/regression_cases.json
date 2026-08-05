@@ -1,0 +1,167 @@
+{
+  "schema": "arr-identity-regressions-v2",
+  "source": "anonymized-real-diagnostics",
+  "movies": {
+    "obsession_2025": {
+      "guess": {
+        "title": "Obsession",
+        "year": 2025
+      },
+      "observed_runtime_minutes": 108,
+      "expected_without_runtime": {
+        "status": "ACCEPTED_FALLBACK",
+        "selected_tmdb_id": 1436161
+      },
+      "expected_with_runtime": {
+        "status": "ACCEPTED_CONFIDENT",
+        "selected_tmdb_id": 1339713,
+        "eliminated_tmdb_ids": [1436161, 1502633]
+      },
+      "candidates": [
+        {
+          "tmdb_id": 1436161,
+          "title": "Obsession",
+          "original_title": "Obsession",
+          "year": 2025,
+          "aliases": ["Obsession"],
+          "popularity": 18.0,
+          "vote_count": 12,
+          "runtime_minutes": 18
+        },
+        {
+          "tmdb_id": 1502633,
+          "title": "Obsession",
+          "original_title": "Obsession",
+          "year": 2025,
+          "aliases": ["Obsession"],
+          "popularity": 12.0,
+          "vote_count": 4,
+          "runtime_minutes": 22
+        },
+        {
+          "tmdb_id": 1339713,
+          "title": "Obsession",
+          "original_title": "Obsession",
+          "year": 2025,
+          "aliases": ["Obsession"],
+          "popularity": 8.0,
+          "vote_count": 3,
+          "runtime_minutes": 108
+        }
+      ]
+    },
+    "obsesion_without_year": {
+      "guess": {
+        "title": "Obsesion"
+      },
+      "expected": {
+        "status": "ACCEPTED_FALLBACK",
+        "selected_tmdb_id": 35852,
+        "oldest_tmdb_id": 5155
+      },
+      "candidates": [
+        {
+          "tmdb_id": 4780,
+          "title": "Fascinación (Obsession)",
+          "original_title": "Obsession",
+          "year": 1976,
+          "aliases": ["Obsesion"],
+          "popularity": 7.0,
+          "vote_count": 240
+        },
+        {
+          "tmdb_id": 5155,
+          "title": "Obsesión",
+          "original_title": "Ossessione",
+          "year": 1943,
+          "aliases": ["Obsesion"],
+          "popularity": 4.0,
+          "vote_count": 180
+        },
+        {
+          "tmdb_id": 35852,
+          "title": "Obsession",
+          "original_title": "Obsession",
+          "year": 1949,
+          "aliases": ["Obsesion"],
+          "popularity": 11.0,
+          "vote_count": 360
+        }
+      ]
+    },
+    "candidate_outside_top_three": {
+      "guess": {
+        "title": "Correcta",
+        "year": 2025
+      },
+      "expected_tmdb_id": 999,
+      "candidates": [
+        {"tmdb_id": 1, "title": "Relleno uno", "year": 2025},
+        {"tmdb_id": 2, "title": "Relleno dos", "year": 2025},
+        {"tmdb_id": 3, "title": "Relleno tres", "year": 2025},
+        {"tmdb_id": 4, "title": "Relleno cuatro", "year": 2025},
+        {"tmdb_id": 999, "title": "Correcta", "year": 2025}
+      ]
+    }
+  },
+  "tv": {
+    "the_office": {
+      "guess_without_year": {
+        "title": "The Office"
+      },
+      "guess_2005": {
+        "title": "The Office",
+        "year": 2005
+      },
+      "expected_without_year": {
+        "status": "ACCEPTED_FALLBACK",
+        "selected_tmdb_id": 2316
+      },
+      "expected_2005": {
+        "status": "ACCEPTED_CONFIDENT",
+        "selected_tmdb_id": 2316
+      },
+      "candidates": [
+        {
+          "tmdb_id": 2316,
+          "title": "The Office",
+          "year": 2005,
+          "popularity": 100.0,
+          "vote_count": 4000
+        },
+        {
+          "tmdb_id": 2996,
+          "title": "The Office",
+          "year": 2001,
+          "popularity": 70.0,
+          "vote_count": 700
+        },
+        {
+          "tmdb_id": 24876,
+          "title": "The Office",
+          "year": 1995,
+          "popularity": 20.0,
+          "vote_count": 90
+        }
+      ]
+    },
+    "episode_intents": {
+      "files": [
+        "The Office [Cap.101].mkv",
+        "The Office Capitulo 14.mkv",
+        "The Office S00E01.mkv",
+        "The Office S01E01E02.mkv",
+        "The Office Temporada 2 completa.mkv"
+      ],
+      "double_episode_runtime_minutes": 84,
+      "candidate_episode_runtime_minutes": 42,
+      "expected_sources": 5
+    },
+    "missing_episode": {
+      "season": 1,
+      "episode": 99,
+      "candidate_episode_count": 10,
+      "expected_status": "BLOCKED_HARD"
+    }
+  }
+}

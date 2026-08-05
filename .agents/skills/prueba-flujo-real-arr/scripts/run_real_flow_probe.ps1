@@ -863,7 +863,7 @@ def expected_probe_outcome(inspection):
     event_types = set(inspection.get("event_types") or [])
     if category == "movies":
         expected_state = "manual_review"
-        expected_error = "identity_suspicious"
+        expected_error = "no_candidates"
         required_phases = {
             "received",
             "stable_wait",

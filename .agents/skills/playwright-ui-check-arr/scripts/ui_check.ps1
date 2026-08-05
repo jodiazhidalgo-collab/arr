@@ -353,7 +353,9 @@ const identityProfiles = [
   ["movies", "peliculas"],
   ["tv", "series"],
 ];
-const identitySections = ["parser", "resolver"];
+function identitySectionsForProfile(profile) {
+  return profile === "common" ? ["parser", "resolver"] : ["resolver"];
+}
 const cleaningSections = [
   ["entrada", "entrada.extensiones_video"],
   ["video", "video.pistas_exactas"],
@@ -365,7 +367,7 @@ const cleaningSections = [
 function canonicalRoutes() {
   const routes = [];
   for (const [profile, slug] of identityProfiles) {
-    for (const section of identitySections) {
+    for (const section of identitySectionsForProfile(profile)) {
       routes.push({
         hash: "#identidad/" + slug + "/" + section,
         view: "identidad",
@@ -914,9 +916,12 @@ async function runIdentityMenu(page, interactions, layouts) {
       }, profile, { timeout: timeoutMs });
       return { profile, final_hash: await page.evaluate(() => location.hash) };
     });
-    for (const section of identitySections) {
+    const profileSections = identitySectionsForProfile(profile);
+    for (const section of profileSections) {
       await runStep(interactions, "identidad " + profile + " " + section, async () => {
-        await page.locator(".identity-subtabs button[data-identity-section=\"" + section + "\"]").click();
+        if (profileSections.length > 1) {
+          await page.locator(".identity-subtabs button[data-identity-section=\"" + section + "\"]").click();
+        }
         const expected = canonicalByHash.get("#identidad/" + slug + "/" + section);
         await waitForRoute(page, expected);
         const layout = await verifyLayout(page, layouts, "identidad " + profile + " " + section);

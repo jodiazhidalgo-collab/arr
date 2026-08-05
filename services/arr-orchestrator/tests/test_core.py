@@ -96,8 +96,75 @@ def test_config(root: Path) -> Config:
 test_config.__test__ = False
 
 
+def _legacy_filebot_source_meta_json() -> str:
+    return json.dumps(
+        {
+            "filebot_rules": {
+                "revision": 2,
+                "rules": {
+                    "movies": {
+                        "language": "es-ES",
+                        "region": "ES",
+                        "query_aliases": [],
+                        "forced_matches": [],
+                    }
+                },
+            }
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+class _AcceptedResolver:
+    enabled = True
+
+    def __init__(
+        self,
+        media_type: str,
+        title: str,
+        *,
+        year: int | None = None,
+        season: int | None = None,
+        episodes: list[int] | None = None,
+    ) -> None:
+        self.identity = ResolvedIdentity(
+            media_type=media_type,
+            tmdb_id=999,
+            title=title,
+            original_title=title,
+            year=year,
+            aliases=[title],
+            score=100,
+            margin=50,
+            query=title,
+            guess={"title": title},
+            source="test",
+            season=season,
+            episodes=list(episodes or []),
+            decision_status="ACCEPTED_CONFIDENT",
+            resolver_algorithm_version="phased-er-v2",
+        )
+
+    def resolve(self, _job, _input_root):
+        return self.identity
+
+    def trace_snapshot(self):
+        return {
+            "resolver_algorithm_version": "phased-er-v2",
+            "decision": {
+                "status": "ACCEPTED_CONFIDENT",
+                "accepted": True,
+                "selected_tmdb_id": self.identity.tmdb_id,
+            }
+        }
+
+    def output_matches(self, _identity, _names):
+        return True
+
+
 class CoreTests(unittest.TestCase):
-    def test_tv_identity_conflict_blocks_local_fallback_but_no_candidates_does_not(self):
+    def test_tv_never_continues_to_filebot_without_an_accepted_identity(self):
         decision = Mock(media_type="tv", confidence="high", block_reason=None)
         job = {"category": "tv"}
 
@@ -122,7 +189,7 @@ class CoreTests(unittest.TestCase):
             "Sin candidatos",
             {"reason_code": "no_candidates"},
         )
-        self.assertTrue(
+        self.assertFalse(
             Engine._can_continue_tv_without_identity(job, decision, no_candidates)
         )
 
@@ -148,6 +215,10 @@ class CoreTests(unittest.TestCase):
             state="ready_filebot",
             source_path=str(original),
             stage_path=str(job_root),
+            source_meta_json=engine._new_job_source_meta_json(
+                category="tv",
+                name=file_name,
+            ),
         )
 
         class AmbiguousResolver:
@@ -213,6 +284,10 @@ class CoreTests(unittest.TestCase):
             state="ready_filebot",
             source_path=str(original),
             stage_path=str(job_root),
+            source_meta_json=engine._new_job_source_meta_json(
+                category=category,
+                name=file_name,
+            ),
         )
 
         class ResolverMustNotRun:
@@ -312,6 +387,10 @@ class CoreTests(unittest.TestCase):
                 "Wasabi",
                 state="waiting_stable",
                 source_path=str(item),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name="Wasabi",
+                ),
             )
 
             class FakeQbt:
@@ -337,6 +416,173 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(
                 any(event["phase"] == "qbt" for event in database.job_detail(job["job_id"])["timeline"])
             )
+            database.close()
+
+    def test_reconcile_qbt_terminalizes_legacy_snapshot_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            legacy_item = config.complete_root / "movies" / "Legacy Snapshot"
+            legacy_content = legacy_item / "Legacy Snapshot.mkv"
+            valid_item = config.complete_root / "movies" / "Valid Snapshot"
+            valid_content = valid_item / "Valid Snapshot.mkv"
+            legacy_content.parent.mkdir(parents=True)
+            valid_content.parent.mkdir(parents=True)
+            legacy_content.write_bytes(b"legacy")
+            valid_content.write_bytes(b"valid")
+            legacy_job = database.create_job(
+                "fs:movies:legacy-snapshot",
+                "fs",
+                "movies",
+                legacy_item.name,
+                state="waiting_stable",
+                source_path=str(legacy_item),
+                source_meta_json=_legacy_filebot_source_meta_json(),
+            )
+            valid_job = database.create_job(
+                "fs:movies:valid-snapshot",
+                "fs",
+                "movies",
+                valid_item.name,
+                state="waiting_stable",
+                source_path=str(valid_item),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name=valid_item.name,
+                ),
+            )
+
+            class FakeQbt:
+                def torrents(self, _torrent_filter):
+                    return [
+                        {
+                            "hash": "a" * 40,
+                            "category": "movies",
+                            "name": legacy_item.name,
+                            "content_path": str(legacy_content),
+                            "added_on": 100,
+                        },
+                        {
+                            "hash": "b" * 40,
+                            "category": "movies",
+                            "name": valid_item.name,
+                            "content_path": str(valid_content),
+                            "added_on": 101,
+                        },
+                    ]
+
+            engine.qbt = FakeQbt()
+            engine._reconcile_qbt()
+
+            blocked = database.get_job(legacy_job["job_id"])
+            continued = database.get_job(valid_job["job_id"])
+            self.assertEqual(blocked["state"], "error_terminal")
+            self.assertEqual(
+                blocked["last_error_code"],
+                "identity_policy_snapshot_incompatible",
+            )
+            self.assertEqual(
+                json.loads(blocked["result_json"])["operation"],
+                "reconcile_qbt",
+            )
+            self.assertEqual(continued["qbt_hash"], "b" * 40)
+            self.assertTrue(
+                any(
+                    event["phase"] == "settings"
+                    and event["event_type"] == "error"
+                    for event in database.events_for_job(legacy_job["job_id"])
+                )
+            )
+            database.close()
+
+    def test_qbt_event_terminalizes_legacy_snapshot_and_consumes_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            item = config.complete_root / "movies" / "Legacy Event"
+            content = item / "Legacy Event.mkv"
+            content.parent.mkdir(parents=True)
+            content.write_bytes(b"legacy")
+            infohash = "c" * 40
+            job = database.create_job(
+                "fs:movies:legacy-event",
+                "fs",
+                "movies",
+                item.name,
+                state="waiting_stable",
+                infohash=infohash,
+                source_path=str(item),
+                source_meta_json=_legacy_filebot_source_meta_json(),
+            )
+            event_path = config.event_dir / "legacy-snapshot.event"
+            event_path.write_text(f"hash={infohash}\n", encoding="utf-8")
+
+            class FakeQbt:
+                def torrent(self, _infohash):
+                    return {
+                        "hash": infohash,
+                        "category": "movies",
+                        "name": item.name,
+                        "content_path": str(content),
+                        "progress": 1,
+                        "completion_on": 123,
+                    }
+
+            engine.qbt = FakeQbt()
+            engine._handle_qbt_event(event_path)
+
+            blocked = database.get_job(job["job_id"])
+            self.assertEqual(blocked["state"], "error_terminal")
+            self.assertEqual(
+                json.loads(blocked["result_json"])["operation"],
+                "qbt_event",
+            )
+            self.assertFalse(event_path.exists())
+            database.close()
+
+    def test_materialized_adoption_terminalizes_legacy_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            item = config.complete_root / "movies" / "Legacy Adoption"
+            content = item / "Legacy Adoption.mkv"
+            content.parent.mkdir(parents=True)
+            content.write_bytes(b"legacy")
+            job = database.create_job(
+                "fs:movies:legacy-adoption",
+                "fs",
+                "movies",
+                item.name,
+                state="waiting_stable",
+                source_path=str(item),
+                source_meta_json=_legacy_filebot_source_meta_json(),
+            )
+            engine.qbt = Mock()
+            engine.qbt.torrents.side_effect = AssertionError(
+                "qB no debe consultarse con un snapshot incompatible"
+            )
+
+            engine._register_materialized("movies", item)
+
+            blocked = database.get_job(job["job_id"])
+            self.assertEqual(blocked["state"], "error_terminal")
+            self.assertEqual(
+                json.loads(blocked["result_json"])["operation"],
+                "adopt_qbt_materialized",
+            )
+            engine.qbt.torrents.assert_not_called()
             database.close()
 
     def test_reconcile_qbt_ignores_hospital_without_creating_job(self) -> None:
@@ -787,7 +1033,7 @@ class CoreTests(unittest.TestCase):
             original = job_root / "original"
             original.mkdir(parents=True)
             (original / "Mi Serie Q03P07.mkv").write_bytes(b"episode")
-            identity_snapshot = engine.identity.job_snapshot()
+            identity_snapshot = engine.identity.job_snapshot_for_category("tv")
             identity_snapshot["rules"]["parser"]["patterns"]["series_sxe"] = (
                 r"(?i)\bQ0?(\d{1,2})P0?(\d{1,3})\b"
             )
@@ -827,6 +1073,12 @@ class CoreTests(unittest.TestCase):
                         "stdout_tail": "already exists",
                     }
 
+            engine.name_resolver = _AcceptedResolver(
+                "tv",
+                "Mi Serie",
+                season=3,
+                episodes=[7],
+            )
             engine.filebot = DuplicateFileBot()
             engine._run_filebot(job)
 
@@ -928,12 +1180,52 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 source_path=str(original),
                 stage_path=str(job_root),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name=source.name,
+                ),
             )
+
+            resolved = ResolvedIdentity(
+                media_type="movie",
+                tmdb_id=9279,
+                title="Un padre en apuros",
+                original_title="Jingle All the Way",
+                year=2026,
+                aliases=["Un padre en apuros"],
+                score=100,
+                margin=50,
+                query="Un padre en apuros",
+                guess={},
+                source="test",
+                decision_status="ACCEPTED_CONFIDENT",
+                resolver_algorithm_version="phased-er-v2",
+            )
+
+            class FakeResolver:
+                enabled = True
+
+                def resolve(self, _job, _input_root):
+                    return resolved
+
+                def trace_snapshot(self):
+                    return {
+                        "resolver_algorithm_version": "phased-er-v2",
+                        "decision": {
+                            "status": "ACCEPTED_CONFIDENT",
+                            "accepted": True,
+                            "selected_tmdb_id": resolved.tmdb_id,
+                        }
+                    }
+
+                def output_matches(self, _identity, names):
+                    return names == ["Un padre en apuros (2026)"]
 
             class FakeFileBot:
                 calls = []
 
-                def run(self, job_id, category, input_path, output_root):
+                def run(self, job_id, category, input_path, output_root, identity):
+                    self.assert_identity = identity
                     self.calls.append((job_id, category, input_path, output_root))
                     source_file = media_files(input_path)[0]
                     destination = output_root / "Un padre en apuros (2026)" / "Un padre en apuros (2026).mkv"
@@ -949,6 +1241,7 @@ class CoreTests(unittest.TestCase):
                     }
 
             fake = FakeFileBot()
+            engine.name_resolver = FakeResolver()
             engine.filebot = fake
 
             engine._run_filebot(job)
@@ -970,7 +1263,11 @@ class CoreTests(unittest.TestCase):
                 if event["phase"] == "filebot" and event["event_type"] == "command"
             ]
             self.assertEqual(len(command_events), 1)
-            self.assertEqual(command_events[0]["structured"]["command_preview"]["mode"], "legacy_amc")
+            self.assertEqual(command_events[0]["structured"]["command_preview"]["mode"], "guided")
+            self.assertEqual(
+                command_events[0]["structured"]["command_preview"]["tmdb_id"],
+                9279,
+            )
             self.assertIn("timeout_sec", command_events[0]["structured"])
             database.close()
 
@@ -2071,12 +2368,16 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 source_path=str(original),
                 stage_path=str(job_root),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="tv",
+                    name=source.name,
+                ),
             )
 
             class FakeFileBot:
                 calls = []
 
-                def run(self, job_id, category, input_path, output_root):
+                def run(self, job_id, category, input_path, output_root, _identity):
                     self.calls.append((job_id, category, input_path, output_root))
                     source_file = media_files(input_path)[0]
                     destination = output_root / "Serie" / "Season 01" / "Serie - S01E01.mkv"
@@ -2092,6 +2393,12 @@ class CoreTests(unittest.TestCase):
                     }
 
             fake = FakeFileBot()
+            engine.name_resolver = _AcceptedResolver(
+                "tv",
+                "Serie",
+                season=1,
+                episodes=[1],
+            )
             engine.filebot = fake
 
             engine._run_filebot(job)
@@ -2118,7 +2425,10 @@ class CoreTests(unittest.TestCase):
             original.mkdir(parents=True)
             source = original / "Un padre en apuros 4Kwebrip2160.atomohd.li.mkv"
             source.write_bytes(b"movie")
-            source_meta = engine._new_job_source_meta_json()
+            source_meta = engine._new_job_source_meta_json(
+                category="movies",
+                name=source.name,
+            )
             job = database.create_job(
                 "fs:movies:guided",
                 "fs",
@@ -2147,6 +2457,8 @@ class CoreTests(unittest.TestCase):
                 query="Un padre en apuros",
                 guess={"title": "Un padre en apuros"},
                 source="search",
+                decision_status="ACCEPTED_FALLBACK",
+                resolver_algorithm_version="phased-er-v2",
             )
 
             class FakeResolver:
@@ -2157,9 +2469,11 @@ class CoreTests(unittest.TestCase):
 
                 def trace_snapshot(self):
                     return {
-                        "resolver_algorithm_version": "title-evidence-v1",
+                        "resolver_algorithm_version": "phased-er-v2",
                         "decision": {
-                            "status": "ACCEPTED",
+                            "status": "ACCEPTED_FALLBACK",
+                            "accepted": True,
+                            "selected_tmdb_id": identity.tmdb_id,
                             "eligibility_reason": "single_primary_title",
                         },
                         "token": "must-not-leak",
@@ -2219,12 +2533,12 @@ class CoreTests(unittest.TestCase):
                 for event in persisted_events
                 if event["phase"] == "identity"
                 and event["event_type"] == "decision"
-                and str(event["message"]).startswith("Identidad confirmada:")
+                and str(event["message"]).startswith("Identidad aceptada (fallback):")
             )
             structured = json.loads(identity_event["structured_json"])
             self.assertEqual(
                 structured["resolver_trace"]["resolver_algorithm_version"],
-                "title-evidence-v1",
+                "phased-er-v2",
             )
             self.assertEqual(
                 structured["resolver_trace"]["decision"]["eligibility_reason"],
@@ -2261,6 +2575,10 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 source_path=str(original),
                 stage_path=str(job_root),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name=source.name,
+                ),
             )
             identity = ResolvedIdentity(
                 media_type="movie",
@@ -2274,6 +2592,8 @@ class CoreTests(unittest.TestCase):
                 query="Un padre en apuros",
                 guess={},
                 source="search",
+                decision_status="ACCEPTED_CONFIDENT",
+                resolver_algorithm_version="phased-er-v2",
             )
 
             class FakeResolver:
@@ -2281,6 +2601,16 @@ class CoreTests(unittest.TestCase):
 
                 def resolve(self, _job, _input_root):
                     return identity
+
+                def trace_snapshot(self):
+                    return {
+                        "resolver_algorithm_version": "phased-er-v2",
+                        "decision": {
+                            "status": "ACCEPTED_CONFIDENT",
+                            "accepted": True,
+                            "selected_tmdb_id": identity.tmdb_id,
+                        }
+                    }
 
                 def output_matches(self, _identity, _names):
                     return False
@@ -2338,6 +2668,10 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 source_path=str(original),
                 stage_path=str(job_root),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name=source.name,
+                ),
             )
 
             class OfflineResolver:
@@ -2355,6 +2689,102 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(updated["last_error_code"], "identity_unavailable")
             self.assertTrue(Path(updated["source_path"]).exists())
             database.close()
+
+    def test_identity_provider_stops_automatic_loop_after_three_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            engine = Engine(config, database)
+            source = config.workshop_root / "job-provider-pending" / "filebot_input"
+            source.mkdir(parents=True)
+            job = database.create_job(
+                "fs:movies:provider-pending",
+                "fs",
+                "movies",
+                "Pelicula pendiente.mkv",
+                state="ready_filebot",
+                source_path=str(source),
+                stage_path=str(source.parent),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name="Pelicula pendiente.mkv",
+                ),
+            )
+            error = ResolverUnavailable(
+                "Proveedor temporalmente no disponible",
+                {
+                    "status": "RETRY_PROVIDER",
+                    "reason_code": "provider_unavailable",
+                    "retryable": True,
+                },
+            )
+
+            for expected_attempt in (1, 2, 3):
+                current = database.get_job(job["job_id"])
+                engine._defer_identity(current, source, error)
+                current = database.get_job(job["job_id"])
+                self.assertEqual(current["retry_filebot"], expected_attempt)
+
+            self.assertEqual(current["state"], "identity_retry")
+            self.assertIsNone(current["identity_retry_at"])
+            self.assertEqual(
+                current["last_error_code"],
+                "identity_provider_retry_exhausted",
+            )
+
+            engine._process_job(current)
+
+            paused = database.get_job(job["job_id"])
+            self.assertEqual(paused["state"], "identity_retry")
+            retry_events = [
+                event
+                for event in database.events_for_job(job["job_id"])
+                if event["phase"] == "identity" and event["event_type"] == "retry"
+            ]
+            retry_payloads = [
+                json.loads(event["structured_json"]) for event in retry_events
+            ]
+            exhausted = next(
+                payload
+                for payload in retry_payloads
+                if payload.get("automatic_retries_exhausted")
+            )
+            database.close()
+            self.assertEqual(exhausted["status"], "RETRY_PROVIDER")
+            self.assertEqual(exhausted["attempt"], 3)
+            self.assertEqual(exhausted["max_attempts"], 3)
+            self.assertTrue(exhausted["automatic_retries_exhausted"])
+
+    def test_identity_without_explicit_v2_acceptance_fails_closed(self) -> None:
+        identity = ResolvedIdentity(
+            media_type="movie",
+            tmdb_id=9279,
+            title="Un padre en apuros",
+            original_title="Jingle All the Way",
+            year=1996,
+            aliases=["Un padre en apuros"],
+            score=0,
+            margin=0,
+            query="Un padre en apuros",
+            guess={},
+            source="test",
+            decision_status="",
+            resolver_algorithm_version="phased-er-v2",
+        )
+
+        decision = Engine._identity_decision_for_result(identity, {})
+
+        self.assertEqual(decision["status"], "")
+        self.assertFalse(decision["accepted"])
+        self.assertIn(
+            "no autoriza FileBot",
+            Engine._accepted_identity_problem(
+                {"category": "movies"}, identity, decision
+            ),
+        )
 
     def test_run_filebot_multiple_movie_outputs_goes_to_manual_review(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2377,10 +2807,14 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 source_path=str(original),
                 stage_path=str(job_root),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name="Pack peliculas",
+                ),
             )
 
             class FakeFileBot:
-                def run(self, job_id, category, input_path, output_root):
+                def run(self, job_id, category, input_path, output_root, _identity):
                     media_files(input_path)[0].unlink()
                     first = output_root / "Pelicula A (2026)" / "Pelicula A (2026).mkv"
                     second = output_root / "Pelicula B (2026)" / "Pelicula B (2026).mkv"
@@ -2399,6 +2833,7 @@ class CoreTests(unittest.TestCase):
                         "stdout_tail": "",
                     }
 
+            engine.name_resolver = _AcceptedResolver("movie", "Pack peliculas")
             engine.filebot = FakeFileBot()
 
             engine._run_filebot(job)
@@ -3085,33 +3520,33 @@ class CoreTests(unittest.TestCase):
             "manual",
         )
 
-    def test_tv_cap_101_continues_to_filebot_when_tmdb_returns_empty(self) -> None:
+    def test_tv_cap_101_blocks_when_tmdb_returns_empty(self) -> None:
         updated, detail, calls = self._run_tv_name_with_ambiguous_resolver(
             "Satisfacion garantizada [HDTV 1080p][Cap.101]",
             "TMDb no devolvio candidatos",
         )
 
-        self.assertEqual(updated["state"], "ready_cleanup")
-        self.assertNotEqual(updated.get("last_error_code"), "identity_suspicious")
-        self.assertEqual(calls[0][1], "tv")
+        self.assertEqual(updated["state"], "manual_review")
+        self.assertEqual(updated.get("last_error_code"), "identity_hard_contradiction")
+        self.assertEqual(calls, [])
         self.assertTrue(detail["decisions"])
         self.assertTrue(
             any(
-                event["event_type"] == "warning"
-                and "senal TV local" in event["message"]
+                event["event_type"] == "decision"
+                and "contradiccion dura" in event["message"]
                 for event in detail["decisions"]
             )
         )
 
-    def test_tv_cap_201_continues_to_filebot_when_identity_threshold_is_low(self) -> None:
+    def test_tv_cap_201_blocks_when_identity_threshold_is_low(self) -> None:
         updated, detail, calls = self._run_tv_name_with_ambiguous_resolver(
             "La Agencia [4k 2160p][Cap.201]",
             "La identidad no supera el umbral de seguridad",
         )
 
-        self.assertEqual(updated["state"], "ready_cleanup")
-        self.assertNotEqual(updated.get("last_error_code"), "identity_suspicious")
-        self.assertEqual(calls[0][1], "tv")
+        self.assertEqual(updated["state"], "manual_review")
+        self.assertEqual(updated.get("last_error_code"), "identity_hard_contradiction")
+        self.assertEqual(calls, [])
         self.assertTrue(detail["decisions"])
 
     def test_movies_category_with_cap_201_goes_to_manual_review_by_conflict(self) -> None:
@@ -3155,6 +3590,10 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 source_path=str(original),
                 stage_path=str(job_root),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name="Los Simpsons - Temporada 34 [Cap.3401]",
+                ),
             )
 
             class ResolverMustNotRun:
@@ -3255,7 +3694,7 @@ class CoreTests(unittest.TestCase):
             source_meta = json.loads(engine._new_job_source_meta_json())
             before = source_meta["identity_rules"]
             changed = engine.identity_rules()["rules"]
-            changed["resolver"]["acceptance"]["min_score"] = 60
+            changed["resolver"]["coverage"]["max_searches"] = 10
             saved = engine.update_identity_rules(
                 {"rules": changed, "expected_revision": 0}
             )
@@ -3270,13 +3709,13 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(before["revision"], 0)
             self.assertEqual(old_job_context["revision"], 0)
             self.assertEqual(
-                old_job_context["rules"]["resolver"]["acceptance"]["min_score"],
-                75,
+                old_job_context["rules"]["resolver"]["coverage"]["max_searches"],
+                12,
             )
             self.assertEqual(after["revision"], 1)
             self.assertEqual(
-                after["rules"]["resolver"]["acceptance"]["min_score"],
-                60,
+                after["rules"]["resolver"]["coverage"]["max_searches"],
+                10,
             )
             database.close()
 
@@ -3301,10 +3740,14 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 stage_path=str(job_root),
                 source_path=str(original),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="movies",
+                    name="Timeout Movie (2026)",
+                ),
             )
 
             class TimeoutFileBot:
-                def run(self, _job_id, _category, _input_path, output_root):
+                def run(self, _job_id, _category, _input_path, output_root, _identity):
                     partial = output_root / "Timeout Movie (2026)" / "Timeout Movie (2026).mkv"
                     partial.parent.mkdir(parents=True, exist_ok=True)
                     partial.write_bytes(b"partial")
@@ -3318,6 +3761,11 @@ class CoreTests(unittest.TestCase):
                         "stdout_tail": "timeout",
                     }
 
+            engine.name_resolver = _AcceptedResolver(
+                "movie",
+                "Timeout Movie",
+                year=2026,
+            )
             engine.filebot = TimeoutFileBot()
             engine._run_filebot(job)
 
@@ -3351,6 +3799,10 @@ class CoreTests(unittest.TestCase):
                 state="ready_filebot",
                 stage_path=str(job_root),
                 source_path=str(original),
+                source_meta_json=engine._new_job_source_meta_json(
+                    category="tv",
+                    name="Timeout Show S01E10",
+                ),
             )
             destination = (
                 config.tv_output
@@ -3378,10 +3830,31 @@ class CoreTests(unittest.TestCase):
                 source="test",
                 season=1,
                 episodes=[10],
+                decision_status="ACCEPTED_CONFIDENT",
+                resolver_algorithm_version="phased-er-v2",
             )
 
+            class AcceptedResolver:
+                enabled = True
+
+                def resolve(self, _job, _input_root):
+                    return resolved
+
+                def trace_snapshot(self):
+                    return {
+                        "resolver_algorithm_version": "phased-er-v2",
+                        "decision": {
+                            "status": "ACCEPTED_CONFIDENT",
+                            "accepted": True,
+                            "selected_tmdb_id": resolved.tmdb_id,
+                        }
+                    }
+
+                def output_matches(self, _identity, _names):
+                    return True
+
             class TimeoutFileBot:
-                def run(self, _job_id, _category, input_path, _output_root):
+                def run(self, _job_id, _category, input_path, _output_root, _identity):
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(b"moved")
                     unrelated_destination.write_bytes(b"other-job")
@@ -3400,6 +3873,7 @@ class CoreTests(unittest.TestCase):
                         "identity": resolved.to_dict(),
                     }
 
+            engine.name_resolver = AcceptedResolver()
             engine.filebot = TimeoutFileBot()
             engine._run_filebot(job)
 

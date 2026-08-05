@@ -14,6 +14,7 @@ def normalize_identity_rules(value: object) -> Dict[str, object]:
     """Valida el contrato completo, rechaza extras y devuelve forma canonica."""
 
     rules = expect_object(value, "rules")
+    version = rules.get("schema_version")
     exact_keys(rules, {"schema_version", "parser", "resolver"}, "rules")
     version = rules.get("schema_version")
     if isinstance(version, bool) or version != IDENTITY_SCHEMA_VERSION:

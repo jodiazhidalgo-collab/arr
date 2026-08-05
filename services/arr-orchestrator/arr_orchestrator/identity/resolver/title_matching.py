@@ -94,7 +94,6 @@ def resolve_title_matching(settings: object = None) -> Dict[str, object]:
     resolved = dict(DEFAULT_TITLE_MATCHING)
     supplied = settings if isinstance(settings, Mapping) else {}
     for key in (
-        "score_parser_candidates",
         "roman_arabic_equivalence",
         "allow_omitted_part_number",
     ):
@@ -162,7 +161,7 @@ def supplemental_title_candidates(
     values: Sequence[object],
     settings: object = None,
 ) -> List[str]:
-    """Filtra candidatos auxiliares demasiado cortos antes de puntuar."""
+    """Filtra candidatos auxiliares demasiado cortos antes de compararlos."""
 
     resolved = resolve_title_matching(settings)
     minimum = int(resolved["supplemental_min_chars"])
@@ -382,18 +381,6 @@ def analyze_candidate_title_evidence(
     }
 
 
-def scoring_title_values(
-    primary_title: str,
-    parser_candidates: Sequence[str],
-    settings: object = None,
-) -> List[str]:
-    resolved = resolve_title_matching(settings)
-    values: List[object] = [primary_title]
-    if bool(resolved["score_parser_candidates"]):
-        values.extend(parser_candidates)
-    return unique_title_values(values)
-
-
 def best_title_match(
     left_values: Sequence[str],
     right_values: Sequence[str],
@@ -473,48 +460,6 @@ def matching_rules_for_pairs(
                 }
             )
     return merge_matching_rules(rules)
-
-
-def parser_candidate_rules_for_pairs(
-    pairs: Sequence[Optional[TitlePairMatch]],
-    parser_candidates: Sequence[str],
-    primary_title: str,
-) -> List[Dict[str, str]]:
-    """Traza auxiliares solo si un par ganador los usa de verdad."""
-
-    return parser_candidate_rules(
-        [pair.left_value for pair in pairs if pair is not None],
-        parser_candidates,
-        primary_title,
-    )
-
-
-def parser_candidate_rules(
-    values: Sequence[str],
-    parser_candidates: Sequence[str],
-    primary_title: str,
-) -> List[Dict[str, str]]:
-    primary = normalize_title(primary_title)
-    candidates = {
-        normalize_title(value): str(value)
-        for value in parser_candidates
-        if normalize_title(value) and normalize_title(value) != primary
-    }
-    rules = []
-    for value in values:
-        normalized = normalize_title(value)
-        if normalized not in candidates:
-            continue
-        rules.append(parser_candidate_rule(candidates[normalized]))
-    return merge_matching_rules(rules)
-
-
-def parser_candidate_rule(value: str) -> Dict[str, str]:
-    title = _compact_trace_value(value)
-    return {
-        "path": "resolver.title_matching.score_parser_candidates",
-        "detail": f"Título auxiliar del parser: {title}",
-    }
 
 
 def merge_matching_rules(*groups: Sequence[Dict[str, str]]) -> List[Dict[str, str]]:

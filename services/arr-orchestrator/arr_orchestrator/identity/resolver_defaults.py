@@ -9,7 +9,6 @@ DEFAULT_SERIES_CANDIDATES: Dict[str, object] = {
 }
 
 DEFAULT_TITLE_MATCHING: Dict[str, object] = {
-    "score_parser_candidates": True,
     "roman_arabic_equivalence": True,
     "allow_omitted_part_number": True,
     "omitted_part_min_words": 3,

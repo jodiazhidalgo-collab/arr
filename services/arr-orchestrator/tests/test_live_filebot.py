@@ -27,6 +27,8 @@ class LiveFileBotTests(unittest.TestCase):
             source="live-test",
             season=1 if media_type == "tv" else None,
             episodes=[1] if media_type == "tv" else [],
+            resolver_algorithm_version="phased-er-v2",
+            decision_status="ACCEPTED_CONFIDENT",
         )
 
     def test_guided_movie_moves_video_and_subtitle(self):

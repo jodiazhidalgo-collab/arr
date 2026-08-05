@@ -3,8 +3,12 @@ import json
 import unittest
 import urllib.error
 import urllib.request
+from types import SimpleNamespace
 
+from arr_orchestrator.engine import Engine
 from arr_orchestrator.health import MAX_REQUEST_BODY_BYTES, start_health_server
+from arr_orchestrator.identity.defaults import factory_identity_rules
+from arr_orchestrator.identity.scopes import scope_identity_rules
 
 
 def _post(url: str, payload: dict):
@@ -225,6 +229,7 @@ class IdentityHealthTests(unittest.TestCase):
             lambda: [],
             identity_rules_provider=provider,
             identity_rules_updater=action("save"),
+            identity_rules_validator=action("validate"),
             identity_rules_resetter=action("reset"),
             identity_cache_clearer=action("cache"),
             identity_parser_tester=action("parser"),
@@ -237,6 +242,18 @@ class IdentityHealthTests(unittest.TestCase):
                 fetched = json.loads(response.read().decode("utf-8"))
             self.assertEqual(fetched["profile"], "movies")
             self.assertEqual(_post(f"{base}/tv", {"expected_revision": 3})[0], 200)
+            self.assertEqual(
+                _post(
+                    f"{base}/movies/validate",
+                    {
+                        "format": "arr-identity-export-v2",
+                        "schema_version": 2,
+                        "profile": "movies",
+                        "rules": {},
+                    },
+                )[0],
+                200,
+            )
             self.assertEqual(
                 _post(f"{base}/tv/reset", {"expected_revision": 3})[0], 200
             )
@@ -260,6 +277,7 @@ class IdentityHealthTests(unittest.TestCase):
             [(call[0], call[1]) for call in calls[1:]],
             [
                 ("save", "tv"),
+                ("validate", "movies"),
                 ("reset", "tv"),
                 ("cache", "movies"),
                 ("parser", "common"),
@@ -267,6 +285,38 @@ class IdentityHealthTests(unittest.TestCase):
                 ("save", "common"),
             ],
         )
+
+    def test_engine_validates_v2_import_without_persisting(self) -> None:
+        complete = factory_identity_rules()
+        common = scope_identity_rules(complete, "common")
+        movies = scope_identity_rules(complete, "movies")
+        identity = SimpleNamespace(payload=lambda profile="common": {"rules": common})
+        engine = object.__new__(Engine)
+        engine.identity = identity
+        export = {
+            "format": "arr-identity-export-v2",
+            "schema_version": 2,
+            "profile": "movies",
+            "base_revision": 8,
+            "base_fingerprint": "sha256:" + ("0" * 64),
+            "rules": movies,
+        }
+
+        result = engine.validate_identity_rules(export, "movies")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["profile"], "movies")
+        self.assertEqual(result["rules"], movies)
+        self.assertRegex(result["fingerprint"], r"^sha256:[0-9a-f]{64}$")
+        self.assertRegex(
+            result["effective_fingerprint"], r"^sha256:[0-9a-f]{64}$"
+        )
+        self.assertEqual(export["rules"], movies)
+
+        mismatched = dict(export, profile="tv")
+        rejected = engine.validate_identity_rules(mismatched, "movies")
+        self.assertFalse(rejected["ok"])
+        self.assertEqual(rejected["error"], "profile_mismatch")
 
 
 if __name__ == "__main__":

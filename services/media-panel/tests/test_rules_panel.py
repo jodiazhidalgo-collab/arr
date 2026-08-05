@@ -267,7 +267,11 @@ class RulesPanelContractTests(unittest.TestCase):
         self.assertIn("function canonicalRouteFromHash", self.panel_js)
         self.assertIn("const exact = exactCanonicalRoute(hash);", self.panel_js)
         self.assertIn("const storedHash = storageGet(", self.panel_js)
-        self.assertIn("const stored = exactCanonicalRoute(storedHash);", self.panel_js)
+        self.assertIn(
+            "canonicalRouteFromHash(storedHash, { useStored: false })",
+            self.panel_js,
+        )
+        self.assertIn("if (!stored.fallback)", self.panel_js)
         self.assertIn('history.replaceState(null, "", route.hash)', self.panel_js)
         self.assertIn("#identidad/comun/parser", self.panel_js)
         self.assertIn("#limpieza-peliculas/${section}", self.panel_js)

@@ -6,10 +6,20 @@
 
   const API_ROOT = "/api/identity-rules";
   const PROFILE_STORAGE_KEY = "arr-identity-profile";
+  const EXPORT_FORMAT = "arr-identity-export-v2";
+  const ACTIVE_SCHEMA_VERSION = 2;
   const MAX_IMPORT_BYTES = 4 * 1024 * 1024;
 
   function sectionStorageKey(profile) {
     return `arr-identity-section-${profile}`;
+  }
+
+  function scrollStorageKey(profile, section) {
+    return `arr-identity-scroll-${profile}-${section}`;
+  }
+
+  function allowedSection(profile, section) {
+    return profile === "common" && section === "parser" ? "parser" : "resolver";
   }
 
   function isObject(value) {
@@ -21,20 +31,28 @@
   }
 
   function validRulesDocument(payload, profile) {
-    return isObject(payload)
+    const baseValid = isObject(payload)
       && payload.ok === true
       && (!payload.profile || payload.profile === profile)
       && isObject(payload.rules)
-      && isObject(payload.rules.parser)
       && isObject(payload.rules.resolver)
       && isObject(payload.defaults)
-      && isObject(payload.defaults.parser)
       && isObject(payload.defaults.resolver)
       && isObject(payload.schema)
-      && isObject(payload.schema.parser)
       && isObject(payload.schema.resolver)
+      && Number.isInteger(payload.rules.schema_version)
+      && payload.rules.schema_version > 0
       && Number.isInteger(payload.revision)
       && payload.revision >= 0;
+    if (!baseValid) return false;
+    if (profile === "common") {
+      return isObject(payload.rules.parser)
+        && isObject(payload.defaults.parser)
+        && isObject(payload.schema.parser);
+    }
+    return !("parser" in payload.rules)
+      && !("parser" in payload.defaults)
+      && !("parser" in payload.schema);
   }
 
   function validCachePayload(payload) {
@@ -44,6 +62,23 @@
       && Number.isFinite(Number(payload.deleted));
   }
 
+  function validImportValidation(payload, profile) {
+    const fingerprint = /^sha256:[0-9a-f]{64}$/;
+    if (!isObject(payload)
+      || payload.ok !== true
+      || payload.format !== EXPORT_FORMAT
+      || payload.schema_version !== ACTIVE_SCHEMA_VERSION
+      || payload.profile !== profile
+      || !isObject(payload.rules)
+      || payload.rules.schema_version !== ACTIVE_SCHEMA_VERSION
+      || !isObject(payload.rules.resolver)
+      || !fingerprint.test(String(payload.fingerprint || ""))
+      || !fingerprint.test(String(payload.effective_fingerprint || ""))) return false;
+    return profile === "common"
+      ? isObject(payload.rules.parser)
+      : !("parser" in payload.rules);
+  }
+
   function storedProfile() {
     const profile = ui.storageGet(PROFILE_STORAGE_KEY, "common");
     return ui.profileConfig[profile] ? profile : "common";
@@ -51,24 +86,31 @@
 
   function storedSection(profile) {
     const section = ui.storageGet(sectionStorageKey(profile), "parser");
-    return ["parser", "resolver"].includes(section) ? section : "parser";
+    return allowedSection(profile, ["parser", "resolver"].includes(section) ? section : "parser");
   }
 
   ui.resolveTarget = function (hash = location.hash) {
     const exact = ui.identityRouteFromHash(hash);
-    if (exact) return exact;
+    if (exact) {
+      const section = allowedSection(exact.profile, exact.section);
+      return Object.freeze({
+        ...exact,
+        section,
+        hash: `#identidad/${ui.profileSlug(exact.profile)}/${section}`
+      });
+    }
 
     const legacy = String(hash || "").match(/^#limpieza-arr(?:\/(parser|resolver))?$/);
     if (legacy) {
       const profile = "common";
-      const section = legacy[1] || storedSection(profile);
+      const section = allowedSection(profile, legacy[1] || storedSection(profile));
       return Object.freeze({ profile, section, hash: `#identidad/comun/${section}`, legacy: true });
     }
 
     const partial = String(hash || "").match(/^#identidad(?:\/(comun|peliculas|series))?(?:\/(parser|resolver))?$/);
     if (!partial) return null;
     const profile = ui.profileFromSlug(partial[1]) || storedProfile();
-    const section = partial[2] || storedSection(profile);
+    const section = allowedSection(profile, partial[2] || storedSection(profile));
     return Object.freeze({
       profile,
       section,
@@ -79,8 +121,44 @@
 
   function rememberRoute(profile, section) {
     ui.storageSet(PROFILE_STORAGE_KEY, profile);
-    ui.storageSet(sectionStorageKey(profile), section);
+    ui.storageSet(sectionStorageKey(profile), allowedSection(profile, section));
   }
+
+  ui.storeScrollPosition = function () {
+    const route = ui.renderedIdentityRoute;
+    if (!route) return;
+    const top = Math.max(0, Math.round(Number(window.scrollY || document.documentElement?.scrollTop || 0)));
+    ui.storageSet(scrollStorageKey(route.profile, route.section), String(top));
+  };
+
+  ui.restoreScrollPosition = function (profile, section, fallback = null) {
+    const stored = Number(ui.storageGet(scrollStorageKey(profile, section), "0"));
+    const target = Number.isFinite(fallback) ? fallback : Number.isFinite(stored) ? stored : 0;
+    const restore = () => window.scrollTo({ top: Math.max(0, target), left: 0, behavior: "auto" });
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(restore);
+    else restore();
+  };
+
+  function profileControl(profile, path) {
+    if (profile === "common") {
+      return !/^resolver\.(?:movies|tv)\./.test(path);
+    }
+    const category = profile === "movies" ? "movies" : "tv";
+    return path.startsWith(`resolver.${category}.`);
+  }
+
+  ui.sectionSchemaForProfile = function (documentState, section, profile) {
+    if (profile !== "common" && section === "parser") return { title: "Parser compartido", groups: [] };
+    const source = documentState?.schema?.[section] || { title: section, groups: [] };
+    const groups = (source.groups || []).map(group => ({
+      ...group,
+      controls: (group.controls || []).filter(control => {
+        const path = String(control?.path || "");
+        return path && (section === "parser" || profileControl(profile, path));
+      })
+    })).filter(group => group.controls.length);
+    return { ...source, groups };
+  };
 
   function activateMainTab() {
     document.querySelectorAll(".tabs [data-view]").forEach(button => {
@@ -148,17 +226,19 @@
 
   function renderToolbar(state) {
     const saving = Boolean(state.saving);
+    const resetting = Boolean(state.resetting);
+    const locked = Boolean(state.readOnly || saving || resetting);
     return `<div class="identity-toolbar toolbar">
       <div id="identity-status" class="status identity-status ${ui.esc(state.notice?.tone || "info")}" role="status" aria-live="polite">
         ${ui.esc(state.notice?.message || "Configuración preparada.")}
       </div>
       <div class="toolbar-actions identity-toolbar-actions">
         <button type="button" class="btn ghost" id="identity-reload">Recargar</button>
-        <button type="button" class="btn ghost" id="identity-reset">Restablecer</button>
-        <button type="button" class="btn primary" id="identity-save" data-tooltip="Orquestador ${ui.esc(API_ROOT)}/${ui.esc(state.profile)}" ${!state.dirty || saving ? "disabled" : ""} ${!state.dirty && !saving ? 'data-idle-disabled="true"' : ""}>${saving ? "Guardando…" : "Guardar"}</button>
-        <button type="button" class="btn ghost" id="identity-export">Exportar</button>
-        <button type="button" class="btn ghost" id="identity-import">Importar</button>
-        ${state.section === "resolver" ? `<button type="button" class="btn ghost danger" id="identity-clear-cache" ${state.cacheClearing ? "disabled" : ""}>${state.cacheClearing ? "Limpiando…" : "Limpiar caché"}</button>` : ""}
+        <button type="button" class="btn ghost" id="identity-reset" ${locked ? "disabled" : ""}>${resetting ? "Restableciendo…" : "Restablecer"}</button>
+        <button type="button" class="btn primary" id="identity-save" data-tooltip="Orquestador ${ui.esc(API_ROOT)}/${ui.esc(state.profile)}" ${!state.dirty || locked ? "disabled" : ""} ${!state.dirty && !saving ? 'data-idle-disabled="true"' : ""}>${saving ? "Guardando…" : "Guardar"}</button>
+        <button type="button" class="btn ghost" id="identity-export" ${locked ? "disabled" : ""}>Exportar v2</button>
+        <button type="button" class="btn ghost" id="identity-import" ${locked ? "disabled" : ""}>Importar v2</button>
+        ${state.section === "resolver" ? `<button type="button" class="btn ghost danger" id="identity-clear-cache" ${state.cacheClearing || state.readOnly ? "disabled" : ""}>${state.cacheClearing ? "Limpiando…" : "Limpiar caché"}</button>` : ""}
       </div>
     </div>`;
   }
@@ -187,9 +267,30 @@
     const app = document.getElementById("app");
     const state = ui.state;
     if (!app || !state.document || !state.draft) return;
-    const section = state.section === "resolver" ? "resolver" : "parser";
-    const sectionSchema = state.document.schema?.[section] || { title: section, groups: [] };
-    const dirtyText = state.dirty ? "Cambios sin guardar" : "Configuración guardada";
+    const section = allowedSection(state.profile, state.section);
+    state.section = section;
+    const sectionSchema = ui.sectionSchemaForProfile(state.document, section, state.profile);
+    const dirtyText = state.readOnly
+      ? "Histórico · solo lectura"
+      : state.dirty ? "Cambios sin guardar" : "Configuración guardada";
+    const rendered = ui.renderedIdentityRoute;
+    const sameRoute = rendered?.profile === state.profile && rendered?.section === section;
+    const preservedScroll = sameRoute
+      ? Math.max(0, Number(window.scrollY || document.documentElement?.scrollTop || 0))
+      : null;
+    if (sameRoute) ui.storeScrollPosition();
+    ui.renderedIdentityRoute = Object.freeze({ profile: state.profile, section });
+    const sectionTabs = state.profile === "common" ? `<nav class="identity-subtabs" role="tablist" aria-label="Sección de Identidad ARR">
+      <button id="identity-tab-parser" type="button" role="tab" aria-selected="${section === "parser"}" aria-controls="identity-panel-parser" tabindex="${section === "parser" ? "0" : "-1"}" class="${section === "parser" ? "active" : ""}" data-identity-section="parser">
+        <span>1</span><div><strong>Parser</strong><small>Limpieza y lectura</small></div>
+      </button>
+      <button id="identity-tab-resolver" type="button" role="tab" aria-selected="${section === "resolver"}" aria-controls="identity-panel-resolver" tabindex="${section === "resolver" ? "0" : "-1"}" class="${section === "resolver" ? "active" : ""}" data-identity-section="resolver">
+        <span>2</span><div><strong>Resolver TMDb</strong><small>Candidatos y evidencias</small></div>
+      </button>
+    </nav>` : "";
+    const profileScope = state.profile === "common"
+      ? '<span class="pill warn">Compartido: afecta realmente a Películas y Series</span>'
+      : `<span class="pill info">Solo ${ui.esc(ui.profileLabel(state.profile))}</span>`;
 
     app.innerHTML = `<section class="identity-shell" data-identity-section="${section}" data-identity-profile="${ui.esc(state.profile)}">
       <nav class="identity-profile-tabs segmented-tabs" aria-label="Perfil de Identidad ARR">
@@ -198,42 +299,35 @@
 
       <header class="identity-hero">
         <div><span class="identity-kicker">Nombre sucio → identidad segura · ${ui.esc(ui.profileLabel(state.profile))}</span>
-          <h2>${section === "parser" ? "Limpiador / Parser" : "Resolver TMDb"}</h2>
+          <h2 id="identity-section-title">${section === "parser" ? "Limpiador / Parser" : "Resolver TMDb"}</h2>
           <p>${section === "parser"
             ? "Limpia el release, extrae título, año, temporada y episodios antes de consultar servicios externos."
-            : "Construye candidatos, puntúa las coincidencias y decide cuándo una identidad es suficientemente segura."}</p>
+            : "Contrasta evidencias, elimina contradicciones y decide una identidad de forma trazable."}</p>
         </div>
         <div class="identity-hero-state">
-          ${state.profile === "common" ? '<span class="pill warn">Afecta a ambos</span>' : ""}
-          <span class="pill ${state.dirty ? "warn" : "ok"}">${dirtyText}</span>
+          ${profileScope}
+          <span class="pill ${state.readOnly || state.dirty ? "warn" : "ok"}">${dirtyText}</span>
           <small>${ui.esc(ui.activeMetadata(state.profile))}</small>
         </div>
       </header>
 
-      <nav class="identity-subtabs" role="tablist" aria-label="Sección de Identidad ARR">
-        <button id="identity-tab-parser" type="button" role="tab" aria-selected="${section === "parser"}" aria-controls="identity-panel-parser" tabindex="${section === "parser" ? "0" : "-1"}" class="${section === "parser" ? "active" : ""}" data-identity-section="parser">
-          <span>1</span><div><strong>Parser</strong><small>Limpieza y lectura</small></div>
-        </button>
-        <button id="identity-tab-resolver" type="button" role="tab" aria-selected="${section === "resolver"}" aria-controls="identity-panel-resolver" tabindex="${section === "resolver" ? "0" : "-1"}" class="${section === "resolver" ? "active" : ""}" data-identity-section="resolver">
-          <span>2</span><div><strong>Resolver TMDb</strong><small>Candidatos y puntuación</small></div>
-        </button>
-      </nav>
+      ${sectionTabs}
 
-      <div id="identity-panel-${section}" class="identity-tabpanel" role="tabpanel" aria-labelledby="identity-tab-${section}" tabindex="0">
+      <div id="identity-panel-${section}" class="identity-tabpanel" role="tabpanel" aria-labelledby="${state.profile === "common" ? `identity-tab-${section}` : "identity-section-title"}" tabindex="0">
         ${renderToolbar(state)}
         <div class="identity-workspace">
           <main class="identity-editor">
             ${ui.renderTester(section)}
             <section class="identity-schema-heading">
               <div><span class="identity-kicker">Controles del motor</span><h3>${ui.esc(sectionSchema.title || "Reglas")}</h3></div>
-              <span class="pill info">Esquema dinámico</span>
+              <span class="pill info">Esquema v2</span>
             </section>
             <div class="identity-groups">${ui.renderGroups(sectionSchema) || `<div class="empty">No hay controles para esta sección.</div>`}</div>
           </main>
           <aside class="identity-sidebar">${renderMetadata(state)}${renderCacheCard(state)}${renderHistory(state)}</aside>
         </div>
       </div>
-      <div id="identity-panel-${section === "parser" ? "resolver" : "parser"}" class="identity-tabpanel" role="tabpanel" aria-labelledby="identity-tab-${section === "parser" ? "resolver" : "parser"}" hidden></div>
+      ${state.profile === "common" ? `<div id="identity-panel-${section === "parser" ? "resolver" : "parser"}" class="identity-tabpanel" role="tabpanel" aria-labelledby="identity-tab-${section === "parser" ? "resolver" : "parser"}" hidden></div>` : ""}
       <input id="identity-import-file" type="file" accept="application/json,.json" data-profile="${ui.esc(state.profile)}" hidden>
     </section>`;
     ui.bindView();
@@ -243,6 +337,7 @@
       state.focusTabAfterRender = false;
       document.getElementById(`identity-tab-${section}`)?.focus();
     }
+    ui.restoreScrollPosition(state.profile, section, preservedScroll);
   };
 
   ui.bindView = function () {
@@ -261,7 +356,7 @@
       });
     });
     document.getElementById("identity-reload")?.addEventListener("click", ui.reloadRules);
-    document.getElementById("identity-reset")?.addEventListener("click", ui.resetDraft);
+    document.getElementById("identity-reset")?.addEventListener("click", ui.resetRules);
     document.getElementById("identity-save")?.addEventListener("click", ui.saveRules);
     document.getElementById("identity-export")?.addEventListener("click", ui.exportRules);
     document.getElementById("identity-import")?.addEventListener("click", ui.openImport);
@@ -271,6 +366,7 @@
 
   ui.switchProfile = function (profile) {
     if (!ui.profileConfig[profile]) return;
+    ui.storeScrollPosition();
     ui.storeOpenGroups?.();
     const section = storedSection(profile);
     rememberRoute(profile, section);
@@ -282,6 +378,8 @@
   ui.switchSection = function (section, { focusTab = false } = {}) {
     if (!["parser", "resolver"].includes(section)) return;
     const state = ui.state;
+    section = allowedSection(state.profile, section);
+    ui.storeScrollPosition();
     ui.storeOpenGroups?.();
     state.section = section;
     state.focusTabAfterRender = focusTab;
@@ -311,10 +409,16 @@
       state.document = payload;
       state.draft = ui.clone(payload.rules);
       state.dirty = false;
+      state.readOnly = Number(payload.rules.schema_version) !== ACTIVE_SCHEMA_VERSION;
       ui.invalidateAllTestResults({ updateDom: false, profile });
-      state.notice = payload.repair_required
+      state.notice = state.readOnly
         ? {
-            message: "La configuración guardada no es válida. El motor usa valores seguros; pulsa Restablecer y después Guardar para repararla.",
+            message: `Documento histórico v${payload.rules.schema_version}: visible únicamente en modo lectura.`,
+            tone: "warn"
+          }
+        : payload.repair_required
+        ? {
+            message: "La configuración guardada no es válida. El motor usa valores seguros; pulsa Restablecer para repararla.",
             tone: "warn"
           }
         : { message: replace ? "Configuración recargada desde el motor." : "Configuración cargada.", tone: "ok" };
@@ -335,28 +439,61 @@
 
   ui.reloadRules = function () {
     const state = ui.state;
+    if (state.resetting) return;
     if (!confirmDraftLoss(state, "Recargar descartará el borrador sin guardar. ¿Continuar?")) return;
     return ui.loadRules({ replace: true, profile: state.profile });
   };
 
-  ui.resetDraft = function () {
+  ui.resetRules = async function () {
     const state = ui.state;
-    if (!confirmDraftLoss(state, "Restablecer sustituirá el borrador actual por los valores de fábrica. ¿Continuar?")) return;
-    state.draft = ui.clone(state.document.defaults);
-    state.dirty = !sameValue(state.draft, state.document.rules)
-      || Boolean(state.document.repair_required);
-    ui.invalidateAllTestResults({ updateDom: false, profile: state.profile });
-    ui.render();
-    document.getElementById("identity-reset")?.focus();
-    ui.status(state.dirty
-      ? "Valores de fábrica cargados en el borrador. Pulsa Guardar para aplicarlos."
-      : "La configuración activa ya coincide con los valores de fábrica.", state.dirty ? "warn" : "ok", state.profile);
+    const profile = state.profile;
+    if (state.readOnly || state.resetting || state.saving) return;
+    if (!window.confirm("Restablecer aplicará ahora los valores de fábrica en el motor. ¿Continuar?")) return;
+    const previous = {
+      document: state.document,
+      draft: state.draft,
+      dirty: state.dirty,
+      readOnly: state.readOnly
+    };
+    state.resetting = true;
+    if (ui.isProfileActive(profile)) ui.render();
+    try {
+      const payload = await ui.api(`${API_ROOT}/${profile}/reset`, {
+        method: "POST",
+        body: JSON.stringify({ expected_revision: Number(state.document.revision || 0) })
+      });
+      if (!validRulesDocument(payload, profile)) {
+        throw new Error("El motor confirmó el restablecimiento sin el contrato completo de reglas.");
+      }
+      state.document = payload;
+      state.draft = ui.clone(payload.rules);
+      state.dirty = false;
+      state.readOnly = Number(payload.rules.schema_version) !== ACTIVE_SCHEMA_VERSION;
+      ui.invalidateAllTestResults({ updateDom: false, profile });
+      ui.status("Valores de fábrica restablecidos y activos en el motor.", "ok", profile);
+    } catch (error) {
+      state.document = previous.document;
+      state.draft = previous.draft;
+      state.dirty = previous.dirty;
+      state.readOnly = previous.readOnly;
+      const conflict = error.status === 409 || error.payload?.error === "revision_conflict";
+      ui.status(conflict
+        ? "Otra ventana cambió esta configuración. El borrador se conserva; recarga antes de restablecer."
+        : `No se pudo restablecer; el borrador se conserva: ${error.message}`, "bad", profile);
+    } finally {
+      state.resetting = false;
+      if (ui.isProfileActive(profile)) {
+        ui.render();
+        const button = document.getElementById("identity-reset");
+        button?.focus();
+      }
+    }
   };
 
   ui.saveRules = async function () {
     const state = ui.state;
     const profile = state.profile;
-    if (!state.dirty || state.saving) return;
+    if (state.readOnly || state.resetting || !state.dirty || state.saving) return;
     const submittedDraft = ui.clone(state.draft);
     const saveEpoch = ++state.saveEpoch;
     state.saving = true;
@@ -378,6 +515,7 @@
       state.document = payload;
       state.draft = changedWhileSaving ? currentDraft : ui.clone(payload.rules);
       state.dirty = changedWhileSaving && !sameValue(currentDraft, payload.rules);
+      state.readOnly = Number(payload.rules.schema_version) !== ACTIVE_SCHEMA_VERSION;
       ui.invalidateAllTestResults({ updateDom: false, profile });
       if (ui.isProfileActive(profile)) ui.render();
       ui.status(changedWhileSaving
@@ -408,11 +546,17 @@
 
   ui.exportRules = function () {
     const state = ui.state;
+    if (state.readOnly || state.resetting || Number(state.draft?.schema_version) !== ACTIVE_SCHEMA_VERSION) {
+      ui.status("Este documento histórico no puede exportarse como configuración v2.", "warn", state.profile);
+      return;
+    }
     const payload = {
+      format: EXPORT_FORMAT,
+      schema_version: ACTIVE_SCHEMA_VERSION,
       exported_at: new Date().toISOString(),
       profile: state.profile,
-      revision: state.document.revision ?? 0,
-      fingerprint: state.document.fingerprint || null,
+      base_revision: state.document.revision ?? 0,
+      base_fingerprint: state.document.fingerprint || null,
       rules: ui.clone(state.draft)
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
@@ -420,16 +564,17 @@
     const link = document.createElement("a");
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     link.href = url;
-    link.download = `arr-identidad-${state.profile}-rev-${payload.revision}-${stamp}.json`;
+    link.download = `arr-identidad-v2-${state.profile}-rev-${payload.base_revision}-${stamp}.json`;
     document.body.appendChild(link);
     link.click();
     link.remove();
     URL.revokeObjectURL(url);
-    ui.status("Borrador exportado. No se ha guardado ningún cambio.", "ok", state.profile);
+    ui.status("Borrador v2 exportado. No se ha guardado ningún cambio.", "ok", state.profile);
   };
 
   ui.openImport = function () {
     const state = ui.state;
+    if (state.readOnly || state.resetting || state.saving) return;
     if (!confirmDraftLoss(state, "Importar sustituirá el borrador sin guardar. ¿Continuar?")) return;
     document.getElementById("identity-import-file")?.click();
   };
@@ -440,18 +585,35 @@
     const state = ui.states[profile];
     const file = input.files?.[0];
     if (!state || !file) return;
+    if (state.readOnly || state.resetting || state.saving) {
+      input.value = "";
+      ui.status("Espera a que termine la operación en curso antes de importar.", "warn", profile);
+      return;
+    }
     try {
       if (file.size > MAX_IMPORT_BYTES) throw new Error("El JSON supera el límite de 4 MB.");
       const parsed = JSON.parse(await file.text());
-      const rules = isObject(parsed?.rules) ? parsed.rules : parsed;
-      if (!isObject(rules) || !isObject(rules.parser) || !isObject(rules.resolver)) {
-        throw new Error("El archivo no contiene reglas de Parser y Resolver.");
+      if (!isObject(parsed) || parsed.format !== EXPORT_FORMAT) throw new Error("El archivo no tiene formato arr-identity-export-v2.");
+      if (!ui.profileConfig[parsed.profile]) throw new Error("El archivo declara un perfil de identidad no válido.");
+      if (parsed.profile !== profile) throw new Error(`El archivo pertenece al perfil ${ui.profileLabel(parsed.profile)}, no a ${ui.profileLabel(profile)}.`);
+      if (parsed.schema_version !== ACTIVE_SCHEMA_VERSION) throw new Error(`El archivo usa un esquema incompatible: v${parsed.schema_version ?? "?"}.`);
+      const rules = parsed.rules;
+      if (!isObject(rules) || rules.schema_version !== ACTIVE_SCHEMA_VERSION || !isObject(rules.resolver)) {
+        throw new Error("El archivo no contiene un documento de reglas v2 válido.");
       }
-      state.draft = ui.clone(rules);
+      if (Number(state.document.rules.schema_version) !== ACTIVE_SCHEMA_VERSION) throw new Error("El perfil activo no admite importaciones v2.");
+      const validated = await ui.api(`${API_ROOT}/${profile}/validate`, {
+        method: "POST",
+        body: JSON.stringify(parsed)
+      });
+      if (!validImportValidation(validated, profile)) {
+        throw new Error("El motor no devolvió una validación v2 completa.");
+      }
+      state.draft = ui.clone(validated.rules);
       state.dirty = !sameValue(state.draft, state.document.rules);
       ui.invalidateAllTestResults({ updateDom: false, profile });
       if (ui.isProfileActive(profile)) ui.render();
-      ui.status("JSON cargado en el borrador. Revísalo o pruébalo antes de Guardar.", state.dirty ? "warn" : "ok", profile);
+      ui.status("JSON v2 validado por el motor y cargado en el borrador. Revísalo o pruébalo antes de Guardar.", state.dirty ? "warn" : "ok", profile);
     } catch (error) {
       ui.status(`No se pudo importar: ${error.message}`, "bad", profile);
     } finally {
@@ -462,7 +624,7 @@
   ui.clearResolverCache = async function () {
     const state = ui.state;
     const profile = state.profile;
-    if (state.cacheClearing) return;
+    if (state.readOnly || state.resetting || state.cacheClearing) return;
     if (!window.confirm("Se eliminará únicamente la caché del Resolver TMDb. ¿Continuar?")) return;
     state.cacheClearing = true;
     const button = document.getElementById("identity-clear-cache");
@@ -498,7 +660,24 @@
     else ui.render();
   };
 
+  let scrollFrame = null;
+  window.addEventListener("scroll", () => {
+    if (!ui.renderedIdentityRoute || scrollFrame !== null) return;
+    const save = () => { scrollFrame = null; ui.storeScrollPosition(); };
+    if (typeof window.requestAnimationFrame === "function") {
+      scrollFrame = true;
+      window.requestAnimationFrame(save);
+    }
+    else save();
+  }, { passive: true });
+
+  window.addEventListener("hashchange", () => {
+    ui.storeScrollPosition();
+    if (!ui.resolveTarget(location.hash)) ui.renderedIdentityRoute = null;
+  });
+
   window.addEventListener("beforeunload", event => {
+    ui.storeScrollPosition();
     if (!Object.values(ui.states).some(state => state.dirty)) return;
     event.preventDefault();
     event.returnValue = "";

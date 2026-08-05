@@ -26,6 +26,7 @@ def start_health_server(
     identity_cache_clearer: Optional[Callable[..., Dict[str, object]]] = None,
     identity_parser_tester: Optional[Callable[..., Dict[str, object]]] = None,
     identity_resolver_tester: Optional[Callable[..., Dict[str, object]]] = None,
+    identity_rules_validator: Optional[Callable[..., Dict[str, object]]] = None,
 ) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -133,6 +134,7 @@ def start_health_server(
                     action = "/".join(parts[1:])
                     identity_handler = {
                         "": identity_rules_updater,
+                        "validate": identity_rules_validator,
                         "reset": identity_rules_resetter,
                         "cache/clear": identity_cache_clearer,
                         "test-parser": identity_parser_tester,

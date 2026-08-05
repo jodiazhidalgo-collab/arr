@@ -20,6 +20,12 @@ from .db import Database
 from .diagnostic_sanitizer import sanitize_for_export
 from .filebot import FileBotRunner
 from .identity.controller import IdentityController
+from .identity.scopes import (
+    compose_identity_scopes,
+    identity_scope_fingerprint,
+    normalize_scoped_identity_rules,
+)
+from .identity.settings import IdentityRulesValidationError, identity_fingerprint
 from .filesystem import (
     JUNK_EXTENSIONS,
     MEDIA_EXTENSIONS,
@@ -200,7 +206,6 @@ SERIES_FULL_PIPELINE_STATES = {
     "ready_extract",
     "extracting",
     "ready_filebot",
-    "identity_retry",
     "filebot_running",
     "series_postprocess_ready",
     "series_postprocess_running",
@@ -587,6 +592,88 @@ class Engine:
         self, payload: Dict[str, object], profile: str = "common"
     ) -> Dict[str, object]:
         return self.identity.update(payload, profile)
+
+    def validate_identity_rules(
+        self, payload: Dict[str, object], profile: str = "common"
+    ) -> Dict[str, object]:
+        """Valida una exportacion v2 sin modificar configuracion ni cache."""
+
+        normalized_profile = str(profile or "").strip().lower()
+        if normalized_profile not in {"common", "movies", "tv"}:
+            return {
+                "ok": False,
+                "error": "invalid_profile",
+                "message": "profile debe ser common, movies o tv.",
+            }
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "profile": normalized_profile,
+                "error": "invalid_import",
+                "message": "La importacion debe ser un objeto JSON.",
+            }
+        if payload.get("format") != "arr-identity-export-v2":
+            return {
+                "ok": False,
+                "profile": normalized_profile,
+                "error": "invalid_import_format",
+                "message": "El archivo no tiene formato arr-identity-export-v2.",
+            }
+        schema_version = payload.get("schema_version")
+        if (
+            isinstance(schema_version, bool)
+            or not isinstance(schema_version, int)
+            or schema_version != 2
+        ):
+            return {
+                "ok": False,
+                "profile": normalized_profile,
+                "error": "invalid_schema_version",
+                "message": "La importacion debe usar schema_version 2.",
+            }
+        declared_profile = payload.get("profile")
+        if declared_profile != normalized_profile:
+            return {
+                "ok": False,
+                "profile": normalized_profile,
+                "error": "profile_mismatch",
+                "message": f"El archivo no pertenece al perfil {normalized_profile}.",
+            }
+        try:
+            normalized_rules = normalize_scoped_identity_rules(
+                payload.get("rules"), normalized_profile
+            )
+            scope_fingerprint = identity_scope_fingerprint(
+                normalized_rules, normalized_profile
+            )
+            if normalized_profile == "common":
+                effective_fingerprint = scope_fingerprint
+            else:
+                common_payload = self.identity.payload("common")
+                common_rules = common_payload.get("rules")
+                effective_rules = compose_identity_scopes(
+                    common_rules,
+                    normalized_rules,
+                    normalized_profile,
+                )
+                effective_fingerprint = identity_fingerprint(effective_rules)
+        except (IdentityRulesValidationError, TypeError, ValueError) as error:
+            return {
+                "ok": False,
+                "profile": normalized_profile,
+                "error": "invalid_rules",
+                "message": str(error),
+            }
+        return {
+            "ok": True,
+            "format": "arr-identity-export-v2",
+            "schema_version": 2,
+            "profile": normalized_profile,
+            "rules": normalized_rules,
+            "fingerprint": scope_fingerprint,
+            "scope_fingerprint": scope_fingerprint,
+            "effective_fingerprint": effective_fingerprint,
+        }
 
     def reset_identity_rules(
         self, payload: Dict[str, object], profile: str = "common"
@@ -1162,7 +1249,17 @@ class Engine:
             if not source_path:
                 continue
             job = self._job_for_qbt_content(infohash, source_path, content_path)
-            identity_context = self.identity.rules_for_job(job) if job else None
+            identity_context = None
+            if job:
+                try:
+                    identity_context = self.identity.rules_for_job(job)
+                except IdentityRulesValidationError as error:
+                    self._terminalize_incompatible_identity_snapshot(
+                        job,
+                        error,
+                        operation="reconcile_qbt",
+                    )
+                    continue
             classification_context = (
                 identity_context
                 if identity_context is not None
@@ -1393,7 +1490,18 @@ class Engine:
             )
             return
         job = self._job_for_qbt_content(infohash, source_path, content_path)
-        identity_context = self.identity.rules_for_job(job) if job else None
+        identity_context = None
+        if job:
+            try:
+                identity_context = self.identity.rules_for_job(job)
+            except IdentityRulesValidationError as error:
+                self._terminalize_incompatible_identity_snapshot(
+                    job,
+                    error,
+                    operation="qbt_event",
+                )
+                path.unlink(missing_ok=True)
+                return
         classification_context = (
             identity_context
             if identity_context is not None
@@ -1645,13 +1753,56 @@ class Engine:
         )
         return updated
 
+    def _terminalize_incompatible_identity_snapshot(
+        self,
+        job: Dict[str, object],
+        error: IdentityRulesValidationError,
+        *,
+        operation: str,
+    ) -> Dict[str, object]:
+        """Aisla un snapshot historico sin romper el ciclo de reconciliacion."""
+
+        job_id = str(job["job_id"])
+        current = self.db.get_job(job_id) or job
+        if str(current.get("state") or "") in TERMINAL_STATES:
+            return current
+        safe_error = self._safe_worker_error(error)
+        details = {
+            "status": "BLOCKED_HARD",
+            "accepted": False,
+            "retryable": False,
+            "reason_code": "identity_policy_snapshot_incompatible",
+            "resolver_algorithm_version": "phased-er-v2",
+            "operation": operation,
+            "error": safe_error,
+        }
+        return self.db.transition(
+            job_id,
+            "error_terminal",
+            "settings",
+            (
+                "Trabajo detenido durante la reconciliacion: "
+                "snapshot de identidad incompatible con phased-er-v2"
+            ),
+            last_error_code="identity_policy_snapshot_incompatible",
+            last_error_message=safe_error,
+            result_json=json.dumps(details, ensure_ascii=False, sort_keys=True),
+        )
+
     def _adopt_qbt_for_materialized_job(
         self,
         job: Dict[str, object],
         category: str,
         item: Path,
     ) -> Dict[str, object]:
-        identity_context = self.identity.rules_for_job(job)
+        try:
+            identity_context = self.identity.rules_for_job(job)
+        except IdentityRulesValidationError as error:
+            return self._terminalize_incompatible_identity_snapshot(
+                job,
+                error,
+                operation="adopt_qbt_materialized",
+            )
         identity_rules = dict(identity_context.get("rules") or {})
         try:
             torrents = self.qbt.torrents("completed")
@@ -1782,7 +1933,10 @@ class Engine:
         if job["state"] != "waiting_stable" and self._series_waits_for_full_pipeline(job):
             return
         if job["state"] == "identity_retry":
-            retry_at = float(job.get("identity_retry_at") or 0)
+            retry_value = job.get("identity_retry_at")
+            if retry_value in (None, ""):
+                return
+            retry_at = float(retry_value)
             if time.time() < retry_at:
                 return
             self.db.transition(
@@ -2163,7 +2317,23 @@ class Engine:
                     phase="filebot",
                 )
                 return
-        identity_context = self.identity.configure_for_job(job)
+        try:
+            identity_context = self.identity.configure_for_job(job)
+        except IdentityRulesValidationError as error:
+            self._block_identity_error(
+                job,
+                job_root,
+                ResolverAmbiguous(
+                    str(error),
+                    {
+                        "status": "BLOCKED_HARD",
+                        "reason_code": "identity_policy_snapshot_incompatible",
+                        "retryable": False,
+                    },
+                ),
+                series_selected=series_selected,
+            )
+            return
         identity_rules = dict(identity_context.get("rules") or {})
         filebot_identity_configure = getattr(
             self.filebot, "configure_identity_rules", None
@@ -2188,10 +2358,15 @@ class Engine:
             },
         )
         identity: Optional[ResolvedIdentity] = None
+        resolver_trace: Dict[str, object] = {}
+        identity_decision: Dict[str, object] = {}
         series_expected_episode_codes: set[Tuple[int, int]] = set()
-        series_expected_episode_groups: List[Tuple[Tuple[int, int], ...]] = []
+        series_expected_episode_intents: List[Dict[str, object]] = []
         series_expected_physical_manifest: List[
-            Tuple[int, int, int, str, Tuple[Tuple[int, int], ...]]
+            Tuple[int, int, int, str]
+        ] = []
+        series_expected_bound_intents: List[
+            Tuple[int, int, int, str, Tuple[object, ...]]
         ] = []
         media_decision = self._media_decision_for_job(job, input_root, identity_rules)
         self.db.add_event(
@@ -2257,89 +2432,160 @@ class Engine:
                 return
             self._send_media_decision_review(job, job_root, media_decision)
             return
-        if self.name_resolver.enabled:
-            try:
-                identity = self.name_resolver.resolve(job, input_root)
-            except ResolverUnavailable as error:
-                self._defer_identity(job, input_root, error)
-                return
-            except ResolverAmbiguous as error:
-                if self._can_continue_tv_without_identity(job, media_decision, error):
-                    self.db.add_event(
-                        str(job["job_id"]),
-                        "identity",
-                        "warning",
-                        "TMDb no confirma, pero se continua por senal TV local",
-                        {
-                            "media_decision": media_decision.to_dict(),
-                            "resolver_error": str(error),
-                            "resolver_details": sanitize_for_export(error.details),
-                        },
-                    )
-                    self.db.update_job(
-                        str(job["job_id"]),
-                        last_error_code=None,
-                        last_error_message=None,
-                    )
-                else:
-                    if series_selected:
-                        self._preserve_series_job_for_review(
-                            job,
-                            job_root,
-                            "identity_ambiguous",
-                            str(error),
-                            phase="identity",
-                        )
-                        return
-                    self._send_identity_review(job, job_root, error)
-                    return
-            except ResolutionError as error:
-                self._defer_identity(job, input_root, error)
-                return
-            if identity:
-                self.db.update_job(
-                    str(job["job_id"]),
-                    identity_json=json.dumps(identity.to_dict(), ensure_ascii=False),
-                    identity_retry_at=None,
-                    last_error_code=None,
-                    last_error_message=None,
+        try:
+            if not bool(getattr(self.name_resolver, "enabled", False)):
+                raise ResolverUnavailable(
+                    "TMDB_API_TOKEN no configurado",
+                    {
+                        "status": "RETRY_PROVIDER",
+                        "reason_code": "tmdb_token_missing",
+                        "retryable": True,
+                    },
                 )
-                identity_event = identity.to_dict()
-                trace_snapshot = getattr(self.name_resolver, "trace_snapshot", None)
-                if callable(trace_snapshot):
-                    resolver_trace = sanitize_for_export(trace_snapshot())
-                    if isinstance(resolver_trace, dict) and resolver_trace:
-                        identity_event["resolver_trace"] = resolver_trace
-                self.db.add_event(
-                    str(job["job_id"]),
-                    "identity",
-                    "resolved",
-                    f"Identidad confirmada: TMDb {identity.tmdb_id} - {identity.title}",
-                    identity_event,
-                )
-        else:
-            self.db.add_event(
-                str(job["job_id"]),
-                "identity",
-                "legacy",
-                "TMDB_API_TOKEN no configurado; se mantiene AMC",
+            identity = self.name_resolver.resolve(job, input_root)
+            resolver_trace = self._resolver_trace_snapshot()
+            identity_decision = self._identity_decision_for_result(
+                identity,
+                resolver_trace,
             )
+            decision_status = str(identity_decision.get("status") or "").upper()
+            if decision_status == "RETRY_PROVIDER" or bool(
+                identity_decision.get("retryable", False)
+            ):
+                raise ResolverUnavailable(
+                    "El proveedor de identidad no pudo confirmar TMDb",
+                    identity_decision,
+                )
+            if not bool(identity_decision.get("accepted", False)):
+                raise ResolverAmbiguous(
+                    "La decision de identidad no autoriza ejecutar FileBot",
+                    {
+                        **identity_decision,
+                        "status": decision_status or "BLOCKED_HARD",
+                        "retryable": False,
+                    },
+                )
+            identity_problem = self._accepted_identity_problem(
+                job,
+                identity,
+                identity_decision,
+            )
+            if identity_problem:
+                raise ResolverAmbiguous(
+                    identity_problem,
+                    {
+                        **identity_decision,
+                        "status": "BLOCKED_HARD",
+                        "reason_code": "accepted_identity_contradiction",
+                        "retryable": False,
+                    },
+                )
+        except ResolverUnavailable as error:
+            self._defer_identity(job, input_root, error)
+            return
+        except ResolverAmbiguous as error:
+            self._block_identity_error(
+                job,
+                job_root,
+                error,
+                series_selected=series_selected,
+            )
+            return
+        except ResolutionError as error:
+            details = error.details if isinstance(error.details, dict) else {}
+            if bool(details.get("retryable")) or str(details.get("status") or "").upper() == "RETRY_PROVIDER":
+                self._defer_identity(job, input_root, error)
+            else:
+                self._block_identity_error(
+                    job,
+                    job_root,
+                    error,
+                    series_selected=series_selected,
+                )
+            return
+
+        if identity is None:
+            self._defer_identity(
+                job,
+                input_root,
+                ResolverUnavailable(
+                    "El resolver termino sin identidad TMDb",
+                    {
+                        "status": "RETRY_PROVIDER",
+                        "reason_code": "identity_missing",
+                        "retryable": True,
+                    },
+                ),
+            )
+            return
+        self.db.update_job(
+            str(job["job_id"]),
+            identity_json=json.dumps(identity.to_dict(), ensure_ascii=False),
+            identity_retry_at=None,
+            last_error_code=None,
+            last_error_message=None,
+        )
+        identity_event = identity.to_dict()
+        identity_event["decision_status"] = str(
+            identity_decision.get("status") or "ACCEPTED_CONFIDENT"
+        )
+        if resolver_trace:
+            identity_event["resolver_trace"] = resolver_trace
+        acceptance_kind = (
+            "fallback"
+            if str(identity_decision.get("status") or "").upper() == "ACCEPTED_FALLBACK"
+            else "confident"
+        )
+        self.db.add_event(
+            str(job["job_id"]),
+            "identity",
+            "resolved",
+            (
+                f"Identidad aceptada ({acceptance_kind}): "
+                f"TMDb {identity.tmdb_id} - {identity.title}"
+            ),
+            identity_event,
+        )
         if series_selected:
             input_media = media_files(input_root)
-            series_expected_episode_groups, unclassified_input = (
-                self._series_episode_groups(input_media)
+            parser_rules = (
+                identity_rules.get("parser")
+                if isinstance(identity_rules.get("parser"), dict)
+                else None
             )
-            series_expected_episode_codes, unclassified_input = (
-                self._series_episode_manifest(input_media)
+            resolver_episode_intents = self._resolved_episode_intents(identity)
+            series_expected_episode_intents, unclassified_input = (
+                self._series_episode_intents(
+                    input_media,
+                    parser_rules=parser_rules,
+                    resolver_intents=resolver_episode_intents,
+                )
             )
-            if not input_media or unclassified_input or not series_expected_episode_codes:
-                details = ", ".join(unclassified_input[:8]) or "sin codigos SxxExx"
+            series_expected_episode_codes = self._series_intent_codes(
+                series_expected_episode_intents
+            )
+            if not input_media or unclassified_input or not series_expected_episode_intents:
+                details = ", ".join(unclassified_input[:8]) or "sin intencion de episodio"
                 self._preserve_series_job_for_review(
                     job,
                     job_root,
                     "series_input_episode_manifest_invalid",
                     f"No se puede congelar el pack de episodios antes de FileBot: {details}",
                     phase="verify",
+                )
+                return
+            identity_conflict = self._series_identity_input_conflict(
+                identity,
+                series_expected_episode_intents,
+                resolver_episode_intents,
+            )
+            if identity_conflict:
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_identity_episode_input_mismatch",
+                    identity_conflict,
+                    phase="identity",
                 )
                 return
             input_files = self._series_remaining_input_files(input_root)
@@ -2355,19 +2601,23 @@ class Engine:
                     phase="verify",
                 )
                 return
-            if identity is not None and identity.season is not None and identity.episodes:
-                identity_codes = {
-                    (int(identity.season), int(episode)) for episode in identity.episodes
-                }
-                if identity_codes != series_expected_episode_codes:
-                    self._preserve_series_job_for_review(
-                        job,
-                        job_root,
-                        "series_identity_episode_input_mismatch",
-                        "La identidad TV congelada no coincide con los episodios de entrada",
-                        phase="identity",
-                    )
-                    return
+            series_expected_bound_intents = self._series_bound_episode_intents(
+                input_files,
+                self._series_binding_intents(
+                    input_files,
+                    parser_rules=parser_rules,
+                    resolver_intents=resolver_episode_intents,
+                ),
+            )
+            if len(series_expected_bound_intents) != len(input_files):
+                self._preserve_series_job_for_review(
+                    job,
+                    job_root,
+                    "series_input_physical_manifest_invalid",
+                    "No se puede ligar cada archivo fisico con su intencion de episodio",
+                    phase="verify",
+                )
+                return
             self.db.add_event(
                 str(job["job_id"]),
                 "verify",
@@ -2377,6 +2627,8 @@ class Engine:
                     "episode_codes": self._format_episode_codes(
                         series_expected_episode_codes
                     ),
+                    "episode_intents": series_expected_episode_intents,
+                    "identity_intent_count": len(resolver_episode_intents),
                     "media_files": len(input_media),
                 },
             )
@@ -2471,18 +2723,13 @@ class Engine:
                 else 14400,
             }),
         )
-        if identity:
-            result = self.filebot.run(
-                str(job["job_id"]),
-                str(job["category"]),
-                input_root,
-                output_root,
-                identity,
-            )
-        else:
-            result = self.filebot.run(
-                str(job["job_id"]), str(job["category"]), input_root, output_root
-            )
+        result = self.filebot.run(
+            str(job["job_id"]),
+            str(job["category"]),
+            input_root,
+            output_root,
+            identity,
+        )
         if result.get("timed_out"):
             if series_selected:
                 self._preserve_series_job_for_review(
@@ -2678,7 +2925,7 @@ class Engine:
                     result_json=json.dumps(result, ensure_ascii=False),
                 )
                 return
-            if identity and not self.name_resolver.output_matches(
+            if not self.name_resolver.output_matches(
                 identity, [media_source.name]
             ):
                 self._reject_identity_output(
@@ -2703,31 +2950,39 @@ class Engine:
 
         if series_selected:
             observed_media = media_files(output_root)
-            observed_groups, unclassified_output = self._series_episode_groups(
-                observed_media
+            observed_intents, unclassified_output = self._series_episode_intents(
+                observed_media,
+                parser_rules=parser_rules,
             )
-            observed_codes, unclassified_output = self._series_episode_manifest(
-                observed_media
-            )
+            observed_codes = self._series_intent_codes(observed_intents)
             observed_files = self._series_remaining_input_files(output_root)
             observed_physical_manifest = self._series_bound_manifest(
                 observed_files,
             )
-            if (
-                not observed_media
-                or unclassified_output
-                or observed_codes != series_expected_episode_codes
-                or observed_groups != series_expected_episode_groups
-                or observed_physical_manifest != series_expected_physical_manifest
-            ):
+            observed_bound_intents = self._series_bound_episode_intents(
+                observed_files,
+                self._series_binding_intents(
+                    observed_files,
+                    parser_rules=parser_rules,
+                ),
+            )
+            manifest_conflict = self._series_output_manifest_conflict(
+                series_expected_bound_intents,
+                observed_bound_intents,
+            )
+            if not observed_media or unclassified_output:
+                manifest_conflict = (
+                    "La salida contiene archivos sin intencion de episodio: "
+                    + (", ".join(unclassified_output[:8]) or "sin archivos multimedia")
+                )
+            elif observed_physical_manifest != series_expected_physical_manifest:
+                manifest_conflict = "La identidad fisica completa del pack cambio durante FileBot"
+            if manifest_conflict:
                 self._preserve_series_job_for_review(
                     job,
                     job_root,
                     "series_filebot_episode_manifest_mismatch",
-                    (
-                        "La salida provisional de FileBot no conserva exactamente "
-                        "el pack de episodios de entrada"
-                    ),
+                    manifest_conflict,
                     phase="verify",
                 )
                 return
@@ -2741,32 +2996,33 @@ class Engine:
                         series_expected_episode_codes
                     ),
                     "observed": self._format_episode_codes(observed_codes),
+                    "expected_intents": series_expected_episode_intents,
+                    "observed_intents": observed_intents,
                     "media_files": len(observed_media),
                 },
             )
-        if identity:
-            output_names = self._tv_output_names(result, output_root)
-            if not output_names or not self.name_resolver.output_matches(
-                identity, output_names
-            ):
-                if series_selected:
-                    self._preserve_series_job_for_review(
-                        job,
-                        job_root,
-                        "series_identity_output_mismatch",
-                        "La salida provisional de FileBot no coincide con la identidad TV congelada",
-                        phase="identity",
-                    )
-                    return
-                self._reject_identity_output(
+        output_names = self._tv_output_names(result, output_root)
+        if not output_names or not self.name_resolver.output_matches(
+            identity, output_names
+        ):
+            if series_selected:
+                self._preserve_series_job_for_review(
                     job,
                     job_root,
-                    result,
-                    identity,
-                    output_names,
-                    output_root,
+                    "series_identity_output_mismatch",
+                    "La salida provisional de FileBot no coincide con la identidad TV congelada",
+                    phase="identity",
                 )
                 return
+            self._reject_identity_output(
+                job,
+                job_root,
+                result,
+                identity,
+                output_names,
+                output_root,
+            )
+            return
         if series_selected:
             self.db.transition(
                 str(job["job_id"]),
@@ -3139,6 +3395,109 @@ class Engine:
             )
         return move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
 
+    def _resolver_trace_snapshot(self) -> Dict[str, object]:
+        trace_snapshot = getattr(self.name_resolver, "trace_snapshot", None)
+        if not callable(trace_snapshot):
+            return {}
+        snapshot = sanitize_for_export(trace_snapshot())
+        return dict(snapshot) if isinstance(snapshot, dict) else {}
+
+    @staticmethod
+    def _identity_decision_for_result(
+        identity: ResolvedIdentity,
+        resolver_trace: Dict[str, object],
+    ) -> Dict[str, object]:
+        raw = resolver_trace.get("decision")
+        decision = dict(raw) if isinstance(raw, dict) else {}
+        status = str(
+            decision.get("status")
+            or getattr(identity, "decision_status", "")
+        ).upper()
+        accepted_statuses = {
+            "ACCEPTED_CONFIDENT",
+            "ACCEPTED_FALLBACK",
+        }
+        decision["status"] = status
+        decision["accepted"] = bool(
+            decision.get("accepted", status in accepted_statuses)
+        )
+        decision["retryable"] = bool(
+            decision.get("retryable", status == "RETRY_PROVIDER")
+        )
+        return decision
+
+    @staticmethod
+    def _accepted_identity_problem(
+        job: Dict[str, object],
+        identity: ResolvedIdentity,
+        decision: Dict[str, object],
+    ) -> Optional[str]:
+        expected_media_type = (
+            "movie"
+            if str(job.get("category") or "") == "movies"
+            else "tv"
+            if str(job.get("category") or "") == "tv"
+            else ""
+        )
+        if not expected_media_type or identity.media_type != expected_media_type:
+            return "La identidad aceptada contradice la categoria del trabajo"
+        if int(identity.tmdb_id) <= 0:
+            return "La identidad aceptada no contiene un TMDb ID valido"
+        if str(identity.resolver_algorithm_version or "") != "phased-er-v2":
+            return "La identidad pertenece a un resolver historico no ejecutable"
+        status = str(decision.get("status") or "").upper()
+        if status not in {"ACCEPTED_CONFIDENT", "ACCEPTED_FALLBACK"}:
+            return f"El estado de identidad {status or 'vacio'} no autoriza FileBot"
+        selected = decision.get("selected")
+        selected_payload = dict(selected) if isinstance(selected, dict) else {}
+        selected_tmdb = decision.get(
+            "selected_tmdb_id",
+            selected_payload.get("tmdb_id"),
+        )
+        if selected_tmdb not in (None, ""):
+            try:
+                if int(selected_tmdb) != int(identity.tmdb_id):
+                    return "La decision y la identidad discrepan en el TMDb ID seleccionado"
+            except (TypeError, ValueError):
+                return "La decision contiene un TMDb ID seleccionado no valido"
+        selected_media_type = str(selected_payload.get("media_type") or "")
+        if selected_media_type and selected_media_type != identity.media_type:
+            return "La decision y la identidad discrepan en el tipo de contenido"
+        return None
+
+    def _block_identity_error(
+        self,
+        job: Dict[str, object],
+        job_root: Path,
+        error: ResolutionError,
+        *,
+        series_selected: bool,
+    ) -> None:
+        details = error.details if isinstance(error.details, dict) else {}
+        reason_code = str(details.get("reason_code") or "identity_hard_contradiction")
+        self.db.add_event(
+            str(job["job_id"]),
+            "identity",
+            "decision",
+            "Identidad bloqueada por contradiccion dura",
+            {
+                "status": "BLOCKED_HARD",
+                "retryable": False,
+                "reason_code": reason_code,
+                "details": sanitize_for_export(details),
+            },
+        )
+        if series_selected:
+            self._preserve_series_job_for_review(
+                job,
+                job_root,
+                reason_code,
+                str(error),
+                phase="identity",
+            )
+            return
+        self._send_identity_review(job, job_root, error)
+
     def _media_decision_for_job(
         self,
         job: Dict[str, object],
@@ -3147,10 +3506,27 @@ class Engine:
     ) -> MediaDecision:
         category = str(job.get("category") or "")
         sources = [str(job.get("name") or ""), input_root.name]
-        files = media_files(input_root)
-        files.sort(key=lambda path: path.stat().st_size if path.exists() else 0, reverse=True)
-        sources.extend(path.stem for path in files[:3])
-        return self.identity.decide_sources(sources, category, identity_rules)
+        files = sorted(media_files(input_root), key=lambda path: str(path).casefold())
+        sources.extend(path.stem for path in files)
+        decision = self.identity.decide_sources(sources, category, identity_rules)
+        if category == "tv" and files:
+            parser_rules = (
+                identity_rules.get("parser")
+                if isinstance(identity_rules, dict)
+                and isinstance(identity_rules.get("parser"), dict)
+                else None
+            )
+            intents, unclassified = self._series_episode_intents(
+                files,
+                parser_rules=parser_rules,
+            )
+            decision.episode_hint = {
+                **dict(decision.episode_hint or {}),
+                "file_intents": intents,
+                "unclassified_files": unclassified,
+                "media_file_count": len(files),
+            }
+        return decision
 
     @staticmethod
     def _can_continue_tv_without_identity(
@@ -3158,23 +3534,8 @@ class Engine:
         media_decision: MediaDecision,
         error: Optional[ResolverAmbiguous] = None,
     ) -> bool:
-        details = error.details if error is not None else {}
-        reason_code = str(details.get("reason_code") or "")
-        identity_conflicts = {
-            "title_evidence_conflict",
-            "title_selection_uncertain",
-            "title_evidence_unconfirmed",
-            "alternate_fallback_requires_year",
-            "alternate_fallback_not_unique",
-            "season_impossible",
-        }
-        return (
-            str(job.get("category") or "") == "tv"
-            and media_decision.media_type == "tv"
-            and media_decision.confidence in {"high", "medium"}
-            and not media_decision.block_reason
-            and reason_code not in identity_conflicts
-        )
+        del job, media_decision, error
+        return False
 
     def _send_media_decision_review(
         self,
@@ -3800,18 +4161,58 @@ class Engine:
         input_root: Path,
         error: ResolutionError,
     ) -> None:
-        retry = int(job.get("retry_filebot") or 0) + 1
-        delay = self.identity.retry_delay(job, retry)
-        retry_at = time.time() + delay
+        attempt = int(job.get("retry_filebot") or 0) + 1
+        max_attempts = 3
+        try:
+            context = self.identity.rules_for_job(job)
+            rules = context.get("rules") if isinstance(context, dict) else {}
+            resolver = rules.get("resolver") if isinstance(rules, dict) else {}
+            retry_rules = resolver.get("retry") if isinstance(resolver, dict) else {}
+            if isinstance(retry_rules, dict):
+                max_attempts = max(1, int(retry_rules.get("max_attempts") or 3))
+        except (TypeError, ValueError):
+            max_attempts = 3
+        exhausted = attempt >= max_attempts
+        delay = self.identity.retry_delay(job, attempt)
+        retry_at = None if exhausted else time.time() + delay
+        details = error.details if isinstance(error.details, dict) else {}
+        self.db.add_event(
+            str(job["job_id"]),
+            "identity",
+            "retry",
+            (
+                "Proveedor de identidad pendiente tras agotar los intentos automaticos"
+                if exhausted
+                else f"Proveedor de identidad no disponible; reintento {attempt + 1} en {delay}s"
+            ),
+            {
+                "status": "RETRY_PROVIDER",
+                "retryable": True,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "automatic_retries_exhausted": exhausted,
+                "retry_at": retry_at,
+                "reason_code": str(details.get("reason_code") or "provider_unavailable"),
+                "details": sanitize_for_export(details),
+            },
+        )
         self.db.transition(
             str(job["job_id"]),
             "identity_retry",
             "identity",
-            f"TMDb no disponible; reintento automatico en {delay}s",
+            (
+                "Identidad pendiente; intentos automaticos agotados"
+                if exhausted
+                else f"TMDb no disponible; reintento automatico en {delay}s"
+            ),
             source_path=str(input_root),
-            retry_filebot=retry,
+            retry_filebot=attempt,
             identity_retry_at=retry_at,
-            last_error_code="identity_unavailable",
+            last_error_code=(
+                "identity_provider_retry_exhausted"
+                if exhausted
+                else "identity_unavailable"
+            ),
             last_error_message=str(error),
         )
 
@@ -3819,15 +4220,19 @@ class Engine:
         self,
         job: Dict[str, object],
         job_root: Path,
-        error: ResolverAmbiguous,
+        error: ResolutionError,
     ) -> None:
+        details = error.details if isinstance(error.details, dict) else {}
+        reason_code = str(details.get("reason_code") or "identity_hard_contradiction")
         review = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
         reason = {
             "job_id": job["job_id"],
             "phase": "identity",
-            "reason": "identity_suspicious",
+            "reason": reason_code,
+            "status": "BLOCKED_HARD",
+            "retryable": False,
             "message": str(error),
-            "details": sanitize_for_export(error.details),
+            "details": sanitize_for_export(details),
             "timestamp": time.time(),
         }
         write_reason(
@@ -3835,7 +4240,7 @@ class Engine:
             reason,
             "Revision manual.txt",
             [
-                "No se encontro una identidad unica despues de agotar las consultas automaticas.",
+                "La evidencia contiene una contradiccion dura y no autoriza FileBot.",
                 str(error),
             ],
         )
@@ -3844,9 +4249,9 @@ class Engine:
             str(job["job_id"]),
             "manual_review",
             "identity",
-            "Identidad realmente ambigua tras los intentos automaticos",
+            "Identidad bloqueada por contradiccion dura",
             stage_path=str(review),
-            last_error_code="identity_suspicious",
+            last_error_code=reason_code,
             last_error_message=str(error),
             result_json=json.dumps(reason, ensure_ascii=False, default=str),
         )
@@ -4129,12 +4534,344 @@ class Engine:
         return {code for group in groups for code in group}, unclassified
 
     @staticmethod
+    def _episode_intent_signature(intent: Dict[str, object]) -> Tuple[object, ...]:
+        codes = tuple(
+            sorted(
+                (int(item[0]), int(item[1]))
+                for item in intent.get("codes") or []
+                if isinstance(item, (list, tuple)) and len(item) == 2
+            )
+        )
+        if codes:
+            return ("episodes", codes)
+        absolute = intent.get("absolute_episode")
+        if absolute not in (None, ""):
+            return ("absolute", int(absolute))
+        if bool(intent.get("is_season_pack")) and intent.get("season") not in (None, ""):
+            return ("season_pack", int(intent["season"]))
+        return ("unknown",)
+
+    @staticmethod
+    def _episode_intent_from_payload(
+        source: str,
+        payload: Dict[str, object],
+    ) -> Optional[Dict[str, object]]:
+        season_value = payload.get("season")
+        season = None if season_value in (None, "") else int(season_value)
+        episodes = sorted(
+            {
+                int(value)
+                for value in payload.get("episodes") or []
+                if value not in (None, "")
+            }
+        )
+        absolute_value = payload.get("absolute_episode")
+        absolute = None if absolute_value in (None, "") else int(absolute_value)
+        is_season_pack = bool(
+            payload.get("is_season_pack", payload.get("season_pack") not in (None, ""))
+        )
+        if season is not None and episodes:
+            codes = [[season, episode] for episode in episodes]
+            kind = "episodes"
+        elif absolute is not None:
+            codes = []
+            kind = "absolute"
+        elif is_season_pack and season is not None:
+            codes = []
+            kind = "season_pack"
+        else:
+            return None
+        return {
+            "source": source,
+            "kind": kind,
+            "season": season,
+            "episodes": episodes,
+            "absolute_episode": absolute,
+            "is_season_pack": is_season_pack,
+            "codes": codes,
+        }
+
+    @classmethod
+    def _series_episode_intent(
+        cls,
+        path: Path,
+        *,
+        parser_rules: Optional[Dict[str, object]] = None,
+    ) -> Optional[Dict[str, object]]:
+        explicit_codes = sorted(cls._series_episode_codes(path))
+        if explicit_codes:
+            seasons = {season for season, _episode in explicit_codes}
+            season = next(iter(seasons)) if len(seasons) == 1 else None
+            return {
+                "source": path.name,
+                "kind": "episodes",
+                "season": season,
+                "episodes": [
+                    episode
+                    for observed_season, episode in explicit_codes
+                    if season is not None and observed_season == season
+                ],
+                "absolute_episode": None,
+                "is_season_pack": False,
+                "codes": [[season, episode] for season, episode in explicit_codes],
+            }
+        parsed = decide_media(path.stem, "tv", rules=parser_rules).parsed
+        if parsed is not None:
+            payload = cls._episode_intent_from_payload(
+                path.name,
+                {
+                    "season": parsed.season,
+                    "episodes": parsed.episodes,
+                    "absolute_episode": parsed.absolute_episode,
+                    "season_pack": parsed.season_pack,
+                    "is_season_pack": parsed.season_pack is not None,
+                },
+            )
+            if payload is not None:
+                return payload
+        special = re.search(
+            r"(?i)(?:^|[ ._\-\[])\s*(?:special|especial|extra)\s*(?:e(?:pisode|pisodio)?[ ._\-]*)?(\d{1,4})(?!\d)",
+            path.stem,
+        )
+        if special:
+            episode = int(special.group(1))
+            return {
+                "source": path.name,
+                "kind": "episodes",
+                "season": 0,
+                "episodes": [episode],
+                "absolute_episode": None,
+                "is_season_pack": False,
+                "codes": [[0, episode]],
+            }
+        return None
+
+    @staticmethod
+    def _series_intent_source_keys(value: object) -> set[str]:
+        text = str(value or "").strip().replace("\\", "/")
+        if not text:
+            return set()
+        name = PurePosixPath(text).name.casefold()
+        stem = Path(name).stem.casefold()
+        return {item for item in (name, stem) if item}
+
+    @classmethod
+    def _series_episode_intents(
+        cls,
+        paths: List[Path],
+        *,
+        parser_rules: Optional[Dict[str, object]] = None,
+        resolver_intents: Optional[List[Dict[str, object]]] = None,
+    ) -> Tuple[List[Dict[str, object]], List[str]]:
+        resolver_entries = [
+            item for item in resolver_intents or [] if isinstance(item, dict)
+        ]
+        intents: List[Dict[str, object]] = []
+        unclassified: List[str] = []
+        for path in paths:
+            intent = cls._series_episode_intent(path, parser_rules=parser_rules)
+            if intent is None:
+                path_keys = cls._series_intent_source_keys(path.name)
+                for candidate in resolver_entries:
+                    if path_keys.intersection(
+                        cls._series_intent_source_keys(candidate.get("source"))
+                    ):
+                        try:
+                            intent = cls._episode_intent_from_payload(path.name, candidate)
+                        except (TypeError, ValueError):
+                            intent = None
+                        if intent is not None:
+                            break
+            if intent is None:
+                unclassified.append(path.name)
+            else:
+                intents.append(intent)
+        return intents, sorted(unclassified, key=str.casefold)
+
+    @classmethod
+    def _series_binding_intents(
+        cls,
+        paths: List[Path],
+        *,
+        parser_rules: Optional[Dict[str, object]] = None,
+        resolver_intents: Optional[List[Dict[str, object]]] = None,
+    ) -> List[Dict[str, object]]:
+        resolver_entries = [
+            item for item in resolver_intents or [] if isinstance(item, dict)
+        ]
+        result: List[Dict[str, object]] = []
+        for path in paths:
+            intent = cls._series_episode_intent(path, parser_rules=parser_rules)
+            if intent is None:
+                path_keys = cls._series_intent_source_keys(path.name)
+                for candidate in resolver_entries:
+                    if not path_keys.intersection(
+                        cls._series_intent_source_keys(candidate.get("source"))
+                    ):
+                        continue
+                    try:
+                        intent = cls._episode_intent_from_payload(path.name, candidate)
+                    except (TypeError, ValueError):
+                        intent = None
+                    if intent is not None:
+                        break
+            result.append(
+                intent
+                or {
+                    "source": path.name,
+                    "kind": "unknown",
+                    "season": None,
+                    "episodes": [],
+                    "absolute_episode": None,
+                    "is_season_pack": False,
+                    "codes": [],
+                }
+            )
+        return result
+
+    @staticmethod
+    def _resolved_episode_intents(identity: ResolvedIdentity) -> List[Dict[str, object]]:
+        raw = getattr(identity, "episode_intents", None)
+        if raw is None:
+            payload = identity.to_dict()
+            raw = payload.get("episode_intents") if isinstance(payload, dict) else None
+        return [dict(item) for item in raw or [] if isinstance(item, dict)]
+
+    @classmethod
+    def _series_intent_codes(
+        cls,
+        intents: List[Dict[str, object]],
+    ) -> set[Tuple[int, int]]:
+        return {
+            (int(item[0]), int(item[1]))
+            for intent in intents
+            for item in intent.get("codes") or []
+            if isinstance(item, (list, tuple)) and len(item) == 2
+        }
+
+    @classmethod
+    def _series_identity_input_conflict(
+        cls,
+        identity: ResolvedIdentity,
+        local_intents: List[Dict[str, object]],
+        resolver_intents: List[Dict[str, object]],
+    ) -> Optional[str]:
+        matched = 0
+        for local in local_intents:
+            local_keys = cls._series_intent_source_keys(local.get("source"))
+            for candidate in resolver_intents:
+                if not local_keys.intersection(
+                    cls._series_intent_source_keys(candidate.get("source"))
+                ):
+                    continue
+                try:
+                    normalized = cls._episode_intent_from_payload(
+                        str(local.get("source") or ""),
+                        candidate,
+                    )
+                except (TypeError, ValueError):
+                    normalized = None
+                if normalized is None:
+                    continue
+                matched += 1
+                if cls._episode_intent_signature(local) != cls._episode_intent_signature(
+                    normalized
+                ):
+                    return "Las intenciones por archivo del resolver contradicen el pack de entrada"
+                break
+        if resolver_intents and matched == 0:
+            return "El resolver devolvio intenciones que no se pueden ligar a los archivos de entrada"
+        if not resolver_intents and len(local_intents) == 1:
+            if identity.season is not None and identity.episodes:
+                legacy = cls._episode_intent_from_payload(
+                    str(local_intents[0].get("source") or ""),
+                    {
+                        "season": identity.season,
+                        "episodes": identity.episodes,
+                    },
+                )
+                if legacy is not None and cls._episode_intent_signature(
+                    legacy
+                ) != cls._episode_intent_signature(local_intents[0]):
+                    return "La identidad TV no coincide con el episodio de entrada"
+        return None
+
+    @classmethod
+    def _series_bound_episode_intents(
+        cls,
+        paths: List[Path],
+        intents: List[Dict[str, object]],
+    ) -> List[Tuple[int, int, int, str, Tuple[object, ...]]]:
+        result: List[Tuple[int, int, int, str, Tuple[object, ...]]] = []
+        if len(paths) != len(intents):
+            return result
+        for path, intent in zip(paths, intents):
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+                continue
+            result.append(
+                (
+                    int(info.st_dev),
+                    int(info.st_ino),
+                    int(info.st_size),
+                    path.suffix.casefold(),
+                    cls._episode_intent_signature(intent),
+                )
+            )
+        return sorted(result)
+
+    @staticmethod
+    def _series_episode_intents_compatible(
+        expected: Tuple[object, ...],
+        observed: Tuple[object, ...],
+    ) -> bool:
+        if expected == observed:
+            return True
+        if expected and expected[0] == "absolute" and observed and observed[0] == "episodes":
+            codes = list(observed[1]) if len(observed) > 1 else []
+            return len(codes) == 1 and int(codes[0][1]) == int(expected[1])
+        if expected and expected[0] == "season_pack" and observed and observed[0] == "episodes":
+            codes = list(observed[1]) if len(observed) > 1 else []
+            return bool(codes) and all(int(code[0]) == int(expected[1]) for code in codes)
+        return False
+
+    @classmethod
+    def _series_output_manifest_conflict(
+        cls,
+        expected: List[Tuple[int, int, int, str, Tuple[object, ...]]],
+        observed: List[Tuple[int, int, int, str, Tuple[object, ...]]],
+    ) -> Optional[str]:
+        expected_by_file = {item[:4]: item[4] for item in expected}
+        observed_by_file = {item[:4]: item[4] for item in observed}
+        if expected_by_file.keys() != observed_by_file.keys():
+            return "FileBot no conserva uno a uno los archivos multimedia del pack"
+        observed_codes: set[Tuple[int, int]] = set()
+        for physical_key, expected_intent in expected_by_file.items():
+            observed_intent = observed_by_file[physical_key]
+            if not cls._series_episode_intents_compatible(
+                expected_intent,
+                observed_intent,
+            ):
+                return "FileBot cambio la intencion de episodio ligada a un archivo fisico"
+            if (
+                physical_key[3] in MEDIA_EXTENSIONS
+                and observed_intent
+                and observed_intent[0] == "episodes"
+            ):
+                codes = {(int(code[0]), int(code[1])) for code in observed_intent[1]}
+                if observed_codes.intersection(codes):
+                    return "La salida provisional repite episodios entre archivos distintos"
+                observed_codes.update(codes)
+        return None
+
+    @staticmethod
     def _series_bound_manifest(
         paths: List[Path],
-    ) -> List[Tuple[int, int, int, str, Tuple[Tuple[int, int], ...]]]:
-        result: List[
-            Tuple[int, int, int, str, Tuple[Tuple[int, int], ...]]
-        ] = []
+    ) -> List[Tuple[int, int, int, str]]:
+        result: List[Tuple[int, int, int, str]] = []
         for path in paths:
             try:
                 info = path.lstat()
@@ -4148,7 +4885,6 @@ class Engine:
                     int(info.st_ino),
                     int(info.st_size),
                     path.suffix.casefold(),
-                    tuple(sorted(Engine._series_episode_codes(path))),
                 )
             )
         return sorted(result)
@@ -6451,11 +7187,14 @@ class Engine:
         output_root: Path,
         identity: Optional[ResolvedIdentity],
     ) -> Dict[str, object]:
+        if identity is None or int(identity.tmdb_id) <= 0:
+            raise ValueError("FileBot no puede prepararse sin una identidad TMDb aceptada")
         preview = getattr(self.filebot, "preview_command", None)
         if callable(preview):
             return dict(preview(job_id, category, input_root, output_root, identity))
         return {
-            "mode": "guided" if identity else "legacy_amc",
+            "mode": "guided",
+            "tmdb_id": identity.tmdb_id,
             "input_path": str(input_root),
             "output_root": str(output_root),
             "timeout_sec": 14400,

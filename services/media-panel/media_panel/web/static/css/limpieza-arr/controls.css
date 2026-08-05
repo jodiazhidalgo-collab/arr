@@ -68,7 +68,8 @@
   min-width: 0;
 }
 
-.identity-control-label label {
+.identity-control-label label,
+.identity-control-label > span {
   color: #e2e8f0;
   font-weight: 700;
 }
@@ -91,6 +92,26 @@
 .identity-control-editor select {
   min-width: 0;
 }
+
+.identity-readonly-list,
+.identity-readonly-value {
+  min-width: 0;
+  margin: 0;
+  padding: 9px 11px;
+  border: 1px solid rgba(148, 163, 184, .2);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, .56);
+  color: #cbd5e1;
+}
+
+.identity-readonly-list {
+  display: grid;
+  gap: 4px;
+  padding-left: 34px;
+}
+
+.identity-readonly-list li { overflow-wrap: anywhere; }
+.identity-readonly-value { display: block; overflow-wrap: anywhere; }
 
 .identity-toggle {
   min-height: 38px;

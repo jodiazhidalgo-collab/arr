@@ -195,12 +195,12 @@ def _parse_release_name(
     if tv_strong:
         media_hint = "tv"
         confidence = _confidence(rules, "high")
-    elif movie_strong:
-        media_hint = "movies"
-        confidence = _confidence(rules, "high")
     elif explicit in trusted and not is_manual:
         media_hint = explicit
         confidence = _confidence(rules, "medium")
+    elif movie_strong:
+        media_hint = "movies"
+        confidence = _confidence(rules, "high")
     elif movie_from_video:
         media_hint = "movies"
         confidence = _confidence(rules, "high")
@@ -208,8 +208,6 @@ def _parse_release_name(
     category_conflict = None
     if explicit == "movies" and tv_strong:
         category_conflict = "movies_vs_tv"
-    elif explicit == "tv" and movie_strong:
-        category_conflict = "tv_vs_movies"
     if trace is not None:
         trace.record(
             "category.classify",

@@ -1,7 +1,6 @@
 """Orquestación estable del resolver; las piezas puras viven en submódulos."""
 
 import copy
-import json
 import logging
 import time
 from pathlib import Path
@@ -10,21 +9,33 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import requests
 
 from ...diagnostic_sanitizer import sanitize_for_export
+from ...filesystem import media_files
 from ...name_parser import parse_release_name
-from .cache import RESOLVER_CACHE_VERSION, cache_key as _cache_key
+from .cache import (
+    RESOLVER_CACHE_VERSION,
+    cache_key as _cache_key,
+    decode_cache_payload,
+    encode_cache_payload,
+)
 from .candidate_data import (
     candidate_from_payload as _candidate_from_payload,
     merge_search_payload as _merge_search_payload,
-    rank_candidates as _rank_candidates,
 )
 from .candidate_search import (
     MAX_DETAIL_CANDIDATES,
     MAX_TMDB_SEARCHES,
     fetch_details,
     find_imdb,
-    search_candidates,
 )
-from .evidence import TECHNICAL_NAMES, best_guess, collect_evidence, collect_name_evidence
+from .evidence import (
+    TECHNICAL_NAMES,
+    best_guess,
+    collect_episode_intents,
+    collect_evidence,
+    collect_file_episode_intents,
+    collect_name_evidence,
+    probe_media_runtimes,
+)
 from .forced import FORCED_TITLE_SIMILARITY, validate_forced_candidate
 from .http_client import TMDB_BASE_URL, get_json
 from .models import (
@@ -35,6 +46,8 @@ from .models import (
     ResolverUnavailable,
 )
 from .policy import effective_policy
+from .phased import adjudicate_candidates
+from .phased_search import SearchCoverage, discover_and_enrich
 from .rules import (
     IMDB_ID_PATTERN,
     TMDB_ID_PATTERN,
@@ -44,8 +57,6 @@ from .rules import (
     parse_forced_matches as _parse_forced_matches,
     parse_query_aliases as _parse_query_aliases,
 )
-from .scoring import score_candidate
-from .title_matching import resolved_title_evidence
 from .text import (
     as_int as _as_int,
     as_int_list as _as_int_list,
@@ -63,8 +74,7 @@ from .text import (
 
 
 MIN_HTTP_TIMEOUT_MS = 100
-SCORE_TIE_EPSILON = 1e-9
-RESOLVER_ALGORITHM_VERSION = "title-evidence-v1"
+RESOLVER_ALGORITHM_VERSION = "phased-er-v2"
 
 
 class NameResolver:
@@ -78,6 +88,7 @@ class NameResolver:
         database: object,
         logger: Optional[logging.Logger] = None,
         session: Optional[requests.Session] = None,
+        probe_runner: object = None,
     ):
         self.token = token.strip()
         self.language = language.strip() or "es-ES"
@@ -89,11 +100,13 @@ class NameResolver:
         self.db = database
         self.log = logger or logging.getLogger("arr-orchestrator.name-resolver")
         self.session = session or requests.Session()
+        self.probe_runner = probe_runner
         self._deadline = 0.0
         self._rules_snapshot: Dict[str, object] = {}
         self._active_policy: Dict[str, object] = {}
         self._preview_mode = False
         self._trace: Dict[str, object] = {}
+        self._search_coverage = SearchCoverage()
 
     @property
     def enabled(self) -> bool:
@@ -115,62 +128,74 @@ class NameResolver:
             "cache_hit": False,
             "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
         }
+        self._search_coverage = SearchCoverage()
         if not self.enabled:
-            raise ResolverUnavailable("TMDB_API_TOKEN no configurado")
+            details = _failure_details("RETRY_PROVIDER", "token_missing", retryable=True)
+            self._trace["decision"] = _failure_decision("RETRY_PROVIDER", "token_missing")
+            raise ResolverUnavailable("TMDB_API_TOKEN no configurado", details)
 
         category = str(job.get("category") or "")
-        parser_rules = None
         active_snapshot = self._rules_snapshot if rules_snapshot is None else rules_snapshot
-        if isinstance(active_snapshot, dict) and isinstance(active_snapshot.get("parser"), dict):
-            parser_rules = active_snapshot.get("parser")
+        parser_rules = (
+            active_snapshot.get("parser")
+            if isinstance(active_snapshot, dict)
+            and isinstance(active_snapshot.get("parser"), dict)
+            else None
+        )
         parsed = parse_release_name(
             str(job.get("name") or input_root.name), category, rules=parser_rules
         )
         self._trace["parser"] = parsed.to_dict()
-        if parsed.category_conflict:
+        if parsed.category_conflict or category not in {"movies", "tv"}:
+            reason = "category_conflict" if parsed.category_conflict else "category_not_resolvable"
+            decision = _failure_decision("BLOCKED_HARD", reason)
+            self._trace["decision"] = decision
             raise ResolverAmbiguous(
-                "Conflicto fuerte entre categoria y nombre",
+                "Conflicto fuerte entre categoria y nombre"
+                if parsed.category_conflict
+                else "Categoria manual o no audiovisual; no se consulta TMDb",
                 {
-                    "reason_code": "category_conflict",
-                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
-                    "parser": parsed.to_dict(),
-                    "category": category,
-                },
-            )
-        if category not in {"movies", "tv"}:
-            raise ResolverAmbiguous(
-                "Categoria manual o no audiovisual; no se consulta TMDb",
-                {
-                    "reason_code": "category_not_resolvable",
-                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+                    **_failure_details("BLOCKED_HARD", reason, retryable=False),
                     "parser": parsed.to_dict(),
                     "category": category,
                 },
             )
 
-        media_type = "movie" if job.get("category") == "movies" else "tv"
+        media_type = "movie" if category == "movies" else "tv"
         rules = self._effective_rules(category, active_snapshot)
         self._active_policy = rules
         http_rules = rules.get("http") if isinstance(rules.get("http"), dict) else {}
+        coverage_rules = (
+            rules.get("coverage") if isinstance(rules.get("coverage"), dict) else {}
+        )
         effective_timeout_ms = max(
-            MIN_HTTP_TIMEOUT_MS,
-            int(http_rules.get("timeout_ms") or self.http_timeout_ms),
+            MIN_HTTP_TIMEOUT_MS, int(http_rules.get("timeout_ms") or self.http_timeout_ms)
         )
         effective_budget_ms = max(
             effective_timeout_ms,
-            int(http_rules.get("total_budget_ms") or self.total_budget_ms),
+            int(coverage_rules.get("total_budget_ms") or self.total_budget_ms),
         )
         self.http_timeout = effective_timeout_ms / 1000
         self.total_budget = effective_budget_ms / 1000
+        # El presupuesto v2 abarca evidencias locales, cache y TMDb. Empezarlo
+        # despues de ffprobe permitia superar ampliamente el limite configurado.
+        self._deadline = time.monotonic() + self.total_budget
         evidence = self._evidence(job, input_root)
         guessed = self._best_guess(evidence, media_type)
+        if media_type == "tv":
+            guessed["_episode_intents"] = (
+                collect_episode_intents(evidence, rules)
+                if self._preview_mode
+                else collect_file_episode_intents(input_root, rules)
+            )
         query = str(guessed.get("title") or "").strip()
         if not query:
+            reason = "empty_title"
+            self._trace["decision"] = _failure_decision("BLOCKED_HARD", reason)
             raise ResolverAmbiguous(
-                "GuessIt no pudo extraer un titulo util",
+                "No se pudo extraer un titulo util",
                 {
-                    "reason_code": "empty_title",
-                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+                    **_failure_details("BLOCKED_HARD", reason, retryable=False),
                     "evidence": evidence,
                     "guess": guessed,
                 },
@@ -183,6 +208,29 @@ class NameResolver:
             forced_match = self._matching_forced_rule(guessed, rules["forced_matches"])
         guessed = self._apply_query_aliases(guessed, rules["query_aliases"])
         forced_tmdb = str(forced_match[2]) if forced_match else None
+
+        # La duracion es evidencia local de identidad. Debe medirse antes de
+        # consultar la cache: dos archivos con el mismo nombre pero distinto
+        # metraje no pueden compartir una adjudicacion.
+        runtime_evidence = (
+            []
+            if self._preview_mode
+            else probe_media_runtimes(  # type: ignore[arg-type]
+                input_root,
+                rules,
+                self.probe_runner,
+                deadline=self._deadline,
+            )
+        )
+        if runtime_evidence:
+            guessed["_runtime_evidence"] = [dict(item) for item in runtime_evidence]
+        if media_type == "tv":
+            guessed["_episode_intents"] = (
+                collect_episode_intents(evidence, rules, runtime_evidence)
+                if self._preview_mode
+                else collect_file_episode_intents(input_root, rules, runtime_evidence)
+            )
+        media_manifest = [] if self._preview_mode else _local_media_manifest(input_root)
         cache_key = self._cache_key(
             media_type,
             evidence,
@@ -191,239 +239,189 @@ class NameResolver:
             direct_imdb,
             forced_tmdb,
             str(rules["fingerprint"]),
+            runtime_evidence,
+            media_manifest,
         )
         cache_rules = rules.get("cache") if isinstance(rules.get("cache"), dict) else {}
         cache_enabled = bool(cache_rules.get("enabled", True))
-        cache_read_enabled = bool(cache_rules.get("read_enabled", True))
         cached = (
             self.db.get_resolver_cache(cache_key)
-            if cache_enabled and cache_read_enabled and not self._preview_mode
+            if cache_enabled
+            and bool(cache_rules.get("read_enabled", True))
+            and not self._preview_mode
             else None
         )
         if cached:
-            self._trace["cache_hit"] = True
-            identity = ResolvedIdentity.from_dict(json.loads(str(cached["payload_json"])))
-            identity.source = "cache"
-            self._trace["candidates"] = []
-            self._trace["decision"] = {
-                "status": "ACCEPTED",
-                "accepted": True,
-                "has_scoring": True,
-                "source": "cache",
-                "cache_reused": True,
-                "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
-                "eligibility_reason": "cache_v3_reuse",
-                "eligibility_blocked": False,
-                "score": identity.score,
-                "margin": identity.margin,
-            }
-            return identity
+            cached_payload = decode_cache_payload(cached.get("payload_json"))
+            if cached_payload is not None:
+                try:
+                    identity = ResolvedIdentity.from_dict(
+                        dict(cached_payload["identity"])
+                    )
+                except (KeyError, TypeError, ValueError):
+                    cached_payload = None
+            if cached_payload is not None:
+                self._trace["cache_hit"] = True
+                identity.source = "cache"
+                decision = copy.deepcopy(dict(cached_payload["decision"]))
+                origin_source = str(decision.get("source") or "")
+                decision["source"] = "cache"
+                decision["cache_reused"] = True
+                if origin_source:
+                    decision["origin_source"] = origin_source
+                alternatives = copy.deepcopy(decision.get("alternatives") or [])
+                evidence_summary = copy.deepcopy(decision.get("evidence") or [])
+                phase_counts = copy.deepcopy(decision.get("phase_counts") or {})
+                self._trace.update(
+                    {
+                        "decision": decision,
+                        "candidates": alternatives,
+                        "alternatives": copy.deepcopy(alternatives),
+                        "evidence": evidence_summary,
+                        "phase_counts": phase_counts,
+                        "coverage_limited": bool(
+                            decision.get("coverage_limited", False)
+                        ),
+                    }
+                )
+                return identity
+            self._trace["cache_payload_ignored"] = True
 
-        self._deadline = time.monotonic() + self.total_budget
         source = "search"
-        if direct_tmdb:
-            candidates = [self._details(media_type, int(direct_tmdb), str(rules["language"]))]
-            source = "tmdb_id"
-        elif direct_imdb:
-            candidates = self._find_imdb(media_type, direct_imdb, str(rules["language"]))
-            source = "imdb_id"
-        elif forced_match:
-            candidates = [
-                self._validated_forced_candidate(media_type, forced_match, str(rules["language"]))
-            ]
-            source = "forced_match"
-        else:
-            candidates = self._search_candidates(
-                media_type,
-                query,
-                guessed,
-                str(rules["language"]),
-                str(rules["region"]),
-            )
+        try:
+            if direct_tmdb:
+                candidates = [
+                    self._details(media_type, int(direct_tmdb), str(rules["language"]))
+                ]
+                source = "tmdb_id"
+                self._search_coverage = SearchCoverage(
+                    candidates=list(candidates), discovered=1, enriched=1
+                )
+            elif direct_imdb:
+                candidates = self._find_imdb(
+                    media_type, direct_imdb, str(rules["language"])
+                )
+                source = "imdb_id"
+                self._search_coverage = SearchCoverage(
+                    candidates=list(candidates),
+                    discovered=len(candidates),
+                    enriched=len(candidates),
+                )
+            elif forced_match:
+                candidates = [
+                    self._validated_forced_candidate(
+                        media_type, forced_match, str(rules["language"])
+                    )
+                ]
+                source = "forced_match"
+                self._search_coverage = SearchCoverage(
+                    candidates=list(candidates), discovered=1, enriched=1
+                )
+            else:
+                candidates = self._search_candidates(
+                    media_type,
+                    query,
+                    guessed,
+                    str(rules["language"]),
+                    str(rules["region"]),
+                )
+        except ResolverUnavailable as error:
+            reason = "provider_unavailable"
+            self._trace["decision"] = _failure_decision("RETRY_PROVIDER", reason)
+            raise ResolverUnavailable(
+                str(error),
+                {
+                    **dict(error.details),
+                    **_failure_details("RETRY_PROVIDER", reason, retryable=True),
+                },
+            ) from error
+        except ResolverAmbiguous as error:
+            reason = str(error.details.get("reason_code") or "forced_identity_conflict")
+            self._trace["decision"] = _failure_decision("BLOCKED_HARD", reason)
+            raise ResolverAmbiguous(
+                str(error),
+                {
+                    **dict(error.details),
+                    **_failure_details("BLOCKED_HARD", reason, retryable=False),
+                },
+            ) from error
+        except ResolutionError as error:
+            reason = "explicit_identity_invalid"
+            self._trace["decision"] = _failure_decision("BLOCKED_HARD", reason)
+            raise ResolverAmbiguous(
+                str(error),
+                {
+                    **dict(error.details),
+                    **_failure_details("BLOCKED_HARD", reason, retryable=False),
+                },
+            ) from error
+
+        coverage = self._search_coverage
+        self._trace["search_strategy"] = coverage.trace()
         if not candidates:
-            raise ResolverAmbiguous(
-                "TMDb no devolvio candidatos",
+            status = "RETRY_PROVIDER" if coverage.provider_failures else "BLOCKED_HARD"
+            reason = "provider_unavailable" if coverage.provider_failures else "no_candidates"
+            self._trace["decision"] = _failure_decision(status, reason)
+            error_type = ResolverUnavailable if status == "RETRY_PROVIDER" else ResolverAmbiguous
+            raise error_type(
+                "TMDb no devolvio candidatos utilizables",
                 {
-                    "reason_code": "no_candidates",
-                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+                    **_failure_details(status, reason, retryable=status == "RETRY_PROVIDER"),
                     "evidence": evidence,
                     "guess": guessed,
                     "query": query,
-                    "search_strategy": self._trace.get("search_strategy", {}),
+                    "search_strategy": coverage.trace(),
                 },
             )
 
-        direct_identity = source in {"tmdb_id", "imdb_id", "forced_match"}
-        ranked = self._rank_candidates(candidates, guessed, evidence, direct_identity)
-        acceptance = rules.get("acceptance") if isinstance(rules.get("acceptance"), dict) else {}
-        min_score = float(acceptance.get("min_score", 75))
-        min_margin = float(acceptance.get("min_margin", 12))
-        bypass = (
-            source in {"tmdb_id", "imdb_id"}
-            and bool(acceptance.get("direct_ids_bypass", True))
-        ) or (source == "forced_match" and bool(acceptance.get("forced_bypass", True)))
-        eligibility = _select_title_eligible_candidates(
-            ranked,
-            guessed=guessed,
-            media_type=media_type,
+        outcome = adjudicate_candidates(
+            candidates,
+            guessed,
+            media_type,
+            rules,
             source=source,
-            title_matching=rules.get("title_matching"),
-            selection_uncertain=bool(self._trace.get("selection_uncertain", False)),
-            selection_uncertainty_alternate_only=bool(
-                self._trace.get("selection_uncertainty_alternate_only", False)
-            ),
-            detail_incomplete=bool(
-                (self._trace.get("search_strategy") or {}).get("detail_incomplete", False)
-            ),
+            runtime_evidence=runtime_evidence,
+            discovered=coverage.discovered or len(candidates),
+            enriched=coverage.enriched,
+            coverage_limited=coverage.coverage_limited,
+            provider_failures=coverage.provider_failures,
         )
-        eligible_ranked = list(eligibility["eligible"])
-        ineligible_ranked = [candidate for candidate in ranked if not candidate.eligible]
-        eligibility_blocked = not eligible_ranked
-        strict_fallback_applied = bool(eligibility["strict_fallback_applied"])
-        normal_top = eligible_ranked[0] if eligible_ranked else ranked[0]
-        normal_second_score = (
-            eligible_ranked[1].score if len(eligible_ranked) > 1 else 0.0
+        outcome.decision["source"] = source
+        self._trace.update(
+            {
+                "decision": copy.deepcopy(outcome.decision),
+                "candidates": copy.deepcopy(outcome.decision["alternatives"]),
+                "alternatives": copy.deepcopy(outcome.decision["alternatives"]),
+                "evidence": copy.deepcopy(outcome.decision["evidence"]),
+                "phase_counts": copy.deepcopy(outcome.decision["phase_counts"]),
+                "coverage_limited": coverage.coverage_limited,
+            }
         )
-        normal_margin = (
-            normal_top.score - normal_second_score if eligible_ranked else 0.0
-        )
-        eligible_ranked, preference_applied = _prefer_original_language_candidate(
-            eligible_ranked,
-            source=source,
-            min_score=min_score,
-            min_margin=min_margin,
-            normal_score_passed=normal_top.score >= min_score,
-            normal_margin_passed=normal_margin >= min_margin,
-            preference=rules.get("original_language_preference"),
-        )
-        oldest_preference_enabled = bool(
-            acceptance.get("prefer_oldest_exact_title_without_year", False)
-        )
-        oldest_preference_applied = False
-        if not preference_applied:
-            eligible_ranked, oldest_preference_applied = _prefer_oldest_exact_title_movie_candidate(
-                eligible_ranked,
-                media_type=media_type,
-                source=source,
-                guessed=guessed,
-                min_score=min_score,
-                min_margin=min_margin,
-                normal_score_passed=normal_top.score >= min_score,
-                normal_margin_passed=normal_margin >= min_margin,
-                enabled=oldest_preference_enabled,
-                search_selection=self._trace.get("oldest_exact_title_search"),
-            )
-        ranked = [*eligible_ranked, *ineligible_ranked] if eligible_ranked else list(ranked)
-        top = eligible_ranked[0] if eligible_ranked else ranked[0]
-        second_score = (
-            eligible_ranked[1].score if len(eligible_ranked) > 1 else 0.0
-        )
-        margin = top.score - second_score if eligible_ranked else 0.0
-        score_passed = top.score >= min_score
-        margin_passed = margin >= min_margin
-        self._trace["candidates"] = [candidate.to_dict() for candidate in ranked]
-        preference_rules = (
-            rules.get("original_language_preference")
-            if isinstance(rules.get("original_language_preference"), dict)
-            else {}
-        )
-        preference_language = str(preference_rules.get("language") or "en")
-        preference_decision = {
-            "applied": preference_applied,
-            "enabled": bool(preference_rules.get("enabled", True)),
-            "language": preference_language,
-            "selected_original_language": top.original_language or None,
-        }
-        oldest_preference_decision = {
-            "applied": oldest_preference_applied,
-            "enabled": oldest_preference_enabled,
-            "selected_year": top.year if oldest_preference_applied else None,
-            "reason_code": (
-                "oldest_exact_title_without_year" if oldest_preference_applied else None
-            ),
-        }
-        decision_status = (
-            "ACCEPTED"
-            if not eligibility_blocked
-            and (
-                bypass
-                or strict_fallback_applied
-                or (score_passed and margin_passed)
-                or preference_applied
-                or oldest_preference_applied
-            )
-            else "REJECTED"
-            if eligibility_blocked
-            else "REJECTED_SCORE"
-            if not score_passed
-            else "REJECTED_MARGIN"
-        )
-        self._trace["decision"] = {
-            "status": decision_status,
-            "accepted": decision_status == "ACCEPTED",
-            "has_scoring": True,
-            "source": source,
-            "bypass": bypass,
-            "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
-            "eligibility_reason": eligibility["reason_code"],
-            "eligible_candidate_count": len(eligible_ranked),
-            "eligibility_blocked": eligibility_blocked,
-            "strict_alternate_fallback": {
-                "applied": strict_fallback_applied,
-                "requires_exact_year": True,
-                "requires_valid_season": media_type == "tv",
-            },
-            "score": top.score,
-            "second_score": second_score,
-            "has_second_candidate": len(eligible_ranked) > 1,
-            "min_score": min_score,
-            "score_passed": score_passed,
-            "margin": margin,
-            "min_margin": min_margin,
-            "margin_passed": margin_passed,
-            "original_language_preference": preference_decision,
-            "oldest_exact_title_preference": oldest_preference_decision,
-        }
-        if (
-            not bypass
-            and not strict_fallback_applied
-            and not preference_applied
-            and not oldest_preference_applied
-            and (eligibility_blocked or top.score < min_score or margin < min_margin)
-        ):
-            raise ResolverAmbiguous(
-                "La identidad no supera el umbral de seguridad",
-                {
-                    "reason_code": eligibility["reason_code"],
-                    "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
-                    "evidence": evidence,
-                    "guess": guessed,
-                    "query": query,
-                    "top_score": top.score,
-                    "margin": margin,
-                    "min_score": min_score,
-                    "min_margin": min_margin,
-                    "candidates": [candidate.to_dict() for candidate in ranked[:5]],
-                    "selection_uncertain": bool(
-                        self._trace.get("selection_uncertain", False)
-                    ),
-                    "raw_exact_candidate_counts": self._trace.get(
-                        "raw_exact_candidate_counts", {}
-                    ),
-                    "search_strategy": self._trace.get("search_strategy", {}),
-                },
-            )
+        if outcome.selected is None:
+            details = {
+                **_failure_details(
+                    outcome.status,
+                    str(outcome.decision.get("fallback_reason") or "identity_conflict"),
+                    retryable=outcome.status == "RETRY_PROVIDER",
+                ),
+                "decision": copy.deepcopy(outcome.decision),
+                "guess": guessed,
+                "query": query,
+                "candidates": copy.deepcopy(outcome.decision["alternatives"]),
+            }
+            if outcome.status == "RETRY_PROVIDER":
+                raise ResolverUnavailable("TMDb no pudo completar la cobertura", details)
+            raise ResolverAmbiguous("Todas las identidades contradicen la evidencia", details)
 
+        selected = outcome.selected
         identity = ResolvedIdentity(
             media_type=media_type,
-            tmdb_id=top.tmdb_id,
-            title=top.title,
-            original_title=top.original_title,
-            year=top.year,
-            original_language=top.original_language,
-            aliases=_unique([top.title, top.original_title, *top.aliases]),
-            score=top.score,
-            margin=margin,
+            tmdb_id=selected.tmdb_id,
+            title=selected.title,
+            original_title=selected.original_title,
+            year=selected.year,
+            original_language=selected.original_language,
+            aliases=_unique([selected.title, selected.original_title, *selected.aliases]),
             query=query,
             guess=_json_safe(guessed),
             source=source,
@@ -434,22 +432,33 @@ class NameResolver:
                 else []
             ),
             resolver_algorithm_version=RESOLVER_ALGORITHM_VERSION,
+            decision_status=outcome.status,
+            coverage_limited=coverage.coverage_limited,
+            evidence_summary=[dict(item) for item in selected.evidence],
+            episode_intents=[
+                dict(item)
+                for item in guessed.get("_episode_intents") or []
+                if isinstance(item, dict)
+            ],
         )
-        if cache_enabled and bool(cache_rules.get("write_enabled", True)) and not self._preview_mode:
+        if (
+            cache_enabled
+            and bool(cache_rules.get("write_enabled", True))
+            and not self._preview_mode
+        ):
             self.db.set_resolver_cache(
                 cache_key,
                 media_type,
-                json.dumps(identity.to_dict(), ensure_ascii=False),
+                encode_cache_payload(identity.to_dict(), outcome.decision),
                 max(1, int(cache_rules.get("ttl_seconds") or 30 * 24 * 3600)),
             )
         self.log.info(
-            "Identidad resuelta: %s -> TMDb %s %s (%s), score %.1f, margen %.1f",
+            "Identidad v2 resuelta: %s -> TMDb %s %s (%s), %s",
             query,
             identity.tmdb_id,
             identity.title,
             identity.year or "sin ano",
-            identity.score,
-            identity.margin,
+            outcome.status,
         )
         return identity
 
@@ -470,6 +479,7 @@ class NameResolver:
             self.db,
             self.log,
             session=self.session,
+            probe_runner=self.probe_runner,
         )
         preview._preview_mode = True
         snapshot = copy.deepcopy(
@@ -481,12 +491,13 @@ class NameResolver:
                 Path("preview"),
                 snapshot,
             )
+            status = identity.decision_status or "ACCEPTED_CONFIDENT"
             return {
                 "ok": True,
-                "status": "ACCEPTED",
+                "status": status,
                 "identity": identity.to_dict(),
                 **copy.deepcopy(preview._trace),
-                "decision": _preview_decision("ACCEPTED", preview._trace),
+                "decision": _preview_decision(status, preview._trace),
             }
         except ResolverAmbiguous as error:
             details = sanitize_for_export(copy.deepcopy(error.details))
@@ -498,28 +509,7 @@ class NameResolver:
                 if isinstance(traced_decision, dict)
                 else ""
             )
-            status = traced_status or (
-                "NO_CANDIDATES"
-                if details.get("reason_code") == "no_candidates"
-                else "REJECTED"
-            )
-            if not traced_status and details.get("top_score") is not None:
-                score = float(details.get("top_score") or 0)
-                margin = float(details.get("margin") or 0)
-                min_score = (
-                    75.0
-                    if details.get("min_score") is None
-                    else float(details["min_score"])
-                )
-                min_margin = (
-                    12.0
-                    if details.get("min_margin") is None
-                    else float(details["min_margin"])
-                )
-                if score < min_score:
-                    status = "REJECTED_SCORE"
-                elif margin < min_margin:
-                    status = "REJECTED_MARGIN"
+            status = traced_status or str(details.get("status") or "BLOCKED_HARD")
             return {
                 "ok": True,
                 "status": status,
@@ -530,13 +520,14 @@ class NameResolver:
             }
         except ResolverUnavailable as error:
             details = sanitize_for_export(copy.deepcopy(error.details))
+            status = str(error.details.get("status") or "RETRY_PROVIDER")
             return {
-                "ok": False,
-                "status": "TMDB_UNAVAILABLE",
+                "ok": True,
+                "status": status,
                 "message": str(error),
                 "details": details if isinstance(details, dict) else {},
                 **copy.deepcopy(preview._trace),
-                "decision": _preview_decision("TMDB_UNAVAILABLE", preview._trace),
+                "decision": _preview_decision(status, preview._trace),
             }
         except ResolutionError as error:
             sanitized = sanitize_for_export(copy.deepcopy(error.details))
@@ -626,7 +617,7 @@ class NameResolver:
         language: Optional[str] = None,
         region: Optional[str] = None,
     ) -> List[ResolverCandidate]:
-        return search_candidates(
+        coverage = discover_and_enrich(
             media_type,
             query,
             guessed,
@@ -635,9 +626,10 @@ class NameResolver:
             self._active_policy,
             self._get,
             self._details,
-            self._rank_candidates,
-            selection_trace=self._trace,
         )
+        self._search_coverage = coverage
+        self._trace["search_strategy"] = coverage.trace()
+        return list(coverage.candidates)
 
     def _find_imdb(
         self, media_type: str, imdb_id: str, language: Optional[str] = None
@@ -650,38 +642,6 @@ class NameResolver:
         return fetch_details(media_type, tmdb_id, language, self.language, self._get)
 
     _candidate_from_payload = staticmethod(_candidate_from_payload)
-
-    def _rank_candidates(
-        self,
-        candidates: Sequence[ResolverCandidate],
-        guessed: Dict[str, object],
-        evidence: Sequence[str],
-        direct_identity: bool,
-    ) -> List[ResolverCandidate]:
-        return _rank_candidates(
-            candidates,
-            guessed,
-            evidence,
-            direct_identity,
-            self._active_policy.get("scoring"),
-            self._active_policy.get("title_matching"),
-        )
-
-    def _score_candidate(
-        self,
-        candidate: ResolverCandidate,
-        guessed: Dict[str, object],
-        evidence: Sequence[str],
-        direct_identity: bool,
-    ) -> Tuple[float, List[Dict[str, object]]]:
-        return score_candidate(
-            candidate,
-            guessed,
-            evidence,
-            direct_identity,
-            self._active_policy.get("scoring"),
-            self._active_policy.get("title_matching"),
-        )
 
     def _get(self, endpoint: str, params: Dict[str, object]) -> Dict[str, object]:
         return get_json(
@@ -698,196 +658,34 @@ class NameResolver:
     _cache_key = staticmethod(_cache_key)
 
 
-def _select_title_eligible_candidates(
-    ranked: Sequence[ResolverCandidate],
-    *,
-    guessed: Dict[str, object],
-    media_type: str,
-    source: str,
-    title_matching: object,
-    selection_uncertain: bool,
-    selection_uncertainty_alternate_only: bool = False,
-    detail_incomplete: bool = False,
-) -> Dict[str, object]:
-    """Separa seguridad de evidencia y puntuacion numerica."""
+def _local_media_manifest(input_root: Path) -> List[Dict[str, object]]:
+    """Huella barata del contenido local que evita cache cruzada por basename."""
 
-    ordered = list(ranked)
-
-    def select(
-        candidates: Sequence[ResolverCandidate],
-        reason: str,
-        *,
-        strict_fallback: bool = False,
-    ) -> Dict[str, object]:
-        selected_ids = {candidate.tmdb_id for candidate in candidates}
-        for candidate in ordered:
-            candidate.eligible = candidate.tmdb_id in selected_ids
-            candidate.eligibility_reasons = [
-                reason if candidate.eligible else f"excluded:{reason}"
-            ]
-        return {
-            "eligible": [candidate for candidate in ordered if candidate.eligible],
-            "reason_code": reason,
-            "strict_fallback_applied": strict_fallback,
-        }
-
-    if source != "search":
-        return select(ordered, f"{source}_validated")
-
-    viable = [
-        candidate
-        for candidate in ordered
-        if not _candidate_has_invalid_season(candidate, guessed, media_type)
-    ]
-    if ordered and not viable:
-        return select([], "season_impossible")
-
-    evidence = resolved_title_evidence(guessed, title_matching)
-    has_alternate = any(item.get("role") == "alternate" for item in evidence)
-    has_composite = any(item.get("role") == "composite" for item in evidence)
-    guessed_year = _as_int(guessed.get("year"))
-    corroborated = [
-        candidate for candidate in viable if candidate.title_match_level == "corroborated"
-    ]
-    configured = [
-        candidate for candidate in viable if candidate.title_match_level == "configured"
-    ]
-    configured_for_year = (
-        configured
-        if guessed_year is None
-        else [candidate for candidate in configured if candidate.year == guessed_year]
-    )
-    if selection_uncertain:
-        if (
-            corroborated
-            and selection_uncertainty_alternate_only
-            and not detail_incomplete
-            and not configured_for_year
-        ):
-            return select(corroborated, "corroborated_titles")
-        return select([], "title_selection_uncertain")
-
-    if configured_for_year:
-        return select(configured_for_year, "configured_primary")
-
-    if not has_alternate and not has_composite:
-        primary_supported = [
-            candidate
-            for candidate in viable
-            if candidate.title_match_level in {"primary", "corroborated"}
-            or (
-                candidate.title_match_level == "configured"
-                and (guessed_year is None or candidate.year == guessed_year)
+    try:
+        paths = media_files(input_root)
+    except OSError:
+        return []
+    result: List[Dict[str, object]] = []
+    for path in sorted(paths, key=lambda item: str(item).casefold()):
+        try:
+            stat = path.stat()
+            source = (
+                path.name
+                if input_root.is_file()
+                else path.relative_to(input_root).as_posix()
             )
-        ]
-        if primary_supported:
-            return select(primary_supported, "single_primary_title")
-        return select([], "title_evidence_unconfirmed")
-
-    if corroborated:
-        return select(corroborated, "corroborated_titles")
-
-    primary = [
-        candidate
-        for candidate in viable
-        if _candidate_has_exact_primary(candidate)
-    ]
-    alternate = [
-        candidate
-        for candidate in viable
-        if _candidate_has_exact_role(candidate, "alternate")
-    ]
-
-    if primary and alternate:
-        year = guessed_year
-        if year is None:
-            return select([], "title_evidence_conflict")
-        exact_primary = [candidate for candidate in primary if candidate.year == year]
-        exact_alternate = [candidate for candidate in alternate if candidate.year == year]
-        if exact_primary and not exact_alternate:
-            return select(exact_primary, "primary_exact_year")
-        if exact_alternate and not exact_primary:
-            if len(exact_alternate) == 1 and _strict_alternate_season_valid(
-                exact_alternate[0], guessed, media_type
-            ):
-                return select(
-                    exact_alternate,
-                    "strict_alternate_fallback",
-                    strict_fallback=True,
-                )
-            return select([], "alternate_fallback_not_unique")
-        return select([], "title_evidence_conflict")
-
-    if primary:
-        return select(primary, "primary_without_alternate_conflict")
-
-    if alternate:
-        year = guessed_year
-        exact = [candidate for candidate in alternate if year is not None and candidate.year == year]
-        if (
-            len(exact) == 1
-            and _strict_alternate_season_valid(exact[0], guessed, media_type)
-        ):
-            return select(
-                exact,
-                "strict_alternate_fallback",
-                strict_fallback=True,
+            result.append(
+                {
+                    "source": source,
+                    "size_bytes": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                }
             )
-        reason = "alternate_fallback_requires_year" if year is None else "alternate_fallback_not_unique"
-        return select([], reason)
-
-    return select([], "title_evidence_unconfirmed")
-
-
-def _candidate_has_exact_role(candidate: ResolverCandidate, role: str) -> bool:
-    if role in candidate.title_identity_exact_roles:
-        return True
-    return any(
-        item.get("role") == role
-        and item.get("identity_exact", item.get("exact")) is True
-        for item in candidate.title_matches
-    )
-
-
-def _candidate_has_exact_primary(candidate: ResolverCandidate) -> bool:
-    if {"primary", "derived_primary"} & set(candidate.title_identity_exact_roles):
-        return True
-    return any(
-        item.get("role") in {"primary", "derived_primary"}
-        and item.get("identity_exact", item.get("exact")) is True
-        for item in candidate.title_matches
-    )
-
-
-def _candidate_has_invalid_season(
-    candidate: ResolverCandidate,
-    guessed: Dict[str, object],
-    media_type: str,
-) -> bool:
-    if media_type != "tv":
-        return False
-    season = _as_int(guessed.get("season"))
-    return bool(
-        season is not None
-        and candidate.season_count is not None
-        and not 0 <= season <= candidate.season_count
-    )
-
-
-def _strict_alternate_season_valid(
-    candidate: ResolverCandidate,
-    guessed: Dict[str, object],
-    media_type: str,
-) -> bool:
-    if media_type != "tv":
-        return True
-    season = _as_int(guessed.get("season"))
-    if season is None:
-        return True
-    return bool(
-        candidate.season_count is not None
-        and 0 <= season <= candidate.season_count
-    )
+        except (OSError, ValueError):
+            # Un archivo que no puede inventariarse no debe compartir una
+            # entrada aparentemente valida con otro lote.
+            result.append({"source": path.name, "unreadable": True})
+    return result
 
 
 def _preview_decision(status: str, trace: Dict[str, object]) -> Dict[str, object]:
@@ -895,129 +693,54 @@ def _preview_decision(status: str, trace: Dict[str, object]) -> Dict[str, object
     if isinstance(existing, dict):
         decision = copy.deepcopy(existing)
         decision["status"] = status
-        decision["accepted"] = status == "ACCEPTED"
-        decision["has_scoring"] = True
+        decision["accepted"] = status.startswith("ACCEPTED_")
+        decision["has_scoring"] = False
         return decision
     return {
         "status": status,
         "accepted": False,
         "has_scoring": False,
-        "bypass": False,
+        "confidence": "none",
+        "fallback_reason": None,
+        "coverage_limited": False,
+        "selected": None,
+        "alternatives": [],
+        "evidence": [],
+        "phase_counts": {
+            "discovered": 0,
+            "enriched": 0,
+            "eliminated": 0,
+            "plausible": 0,
+        },
     }
 
 
-def _prefer_original_language_candidate(
-    ranked: Sequence[ResolverCandidate],
-    *,
-    source: str,
-    min_score: float,
-    min_margin: float,
-    normal_score_passed: bool,
-    normal_margin_passed: bool,
-    preference: object,
-) -> Tuple[List[ResolverCandidate], bool]:
-    """Promueve un unico idioma preferido solo dentro de la zona ambigua."""
-
-    ordered = list(ranked)
-    settings = preference if isinstance(preference, dict) else {}
-    enabled = bool(settings.get("enabled", True))
-    language = _base_language(str(settings.get("language") or "en"))
-    if (
-        not ordered
-        or source != "search"
-        or not enabled
-        or not language
-        or not normal_score_passed
-        or normal_margin_passed
-    ):
-        return ordered, False
-
-    best_score = ordered[0].score
-    ambiguous = [
-        candidate
-        for candidate in ordered
-        if candidate.score >= min_score
-        and best_score - candidate.score < min_margin
-    ]
-    if len(ambiguous) < 2:
-        return ordered, False
-    preferred = [
-        candidate
-        for candidate in ambiguous
-        if _base_language(candidate.original_language) == language
-    ]
-    if len(preferred) != 1:
-        return ordered, False
-
-    selected = preferred[0]
-    return [selected, *(candidate for candidate in ordered if candidate is not selected)], True
+def _failure_details(status: str, reason: str, *, retryable: bool) -> Dict[str, object]:
+    return {
+        "status": status,
+        "reason_code": reason,
+        "retryable": retryable,
+        "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+    }
 
 
-def _base_language(value: str) -> str:
-    return str(value or "").strip().split("-", 1)[0].casefold()
-
-
-def _prefer_oldest_exact_title_movie_candidate(
-    ranked: Sequence[ResolverCandidate],
-    *,
-    media_type: str,
-    source: str,
-    guessed: Dict[str, object],
-    min_score: float,
-    min_margin: float,
-    normal_score_passed: bool,
-    normal_margin_passed: bool,
-    enabled: bool,
-    search_selection: object,
-) -> Tuple[List[ResolverCandidate], bool]:
-    """Promueve el unico año minimo solo en una ambiguedad exacta y comprobada."""
-
-    ordered = list(ranked)
-    selection = search_selection if isinstance(search_selection, dict) else {}
-    expected_tmdb_id = _as_int(selection.get("tmdb_id"))
-    if (
-        len(ordered) < 2
-        or media_type != "movie"
-        or source != "search"
-        or not enabled
-        or _as_int(guessed.get("year")) is not None
-        or not normal_score_passed
-        or normal_margin_passed
-        or abs(ordered[0].score - ordered[1].score) > SCORE_TIE_EPSILON
-        or selection.get("eligible") is not True
-        or expected_tmdb_id is None
-    ):
-        return ordered, False
-
-    best_score = ordered[0].score
-    ambiguous = [
-        candidate
-        for candidate in ordered
-        if candidate.score >= min_score
-        and best_score - candidate.score < min_margin
-    ]
-    query_normalized = _normalize_title(str(guessed.get("title") or ""))
-    if (
-        len(ambiguous) < 2
-        or not query_normalized
-        or any(
-            abs(best_score - candidate.score) > SCORE_TIE_EPSILON
-            for candidate in ambiguous
-        )
-        or any(
-            _normalize_title(candidate.title) != query_normalized
-            for candidate in ambiguous
-        )
-        or any(candidate.year is None for candidate in ambiguous)
-    ):
-        return ordered, False
-
-    oldest_year = min(
-        int(candidate.year) for candidate in ambiguous if candidate.year is not None
-    )
-    oldest = [candidate for candidate in ambiguous if candidate.year == oldest_year]
-    if len(oldest) != 1 or oldest[0].tmdb_id != expected_tmdb_id:
-        return ordered, False
-
-    selected = oldest[0]
-    return [selected, *(candidate for candidate in ordered if candidate is not selected)], True
+def _failure_decision(status: str, reason: str) -> Dict[str, object]:
+    return {
+        "status": status,
+        "accepted": False,
+        "confidence": "none",
+        "fallback_reason": reason,
+        "coverage_limited": status == "RETRY_PROVIDER",
+        "selected": None,
+        "selected_tmdb_id": None,
+        "alternatives": [],
+        "evidence": [],
+        "phase_counts": {
+            "discovered": 0,
+            "enriched": 0,
+            "eliminated": 0,
+            "plausible": 0,
+        },
+        "has_scoring": False,
+        "resolver_algorithm_version": RESOLVER_ALGORITHM_VERSION,
+    }

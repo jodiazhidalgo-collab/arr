@@ -142,7 +142,7 @@ class Config:
                 os.environ.get("ARR_RESOLVER_HTTP_TIMEOUT_MS", "2500")
             ),
             resolver_total_budget_ms=int(
-                os.environ.get("ARR_RESOLVER_TOTAL_BUDGET_MS", "5000")
+                os.environ.get("ARR_RESOLVER_TOTAL_BUDGET_MS", "20000")
             ),
             resolver_retry_seconds=int(
                 os.environ.get("ARR_RESOLVER_RETRY_SECONDS", "60")

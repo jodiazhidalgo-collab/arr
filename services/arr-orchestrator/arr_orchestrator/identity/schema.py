@@ -168,239 +168,179 @@ IDENTITY_SETTINGS_SCHEMA: Dict[str, object] = {
             ),
         ],
     },
-    "resolver": {
-        "title": "Resolucion TMDb",
+    "resolver": {"title": "", "groups": []},
+}
+
+
+_PARSER_SETTINGS_SCHEMA = copy.deepcopy(IDENTITY_SETTINGS_SCHEMA["parser"])
+
+
+def _common_resolver_schema() -> Dict[str, object]:
+    return {
+        "title": "Identidad por evidencias",
         "groups": [
             _group(
-                "resolver_locales",
-                "Idiomas y reglas directas",
-                "Preferencias de consulta y excepciones expresamente aprobadas.",
+                "resolver_algorithm",
+                "Algoritmo",
+                "Resolver v2 por fases, sin pesos ni margenes numericos.",
                 [
-                    _control("resolver.locales.movies.language", "language", "Idioma peliculas", "Locale principal para peliculas."),
-                    _control("resolver.locales.movies.region", "region", "Region peliculas", "Region de resultados TMDb."),
-                    _control("resolver.locales.tv.language", "language", "Idioma series", "Locale principal para series."),
+                    _control(
+                        "resolver.algorithm",
+                        "select",
+                        "Algoritmo activo",
+                        "Contrato estable del resolver.",
+                        options=[{"value": "phased-er-v2", "label": "Phased ER v2"}],
+                    ),
                     _control("resolver.locales.fallback_language", "language", "Idioma alternativo", "Segundo idioma de busqueda."),
-                    _control("resolver.locales.use_fallback", "toggle", "Usar idioma alternativo", "Consulta el idioma alternativo cuando aporta candidatos."),
-                    _control(
-                        "resolver.original_language_preference.language",
-                        "language",
-                        "Idioma original preferido",
-                        "Idioma original usado para resolver resultados ambiguos, por ejemplo en.",
-                    ),
-                    _control(
-                        "resolver.original_language_preference.enabled",
-                        "toggle",
-                        "Resolver ambigüedades con este idioma",
-                        "Si existe un único candidato de este idioma entre los mejores, lo selecciona sin excluir películas claras de otros países.",
-                    ),
-                    _control("resolver.aliases.movies", "mapping_rules", "Alias de peliculas", "Formato: origen | destino.", format="origen | destino"),
-                    _control("resolver.aliases.tv", "mapping_rules", "Alias de series", "Formato: origen | destino.", format="origen | destino"),
-                    _control("resolver.forced_matches.movies", "mapping_rules", "Coincidencias forzadas de peliculas", "Formato: titulo | año | tmdb_id.", format="titulo | año | tmdb_id"),
-                    _control("resolver.forced_matches.tv", "mapping_rules", "Coincidencias forzadas de series", "Formato: titulo | tmdb_id o titulo | año | tmdb_id.", format="titulo | tmdb_id"),
+                    _control("resolver.locales.use_fallback", "toggle", "Usar idioma alternativo", "Amplia cobertura cuando el idioma principal no basta."),
+                    _control("resolver.locales.movies.language", "language", "Idioma peliculas", "Idioma principal de peliculas."),
+                    _control("resolver.locales.movies.region", "region", "Region peliculas", "Region principal de peliculas."),
+                    _control("resolver.locales.tv.language", "language", "Idioma series", "Idioma principal de series."),
+                    _control("resolver.aliases.movies", "mapping_rules", "Alias de peliculas", "Formato origen | destino.", format="origen | destino"),
+                    _control("resolver.aliases.tv", "mapping_rules", "Alias de series", "Formato origen | destino.", format="origen | destino"),
+                    _control("resolver.forced_matches.movies", "mapping_rules", "TMDb forzado peliculas", "Formato titulo | año | tmdb_id.", format="titulo | año | tmdb_id"),
+                    _control("resolver.forced_matches.tv", "mapping_rules", "TMDb forzado series", "Formato titulo | tmdb_id o titulo | año | tmdb_id.", format="titulo | tmdb_id"),
                 ],
             ),
             _group(
                 "resolver_evidence",
-                "Evidencias y candidato inicial",
-                "Fuentes y pesos usados para construir el nombre consultado.",
+                "Fuentes de evidencia",
+                "Cada familia se cuenta una sola vez como acuerdo, desacuerdo o desconocida.",
                 [
-                    *[
-                        _control(f"resolver.evidence.{key}", "toggle", label, help_text)
-                        for key, label, help_text in (
-                            ("use_job_name", "Nombre del trabajo", "Usa el nombre recibido por ARR."),
-                            ("use_folder_name", "Nombre de carpeta", "Usa el nombre de la carpeta de entrada."),
-                            ("use_media_files", "Nombres de archivos", "Usa archivos multimedia como evidencia adicional."),
-                            ("sort_largest_first", "Archivos grandes primero", "Prioriza los archivos mas representativos."),
-                        )
-                    ],
-                    _control("resolver.evidence.max_media_files", "number", "Maximo de archivos", "Limite de nombres de archivos examinados.", min=0, max=1000, step=1),
-                    *[
-                        _control(f"resolver.guess_selection.{key}", "number", label, help_text, min=minimum, max=maximum, step=1)
-                        for key, label, help_text, minimum, maximum in (
-                            ("base", "Base", "Puntuacion base de una evidencia.", 0, 1000),
-                            ("index_penalty", "Penalizacion por orden", "Resta por cada evidencia posterior.", 0, 100),
-                            ("year_bonus", "Bonus de año", "Suma cuando GuessIt obtiene año.", -500, 500),
-                            ("season_bonus", "Bonus de temporada", "Suma cuando obtiene temporada.", -500, 500),
-                            ("parser_high_bonus", "Bonus parser alto", "Suma si el parser tiene confianza alta.", -500, 500),
-                        )
-                    ],
+                    _control("resolver.evidence.use_job_name", "toggle", "Nombre del trabajo", "Usa el nombre recibido por ARR."),
+                    _control("resolver.evidence.use_folder_name", "toggle", "Nombre de carpeta", "Usa la carpeta de entrada."),
+                    _control("resolver.evidence.use_media_files", "toggle", "Archivos multimedia", "Usa cada archivo como evidencia independiente."),
+                    _control("resolver.evidence.max_media_files", "number", "Maximo de archivos", "Limite de archivos examinados.", min=0, max=1000, step=1),
+                    _control("resolver.evidence.sort_largest_first", "toggle", "Mayores primero", "Prioriza los archivos principales."),
                 ],
             ),
             _group(
-                "resolver_series_candidates",
-                "Candidatos de series",
-                "Reglas para construir titulos alternativos alrededor de marcadores de episodio.",
-                [
-                    _control(
-                        "resolver.series_candidates.title_before_episode_marker",
-                        "toggle",
-                        "Título anterior al episodio",
-                        "Añade como candidato el título situado antes de S01E02, 1x02 y otros patrones configurados en el Parser.",
-                    ),
-                    _control(
-                        "resolver.series_candidates.min_title_words",
-                        "number",
-                        "Mínimo de palabras",
-                        "Número mínimo de palabras que debe tener ese título alternativo.",
-                        min=1,
-                        max=20,
-                        step=1,
-                    ),
-                ],
-            ),
-            _group(
-                "resolver_title_matching",
-                "Comparación de títulos",
-                "Equivalencias y límites aplicados al comparar candidatos sin alterar sus puntos.",
-                [
-                    _control(
-                        "resolver.title_matching.score_parser_candidates",
-                        "toggle",
-                        "Puntuar candidatos del parser",
-                        "Usa las variantes del parser al puntuar, independientemente de si se consultan en TMDb.",
-                    ),
-                    _control(
-                        "resolver.title_matching.roman_arabic_equivalence",
-                        "toggle",
-                        "Equivalencia romana y arábiga",
-                        "Considera equivalentes números como III y 3 al comparar títulos.",
-                    ),
-                    _control(
-                        "resolver.title_matching.allow_omitted_part_number",
-                        "toggle",
-                        "Permitir número de saga omitido",
-                        "Acepta una coincidencia cuando un título omite únicamente el número de la entrega.",
-                    ),
-                    _control(
-                        "resolver.title_matching.omitted_part_min_words",
-                        "number",
-                        "Palabras mínimas sin número",
-                        "Mínimo de palabras compartidas para aceptar un número de saga omitido.",
-                        min=1,
-                        max=20,
-                        step=1,
-                    ),
-                    _control(
-                        "resolver.title_matching.supplemental_min_chars",
-                        "number",
-                        "Longitud mínima del título auxiliar",
-                        "Descarta candidatos auxiliares más cortos que este número de caracteres.",
-                        min=1,
-                        max=100,
-                        step=1,
-                    ),
-                ],
-            ),
-            _group(
-                "resolver_search",
-                "Busqueda",
-                "Variantes y limites duros de llamadas a TMDb.",
+                "resolver_queries",
+                "Consultas y comparacion",
+                "Variantes de descubrimiento y equivalencias de titulo.",
                 [
                     *[
                         _control(f"resolver.query_variants.{key}", "toggle", label, help_text)
                         for key, label, help_text in (
                             ("with_year", "Buscar con año", "Incluye el año cuando existe."),
-                            ("without_year", "Buscar sin año", "Prueba tambien una consulta mas amplia."),
-                            ("use_parser_candidates", "Candidatos del parser", "Consulta las variantes de titulo del parser."),
-                            ("use_guessit", "Titulo de GuessIt", "Incluye el titulo inferido por GuessIt."),
-                            ("use_tail_cleanup", "Limpiar cola", "Prueba una variante sin ruido final."),
-                            ("use_spanish_correction", "Correccion española", "Prueba la correccion conservadora de titulos españoles."),
+                            ("without_year", "Buscar sin año", "Amplia cobertura sin forzar el año."),
+                            ("use_parser_candidates", "Titulos del parser", "Consulta los titulos estructurados del parser."),
+                            ("use_guessit", "Titulo GuessIt", "Incluye el titulo reconocido por GuessIt."),
+                            ("use_tail_cleanup", "Limpiar ruido final", "Reintenta sin etiquetas tecnicas finales."),
+                            ("use_spanish_correction", "Correccion española", "Prueba variantes ortograficas seguras."),
                         )
                     ],
-                    *[
-                        _control(f"resolver.search_limits.{key}", "number", label, help_text, min=1, max=maximum, step=1)
-                        for key, label, help_text, maximum in (
-                            ("max_searches", "Maximo de consultas", "Tope total de busquedas TMDb.", 8),
-                            ("results_per_search", "Resultados por consulta", "Resultados leidos de cada respuesta.", 100),
-                            ("detail_candidates", "Detalles de candidatos", "Maximo de fichas completas descargadas.", 3),
-                            ("initial_candidates", "Candidatos iniciales", "Primeros candidatos que pasan a detalle.", 3),
-                        )
-                    ],
-                    _control("resolver.search_limits.include_exact_year_candidate", "toggle", "Incluir año exacto", "Reserva un candidato con el año exacto si no quedo arriba."),
+                    _control("resolver.title_matching.roman_arabic_equivalence", "toggle", "Romanos y arabigos", "Considera equivalentes numeros romanos y arabigos."),
+                    _control("resolver.title_matching.allow_omitted_part_number", "toggle", "Parte omitida", "Permite omitir un numero de saga bajo reglas seguras."),
+                    _control("resolver.title_matching.omitted_part_min_words", "number", "Palabras minimas", "Minimo para una parte omitida.", min=1, max=20, step=1),
+                    _control("resolver.title_matching.supplemental_min_chars", "number", "Longitud alternativa", "Longitud minima de un titulo alternativo.", min=1, max=100, step=1),
                 ],
             ),
             _group(
-                "resolver_scoring",
-                "Puntuacion",
-                "Pesos del ranking. Los negativos penalizan contradicciones.",
+                "resolver_coverage",
+                "Cobertura adaptativa",
+                "Topes duros para descubrir y enriquecer candidatos.",
                 [
-                    *[
-                        _control(f"resolver.scoring.{key}", control_type, label, help_text, min=minimum, max=maximum, step=step)
-                        for key, control_type, label, help_text, minimum, maximum, step in (
-                            ("direct_identity", "number", "Identificador directo", "Puntuacion de TMDb/IMDb confirmado.", 0, 1000, 1),
-                            ("title_exact", "number", "Titulo exacto", "Bonus por titulo exacto.", 0, 500, 1),
-                            ("title_similarity_max", "number", "Similitud de titulo", "Peso maximo de similitud.", 0, 500, 1),
-                            ("token_overlap_max", "number", "Coincidencia de palabras", "Peso maximo de tokens compartidos.", 0, 500, 1),
-                            ("spanish_correction", "number", "Correccion española", "Bonus por correccion exacta.", 0, 500, 1),
-                            ("parser_exact", "number", "Alias parser exacto", "Bonus por candidato exacto del parser.", 0, 500, 1),
-                            ("parser_near", "number", "Alias parser cercano", "Bonus por candidato cercano.", 0, 500, 1),
-                            ("parser_near_min", "decimal", "Minimo de cercania", "Similitud minima entre 0 y 1.", 0, 1, 0.01),
-                            ("configured_alias", "number", "Alias configurado", "Bonus por alias aprobado.", 0, 500, 1),
-                            ("year_exact", "number", "Año exacto", "Bonus por año igual.", 0, 500, 1),
-                            ("year_near", "number", "Año cercano", "Bonus dentro de tolerancia.", 0, 500, 1),
-                            ("year_tolerance", "number", "Tolerancia de año", "Diferencia maxima considerada cercana.", 0, 10, 1),
-                            ("year_contradiction", "number", "Año contradictorio", "Penalizacion por año distinto.", -1000, 0, 1),
-                            ("missing_movie_year", "number", "Año ausente", "Penalizacion si falta el año de pelicula.", -1000, 0, 1),
-                            ("category", "number", "Categoria correcta", "Bonus por tipo de medio correcto.", 0, 500, 1),
-                            ("origin_evidence", "number", "Evidencia de origen", "Bonus si otra evidencia confirma el titulo.", 0, 500, 1),
-                            ("season_valid", "number", "Temporada valida", "Bonus si la temporada existe.", 0, 500, 1),
-                            ("season_invalid", "number", "Temporada imposible", "Penalizacion si la temporada no existe.", -1000, 0, 1),
-                        )
-                    ],
+                    _control("resolver.coverage.max_searches", "number", "Busquedas", "Maximo 12 consultas TMDb.", min=1, max=12, step=1),
+                    _control("resolver.coverage.max_candidates", "number", "IDs candidatos", "Maximo 60 IDs unicos.", min=1, max=60, step=1),
+                    _control("resolver.coverage.batch_size", "number", "Lote", "Candidatos por lote adaptativo.", min=1, max=8, step=1),
+                    _control("resolver.coverage.max_details", "number", "Detalles", "Maximo 40 fichas enriquecidas.", min=1, max=40, step=1),
+                    _control("resolver.coverage.total_budget_ms", "number", "Presupuesto", "Tiempo total del resolver.", min=100, max=300000, step=100),
                 ],
             ),
             _group(
-                "resolver_acceptance",
-                "Aceptacion y validacion",
-                "Umbrales que deciden si una identidad es segura y si la salida coincide.",
+                "resolver_adjudication",
+                "Adjudicacion",
+                "La ambiguedad normal elige la identidad mas probable con orden estable.",
                 [
-                    *[
-                        _control(f"resolver.acceptance.{key}", "number", label, help_text, min=minimum, max=1000, step=1)
-                        for key, label, help_text, minimum in (
-                            ("min_score", "Puntuacion minima", "Minimo para aceptar el primer candidato.", -1000),
-                            ("min_margin", "Margen minimo", "Ventaja minima sobre el segundo candidato.", 0),
-                            ("early_stop_score", "Corte temprano", "Puntuacion para dejar de buscar.", -1000),
-                            ("early_stop_margin", "Margen de corte", "Margen para dejar de buscar.", 0),
-                        )
-                    ],
-                    *[
-                        _control(f"resolver.acceptance.{key}", "toggle", label, help_text)
-                        for key, label, help_text in (
-                            ("early_stop_require_exact_movie_year", "Exigir año exacto", "El corte temprano de peliculas exige año exacto."),
-                            ("direct_ids_bypass", "ID directo evita umbrales", "TMDb/IMDb confirmado no compite por score."),
-                            ("forced_bypass", "Forzado evita umbrales", "Una regla forzada validada no compite por score."),
-                            ("prefer_oldest_exact_title_without_year", "Preferir la película más antigua", "Si varias películas sin año tienen título y puntuación exactamente iguales, elige la de estreno más antiguo sin saltarse la puntuación mínima."),
-                        )
-                    ],
-                    _control("resolver.forced_validation.min_title_similarity", "decimal", "Similitud forzada", "Minimo para validar el titulo de una regla forzada.", min=0, max=1, step=0.01),
-                    _control("resolver.forced_validation.require_year", "toggle", "Validar año forzado", "Comprueba el año si la regla lo incluye."),
-                    _control("resolver.output_validation.require_title_alias", "toggle", "Validar titulo de salida", "La salida debe coincidir con un alias resuelto."),
-                    _control("resolver.output_validation.year_tolerance", "number", "Tolerancia de salida", "Diferencia de año permitida en la salida.", min=0, max=10, step=1),
+                    _control("resolver.adjudication.mode", "select", "Modo", "Modo v2 de adjudicacion.", options=[{"value": "most_probable", "label": "Mas probable"}]),
+                    _control("resolver.adjudication.tie_breakers", "ordered_tags", "Desempates", "Orden canonico: año, acuerdos, desacuerdos, popularidad, votos, año nuevo e ID menor.", readonly=True),
                 ],
             ),
             _group(
                 "resolver_operations",
                 "Red, reintentos y cache",
-                "Limites operativos del resolver; no contiene tokens ni rutas.",
+                "Limites operativos del resolver.",
                 [
-                    _control("resolver.http.timeout_ms", "number", "Timeout HTTP", "Timeout de una llamada TMDb en milisegundos.", min=100, max=60000, step=100),
-                    _control("resolver.http.total_budget_ms", "number", "Presupuesto total", "Tiempo total permitido por resolucion.", min=100, max=300000, step=100),
-                    _control("resolver.retry.base_seconds", "number", "Reintento base", "Espera inicial tras indisponibilidad.", min=1, max=86400, step=1),
-                    _control("resolver.retry.multiplier", "number", "Multiplicador", "Factor exponencial entre reintentos.", min=1, max=10, step=1),
-                    _control("resolver.retry.max_exponent", "number", "Exponente maximo", "Limite del crecimiento exponencial.", min=0, max=16, step=1),
-                    _control("resolver.retry.max_seconds", "number", "Espera maxima", "Tope absoluto entre reintentos.", min=1, max=604800, step=1),
-                    _control("resolver.cache.enabled", "toggle", "Cache activa", "Interruptor principal de cache."),
-                    _control("resolver.cache.ttl_seconds", "number", "Vida de cache", "Segundos hasta caducar una identidad.", min=60, max=31536000, step=60),
-                    _control("resolver.cache.read_enabled", "toggle", "Leer cache", "Permite reutilizar identidades vigentes."),
-                    _control("resolver.cache.write_enabled", "toggle", "Escribir cache", "Guarda resoluciones nuevas."),
+                    _control("resolver.http.timeout_ms", "number", "Timeout HTTP", "Timeout por llamada TMDb.", min=100, max=60000, step=100),
+                    _control("resolver.retry.base_seconds", "number", "Reintento base", "Espera inicial.", min=1, max=86400, step=1),
+                    _control("resolver.retry.multiplier", "number", "Multiplicador", "Factor exponencial.", min=1, max=10, step=1),
+                    _control("resolver.retry.max_exponent", "number", "Exponente maximo", "Limite del crecimiento.", min=0, max=16, step=1),
+                    _control("resolver.retry.max_seconds", "number", "Espera maxima", "Tope entre reintentos.", min=1, max=604800, step=1),
+                    _control("resolver.retry.max_attempts", "number", "Intentos maximos", "Tras tres fallos queda pendiente manualmente.", min=1, max=10, step=1),
+                    _control("resolver.cache.enabled", "toggle", "Cache activa", "Interruptor principal."),
+                    _control("resolver.cache.ttl_seconds", "number", "Vida de cache", "Segundos hasta caducar.", min=60, max=31536000, step=60),
+                    _control("resolver.cache.read_enabled", "toggle", "Leer cache", "Reutiliza identidades v2."),
+                    _control("resolver.cache.write_enabled", "toggle", "Escribir cache", "Guarda identidades v2."),
+                    _control("resolver.output_validation.require_title_alias", "toggle", "Validar salida", "La salida debe coincidir con la identidad."),
+                    _control("resolver.output_validation.year_tolerance", "number", "Tolerancia de salida", "Diferencia de año permitida.", min=0, max=10, step=1),
                 ],
             ),
         ],
-    },
-}
+    }
 
 
-def identity_settings_schema() -> Dict[str, object]:
-    """Devuelve una copia para que el frontend no mute el contrato global."""
+def _category_resolver_schema(profile: str) -> Dict[str, object]:
+    if profile == "movies":
+        controls = [
+            _control("resolver.movies.year_tolerance", "number", "Tolerancia de año", "Diferencia permitida en el timeline.", min=0, max=5, step=1),
+            _control("resolver.movies.use_release_timeline", "toggle", "Timeline de estrenos", "Compara todos los estrenos conocidos."),
+            _control("resolver.movies.hard_year_conflict", "toggle", "Año contradictorio", "Elimina candidatos con contradiccion real de año."),
+            _control("resolver.movies.runtime_tolerance_minutes", "number", "Tolerancia minutos", "Margen absoluto de duracion.", min=0, max=120, step=1),
+            _control("resolver.movies.runtime_tolerance_percent", "number", "Tolerancia porcentual", "Margen relativo de duracion.", min=0, max=100, step=1),
+            _control("resolver.movies.short_runtime_minutes", "number", "Corto", "Umbral maximo de cortometraje.", min=1, max=180, step=1),
+            _control("resolver.movies.feature_runtime_minutes", "number", "Largometraje", "Umbral minimo de largometraje.", min=1, max=300, step=1),
+        ]
+        title = "Reglas de peliculas"
+    else:
+        controls = [
+            *[
+                _control(f"resolver.tv.{key}", "toggle", label, help_text)
+                for key, label, help_text in (
+                    ("validate_season", "Validar temporada", "Comprueba que la temporada exista."),
+                    ("validate_episode", "Validar episodio", "Comprueba episodios bajo demanda."),
+                    ("allow_absolute_episode", "Episodio absoluto", "Conserva numeracion absoluta."),
+                    ("allow_specials", "Especiales", "Permite temporada 0."),
+                    ("allow_season_packs", "Pack de temporada", "Permite lotes sin episodio concreto."),
+                    ("allow_multi_episode", "Varios episodios", "Conserva rangos y episodios multiples."),
+                )
+            ],
+            _control("resolver.tv.runtime_tolerance_minutes", "number", "Tolerancia minutos", "Margen absoluto por episodio.", min=0, max=120, step=1),
+            _control("resolver.tv.runtime_tolerance_percent", "number", "Tolerancia porcentual", "Margen relativo por episodio.", min=0, max=100, step=1),
+        ]
+        title = "Reglas de series"
+    return {
+        "title": title,
+        "groups": [
+            _group(
+                f"resolver_{profile}",
+                title,
+                "Overrides efectivos del perfil; Common aporta el resto.",
+                controls,
+            )
+        ],
+    }
 
-    return copy.deepcopy(IDENTITY_SETTINGS_SCHEMA)
+
+def identity_settings_schema(profile: str = "common") -> Dict[str, object]:
+    """Schema v2 filtrado: Common compartido y perfiles solo overrides."""
+
+    normalized = str(profile or "common").strip().lower()
+    if normalized not in {"common", "movies", "tv"}:
+        normalized = "common"
+    result: Dict[str, object] = {
+        "schema_version": 2,
+        "profile": normalized,
+        "resolver": (
+            _common_resolver_schema()
+            if normalized == "common"
+            else _category_resolver_schema(normalized)
+        ),
+    }
+    if normalized == "common":
+        result["parser"] = copy.deepcopy(_PARSER_SETTINGS_SCHEMA)
+    return result
+
+
+# Export estable para consumidores que importaban la constante directamente.
+IDENTITY_SETTINGS_SCHEMA = identity_settings_schema("common")

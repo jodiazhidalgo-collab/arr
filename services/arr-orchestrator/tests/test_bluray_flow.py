@@ -87,6 +87,8 @@ def movie_identity():
         query="Las vacaciones de Mr. Bean",
         guess={"title": "Las vacaciones de Mr. Bean", "year": 2007},
         source="test",
+        resolver_algorithm_version="phased-er-v2",
+        decision_status="ACCEPTED_CONFIDENT",
     )
 
 
@@ -95,6 +97,16 @@ class Resolver:
 
     def resolve(self, _job, _input_root):
         return movie_identity()
+
+    def trace_snapshot(self):
+        return {
+            "decision": {
+                "status": "ACCEPTED_CONFIDENT",
+                "accepted": True,
+                "selected_tmdb_id": 1268,
+                "resolver_algorithm_version": "phased-er-v2",
+            }
+        }
 
     def output_matches(self, _identity, names):
         return names == ["Las vacaciones de Mr. Bean (2007)"]
@@ -193,6 +205,10 @@ def make_engine_job(tmp_path: Path, release: Path):
         state="ready_filebot",
         source_path=str(original),
         stage_path=str(job_root),
+        source_meta_json=engine._new_job_source_meta_json(
+            category="movies",
+            name="Las vacaciones de Mr. Bean (2007)",
+        ),
     )
     engine.name_resolver = Resolver()
     return engine, database, job

@@ -229,6 +229,18 @@ class NameParserTests(unittest.TestCase):
         self.assertIsNone(decision.block_reason)
         self.assertTrue(decision.allow_external_lookup)
 
+    def test_year_alone_does_not_conflict_with_explicit_tv(self):
+        decision = decide_media("The Office (2005)", "tv")
+
+        self.assertEqual(decision.media_type, "tv")
+        self.assertIsNone(decision.block_reason)
+        self.assertTrue(decision.allow_external_lookup)
+
+    def test_year_still_classifies_movies_without_explicit_category(self):
+        parsed = parse_release_name("The Office (2005)")
+
+        self.assertEqual(parsed.media_hint, "movies")
+
     def test_tv_year_range_skips_only_year_barriers(self):
         allowed = parse_release_name(
             "Serie.S01.2010-2020.1080p.mkv",

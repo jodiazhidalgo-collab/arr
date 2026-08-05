@@ -4,7 +4,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 
 SCHEMA = """
@@ -181,6 +181,20 @@ class Database:
         ).fetchone()
         return str(row["value"]) if row else None
 
+    def get_settings(self, keys: Iterable[str]) -> Dict[str, Optional[str]]:
+        """Lee varias claves en una unica instantanea de SQLite."""
+
+        ordered = tuple(dict.fromkeys(str(key) for key in keys))
+        if not ordered:
+            return {}
+        placeholders = ", ".join("?" for _ in ordered)
+        rows = self.connect().execute(
+            f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+            ordered,
+        ).fetchall()
+        found = {str(row["key"]): str(row["value"]) for row in rows}
+        return {key: found.get(key) for key in ordered}
+
     def set_setting(self, key: str, value: str) -> None:
         connection = self.connect()
         connection.execute(
@@ -192,6 +206,21 @@ class Database:
             (key, value),
         )
         connection.commit()
+
+    def delete_settings(self, keys: Iterable[str]) -> int:
+        """Elimina un conjunto explicito de ajustes y devuelve cuantas filas borro."""
+
+        ordered = tuple(dict.fromkeys(str(key) for key in keys))
+        if not ordered:
+            return 0
+        placeholders = ", ".join("?" for _ in ordered)
+        connection = self.connect()
+        cursor = connection.execute(
+            f"DELETE FROM settings WHERE key IN ({placeholders})",
+            ordered,
+        )
+        connection.commit()
+        return max(0, int(cursor.rowcount))
 
     def compare_and_set_setting(
         self,
@@ -253,6 +282,58 @@ class Database:
                 """,
                 (key, value),
             )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+
+    def compare_and_set_settings(
+        self,
+        expected_values: Mapping[str, Optional[str]],
+        values: Mapping[str, str],
+        *,
+        clear_resolver_cache: bool = False,
+    ) -> bool:
+        """CAS exacto de varias claves dentro de una unica transaccion.
+
+        La migracion de identidad usa esta primitiva para comprobar a la vez
+        todas las fuentes v1, crear los tres scopes v2 e invalidar la cache
+        antigua. Si cambia una sola fuente, no se escribe ni se borra nada.
+        """
+
+        expected = {str(key): value for key, value in expected_values.items()}
+        updates = {str(key): str(value) for key, value in values.items()}
+        if any(not key for key in (*expected, *updates)):
+            raise ValueError("Las claves de settings no pueden estar vacias")
+        if not expected and not updates and not clear_resolver_cache:
+            return True
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            if expected:
+                keys = tuple(expected)
+                placeholders = ", ".join("?" for _ in keys)
+                rows = connection.execute(
+                    f"SELECT key, value FROM settings WHERE key IN ({placeholders})",
+                    keys,
+                ).fetchall()
+                current = {str(row["key"]): str(row["value"]) for row in rows}
+                if any(current.get(key) != value for key, value in expected.items()):
+                    connection.rollback()
+                    return False
+            for key, value in updates.items():
+                connection.execute(
+                    """
+                    INSERT INTO settings(key, value)
+                    VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (key, value),
+                )
+            if clear_resolver_cache:
+                connection.execute("DELETE FROM resolver_cache")
             connection.commit()
             return True
         except Exception:

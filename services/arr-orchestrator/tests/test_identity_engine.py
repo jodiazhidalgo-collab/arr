@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from arr_orchestrator.db import Database
 from arr_orchestrator.engine import Engine
-from arr_orchestrator.identity.fingerprint import identity_fingerprint
+from arr_orchestrator.identity.scopes import identity_scope_fingerprint
 from test_core import test_config
 
 
@@ -27,7 +27,9 @@ class IdentityEngineIntegrationTests(unittest.TestCase):
                 "min": 1800,
             }
         )
-        snapshot["fingerprint"] = identity_fingerprint(snapshot["rules"])
+        snapshot["fingerprint"] = identity_scope_fingerprint(
+            snapshot["rules"], "common"
+        )
         return snapshot
 
     def test_job_keeps_identity_snapshot_across_save_and_restart(self) -> None:
@@ -50,7 +52,7 @@ class IdentityEngineIntegrationTests(unittest.TestCase):
                 source_meta_json=source_meta,
             )
             draft = engine.identity_rules()["rules"]
-            draft["resolver"]["acceptance"]["min_score"] = 60
+            draft["resolver"]["coverage"]["max_candidates"] = 55
             saved = engine.update_identity_rules(
                 {"rules": draft, "expected_revision": 0}
             )
@@ -66,13 +68,13 @@ class IdentityEngineIntegrationTests(unittest.TestCase):
 
             self.assertEqual(old_context["revision"], 0)
             self.assertEqual(
-                old_context["rules"]["resolver"]["acceptance"]["min_score"],
-                75,
+                old_context["rules"]["resolver"]["coverage"]["max_candidates"],
+                60,
             )
             self.assertEqual(new_snapshot["revision"], 1)
             self.assertEqual(
-                new_snapshot["rules"]["resolver"]["acceptance"]["min_score"],
-                60,
+                new_snapshot["rules"]["resolver"]["coverage"]["max_candidates"],
+                55,
             )
             restarted_database.close()
 
@@ -344,7 +346,7 @@ class IdentityEngineIntegrationTests(unittest.TestCase):
             content.write_bytes(b"movie")
 
             movie_rules = engine.identity_rules("movies")["rules"]
-            movie_rules["resolver"]["acceptance"]["min_score"] = 63
+            movie_rules["resolver"]["movies"]["runtime_tolerance_minutes"] = 12
             saved = engine.update_identity_rules(
                 {"rules": movie_rules, "expected_revision": 0}, "movies"
             )
@@ -382,7 +384,8 @@ class IdentityEngineIntegrationTests(unittest.TestCase):
             self.assertEqual(stored["profile"], "movies")
             self.assertEqual(stored["revision"], saved["revision"])
             self.assertEqual(
-                stored["rules"]["resolver"]["acceptance"]["min_score"], 63
+                stored["rules"]["resolver"]["movies"]["runtime_tolerance_minutes"],
+                12,
             )
             database.close()
 
