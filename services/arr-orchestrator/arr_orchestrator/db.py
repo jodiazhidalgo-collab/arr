@@ -579,6 +579,7 @@ class Database:
 
     def _job_api_payload(self, job: Mapping[str, Any]) -> Dict[str, Any]:
         payload = dict(job)
+        processing = _processing_summary(_load_json(payload.get("result_json")))
         source_meta = _load_json(payload.get("source_meta_json"))
         batch_meta = source_meta.get("batch") if isinstance(source_meta, dict) else None
         parent_job_id = str(payload.get("parent_job_id") or "")
@@ -620,6 +621,8 @@ class Database:
                 }
             )
         payload["batch"] = batch
+        if processing:
+            payload["processing"] = processing
         return payload
 
     def events_for_job(self, job_id: str, limit: int = 200) -> List[Dict[str, Any]]:
@@ -978,6 +981,7 @@ def _result_summary(result: Any) -> Any:
             "problemas": plan.get("problemas"),
             "audio_modo": plan.get("audio_modo"),
             "subtitulo_titulo": plan.get("subtitulo_titulo"),
+            "processing_mode": plan.get("processing_mode"),
         }
     if isinstance(result.get("process"), dict):
         process = result["process"]
@@ -987,7 +991,14 @@ def _result_summary(result: Any) -> Any:
             "audio_modo": process.get("audio_modo"),
             "capitulos": process.get("capitulos"),
             "tamano_salida": process.get("tamano_salida"),
+            "processing_mode": process.get("processing_mode"),
         }
+    if result.get("processing_mode"):
+        summary["processing_mode"] = result.get("processing_mode")
+    if isinstance(result.get("timings_ms"), dict):
+        summary["timings_ms"] = result.get("timings_ms")
+    if isinstance(result.get("processing"), dict):
+        summary["processing"] = _compact_structured(result.get("processing"))
     if isinstance(result.get("verification"), dict):
         verification = result["verification"]
         summary["verification"] = {
@@ -1001,6 +1012,33 @@ def _result_summary(result: Any) -> Any:
     if result.get("output_media"):
         summary["output_media"] = result.get("output_media")
     return summary
+
+
+def _processing_summary(result: Any) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    mode = str(result.get("processing_mode") or "")
+    timings = result.get("timings_ms")
+    process = result.get("process")
+    if not mode and isinstance(process, dict):
+        mode = str(process.get("processing_mode") or "")
+    processing = result.get("processing")
+    if isinstance(processing, dict):
+        episodes = processing.get("episodes")
+        if isinstance(episodes, list) and episodes:
+            first = episodes[0] if isinstance(episodes[0], dict) else {}
+            mode = str(first.get("processing_mode") or mode)
+            timings = first.get("timings_ms") or timings
+    if mode not in {"metadata_only", "single_remux", "ocr_single_remux"}:
+        return {}
+    safe_timings: Dict[str, int] = {}
+    if isinstance(timings, dict):
+        for key in ("analysis", "ocr", "remux", "verification"):
+            try:
+                safe_timings[key] = max(0, int(timings.get(key) or 0))
+            except (TypeError, ValueError):
+                safe_timings[key] = 0
+    return {"mode": mode, "timings_ms": safe_timings}
 
 
 def _collect_report_paths(payload: Any, reports: List[str], seen: Set[str]) -> None:

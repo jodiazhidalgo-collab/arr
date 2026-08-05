@@ -181,6 +181,13 @@ def _validate_semantics(rules: dict[str, Any]) -> None:
         raise RulesValidationError(
             "subtitulos.delay_audio.frases_maximo no puede superar frases_maximo_unico_forzado."
         )
+    if rules["subtitulos"]["ocr_imagen_modo"] not in {
+        "solo_forzados_cortos",
+        "desactivado",
+    }:
+        raise RulesValidationError(
+            "subtitulos.ocr_imagen_modo debe ser solo_forzados_cortos o desactivado."
+        )
 
 
 def rules_fingerprint(rules: dict[str, Any]) -> str:
@@ -248,9 +255,13 @@ class RulesStore:
                 )
             persisted = {block: deepcopy(seed_document[block]) for block in RULE_BLOCKS}
             seeded = True
-        self._active = _sanitize(persisted, self._defaults)
-        merged = _merge(self._defaults, self._active)
+        persisted_active = _sanitize(persisted, self._defaults)
+        merged = _merge(self._defaults, persisted_active)
         _validate_semantics(merged)
+        # ``active`` representa la política efectiva completa. Al aparecer un
+        # campo nuevo, se hereda del default sin obligar a reescribir la
+        # configuración productiva durante el arranque.
+        self._active = deepcopy(merged)
         self._snapshot = RulesSnapshot(merged, rules_fingerprint(merged))
         self._seeded_from_movies = seeded
         if seeded:

@@ -26,6 +26,7 @@ from .batch_preparer import (
     child_source_uid,
     clean_and_plan_batch,
     materialize_item,
+    materialize_filebot_item,
 )
 from .clients import QbitLikeClient
 from .config import Config
@@ -2304,6 +2305,46 @@ class Engine:
             item.episode_reason = reason
         return plan.finalize()
 
+    @staticmethod
+    def _normalized_batch_path(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(str(path)))
+
+    def _map_series_batch_filebot_outputs(
+        self,
+        plan: BatchPlan,
+        result: Dict[str, object],
+        output_root: Path,
+    ) -> BatchPlan:
+        """Liga cada movimiento FileBot con su vídeo físico sin volver a escanearlo."""
+
+        root = Path(plan.input_root)
+        output_lexical = Path(os.path.abspath(str(output_root)))
+        moved: Dict[str, str] = {}
+        for raw in result.get("moves") or []:
+            if not isinstance(raw, dict):
+                continue
+            source = Path(str(raw.get("source") or ""))
+            destination = Path(str(raw.get("destination") or ""))
+            if not source.name or not destination.name:
+                continue
+            try:
+                relative = Path(os.path.abspath(str(destination))).relative_to(
+                    output_lexical
+                )
+            except ValueError:
+                continue
+            moved[self._normalized_batch_path(source)] = relative.as_posix()
+        for item in plan.items:
+            item.filebot_outputs = []
+            for raw_source in item.sources:
+                original = root.joinpath(*PurePosixPath(raw_source).parts)
+                mapped = moved.get(self._normalized_batch_path(original))
+                if mapped:
+                    item.filebot_outputs.append(mapped)
+            if len(item.filebot_outputs) != len(item.sources):
+                item.filebot_outputs = []
+        return plan.finalize()
+
     def _run_batch_prepare(self, job: Dict[str, object]) -> None:
         plan = self._batch_plan_for_job(job)
         if plan is None or not plan.should_split:
@@ -2399,7 +2440,16 @@ class Engine:
             child = self.db.update_job(child_id, stage_path=str(child_root))
             if str(child.get("state") or "") != "batch_child_staging":
                 continue
-            materialized = materialize_item(item, input_root, child_root)
+            inherited_filebot = bool(item.filebot_outputs)
+            if inherited_filebot:
+                parent_filebot_root = parent_root / "series_filebot_output"
+                materialized = materialize_filebot_item(
+                    item,
+                    parent_filebot_root,
+                    child_root,
+                )
+            else:
+                materialized = materialize_item(item, input_root, child_root)
             child = self.db.update_job(
                 child_id,
                 source_path=str(materialized),
@@ -2416,6 +2466,7 @@ class Engine:
                     "total": item.total,
                     "episode_validation": item.episode_validation,
                     "episode_reason": item.episode_reason,
+                    "filebot_inherited": inherited_filebot,
                 },
             )
             if item.episode_validation == "DISAGREE":
@@ -2427,12 +2478,21 @@ class Engine:
                     phase="identity",
                 )
                 continue
-            self.db.transition(
-                child_id,
-                "ready_filebot",
-                "batch",
-                f"Vídeo {item.index} de {item.total} listo para procesar",
-            )
+            if inherited_filebot:
+                self.db.transition(
+                    child_id,
+                    "series_postprocess_ready",
+                    "batch",
+                    f"Vídeo {item.index} de {item.total} heredó el nombre FileBot del lote",
+                    output_root=str(self.config.tv_output),
+                )
+            else:
+                self.db.transition(
+                    child_id,
+                    "ready_filebot",
+                    "batch",
+                    f"Vídeo {item.index} de {item.total} usará FileBot individual de respaldo",
+                )
 
         self._persist_parent_batch_plan(job, plan, status="waiting_children")
         self.db.transition(
@@ -3025,15 +3085,15 @@ class Engine:
                 identity,
                 identity_rules,
             )
-            self._persist_parent_batch_plan(job, enriched_plan, status="identity_resolved")
-            self.db.transition(
+            self._persist_parent_batch_plan(job, enriched_plan, status="filebot_pending")
+            parent_batch_plan = enriched_plan
+            self.db.add_event(
                 str(job["job_id"]),
-                "batch_preparing",
                 "batch",
-                f"Identidad TMDb común resuelta; preparando {len(enriched_plan.items)} vídeos",
-                source_path=str(input_root),
+                "decision",
+                f"Identidad TMDb común resuelta; FileBot renombrará {len(enriched_plan.items)} vídeos de una vez",
+                {"total": len(enriched_plan.items)},
             )
-            return
         if series_selected:
             input_media = media_files(input_root)
             allow_unknown_batch_episode = bool(
@@ -3226,6 +3286,54 @@ class Engine:
             output_root,
             identity,
         )
+        if series_selected and parent_batch_plan is not None:
+            output_names = self._tv_output_names(result, output_root)
+            if output_names and not self.name_resolver.output_matches(
+                identity, output_names
+            ):
+                self._reject_identity_output(
+                    job,
+                    job_root,
+                    result,
+                    identity,
+                    output_names,
+                    output_root,
+                )
+                return
+            mapped_plan = self._map_series_batch_filebot_outputs(
+                parent_batch_plan,
+                result,
+                output_root,
+            )
+            mapped = sum(bool(item.filebot_outputs) for item in mapped_plan.items)
+            fallback = len(mapped_plan.items) - mapped
+            self._persist_parent_batch_plan(job, mapped_plan, status="filebot_mapped")
+            event_kind = "warning" if fallback else "decision"
+            self.db.add_event(
+                str(job["job_id"]),
+                "filebot",
+                event_kind,
+                (
+                    f"FileBot del lote creó {mapped} nombres; {fallback} vídeo(s) usarán respaldo individual"
+                    if fallback
+                    else f"FileBot del lote creó los {mapped} nombres en una sola llamada"
+                ),
+                {
+                    "mapped": mapped,
+                    "fallback": fallback,
+                    "exit_code": result.get("exit_code"),
+                    "timed_out": bool(result.get("timed_out")),
+                },
+            )
+            self.db.transition(
+                str(job["job_id"]),
+                "batch_preparing",
+                "batch",
+                f"Mapa FileBot persistido; preparando {len(mapped_plan.items)} vídeos",
+                source_path=str(input_root),
+                result_json=json.dumps(result, ensure_ascii=False, default=str),
+            )
+            return
         if result.get("timed_out"):
             if series_selected:
                 self._preserve_series_job_for_review(

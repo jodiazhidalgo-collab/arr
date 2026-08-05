@@ -55,6 +55,7 @@
       "frases_maximo": 150
     },
     "sin_subtitulos_modo": "procesar_sin_subtitulos",
+    "ocr_imagen_modo": "solo_forzados_cortos",
     "frases_maximo_unico_forzado": 150,
     "unico_es_modo": "aplicar_limite",
     "titulo_final": "Forzados",

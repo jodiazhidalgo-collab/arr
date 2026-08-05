@@ -128,6 +128,14 @@ def _fingerprint(rules: dict[str, Any]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _validate_semantics(rules: dict[str, Any]) -> None:
+    mode = str(rules.get("subtitulos", {}).get("ocr_imagen_modo") or "")
+    if mode not in {"solo_forzados_cortos", "desactivado"}:
+        raise RulesValidationError(
+            "subtitulos.ocr_imagen_modo debe ser solo_forzados_cortos o desactivado."
+        )
+
+
 def _saved_at(path: Path) -> Optional[str]:
     try:
         return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
@@ -154,6 +162,7 @@ class MediaRulesStore:
         raw_active = _leer_json(self.config_path)
         self._active = _validate_and_sanitize(raw_active, self._defaults)
         merged = _merge(self._defaults, self._active)
+        _validate_semantics(merged)
         self._snapshot = RulesSnapshot(merged, _fingerprint(merged))
 
     def snapshot(self) -> RulesSnapshot:
@@ -216,6 +225,7 @@ class MediaRulesStore:
                 raise RulesConflictError(self.payload())
             sanitized = _validate_and_sanitize(rules, self._defaults)
             merged = _merge(self._defaults, sanitized)
+            _validate_semantics(merged)
             next_fingerprint = _fingerprint(merged)
             changed = next_fingerprint != self._snapshot.fingerprint
             backup = None

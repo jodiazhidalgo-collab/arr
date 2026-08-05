@@ -957,12 +957,17 @@ def _finalize_processed_in_place(
             raise SeriesWorkerError(f"Falta salida limpia: {entry.source_relpath}")
         if provisional.stat().st_size != episode.output_size:
             raise SeriesWorkerError(f"Tamaño de salida inesperado: {entry.source_relpath}")
-        if original.is_symlink() or not original.is_file():
+        consumed_original = (
+            str(episode.verification.get("processing_mode") or "") == "metadata_only"
+            and not original.exists()
+            and not original.is_symlink()
+        )
+        if not consumed_original and (original.is_symlink() or not original.is_file()):
             raise SeriesWorkerError(f"Falta el original de FileBot: {entry.source_relpath}")
         if destination != original and (destination.exists() or destination.is_symlink()):
             raise SeriesWorkerError(f"Ya existe el destino limpio: {entry.target_relpath}")
         os.replace(provisional, destination)
-        if original != destination:
+        if original != destination and not consumed_original:
             original.unlink(missing_ok=True)
         relative_text = relative.as_posix()
         expected_files.append(relative_text)
@@ -2858,6 +2863,17 @@ class SeriesCoordinator:
             if delivery_result.get("status") != "committed":
                 raise DeliveryError("La publicación no terminó COMMITTED")
             result = self._done_result(prepared, delivery_result, recovered=False)
+            if processing is not None:
+                result["processing"] = {
+                    "episodes": [
+                        {
+                            "source_relpath": episode.source_relpath,
+                            "processing_mode": episode.verification.get("processing_mode"),
+                            "timings_ms": episode.verification.get("timings_ms") or {},
+                        }
+                        for episode in processing.episodes
+                    ]
+                }
             self._write_result(prepared, result)
             _emit_callback(prepared, "series", "finished", "Serie publicada")
             return result

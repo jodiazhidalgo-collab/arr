@@ -143,6 +143,10 @@ const RULE_SECTIONS = {
           { type: "select", path: "subtitulos.sin_subtitulos_modo", label: "Sin subtitulos", options: [
             { value: "procesar_sin_subtitulos", label: "Procesar sin subtitulos" },
             { value: "cuarentena", label: "Mandar a revision" }
+          ] },
+          { type: "select", path: "subtitulos.ocr_imagen_modo", label: "OCR de imagen", options: [
+            { value: "solo_forzados_cortos", label: "Solo forzados cortos" },
+            { value: "desactivado", label: "Desactivado" }
           ] }
         ]
       },
@@ -475,16 +479,36 @@ function batchSummary(job) {
   return `${Number(batch.completed || 0)} de ${total} terminados`;
 }
 
+function processingSummary(job) {
+  const processing = job?.processing || {};
+  const labels = {
+    metadata_only: "Vía rápida",
+    single_remux: "Remux único",
+    ocr_single_remux: "OCR y remux único"
+  };
+  const label = labels[String(processing.mode || "")];
+  if (!label) return "";
+  const timings = processing.timings_ms || {};
+  const seconds = value => `${(Math.max(0, Number(value || 0)) / 1000).toFixed(1)} s`;
+  const parts = [`Análisis ${seconds(timings.analysis)}`];
+  if (Number(timings.ocr || 0) > 0) parts.push(`OCR ${seconds(timings.ocr)}`);
+  if (String(processing.mode || "") !== "metadata_only") {
+    parts.push(`Remux ${seconds(timings.remux)}`);
+  }
+  return `${label} · ${parts.join(" · ")}`;
+}
+
 function jobRows(job, actions) {
   const isParent = job?.batch?.role === "parent";
   const total = Number(job?.batch?.total || job?._batchChildren?.length || 0);
   const summary = batchSummary(job);
+  const processing = processingSummary(job);
   const main = `<tr class="${isParent ? "batch-parent-row" : ""}">
     <td data-label="Nombre">
       ${isParent ? `<strong>Lote detectado · ${total} vídeos</strong><span class="batch-source-name">${esc(job.name)}</span>` : esc(job.name)}
     </td>
     <td data-label="Categoría">${esc(job.category)}</td>
-    <td data-label="Estado">${pill(stateLabel(job.state), stateTone(job.state))}${summary ? `<span class="batch-progress">${esc(summary)}</span>` : ""}</td>
+    <td data-label="Estado">${pill(stateLabel(job.state), stateTone(job.state))}${summary ? `<span class="batch-progress">${esc(summary)}</span>` : ""}${processing ? `<span class="batch-progress">${esc(processing)}</span>` : ""}</td>
     <td data-label="Actualizado">${esc(formatTime(job.updated_at))}</td>
     ${actions ? `<td data-label="Diagnóstico"><button class="btn ghost small" data-codex-job="${esc(job.job_id)}">Informe Codex</button></td>` : ""}
   </tr>`;
@@ -494,10 +518,12 @@ function jobRows(job, actions) {
   const childRows = children.length
     ? children.map(child => {
         const incident = child.last_error_message || child.last_error_code || "";
+        const processing = processingSummary(child);
         return `<li class="batch-child ${incident ? "has-incident" : ""}">
           <span class="batch-child-position">${Number(child?.batch?.index || 0)}.</span>
           <span class="batch-child-name">${esc(child.name)}</span>
           ${pill(stateLabel(child.state), stateTone(child.state))}
+          ${processing ? `<span class="batch-child-incident">${esc(processing)}</span>` : ""}
           ${incident ? `<span class="batch-child-incident">${esc(incident)}</span>` : ""}
         </li>`;
       }).join("")

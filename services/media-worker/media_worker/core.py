@@ -152,95 +152,185 @@ def _emit_event(
         pass
 
 
-def _is_rescue_candidate(plan: Dict[str, object], analysis: Dict[str, object]) -> bool:
-    text = " ".join(str(x) for x in plan.get("problemas", []))
-    text += " " + str(analysis.get("estado", ""))
-    lowered = text.lower()
-    return (
-        "subtitulo" in lowered
-        and (
-            "imagen" in lowered
-            or "ocr" in lowered
-            or "convertible" in lowered
-            or "dudoso" in lowered
-        )
+def _bind_plan_to_video(plan: Dict[str, object], video: Path) -> Dict[str, object]:
+    output = video.with_name(f"{video.stem}.limpio.mkv")
+    if output.exists():
+        output = output.with_name(f"{output.stem}.{int(time.time())}{output.suffix}")
+    plan["entrada"] = str(video)
+    plan["salida"] = str(output)
+    return plan
+
+
+def _plan_with_external_subtitle(
+    analysis: Dict[str, object],
+    video: Path,
+    subtitle: Dict[str, object],
+    srt: Path,
+    *,
+    mode: str,
+    cues: int,
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    selected = dict(subtitle)
+    selected.update(
+        {
+            "decision": "CANDIDATO FORZADO REAL",
+            "frases": cues,
+            "prioridad": 200000 - cues,
+        }
     )
+    adjusted = dict(analysis)
+    adjusted["estado"] = "APTO PARA PROCESO AUTOMATICO"
+    adjusted["subtitulos"] = [selected]
+    plan = _bind_plan_to_video(planificador.crear_plan(adjusted), video)
+    if plan.get("estado") != "PLAN APTO":
+        raise RuntimeError("No se pudo construir el plan final con el SRT elegido.")
+    plan["subtitulo_externo"] = str(srt)
+    plan["subtitulo_origen_interno"] = mode == "internal_text"
+    plan["processing_mode"] = "ocr_single_remux" if mode == "ocr" else "single_remux"
+    plan["duration"] = float(analysis.get("duration") or 0)
+    plan["stream_counts"] = dict(analysis.get("stream_counts") or {})
+    return adjusted, plan
 
 
-def _rescue_in_place(folder: Path, video: Path, job_id: str, reports_root: Path) -> Dict[str, object]:
+def _prepare_subtitle_plan(
+    analysis: Dict[str, object],
+    plan: Dict[str, object],
+    video: Path,
+    job_id: str,
+    reports_root: Path,
+) -> Tuple[Dict[str, object], Dict[str, object], Optional[Dict[str, object]]]:
     tmp_dir = _reports(job_id, reports_root) / "rescue_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
-    data = rescate_subtitulos.ffprobe_json(video)
-    pistas = rescate_subtitulos.completar_eventos_pistas_imagen(
-        video, rescate_subtitulos.pistas_imagen_es(data)
-    )
-    pistas_texto = rescate_subtitulos.pistas_texto_mkv_es(video)
-    pistas_texto_validas = rescate_subtitulos.pistas_texto_rescatables(video, pistas_texto)
-
-    if pistas_texto_validas and pistas:
-        final, original_eliminado, log = rescate_subtitulos.remux_con_texto_existente(
-            video, pistas_texto_validas, folder
-        )
-        return {
-            "status": "rescued",
-            "mode": "texto_existente",
-            "video": str(final),
-            "original_removed": str(original_eliminado),
-            "pistas_texto_validas": pistas_texto_validas,
-            "log": log[-3000:],
-        }
-
-    if not pistas:
-        raise RuntimeError("No hay subtitulo de imagen espanol para OCR.")
-
-    pistas_rescatables = [
-        pista for pista in pistas
-        if rescate_subtitulos.subtitulo_imagen_rescatable(pista)
+    subtitle_rules = {
+        "text": set(valor("subtitulos.formatos_texto_aceptados", []) or []),
+        "image": set(valor("subtitulos.formatos_imagen_no_aceptados", []) or []),
+        "minimum": int(valor("subtitulos.frases_descartar_hasta", 1) or 1),
+        "maximum": int(valor("subtitulos.frases_maximo_unico_forzado", 150) or 150),
+        "delay_maximum": int(valor("subtitulos.delay_audio.frases_maximo", 150) or 150),
+        "without": str(valor("subtitulos.sin_subtitulos_modo", "cuarentena") or "").strip().lower(),
+        "unique": str(valor("subtitulos.unico_es_modo", "aplicar_limite") or "").strip().lower(),
+        "ocr": str(valor("subtitulos.ocr_imagen_modo", "solo_forzados_cortos") or "").strip().lower(),
+    }
+    spanish = [
+        dict(item) for item in analysis.get("subtitulos", [])
+        if isinstance(item, dict) and item.get("language_final") == "es"
     ]
-    if not pistas_rescatables:
-        final, original_eliminado, log = rescate_subtitulos.remux_sin_subtitulos(video)
-        return {
-            "status": "rescued",
-            "mode": "sin_subtitulos",
-            "video": str(final),
-            "original_removed": str(original_eliminado),
-            "pistas_descartadas": pistas,
-            "log": log[-3000:],
-        }
+    text_tracks = [item for item in spanish if str(item.get("codec") or "").lower() in subtitle_rules["text"]]
+    image_tracks = [item for item in spanish if str(item.get("codec") or "").lower() in subtitle_rules["image"]]
 
-    pista = pistas_rescatables[0]
-    if rescate_subtitulos.subtitulo_imagen_largo(pista):
-        final, original_eliminado, log = rescate_subtitulos.remux_sin_subtitulos(video)
-        return {
-            "status": "rescued",
-            "mode": "sin_subtitulos",
-            "video": str(final),
-            "original_removed": str(original_eliminado),
-            "pista_descartada": pista,
-            "log": log[-3000:],
-        }
+    if text_tracks:
+        selected = sorted(
+            text_tracks,
+            key=lambda item: (
+                0 if item.get("delay_audio_aceptado") else 1,
+                0 if item.get("forced") or item.get("nombre_forzado") else 1,
+                int(item.get("frases") or subtitle_rules["maximum"]),
+                int(item.get("index") or 0),
+            ),
+        )[0]
+        srt, cues = rescate_subtitulos.extraer_texto_srt(video, selected, tmp_dir)
+        selected_maximum = (
+            subtitle_rules["delay_maximum"]
+            if selected.get("delay_audio_aceptado")
+            else subtitle_rules["maximum"]
+        )
+        accepted = cues > subtitle_rules["minimum"] and (
+            cues <= selected_maximum
+            or (
+                not selected.get("delay_audio_aceptado")
+                and subtitle_rules["unique"] == "aceptar_siempre"
+            )
+        )
+        if accepted:
+            adjusted, prepared = _plan_with_external_subtitle(
+                analysis, video, selected, srt, mode="internal_text", cues=cues
+            )
+            return adjusted, prepared, {
+                "status": "prepared",
+                "mode": "texto_extraido_una_vez",
+                "cues": cues,
+            }
+        if subtitle_rules["without"] == "procesar_sin_subtitulos":
+            discarded = [selected]
+            one_pass = _build_one_pass_no_subtitles_plan(video, analysis, discarded)
+            if one_pass:
+                adjusted, prepared = one_pass
+                return adjusted, prepared, {
+                    "status": "prepared",
+                    "mode": "texto_largo_sin_ocr",
+                    "cues": cues,
+                }
+        return analysis, plan, None
 
-    srt, cues, method = rescate_subtitulos.ejecutar_seconv(video, pista, tmp_dir)
-    final, original_eliminado, log = rescate_subtitulos.remux_con_srt(video, srt, folder)
-    return {
-        "status": "rescued",
+    if not image_tracks:
+        return analysis, plan, None
+    if subtitle_rules["ocr"] == "desactivado":
+        selected = image_tracks[0]
+        one_pass = _build_one_pass_no_subtitles_plan(video, analysis, image_tracks)
+        if one_pass:
+            adjusted, prepared = one_pass
+            return adjusted, prepared, {"status": "prepared", "mode": "ocr_desactivado"}
+        return analysis, plan, None
+
+    selected = sorted(
+        image_tracks,
+        key=lambda item: (
+            0 if item.get("forced") or item.get("nombre_forzado") else 1,
+            int(item.get("eventos") or 999999999),
+            int(item.get("index") or 0),
+        ),
+    )[0]
+    events = _int_or_none(selected.get("eventos"))
+    if events is None:
+        events = rescate_subtitulos.eventos_subtitulo_pista(video, int(selected["index"]))
+        selected["eventos"] = events
+    plausible = (
+        events is not None
+        and subtitle_rules["minimum"] < events <= subtitle_rules["maximum"]
+        and (
+            bool(selected.get("forced") or selected.get("nombre_forzado"))
+            or len(image_tracks) == 1
+        )
+    )
+    if not plausible:
+        one_pass = _build_one_pass_no_subtitles_plan(video, analysis, image_tracks)
+        if one_pass:
+            adjusted, prepared = one_pass
+            return adjusted, prepared, {
+                "status": "prepared",
+                "mode": "imagen_no_plausible_sin_ocr",
+                "events": events,
+            }
+        return analysis, plan, None
+
+    srt, cues, method = rescate_subtitulos.ejecutar_seconv(video, selected, tmp_dir)
+    if not (subtitle_rules["minimum"] < cues <= subtitle_rules["maximum"]):
+        one_pass = _build_one_pass_no_subtitles_plan(video, analysis, image_tracks)
+        if one_pass:
+            adjusted, prepared = one_pass
+            return adjusted, prepared, {
+                "status": "prepared",
+                "mode": "ocr_fuera_limite_sin_subtitulos",
+                "cues": cues,
+            }
+        return analysis, plan, None
+    adjusted, prepared = _plan_with_external_subtitle(
+        analysis, video, selected, srt, mode="ocr", cues=cues
+    )
+    return adjusted, prepared, {
+        "status": "prepared",
         "mode": "ocr",
         "method": method,
-        "video": str(final),
-        "original_removed": str(original_eliminado),
         "cues": cues,
-        "log": log[-3000:],
     }
 
 
 def _build_plan(video: Path) -> Tuple[Dict[str, object], Dict[str, object]]:
     analysis = detector.analizar_archivo(video)
     plan = planificador.crear_plan(analysis)
-    output = video.with_name(f"{video.stem}.limpio.mkv")
-    if output.exists():
-        output = output.with_name(f"{output.stem}.{int(time.time())}{output.suffix}")
-    plan["entrada"] = str(video)
-    plan["salida"] = str(output)
+    _bind_plan_to_video(plan, video)
+    plan["duration"] = float(analysis.get("duration") or 0)
+    plan["stream_counts"] = dict(analysis.get("stream_counts") or {})
     return analysis, plan
 
 
@@ -251,59 +341,6 @@ def _int_or_none(value: object) -> Optional[int]:
         return int(value)
     except Exception:
         return None
-
-
-def _subtitle_rescuable_by_rules(events: Optional[int]) -> bool:
-    if events is None:
-        return True
-    min_events = int(valor("subtitulos.frases_descartar_hasta", 1) or 1)
-    max_events = int(valor("subtitulos.frases_maximo_unico_forzado", 150) or 150)
-    return min_events < events <= max_events
-
-
-def _discardable_image_subtitles(analysis: Dict[str, object], video: Path) -> Optional[List[Dict[str, object]]]:
-    mode = str(valor("subtitulos.sin_subtitulos_modo", "cuarentena") or "").strip().lower()
-    if mode != "procesar_sin_subtitulos":
-        return None
-
-    subtitles = analysis.get("subtitulos") or []
-    if not isinstance(subtitles, list):
-        return None
-
-    text_codecs = set(valor("subtitulos.formatos_texto_aceptados", []) or [])
-    image_codecs = set(valor("subtitulos.formatos_imagen_no_aceptados", []) or [])
-
-    spanish_image = [
-        s for s in subtitles
-        if isinstance(s, dict)
-        and s.get("language_final") == "es"
-        and str(s.get("codec") or "").lower() in image_codecs
-    ]
-    if not spanish_image:
-        return None
-
-    if any(_int_or_none(subtitle.get("eventos")) is None for subtitle in spanish_image):
-        try:
-            data = rescate_subtitulos.ffprobe_json(video)
-            image_tracks = rescate_subtitulos.pistas_imagen_es(data)
-            by_index = {
-                int(track.get("index")): track
-                for track in rescate_subtitulos.completar_eventos_pistas_imagen(video, image_tracks)
-                if track.get("index") is not None
-            }
-            for subtitle in spanish_image:
-                idx = _int_or_none(subtitle.get("index"))
-                if idx is not None and idx in by_index:
-                    subtitle["eventos"] = by_index[idx].get("eventos")
-        except Exception:
-            return None
-
-    for subtitle in spanish_image:
-        events = _int_or_none(subtitle.get("eventos"))
-        if _subtitle_rescuable_by_rules(events):
-            return None
-
-    return spanish_image
 
 
 def _build_one_pass_no_subtitles_plan(
@@ -328,14 +365,44 @@ def _build_one_pass_no_subtitles_plan(
     if plan.get("estado") != "PLAN APTO":
         return None
 
-    output = video.with_name(f"{video.stem}.limpio.mkv")
-    if output.exists():
-        output = output.with_name(f"{output.stem}.{int(time.time())}{output.suffix}")
-    plan["entrada"] = str(video)
-    plan["salida"] = str(output)
+    _bind_plan_to_video(plan, video)
+    plan["duration"] = float(analysis.get("duration") or 0)
+    plan["stream_counts"] = dict(analysis.get("stream_counts") or {})
     plan["rescate_una_pasada"] = True
     plan["subtitulos_descartados"] = discarded_subtitles
     return adjusted_analysis, plan
+
+
+def _apply_movie_processing_mode(
+    analysis: Dict[str, object],
+    plan: Dict[str, object],
+    video: Path,
+) -> None:
+    counts = dict(analysis.get("stream_counts") or {})
+    audio = plan.get("audio") if isinstance(plan.get("audio"), dict) else {}
+    subtitle = plan.get("subtitulo") if isinstance(plan.get("subtitulo"), dict) else None
+    audio_action = str(audio.get("audio_accion") or "")
+    metadata_only = (
+        video.suffix.lower() == ".mkv"
+        and int(counts.get("video") or 0) == 1
+        and int(counts.get("audio") or 0) == 1
+        and int(counts.get("attachment") or 0) == 0
+        and int(counts.get("data") or 0) == 0
+        and audio_action != "convertir_ac3_5_1"
+        and (
+            (subtitle is None and int(counts.get("subtitle") or 0) == 0)
+            or (
+                subtitle is not None
+                and int(counts.get("subtitle") or 0) == 1
+                and str(subtitle.get("codec") or "").lower() in {"subrip", "srt"}
+                and bool(plan.get("subtitulo_origen_interno"))
+            )
+        )
+    )
+    if metadata_only:
+        plan["processing_mode"] = "metadata_only"
+    elif str(plan.get("processing_mode") or "") != "ocr_single_remux":
+        plan["processing_mode"] = "single_remux"
 
 
 def _finalize_movie(
@@ -507,6 +574,7 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
 
     video = videos[0]
     rescue_result: Optional[Dict[str, object]] = None
+    timings_ms: Dict[str, int] = {"analysis": 0, "ocr": 0, "remux": 0, "verification": 0}
     _emit_event(
         callback_url,
         "media_analysis",
@@ -514,7 +582,9 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         "Analisis de pistas iniciado",
         {"video": str(video)},
     )
+    analysis_started = time.monotonic()
     analysis, plan = _build_plan(video)
+    timings_ms["analysis"] = round((time.monotonic() - analysis_started) * 1000)
     _emit_event(
         callback_url,
         "media_analysis",
@@ -529,95 +599,55 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         },
     )
 
-    if plan.get("estado") != "PLAN APTO" and _is_rescue_candidate(plan, analysis):
-        _emit_event(
-            callback_url,
-            "media_rescue",
-            "decision",
-            "Rescate de subtitulos necesario",
-            {"problemas": plan.get("problemas"), "estado": analysis.get("estado")},
+    try:
+        subtitle_started = time.monotonic()
+        analysis, plan, rescue_result = _prepare_subtitle_plan(
+            analysis,
+            plan,
+            video,
+            job_id,
+            reports_root,
         )
-        discarded_subtitles = _discardable_image_subtitles(analysis, video)
-        one_pass_plan = (
-            _build_one_pass_no_subtitles_plan(video, analysis, discarded_subtitles)
-            if discarded_subtitles
-            else None
-        )
-        if one_pass_plan:
-            analysis, plan = one_pass_plan
+        subtitle_elapsed = round((time.monotonic() - subtitle_started) * 1000)
+        if rescue_result and str(rescue_result.get("mode") or "") == "ocr":
+            timings_ms["ocr"] = subtitle_elapsed
+        _apply_movie_processing_mode(analysis, plan, video)
+        if rescue_result is not None:
             _emit_event(
                 callback_url,
                 "media_rescue",
-                "skipped",
-                "Remux de rescate omitido: los subtitulos se descartan en la pasada final",
+                "finished",
+                f"Subtitulo preparado: {rescue_result.get('mode')}",
                 {
-                    "mode": "sin_subtitulos_una_pasada",
-                    "video": str(video),
-                    "pistas_descartadas": discarded_subtitles,
+                    "mode": rescue_result.get("mode"),
+                    "cues": rescue_result.get("cues"),
+                    "events": rescue_result.get("events"),
+                    "processing_mode": plan.get("processing_mode"),
                 },
             )
-        else:
-            try:
-                _emit_event(
-                    callback_url,
-                    "media_rescue",
-                    "started",
-                    "Rescate de subtitulos iniciado",
-                    {"video": str(video)},
-                )
-                rescue_result = _rescue_in_place(source, video, job_id, reports_root)
-                _emit_event(
-                    callback_url,
-                    "media_rescue",
-                    "finished",
-                    f"Rescate terminado: {rescue_result.get('mode')}",
-                    {
-                        "mode": rescue_result.get("mode"),
-                        "video": rescue_result.get("video"),
-                        "cues": rescue_result.get("cues"),
-                        "original_removed": rescue_result.get("original_removed"),
-                    },
-                )
-                videos = _video_files(source)
-                video = Path(str(rescue_result.get("video") or (videos[0] if videos else video)))
-                _emit_event(
-                    callback_url,
-                    "media_analysis",
-                    "started",
-                    "Reanalisis tras rescate iniciado",
-                    {"video": str(video)},
-                )
-                analysis, plan = _build_plan(video)
-                _emit_event(
-                    callback_url,
-                    "media_analysis",
-                    "finished",
-                    f"Reanalisis terminado: {plan.get('estado')}",
-                    {"estado": plan.get("estado"), "problemas": plan.get("problemas")},
-                )
-            except Exception as error:
-                _emit_event(
-                    callback_url,
-                    "media_rescue",
-                    "error",
-                    "Rescate de subtitulos fallido",
-                    {"error": str(error), "video": str(video)},
-                )
-                return _move_to_review(
-                    source,
-                    review_root,
-                    job_id,
-                    "OCR subtitulo fallido.txt",
-                    [str(error)],
-                    {
-                        "job_id": job_id,
-                        "phase": "media_rescue",
-                        "source": str(source),
-                        "analysis": analysis,
-                        "plan": plan,
-                        "error": str(error),
-                    },
-                )
+    except Exception as error:
+        _emit_event(
+            callback_url,
+            "media_rescue",
+            "error",
+            "Preparacion de subtitulos fallida",
+            {"error": str(error), "video": str(video)},
+        )
+        return _move_to_review(
+            source,
+            review_root,
+            job_id,
+            "OCR subtitulo fallido.txt",
+            [str(error)],
+            {
+                "job_id": job_id,
+                "phase": "media_rescue",
+                "source": str(source),
+                "analysis": analysis,
+                "plan": plan,
+                "error": str(error),
+            },
+        )
 
     if plan.get("estado") != "PLAN APTO":
         reason_file = "Error de proceso.txt"
@@ -666,25 +696,36 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         )
         return late_duplicate
 
+    processing_mode = str(plan.get("processing_mode") or "single_remux")
+    process_phase = "media_metadata" if processing_mode == "metadata_only" else "media_remux"
+    process_label = {
+        "metadata_only": "Vía rápida",
+        "ocr_single_remux": "OCR y remux único",
+    }.get(processing_mode, "Remux único")
     _emit_event(
         callback_url,
-        "media_ffmpeg",
+        process_phase,
         "started",
-        "FFmpeg iniciado",
+        f"{process_label} iniciada",
         {
             "entrada": plan.get("entrada"),
             "salida": plan.get("salida"),
             "audio_modo": plan.get("audio_modo"),
+            "processing_mode": plan.get("processing_mode"),
         },
     )
+    process_started = time.monotonic()
     process_result = procesador.ejecutar_ffmpeg(plan)
+    process_elapsed = round((time.monotonic() - process_started) * 1000)
+    if processing_mode != "metadata_only":
+        timings_ms["remux"] = process_elapsed
     _write_json(reports_dir / "media_process.json", process_result)
     if not process_result.get("ok"):
         _emit_event(
             callback_url,
-            "media_ffmpeg",
+            process_phase,
             "error",
-            "FFmpeg fallo",
+            f"{process_label} falló",
             {
                 "returncode": process_result.get("returncode"),
                 "salida": process_result.get("salida"),
@@ -709,14 +750,16 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         )
     _emit_event(
         callback_url,
-        "media_ffmpeg",
+        process_phase,
         "finished",
-        "FFmpeg terminado",
+        f"{process_label} terminada",
         {
             "salida": process_result.get("salida"),
             "tamano_salida": process_result.get("tamano_salida"),
             "audio_modo": process_result.get("audio_modo"),
             "capitulos": process_result.get("capitulos"),
+            "processing_mode": processing_mode,
+            "elapsed_ms": process_elapsed,
         },
     )
 
@@ -728,7 +771,11 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         "Verificacion iniciada",
         {"video": str(clean_video)},
     )
+    verification_started = time.monotonic()
     verification = verificador.verificar_archivo(clean_video)
+    timings_ms["verification"] = round(
+        (time.monotonic() - verification_started) * 1000
+    )
     _write_json(reports_dir / "media_verify.json", verification)
     if verification.get("estado") != "LIMPIO OK":
         _emit_event(
@@ -814,6 +861,8 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         "process": process_result,
         "verification": verification,
         "rescue": rescue_result,
+        "processing_mode": processing_mode,
+        "timings_ms": timings_ms,
         "final": final,
         "reports_dir": str(reports_dir),
     }
@@ -823,7 +872,12 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
         "media",
         "finished",
         "Media Worker terminado correctamente",
-        {"reports_dir": str(reports_dir), "final": final},
+        {
+            "reports_dir": str(reports_dir),
+            "final": final,
+            "processing_mode": processing_mode,
+            "timings_ms": timings_ms,
+        },
     )
     return result
 

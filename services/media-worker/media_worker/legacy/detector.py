@@ -250,6 +250,14 @@ def int_no_negativo(v):
         return None
     return numero if numero >= 0 else None
 
+
+def float_no_negativo(v):
+    try:
+        numero = float(str(v or "").strip())
+    except Exception:
+        return 0.0
+    return numero if numero >= 0 else 0.0
+
 def contar_eventos_subtitulos(ruta):
     cmd = [
         "ffprobe",
@@ -324,7 +332,6 @@ def analizar_archivo(ruta):
     videos = []
     audios = []
     subtitulos = []
-    eventos_subtitulos = None
     audio_es_valido = hay_audio_es_valido(streams)
     video_queda_es = video_queda_en_es(streams, audio_es_valido)
 
@@ -413,13 +420,11 @@ def analizar_archivo(ruta):
             error_extra = None
 
             if codec in text_subs:
-                cues, error_extra = contar_frases_subtitulo(ruta, idx, s)
+                cues = contar_frases_metadata(s)
+                if cues is None:
+                    error_extra = "conteo pendiente para la pista elegida"
             elif codec in image_subs or codec not in text_subs:
                 eventos = contar_frases_metadata(s)
-                if eventos is None:
-                    if eventos_subtitulos is None:
-                        eventos_subtitulos = contar_eventos_subtitulos(ruta)
-                    eventos = eventos_subtitulos.get(idx)
 
             delay_audio_ok = subtitulo_delay_audio_aceptado(s, esp, codec, cues)
 
@@ -433,8 +438,8 @@ def analizar_archivo(ruta):
                 decision = "CUARENTENA: formato de subtítulo no controlado"
                 prioridad = 0
             elif cues is None:
-                decision = "DESCARTAR: subtitulo largo sin conteo"
-                prioridad = 0
+                decision = "CANDIDATO FORZADO REAL"
+                prioridad = 150000 if forced else 90000
             elif cues <= spam_max:
                 decision = "DESCARTAR: posible promo/trampa"
                 prioridad = 0
@@ -536,4 +541,9 @@ def analizar_archivo(ruta):
         "videos": videos,
         "audios": sorted(audios, key=lambda x: x["prioridad"], reverse=True),
         "subtitulos": sorted(subtitulos, key=lambda x: x["prioridad"], reverse=True),
+        "duration": float_no_negativo((data.get("format") or {}).get("duration")),
+        "stream_counts": {
+            kind: sum(1 for stream in streams if stream.get("codec_type") == kind)
+            for kind in ("video", "audio", "subtitle", "attachment", "data")
+        },
     }

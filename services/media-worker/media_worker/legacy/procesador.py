@@ -2,6 +2,7 @@
 import os
 import json
 import html
+import shutil
 import subprocess
 import time
 import traceback
@@ -207,7 +208,99 @@ def limpiar_tags_mkv(ruta):
 def aplicar_capitulos_mkv(ruta, ruta_capitulos):
     return run(["mkvpropedit", str(ruta), "--chapters", str(ruta_capitulos)])
 
+
+def ejecutar_metadata_only(plan):
+    entrada = Path(plan["entrada"])
+    salida = Path(plan["salida"])
+    salida.parent.mkdir(parents=True, exist_ok=True)
+    TEMP.mkdir(parents=True, exist_ok=True)
+    tmp = salida.with_suffix(".procesando.tmp.mkv")
+    chapters = TEMP / f"chapters_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.xml"
+    tmp.unlink(missing_ok=True)
+    duracion = float(plan.get("duration") or 0)
+    total_capitulos = crear_capitulos_10min(entrada, chapters, duracion)
+    audio = plan["audio"]
+    sub = plan.get("subtitulo")
+    audio_codec = str(audio.get("codec") or "").lower()
+    audio_channels = int(audio.get("channels") or 0)
+    audio_title = (
+        str(REGLAS.get("audio", {}).get("titulo_ac3_convertido", "AC3 5.1"))
+        if es_ac3_5_1(audio_codec, audio_channels)
+        else titulo_audio_original(audio_codec, audio_channels)
+    )
+    command = ["mkvpropedit", str(tmp)]
+    if REGLAS.get("limpieza", {}).get("limpiar_tags_mkv", True):
+        command += ["--tags", "all:"]
+    if total_capitulos > 0:
+        command += ["--chapters", str(chapters)]
+    command += [
+        "--edit", "track:v1",
+        "--set", f"language={plan['video'].get('language_final') or 'es'}",
+        "--set", f"flag-default={1 if REGLAS.get('video', {}).get('marcar_default', True) else 0}",
+        "--set", f"flag-forced={1 if REGLAS.get('video', {}).get('marcar_forzado', False) else 0}",
+        "--edit", "track:a1",
+        "--set", f"language={audio.get('language_final') or 'es'}",
+        "--set", f"name={audio_title}",
+        "--set", f"flag-default={1 if REGLAS.get('audio', {}).get('marcar_default', True) else 0}",
+        "--set", f"flag-forced={1 if REGLAS.get('audio', {}).get('marcar_forzado', False) else 0}",
+    ]
+    if sub:
+        command += [
+            "--edit", "track:s1",
+            "--set", f"language={sub.get('language_final') or 'es'}",
+            "--set", f"name={plan.get('subtitulo_titulo') or REGLAS.get('subtitulos', {}).get('titulo_final', 'Forzados')}",
+            "--set", f"flag-default={1 if REGLAS.get('subtitulos', {}).get('interno_default', False) else 0}",
+            "--set", f"flag-forced={1 if REGLAS.get('subtitulos', {}).get('interno_forzado', False) else 0}",
+        ]
+    result = None
+    try:
+        os.replace(entrada, tmp)
+        result = run(command)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "mkvpropedit falló")[-2000:])
+        os.replace(tmp, salida)
+        external = Path(str(plan.get("subtitulo_externo"))) if plan.get("subtitulo_externo") else None
+        if sub and external is not None and plan.get("subtitulo_exportar_srt", True):
+            suffix = str(plan.get("subtitulo_sufijo_srt") or REGLAS.get("subtitulos", {}).get("sufijo_srt_externo", ".es.forced.srt"))
+            sidecar = salida.with_name(f"{salida.stem.replace('.limpio', '')}{suffix}")
+            sidecar_tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+            shutil.copyfile(external, sidecar_tmp)
+            os.replace(sidecar_tmp, sidecar)
+        return {
+            "archivo": plan["archivo"],
+            "entrada": str(entrada),
+            "salida": str(salida),
+            "returncode": 0,
+            "ok": True,
+            "audio_modo": "Audio copiado sin remux",
+            "audio_titulo": audio_title,
+            "capitulos": total_capitulos,
+            "limpieza": "Vía rápida de metadatos y capítulos",
+            "log": "metadata_only",
+            "tamano_salida": salida.stat().st_size,
+            "processing_mode": "metadata_only",
+        }
+    except Exception as error:
+        if salida.exists() and not entrada.exists():
+            os.replace(salida, entrada)
+        elif tmp.exists() and not entrada.exists():
+            os.replace(tmp, entrada)
+        return {
+            "archivo": plan.get("archivo"),
+            "entrada": str(entrada),
+            "salida": str(salida),
+            "returncode": int(getattr(result, "returncode", 1) or 1),
+            "ok": False,
+            "log": str(error),
+            "processing_mode": "metadata_only",
+        }
+    finally:
+        tmp.unlink(missing_ok=True)
+        chapters.unlink(missing_ok=True)
+
 def ejecutar_ffmpeg(plan):
+    if str(plan.get("processing_mode") or "") == "metadata_only":
+        return ejecutar_metadata_only(plan)
     entrada = Path(plan["entrada"])
     salida = Path(plan["salida"])
     salida.parent.mkdir(parents=True, exist_ok=True)
@@ -216,6 +309,7 @@ def ejecutar_ffmpeg(plan):
     video = plan["video"]
     audio = plan["audio"]
     sub = plan.get("subtitulo")
+    sub_externo = Path(str(plan.get("subtitulo_externo"))) if plan.get("subtitulo_externo") else None
     sin_subtitulos = bool(plan.get("sin_subtitulos")) or not sub
 
     audio_codec = str(audio.get("codec", "")).lower()
@@ -237,7 +331,7 @@ def ejecutar_ffmpeg(plan):
     if tmp.exists():
         tmp.unlink()
 
-    duracion_total = obtener_duracion_segundos(entrada)
+    duracion_total = float(plan.get("duration") or 0) or obtener_duracion_segundos(entrada)
     total_capitulos = crear_capitulos_10min(entrada, metadata_chapters, duracion_total)
 
     cmd = [
@@ -248,14 +342,17 @@ def ejecutar_ffmpeg(plan):
         "-y",
         "-fflags", "+genpts",
         "-i", str(entrada),
-
+    ]
+    if sub_externo is not None:
+        cmd += ["-i", str(sub_externo)]
+    cmd += [
         "-map", f"0:{video['index']}",
         "-map", f"0:{audio['index']}",
         "-c:v", "copy",
     ]
 
     if not sin_subtitulos:
-        cmd += ["-map", f"0:{sub['index']}"]
+        cmd += ["-map", "1:0" if sub_externo is not None else f"0:{sub['index']}"]
 
     if REGLAS.get("limpieza", {}).get("borrar_metadata_original", True):
         cmd += ["-map_metadata", "-1"]
@@ -319,20 +416,27 @@ def ejecutar_ffmpeg(plan):
 
         if sub_exportar_srt and not sin_subtitulos:
             srt_externo = salida.with_name(f"{salida.stem.replace('.limpio', '')}{sub_sufijo_srt}")
-            r_srt = run([
-                "ffmpeg",
-                "-hide_banner",
-                "-nostats",
-                "-y",
-                "-fflags", "+genpts",
-                "-i", str(entrada),
-                "-map", f"0:{sub['index']}",
-                "-c:s", "srt",
-                str(srt_externo)
-            ])
-
-            if r_srt.returncode != 0 or not srt_externo.exists():
-                ok = False
+            if sub_externo is not None:
+                try:
+                    srt_tmp = srt_externo.with_suffix(srt_externo.suffix + ".tmp")
+                    shutil.copyfile(sub_externo, srt_tmp)
+                    os.replace(srt_tmp, srt_externo)
+                except OSError:
+                    ok = False
+            else:
+                r_srt = run([
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-nostats",
+                    "-y",
+                    "-fflags", "+genpts",
+                    "-i", str(entrada),
+                    "-map", f"0:{sub['index']}",
+                    "-c:s", "srt",
+                    str(srt_externo)
+                ])
+                if r_srt.returncode != 0 or not srt_externo.exists():
+                    ok = False
     else:
         if tmp.exists():
             tmp.unlink()
@@ -358,4 +462,5 @@ def ejecutar_ffmpeg(plan):
         "limpieza": "Metadatos originales, capítulos originales, adjuntos y carátulas descartados",
         "log": log_limpio,
         "tamano_salida": salida.stat().st_size if salida.exists() else 0,
+        "processing_mode": str(plan.get("processing_mode") or "single_remux"),
     }

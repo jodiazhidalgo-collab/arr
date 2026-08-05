@@ -112,6 +112,44 @@ class _Resolver:
         return True
 
 
+class _BatchFileBot:
+    def __init__(self, *, skip_names=()) -> None:
+        self.calls = 0
+        self.skip_names = set(skip_names)
+
+    def configure_identity_rules(self, _rules) -> None:
+        return None
+
+    def preview_command(self, job_id, category, input_path, output_root, identity):
+        return {
+            "argv": ["filebot", str(input_path)],
+            "cwd": str(input_path),
+            "timeout_sec": 30,
+            "tmdb_id": identity.tmdb_id,
+        }
+
+    def run(self, job_id, category, input_path, output_root, identity):
+        self.calls += 1
+        moves = []
+        output_media = []
+        for source in sorted(Path(input_path).rglob("*.mkv")):
+            if source.name in self.skip_names:
+                continue
+            destination = Path(output_root) / "Juego de Tronos" / "Season 04" / source.name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(destination)
+            moves.append({"source": str(source), "destination": str(destination)})
+            output_media.append(str(destination))
+        return {
+            "exit_code": 0,
+            "moves": moves,
+            "output_media": output_media,
+            "duplicate": False,
+            "timed_out": False,
+            "identity": identity.to_dict(),
+        }
+
+
 def _batch_parent(tmp_path: Path, names: list[str]):
     config = _config(tmp_path)
     database = Database(tmp_path / "config" / "orchestrator.db")
@@ -263,8 +301,10 @@ def test_game_of_thrones_t4_creates_ten_children_with_one_tmdb_resolution(tmp_pa
     names = [f"Juego de Tronos S04E{episode:02d} 1080p.mkv" for episode in range(1, 11)]
     engine, database, parent = _batch_parent(tmp_path, names)
     resolver = _Resolver(_identity())
+    filebot = _BatchFileBot()
     engine.identity.resolver = resolver
     engine.name_resolver = resolver
+    engine.filebot = filebot
 
     engine._run_extract(parent)
     parent = database.get_job(str(parent["job_id"]))
@@ -272,13 +312,15 @@ def test_game_of_thrones_t4_creates_ten_children_with_one_tmdb_resolution(tmp_pa
     engine._run_filebot(parent)
     parent = database.get_job(str(parent["job_id"]))
     assert parent["state"] == "batch_preparing"
+    engine = Engine(engine.config, database)
     engine._run_batch_prepare(parent)
 
     children = database.children_for_parent(str(parent["job_id"]))
     assert resolver.calls == 1
     assert resolver.deferred == [True]
+    assert filebot.calls == 1
     assert len(children) == 10
-    assert all(child["state"] == "ready_filebot" for child in children)
+    assert all(child["state"] == "series_postprocess_ready" for child in children)
     assert all(json.loads(child["identity_json"])["tmdb_id"] == 1399 for child in children)
     assert sorted(child["batch_index"] for child in children) == list(range(1, 11))
 
@@ -291,8 +333,10 @@ def test_only_nonexistent_episode_child_goes_to_review(tmp_path: Path):
     names = ["Juego de Tronos S04E01.mkv", "Juego de Tronos S04E99.mkv"]
     engine, database, parent = _batch_parent(tmp_path, names)
     resolver = _Resolver(_identity())
+    filebot = _BatchFileBot()
     engine.identity.resolver = resolver
     engine.name_resolver = resolver
+    engine.filebot = filebot
 
     engine._run_extract(parent)
     parent = database.get_job(str(parent["job_id"]))
@@ -301,9 +345,35 @@ def test_only_nonexistent_episode_child_goes_to_review(tmp_path: Path):
     engine._run_batch_prepare(parent)
 
     children = database.children_for_parent(str(parent["job_id"]))
-    assert [child["state"] for child in children] == ["ready_filebot", "manual_review"]
+    assert [child["state"] for child in children] == ["series_postprocess_ready", "manual_review"]
     assert children[1]["last_error_code"] == "series_episode_not_found"
     assert children[0]["stage_path"].startswith(str(engine.config.workshop_root))
+    database.close()
+
+
+def test_unmapped_batch_child_uses_individual_filebot_without_blocking_siblings(
+    tmp_path: Path,
+):
+    names = ["Juego de Tronos S04E01.mkv", "Juego de Tronos S04E02.mkv"]
+    engine, database, parent = _batch_parent(tmp_path, names)
+    resolver = _Resolver(_identity())
+    filebot = _BatchFileBot(skip_names={names[1]})
+    engine.identity.resolver = resolver
+    engine.name_resolver = resolver
+    engine.filebot = filebot
+
+    engine._run_extract(parent)
+    parent = database.get_job(str(parent["job_id"]))
+    engine._run_filebot(parent)
+    parent = database.get_job(str(parent["job_id"]))
+    engine._run_batch_prepare(parent)
+
+    children = database.children_for_parent(str(parent["job_id"]))
+    assert filebot.calls == 1
+    assert [child["state"] for child in children] == [
+        "series_postprocess_ready",
+        "ready_filebot",
+    ]
     database.close()
 
 
@@ -356,6 +426,44 @@ def test_api_groups_parent_and_child_progress(tmp_path: Path):
     }
     assert len(database.job_detail(parent["job_id"])["children"]) == 2
     assert database.job_detail(child["job_id"])["parent"]["job_id"] == parent["job_id"]
+    database.close()
+
+
+def test_jobs_api_exposes_human_processing_route_and_timings(tmp_path: Path):
+    database = Database(tmp_path / "jobs.db")
+    database.initialize()
+    job = database.create_job(
+        "processing-api",
+        "fs",
+        "movies",
+        "Película",
+        state="done",
+        result_json=json.dumps(
+            {
+                "status": "done",
+                "processing_mode": "metadata_only",
+                "timings_ms": {
+                    "analysis": 1200,
+                    "ocr": 0,
+                    "remux": 0,
+                    "verification": 300,
+                },
+            }
+        ),
+    )
+
+    payload = next(
+        item for item in database.jobs_for_api() if item["job_id"] == job["job_id"]
+    )
+    assert payload["processing"] == {
+        "mode": "metadata_only",
+        "timings_ms": {
+            "analysis": 1200,
+            "ocr": 0,
+            "remux": 0,
+            "verification": 300,
+        },
+    }
     database.close()
 
 

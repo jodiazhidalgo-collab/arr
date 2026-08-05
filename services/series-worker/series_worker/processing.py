@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -195,6 +196,9 @@ class EpisodePlan:
     audio_mode: str
     rules_fingerprint: str
     duration: float
+    processing_mode: str
+    analysis_ms: int
+    ocr_ms: int
 
 
 @dataclass(frozen=True)
@@ -497,21 +501,64 @@ def _subtitle_cues_from_text(value: str) -> int:
     return count if count else (value or "").count("-->")
 
 
-def _stream_cues(source: Path, index: int, runner: Runner) -> int | None:
+def _stream_events(stream: dict[str, Any]) -> int | None:
+    tags = stream.get("tags") or {}
+    for value in (
+        tags.get("NUMBER_OF_FRAMES"),
+        tags.get("NUMBER_OF_BLOCKS"),
+        stream.get("nb_read_packets"),
+        stream.get("nb_read_frames"),
+        stream.get("nb_frames"),
+    ):
+        try:
+            if value is not None and int(value) >= 0:
+                return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _stream_packet_count(source: Path, index: int, runner: Runner) -> int | None:
     try:
         result = _run_checked(
             runner,
             [
-                "ffmpeg", "-nostdin", "-v", "error", "-i", str(source),
-                "-map", f"0:{index}", "-f", "srt", "-",
+                "ffprobe", "-v", "error", "-select_streams", str(index),
+                "-count_packets", "-show_entries",
+                "stream=nb_read_packets,nb_read_frames,nb_frames:stream_tags=NUMBER_OF_FRAMES,NUMBER_OF_BLOCKS",
+                "-print_format", "json", str(source),
             ],
             timeout=900,
-            label="conteo de subtítulo",
+            label="conteo dirigido de subtítulo",
         )
-    except ProcessingError:
+        payload = json.loads(result.stdout or "{}")
+        streams = payload.get("streams") or []
+        return _stream_events(streams[0]) if streams else None
+    except (ProcessingError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    cues = _subtitle_cues_from_text(result.stdout or "")
-    return cues if cues > 0 else None
+
+
+def _extract_internal_subtitle(
+    source: Path,
+    index: int,
+    workspace: Path,
+    runner: Runner,
+) -> tuple[Path, int | None]:
+    workspace.mkdir(parents=True, exist_ok=True)
+    output = workspace / "subtitle_selected.srt"
+    output.unlink(missing_ok=True)
+    _run_checked(
+        runner,
+        [
+            "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(source),
+            "-map", f"0:{index}", "-c:s", "srt", str(output),
+        ],
+        timeout=900,
+        label="extracción única de subtítulo",
+    )
+    if not _srt_valid(output):
+        raise SubtitleNotConvertibleError("El subtítulo elegido no produjo un SRT válido.")
+    return output, _external_cues(output)
 
 
 def _sidecar_language_allowed(source: Path, sidecar: Path) -> bool:
@@ -571,6 +618,7 @@ def _select_subtitle(
     delay_title = _text(delay["texto_titulo"])
     text_choices: list[tuple[tuple[int, int, int], SubtitleChoice]] = []
     image_candidates: list[dict[str, Any]] = []
+    rejected_text = False
 
     for stream in probe.get("streams") or []:
         if stream.get("codec_type") != "subtitle" or not _is_spanish(stream, accepted):
@@ -584,15 +632,15 @@ def _select_subtitle(
                 f"Codec de subtítulo desconocido para automatización: {codec or '-'}"
             )
         index = int(stream["index"])
-        cues = _stream_cues(source, index, runner)
-        if cues is None or cues <= minimum:
+        cues = _stream_events(stream)
+        if cues is not None and cues <= minimum:
             continue
         title = str((stream.get("tags") or {}).get("title") or "")
         is_delay = bool(delay["activo"] and delay_title and delay_title in _text(title))
-        if is_delay and cues > int(delay["frases_maximo"]):
+        if is_delay and cues is not None and cues > int(delay["frases_maximo"]):
             is_delay = False
         forced = int((stream.get("disposition") or {}).get("forced", 0) or 0) == 1
-        if cues <= maximum or subtitle_rules["unico_es_modo"] == "aceptar_siempre" or is_delay:
+        if cues is None or cues <= maximum or subtitle_rules["unico_es_modo"] == "aceptar_siempre" or is_delay:
             choice = SubtitleChoice(
                 mode="internal_delay" if is_delay else "internal_text",
                 stream_index=index,
@@ -600,7 +648,9 @@ def _select_subtitle(
                 cues=cues,
                 title=title,
             )
-            text_choices.append(((0 if is_delay else 1, 0 if forced else 1, cues), choice))
+            text_choices.append(((0 if is_delay else 1, 0 if forced else 1, cues if cues is not None else maximum), choice))
+        else:
+            rejected_text = True
 
     for external in _external_subtitles(source, external_subtitles):
         name = _text(external.name)
@@ -625,8 +675,28 @@ def _select_subtitle(
 
     if text_choices:
         return min(text_choices, key=lambda item: item[0])[1], None
+    if rejected_text:
+        if str(subtitle_rules["sin_subtitulos_modo"]).strip().casefold() == "procesar_sin_subtitulos":
+            return None, None
+        raise SubtitleReviewRequiredError(
+            "El subtítulo español de texto supera el límite configurado."
+        )
     if image_candidates:
-        return None, image_candidates[0]
+        if str(subtitle_rules["ocr_imagen_modo"]).casefold() == "desactivado":
+            if str(subtitle_rules["sin_subtitulos_modo"]).strip().casefold() == "procesar_sin_subtitulos":
+                return None, None
+            raise SubtitleReviewRequiredError("El OCR de imagen está desactivado.")
+        ranked = sorted(
+            image_candidates,
+            key=lambda stream: (
+                0 if int((stream.get("disposition") or {}).get("forced", 0) or 0) == 1 else 1,
+                0 if any(marker in _text((stream.get("tags") or {}).get("title")) for marker in ("forced", "forzado", "forzados")) else 1,
+                int(stream.get("index") or 0),
+            ),
+        )
+        selected = dict(ranked[0])
+        selected["_sole_spanish_image"] = len(image_candidates) == 1
+        return None, selected
     if str(subtitle_rules["sin_subtitulos_modo"]).strip().casefold() == "procesar_sin_subtitulos":
         return None, None
     raise SubtitleNotConvertibleError("No hay subtítulo español procesable.")
@@ -725,6 +795,33 @@ def _ocr_subtitle(
         raise OCRSubtitleError(str(error)) from error
 
 
+def _metadata_only_eligible(
+    source: Path,
+    probe: dict[str, Any],
+    video: dict[str, Any],
+    audio: dict[str, Any],
+    subtitle: SubtitleChoice | None,
+    audio_mode: str,
+) -> bool:
+    if source.suffix.casefold() != ".mkv" or audio_mode != "copy":
+        return False
+    selected = {int(video["index"]), int(audio["index"])}
+    if subtitle is not None:
+        if subtitle.stream_index is None or subtitle.codec.casefold() not in {"subrip", "srt"}:
+            return False
+        selected.add(int(subtitle.stream_index))
+    streams = list(probe.get("streams") or [])
+    relevant = [
+        stream for stream in streams
+        if stream.get("codec_type") in {"video", "audio", "subtitle", "attachment", "data"}
+    ]
+    return bool(relevant) and all(
+        stream.get("codec_type") in {"video", "audio", "subtitle"}
+        and int(stream.get("index", -1)) in selected
+        for stream in relevant
+    ) and len(relevant) == len(selected)
+
+
 def analyze_episode(
     source: Path | str,
     output: Path | str,
@@ -738,6 +835,8 @@ def analyze_episode(
 
     if not isinstance(rules_snapshot, RulesSnapshot):
         raise ProcessingError("rules_snapshot explícito es obligatorio.")
+    analysis_started = time.monotonic()
+    ocr_ms = 0
     active = runner or SubprocessRunner()
     require_tools(active, BASE_TOOLS)
     source_path = Path(source)
@@ -752,16 +851,71 @@ def analyze_episode(
     subtitle, image_stream = _select_subtitle(
         source_path, probe, rules_snapshot.rules, active, external_subtitles
     )
+    subtitle_rules = rules_snapshot.rules["subtitulos"]
+    if subtitle is not None and subtitle.stream_index is not None:
+        workspace = ocr_workspace or Path(output).parent / ".ocr"
+        extracted, cues = _extract_internal_subtitle(
+            source_path,
+            int(subtitle.stream_index),
+            workspace,
+            active,
+        )
+        minimum = int(subtitle_rules["frases_descartar_hasta"])
+        maximum = (
+            int(subtitle_rules["delay_audio"]["frases_maximo"])
+            if subtitle.mode == "internal_delay"
+            else int(subtitle_rules["frases_maximo_unico_forzado"])
+        )
+        accepted = cues is not None and cues > minimum and (
+            cues <= maximum or subtitle_rules["unico_es_modo"] == "aceptar_siempre"
+        )
+        if accepted:
+            subtitle = SubtitleChoice(
+                mode=subtitle.mode,
+                stream_index=subtitle.stream_index,
+                external_path=extracted,
+                codec=subtitle.codec,
+                cues=cues,
+                title=subtitle.title,
+            )
+        elif str(subtitle_rules["sin_subtitulos_modo"]).casefold() == "procesar_sin_subtitulos":
+            subtitle = None
+        else:
+            raise SubtitleReviewRequiredError(
+                "El subtítulo español elegido queda fuera del límite configurado."
+            )
+    if image_stream is not None:
+        minimum = int(subtitle_rules["frases_descartar_hasta"])
+        maximum = int(subtitle_rules["frases_maximo_unico_forzado"])
+        events = _stream_events(image_stream)
+        if events is None:
+            events = _stream_packet_count(source_path, int(image_stream["index"]), active)
+        title = _text((image_stream.get("tags") or {}).get("title"))
+        forced = (
+            int((image_stream.get("disposition") or {}).get("forced", 0) or 0) == 1
+            or any(marker in title for marker in ("forced", "forzado", "forzados"))
+        )
+        plausible = (
+            events is not None
+            and minimum < events <= maximum
+            and (forced or bool(image_stream.get("_sole_spanish_image")))
+        )
+        if not plausible:
+            if str(subtitle_rules["sin_subtitulos_modo"]).casefold() == "procesar_sin_subtitulos":
+                image_stream = None
+            else:
+                raise SubtitleReviewRequiredError(
+                    "El subtítulo de imagen no demuestra ser un forzado corto."
+                )
     if image_stream is not None:
         workspace = ocr_workspace or Path(output).parent / ".ocr"
+        ocr_started = time.monotonic()
         external = _ocr_subtitle(source_path, image_stream, workspace, active)
+        ocr_ms = round((time.monotonic() - ocr_started) * 1000)
         cues = _external_cues(external)
-        subtitle_rules = rules_snapshot.rules["subtitulos"]
         minimum = int(subtitle_rules["frases_descartar_hasta"])
         maximum = int(subtitle_rules["frases_maximo_unico_forzado"])
         accepted = cues is not None and minimum < cues <= maximum
-        if not accepted and subtitle_rules["unico_es_modo"] == "aceptar_siempre":
-            accepted = cues is not None and cues > minimum
         if accepted:
             subtitle = SubtitleChoice(
                 mode="ocr",
@@ -776,6 +930,13 @@ def analyze_episode(
             raise OCRReviewRequiredError(
                 "El SRT OCR queda fuera de los límites de frases."
             )
+    processing_mode = (
+        "metadata_only"
+        if _metadata_only_eligible(source_path, probe, video, audio, subtitle, audio_mode)
+        else "ocr_single_remux"
+        if subtitle is not None and subtitle.mode == "ocr"
+        else "single_remux"
+    )
     return EpisodePlan(
         source=source_path,
         output=Path(output),
@@ -785,6 +946,9 @@ def analyze_episode(
         audio_mode=audio_mode,
         rules_fingerprint=rules_snapshot.fingerprint,
         duration=_selected_av_duration(probe, video, audio),
+        processing_mode=processing_mode,
+        analysis_ms=round((time.monotonic() - analysis_started) * 1000),
+        ocr_ms=ocr_ms,
     )
 
 
@@ -936,6 +1100,39 @@ def _ffmpeg_command(plan: EpisodePlan, temporary: Path, rules: dict[str, Any]) -
     return command
 
 
+def _mkvpropedit_command(
+    path: Path,
+    plan: EpisodePlan,
+    rules: dict[str, Any],
+    chapter_file: Path | None,
+) -> list[str]:
+    command = ["mkvpropedit", str(path)]
+    if rules["limpieza"]["limpiar_tags_mkv"]:
+        command += ["--tags", "all:"]
+    if chapter_file is not None:
+        command += ["--chapters", str(chapter_file)]
+    command += [
+        "--edit", "track:v1",
+        "--set", f"language={rules['video']['idioma_final']}",
+        "--set", f"flag-default={1 if rules['video']['marcar_default'] else 0}",
+        "--set", f"flag-forced={1 if rules['video']['marcar_forzado'] else 0}",
+        "--edit", "track:a1",
+        "--set", f"language={rules['audio']['idioma_final_condicional']}",
+        "--set", f"name={_audio_title(plan.audio, rules, plan.audio_mode)}",
+        "--set", f"flag-default={1 if rules['audio']['marcar_default'] else 0}",
+        "--set", f"flag-forced={1 if rules['audio']['marcar_forzado'] else 0}",
+    ]
+    if plan.subtitle is not None:
+        command += [
+            "--edit", "track:s1",
+            "--set", "language=es",
+            "--set", f"name={rules['subtitulos']['titulo_final']}",
+            "--set", f"flag-default={1 if rules['subtitulos']['interno_default'] else 0}",
+            "--set", f"flag-forced={1 if rules['subtitulos']['interno_forzado'] else 0}",
+        ]
+    return command
+
+
 def _verify_output(
     path: Path,
     plan: EpisodePlan,
@@ -1046,23 +1243,26 @@ def _execute_plan(
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".procesando.tmp.mkv")
     chapter_file = Path(tempfile.gettempdir()) / f"series_chapters_{uuid.uuid4().hex}.xml"
+    moved_source = False
     try:
-        _run_checked(
-            runner,
-            _ffmpeg_command(plan, temporary, rules_snapshot.rules),
-            timeout=14400,
-            label="remux FFmpeg",
-        )
-        if not temporary.is_file() or temporary.stat().st_size <= 0:
-            raise ProcessingError("FFmpeg no produjo un MKV provisional.")
-        if rules_snapshot.rules["limpieza"]["limpiar_tags_mkv"]:
+        temporary.unlink(missing_ok=True)
+        remux_ms = 0
+        if plan.processing_mode == "metadata_only":
+            os.replace(plan.source, temporary)
+            moved_source = True
+        else:
+            remux_started = time.monotonic()
             _run_checked(
                 runner,
-                ["mkvpropedit", str(temporary), "--tags", "all:"],
-                timeout=900,
-                label="limpieza de tags MKV",
+                _ffmpeg_command(plan, temporary, rules_snapshot.rules),
+                timeout=14400,
+                label="remux FFmpeg",
             )
+            remux_ms = round((time.monotonic() - remux_started) * 1000)
+        if not temporary.is_file() or temporary.stat().st_size <= 0:
+            raise ProcessingError("No se produjo un MKV provisional.")
         chapters = 0
+        active_chapter_file: Path | None = None
         if rules_snapshot.rules["limpieza"]["crear_capitulos"]:
             chapters = _write_chapters(
                 chapter_file,
@@ -1070,20 +1270,42 @@ def _execute_plan(
                 int(rules_snapshot.rules["limpieza"]["capitulo_cada_segundos"]),
             )
             if chapters:
-                _run_checked(
-                    runner,
-                    ["mkvpropedit", str(temporary), "--chapters", str(chapter_file)],
-                    timeout=900,
-                    label="capítulos MKV",
-                )
+                active_chapter_file = chapter_file
+        _run_checked(
+            runner,
+            _mkvpropedit_command(
+                temporary,
+                plan,
+                rules_snapshot.rules,
+                active_chapter_file,
+            ),
+            timeout=900,
+            label="metadatos y capítulos MKV",
+        )
         # Una sola comprobación por ffprobe, igual que Media Worker de películas.
+        verification_started = time.monotonic()
         verification = _verify_output(temporary, plan, runner)
+        verification_ms = round((time.monotonic() - verification_started) * 1000)
         verification["chapters"] = chapters
+        verification["processing_mode"] = plan.processing_mode
+        verification["timings_ms"] = {
+            "analysis": plan.analysis_ms,
+            "ocr": plan.ocr_ms,
+            "remux": remux_ms,
+            "verification": verification_ms,
+        }
         exported_subtitle = _export_subtitle(plan, output, rules_snapshot.rules, runner)
         os.replace(temporary, output)
+        moved_source = False
         return verification, exported_subtitle, (int(output.stat().st_size), "")
+    except Exception:
+        if moved_source and temporary.exists() and not plan.source.exists():
+            os.replace(temporary, plan.source)
+            moved_source = False
+        raise
     finally:
-        temporary.unlink(missing_ok=True)
+        if not moved_source:
+            temporary.unlink(missing_ok=True)
         chapter_file.unlink(missing_ok=True)
 
 

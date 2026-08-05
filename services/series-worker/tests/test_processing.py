@@ -130,6 +130,8 @@ class FakeRunner:
                 tracks.append({"type": "subtitles"})
             return subprocess.CompletedProcess(argv, 0, json.dumps({"tracks": tracks}), "")
         if executable == "mkvpropedit":
+            path = Path(argv[1])
+            self.generated_subtitles[path] = "track:s1" in argv
             return subprocess.CompletedProcess(argv, 0, "", "")
         if executable == "seconv":
             name = next(
@@ -247,7 +249,7 @@ def _job(tmp_path: Path, names):
 
 
 @pytest.mark.parametrize("suffix", [".mkv", ".mp4", ".avi"])
-def test_supported_inputs_are_processed_to_mkv_without_touching_original(
+def test_supported_inputs_use_metadata_only_for_clean_mkv_and_remux_others(
     tmp_path: Path, suffix: str
 ) -> None:
     relative = f"Serie/Season 01/Serie.S01E01{suffix}"
@@ -260,7 +262,12 @@ def test_supported_inputs_are_processed_to_mkv_without_touching_original(
     output = source / "Serie/Season 01/Serie.S01E01.limpio.mkv"
     assert result.status == "verified"
     assert output.is_file()
-    assert (source / relative).read_bytes() == original
+    if suffix == ".mkv":
+        assert not (source / relative).exists()
+        assert result.episodes[0].verification["processing_mode"] == "metadata_only"
+    else:
+        assert (source / relative).read_bytes() == original
+        assert result.episodes[0].verification["processing_mode"] == "single_remux"
     assert result.episodes[0].provisional_relpath == (
         "series_filebot_output/Serie/Season 01/Serie.S01E01.limpio.mkv"
     )
@@ -270,7 +277,8 @@ def test_supported_inputs_are_processed_to_mkv_without_touching_original(
         for command, _cwd in runner.commands
         if command[0] == "ffmpeg" and command[-1].endswith(".mkv")
     ]
-    assert any(path.endswith(".limpio.procesando.tmp.mkv") for path in ffmpeg_outputs)
+    assert bool(ffmpeg_outputs) is (suffix != ".mkv")
+    assert all(path.endswith(".limpio.procesando.tmp.mkv") for path in ffmpeg_outputs)
     assert all(command[0] != "mkvmerge" for command, _cwd in runner.commands)
     assert all(command[-3:] != ["-f", "null", "-"] for command, _cwd in runner.commands)
 
@@ -279,7 +287,10 @@ def test_entries_run_sequentially_and_failure_never_publishes(tmp_path: Path) ->
     first = "Serie/Season 01/Serie.S01E01.mkv"
     second = "Serie/Season 01/Serie.S01E02.mkv"
     job, source, manifest = _job(tmp_path, [first, second])
-    runner = FakeRunner(fail_source="S01E02")
+    runner = FakeRunner(
+        {"Serie.S01E02.mkv": _stream_probe(extra_audio=True)},
+        fail_source="S01E02",
+    )
 
     with pytest.raises(EpisodeProcessingError) as captured:
         SeriesProcessor(runner).process(
@@ -293,7 +304,7 @@ def test_entries_run_sequentially_and_failure_never_publishes(tmp_path: Path) ->
     assert (source / "Serie/Season 01/Serie.S01E01.limpio.mkv").exists()
     assert not (source / "Serie/Season 01/Serie.S01E02.limpio.mkv").exists()
     assert not (job / "tv").exists()
-    assert (source / first).exists() and (source / second).exists()
+    assert not (source / first).exists() and (source / second).exists()
 
 
 def test_video_avoids_full_hash_when_size_and_mtime_are_unchanged(tmp_path: Path) -> None:
@@ -546,9 +557,8 @@ def test_french_and_german_sidecars_are_never_selected_as_spanish(tmp_path: Path
     result = process_manifest(manifest, source, job, _snapshot(tmp_path), runner)
 
     assert result.episodes[0].subtitle_mode == "none"
-    remux = next(command for command, _ in runner.commands if command[0] == "ffmpeg" and command[-1].endswith(".mkv"))
-    assert str(french) not in remux
-    assert str(german) not in remux
+    assert result.episodes[0].verification["processing_mode"] == "metadata_only"
+    assert not any(command[0] == "ffmpeg" and command[-1].endswith(".mkv") for command, _ in runner.commands)
 
 
 def test_no_subtitles_is_valid_when_snapshot_allows_it(tmp_path: Path) -> None:
@@ -567,7 +577,7 @@ def test_image_subtitle_uses_real_ocr_route_contract(tmp_path: Path) -> None:
         "index": 2,
         "codec_type": "subtitle",
         "codec_name": "hdmv_pgs_subtitle",
-        "tags": {"language": "spa"},
+        "tags": {"language": "spa", "NUMBER_OF_FRAMES": "2"},
         "disposition": {},
     }
     runner = FakeRunner({"Serie.S01E01.mkv": _stream_probe(subtitle=subtitle)})
@@ -585,7 +595,7 @@ def test_unknown_spanish_subtitle_codec_requires_review(tmp_path: Path) -> None:
         "index": 2,
         "codec_type": "subtitle",
         "codec_name": "mystery_subtitle",
-        "tags": {"language": "spa"},
+        "tags": {"language": "spa", "NUMBER_OF_FRAMES": "2"},
         "disposition": {},
     }
     runner = FakeRunner({"Serie.S01E01.mkv": _stream_probe(subtitle=subtitle)})
@@ -609,7 +619,7 @@ def test_ocr_tool_failure_keeps_ocr_identity_through_episode_wrapper(
         "index": 2,
         "codec_type": "subtitle",
         "codec_name": "hdmv_pgs_subtitle",
-        "tags": {"language": "spa"},
+        "tags": {"language": "spa", "NUMBER_OF_FRAMES": "2"},
         "disposition": {},
     }
 
@@ -645,7 +655,7 @@ def test_ocr_result_reapplies_cue_limit_before_embedding(tmp_path: Path) -> None
         "index": 2,
         "codec_type": "subtitle",
         "codec_name": "hdmv_pgs_subtitle",
-        "tags": {"language": "spa"},
+        "tags": {"language": "spa", "NUMBER_OF_FRAMES": "2"},
         "disposition": {},
     }
 

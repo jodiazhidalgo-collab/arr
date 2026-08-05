@@ -1,97 +1,9 @@
 #!/usr/bin/env python3
 import json
-import os
 import re
 import shutil
 import subprocess
-import sys
-import unicodedata
-from datetime import datetime
 from pathlib import Path
-
-try:
-    from .reglas import entero as regla_entero, lista as regla_lista
-except Exception:
-    def regla_entero(ruta, defecto=0):
-        if ruta == "subtitulos.frases_maximo_unico_forzado":
-            try:
-                return int(os.environ.get("MEDIA_RESCATE_MAX_EVENTOS_FORZADOS", defecto) or defecto)
-            except Exception:
-                return defecto
-        if ruta == "subtitulos.frases_descartar_hasta":
-            return 1
-        return defecto
-
-    def regla_lista(ruta, defecto=None):
-        return defecto or []
-
-TALLER = Path(os.environ.get("MEDIA_AUTO_TALLER", "/taller"))
-WORK = TALLER / "work"
-CUARENTENA = TALLER / "cuarentena"
-REPORTES = Path(os.environ.get("MEDIA_RESCATE_REPORTES", "/reportes"))
-TEMP = Path(os.environ.get("MEDIA_RESCATE_TEMP", "/temp/subtitulos"))
-
-MOTIVOS_RESCATE = {
-    "Subtitulo imagen no convertible.txt",
-    "Subtitulo no convertible.txt",
-}
-MOTIVO_FALLO = "OCR subtitulo fallido.txt"
-
-VIDEO_EXTS = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts", ".mts", ".webm"}
-IMAGE_CODECS = {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"}
-TEXT_CODECS = {"subrip", "ass", "ssa", "webvtt", "mov_text"}
-MKVMERGE_TEXT_CODECS = ("subrip", "srt", "substation", "webvtt", "quicktime text", "ssa", "ass")
-MAX_EVENTOS_FORZADOS = int(os.environ.get("MEDIA_RESCATE_MAX_EVENTOS_FORZADOS", "150") or "150")
-
-
-def ahora():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def stamp():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def texto_busqueda(valor):
-    txt = unicodedata.normalize("NFKD", str(valor or ""))
-    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
-    return txt.strip().lower()
-
-
-def idiomas_subtitulo_validos():
-    validos = {
-        texto_busqueda(x)
-        for x in regla_lista("subtitulos.idiomas_aceptados", ["es", "spa"])
-    }
-    validos = validos.intersection({"es", "spa"})
-    return validos or {"es", "spa"}
-
-
-def frases_descartar_hasta():
-    return max(0, regla_entero("subtitulos.frases_descartar_hasta", 1))
-
-
-def frases_maximas_rescate():
-    minimo = frases_descartar_hasta() + 1
-    maximo = regla_entero("subtitulos.frases_maximo_unico_forzado", MAX_EVENTOS_FORZADOS)
-    return max(minimo, maximo)
-
-
-def cantidad_rescatable(cantidad):
-    numero = entero_no_negativo(cantidad)
-    return numero is not None and frases_descartar_hasta() < numero <= frases_maximas_rescate()
-
-
-def destino_numerado(destino):
-    destino = Path(destino)
-    if not destino.exists():
-        return destino
-    for n in range(1, 10000):
-        candidato = destino.with_name(f"{destino.name} ({n})")
-        if not candidato.exists():
-            return candidato
-    return destino.with_name(f"{destino.name} ({stamp()})")
-
 
 def run(cmd, timeout=7200, cwd=None):
     return subprocess.run(
@@ -107,79 +19,6 @@ def run(cmd, timeout=7200, cwd=None):
 
 def comando_ok(nombre):
     return shutil.which(nombre) is not None
-
-
-def video_principal(carpeta):
-    videos = [p for p in carpeta.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS]
-    if not videos:
-        return None
-    return sorted(videos, key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)[0]
-
-
-def ffprobe_json(ruta):
-    r = run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=index,codec_type,codec_name,nb_frames,disposition:stream_tags=language,title,NUMBER_OF_FRAMES,NUMBER_OF_BLOCKS",
-            "-print_format",
-            "json",
-            str(ruta),
-        ],
-        timeout=240,
-    )
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or r.stdout or "ffprobe no pudo leer el video").strip()[-2000:])
-    return json.loads(r.stdout or "{}")
-
-
-def ffprobe_streams_json(ruta):
-    r = run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=index,codec_type,codec_name:stream_tags=language,title",
-            "-print_format",
-            "json",
-            str(ruta),
-        ],
-        timeout=240,
-    )
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or r.stdout or "ffprobe no pudo leer el video").strip()[-2000:])
-    return json.loads(r.stdout or "{}")
-
-
-def tag(stream, nombre):
-    buscado = str(nombre or "").lower()
-    for clave, valor in (stream.get("tags") or {}).items():
-        if str(clave or "").lower() == buscado:
-            return valor
-    return ""
-
-
-def idioma(stream):
-    return str(tag(stream, "language") or "").strip()
-
-
-def titulo(stream):
-    return str(tag(stream, "title") or "").strip()
-
-
-def es_espanol(stream):
-    lang = texto_busqueda(idioma(stream))
-    txt = texto_busqueda(" ".join(str(v) for v in (stream.get("tags") or {}).values()))
-    return (
-        lang in {"es", "spa", "esp", "esl", "spanish", "castilian"}
-        or "espanol" in txt
-        or "spanish" in txt
-        or "castellano" in txt
-        or "latino" in txt
-    )
 
 
 def entero_no_negativo(valor):
@@ -232,113 +71,27 @@ def eventos_subtitulo_pista(video, pista_index):
     return eventos_subtitulo(stream)
 
 
-def pistas_imagen_es(data):
-    candidatos = []
-    for stream in data.get("streams", []) or []:
-        if stream.get("codec_type") != "subtitle":
-            continue
-        codec = str(stream.get("codec_name") or "").strip().lower()
-        if codec not in IMAGE_CODECS:
-            continue
-        if not es_espanol(stream):
-            continue
-        item = {
-            "index": int(stream.get("index") or 0),
-            "codec": codec,
-            "idioma": idioma(stream) or "-",
-            "titulo": titulo(stream),
-            "eventos": eventos_subtitulo(stream),
-        }
-        candidatos.append(item)
-    return sorted(candidatos, key=lambda s: (s["eventos"] is None, s["eventos"] or 999999999, s["index"]))
-
-
-def completar_eventos_pistas_imagen(video, pistas):
-    for pista in pistas:
-        if pista.get("eventos") is not None:
-            continue
-        pista["eventos"] = eventos_subtitulo_pista(video, pista["index"])
-    return sorted(pistas, key=lambda s: (s["eventos"] is None, s["eventos"] or 999999999, s["index"]))
-
-
-def subtitulo_imagen_largo(pista):
-    eventos = entero_no_negativo(pista.get("eventos"))
-    return eventos is not None and eventos > frases_maximas_rescate()
-
-
-def subtitulo_imagen_rescatable(pista):
-    eventos = entero_no_negativo(pista.get("eventos"))
-    return eventos is None or cantidad_rescatable(eventos)
-
-
-def mkvmerge_json(ruta):
-    r = run(["mkvmerge", "-J", str(ruta)], timeout=300)
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or r.stdout or "mkvmerge no pudo leer el video").strip()[-2000:])
-    return json.loads(r.stdout or "{}")
-
-
-def texto_track_es(track):
-    props = track.get("properties") or {}
-    lang = texto_busqueda(props.get("language"))
-    return lang in idiomas_subtitulo_validos()
-
-
-def pistas_texto_mkv_es(video):
-    data = mkvmerge_json(video)
-    pistas = []
-    for track in data.get("tracks", []) or []:
-        if track.get("type") != "subtitles":
-            continue
-        codec = str(track.get("codec") or "").strip()
-        codec_norm = texto_busqueda(codec)
-        if not any(tipo in codec_norm for tipo in MKVMERGE_TEXT_CODECS):
-            continue
-        if not texto_track_es(track):
-            continue
-        props = track.get("properties") or {}
-        pistas.append({
-            "id": int(track.get("id")),
-            "codec": codec,
-            "idioma": props.get("language") or "-",
-            "titulo": props.get("track_name") or "",
-        })
-    return sorted(pistas, key=lambda p: p["id"])
-
-
-def contar_frases_pista_texto(video, pista):
-    pista_id = int(pista["id"])
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-v", "error",
-        "-i", str(video),
-        "-map", f"0:{pista_id}",
-        "-f", "srt",
-        "-"
-    ]
-    try:
-        r = run(cmd, timeout=900)
-    except subprocess.TimeoutExpired:
-        return None, "Tiempo agotado extrayendo subtitulo de texto"
-    if r.returncode != 0 or not (r.stdout or "").strip():
+def extraer_texto_srt(video, pista, tmp_dir):
+    tmp_dir = Path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    salida = tmp_dir / "subtitle_selected.srt"
+    salida.unlink(missing_ok=True)
+    pista_id = int(pista.get("index", pista.get("id")))
+    r = run(
+        [
+            "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(video),
+            "-map", f"0:{pista_id}", "-c:s", "srt", str(salida),
+        ],
+        timeout=900,
+    )
+    ok, cues = srt_valido(salida)
+    if r.returncode != 0 or not ok:
+        salida.unlink(missing_ok=True)
         error = ((r.stderr or "") + "\n" + (r.stdout or "")).strip()
-        return None, (error or "No se pudo extraer subtitulo de texto como SRT")[-800:]
-    cues = len(re.findall(r"\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->", r.stdout))
-    if cues == 0:
-        cues = r.stdout.count("-->")
-    return cues, None
-
-
-def pistas_texto_rescatables(video, pistas):
-    buenas = []
-    for pista in pistas:
-        frases, error = contar_frases_pista_texto(video, pista)
-        pista["frases"] = frases
-        pista["error_conteo"] = error or ""
-        if cantidad_rescatable(frases):
-            buenas.append(pista)
-    return sorted(buenas, key=lambda p: (int(p.get("frases") or 999999), p["id"]))
+        raise RuntimeError(
+            "No se pudo extraer la pista de texto elegida como SRT. " + error[-1000:]
+        )
+    return salida, cues
 
 
 def srt_valido(ruta):
@@ -641,26 +394,6 @@ def ejecutar_vobsubocr(video, pista, tmp_dir):
     return salida, cues, "mkvextract VobSub + vobsubocr + validacion seconv"
 
 
-def reemplazar_original_verificado(video, tmp_mkv, salida_final):
-    video = Path(video)
-    tmp_mkv = Path(tmp_mkv)
-    salida_final = Path(salida_final)
-
-    if not tmp_mkv.exists() or tmp_mkv.stat().st_size <= 0:
-        raise RuntimeError("No existe MKV temporal verificado para reemplazar el original.")
-
-    original_eliminado = ""
-    if video.exists():
-        original_eliminado = str(video)
-        video.unlink()
-
-    if salida_final.exists():
-        salida_final.unlink()
-
-    tmp_mkv.rename(salida_final)
-    return salida_final, original_eliminado
-
-
 def ejecutar_seconv(video, pista, tmp_dir):
     if pista["codec"] == "dvd_subtitle":
         return ejecutar_vobsubocr(video, pista, tmp_dir)
@@ -695,117 +428,3 @@ def ejecutar_seconv(video, pista, tmp_dir):
 
     error = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
     raise RuntimeError("OCR no genero un SRT valido. " + error[-3000:])
-
-
-def remux_con_srt(video, srt, carpeta):
-    salida_final = video if video.suffix.lower() == ".mkv" else video.with_suffix(".mkv")
-    tmp_mkv = salida_final.with_name(f"{salida_final.stem}.rescate_subtitulos.tmp.mkv")
-    tmp_mkv.unlink(missing_ok=True)
-
-    cmd = [
-        "mkvmerge",
-        "-o",
-        str(tmp_mkv),
-        "--no-subtitles",
-        str(video),
-        "--language",
-        "0:spa",
-        "--track-name",
-        "0:Forzados",
-        "--default-track",
-        "0:no",
-        "--forced-display-flag",
-        "0:no",
-        str(srt),
-    ]
-    r = run(cmd, timeout=14400)
-    log = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
-    if r.returncode != 0 or not tmp_mkv.exists() or tmp_mkv.stat().st_size <= 0:
-        tmp_mkv.unlink(missing_ok=True)
-        raise RuntimeError("mkvmerge no pudo remuxar el SRT. " + log[-3000:])
-
-    probe = ffprobe_streams_json(tmp_mkv)
-    subs = [
-        s
-        for s in probe.get("streams", []) or []
-        if s.get("codec_type") == "subtitle" and str(s.get("codec_name") or "").lower() in TEXT_CODECS
-    ]
-    if not subs:
-        tmp_mkv.unlink(missing_ok=True)
-        raise RuntimeError("El MKV remuxado no contiene SRT de texto.")
-
-    salida_final, original_eliminado = reemplazar_original_verificado(video, tmp_mkv, salida_final)
-    return salida_final, original_eliminado, log[-3000:]
-
-
-def remux_con_texto_existente(video, pistas, carpeta):
-    salida_final = video if video.suffix.lower() == ".mkv" else video.with_suffix(".mkv")
-    tmp_mkv = salida_final.with_name(f"{salida_final.stem}.rescate_texto.tmp.mkv")
-    tmp_mkv.unlink(missing_ok=True)
-
-    track_ids = ",".join(str(p["id"]) for p in pistas)
-    cmd = [
-        "mkvmerge",
-        "-o",
-        str(tmp_mkv),
-        "--no-subtitles",
-        str(video),
-        "--no-video",
-        "--no-audio",
-        "--no-attachments",
-        "--no-chapters",
-        "--subtitle-tracks",
-        track_ids,
-        str(video),
-    ]
-    r = run(cmd, timeout=14400)
-    log = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
-    if r.returncode != 0 or not tmp_mkv.exists() or tmp_mkv.stat().st_size <= 0:
-        tmp_mkv.unlink(missing_ok=True)
-        raise RuntimeError("mkvmerge no pudo limpiar subtitulos de imagen. " + log[-3000:])
-
-    data = ffprobe_streams_json(tmp_mkv)
-    subs_imagen = [
-        s
-        for s in data.get("streams", []) or []
-        if s.get("codec_type") == "subtitle" and str(s.get("codec_name") or "").lower() in IMAGE_CODECS
-    ]
-    subs_texto = [
-        s
-        for s in data.get("streams", []) or []
-        if s.get("codec_type") == "subtitle" and str(s.get("codec_name") or "").lower() in TEXT_CODECS
-    ]
-    if subs_imagen or not subs_texto:
-        tmp_mkv.unlink(missing_ok=True)
-        raise RuntimeError("La limpieza no dejo un MKV con subtitulo de texto limpio.")
-
-    salida_final, original_eliminado = reemplazar_original_verificado(video, tmp_mkv, salida_final)
-    return salida_final, original_eliminado, log[-3000:]
-
-
-def remux_sin_subtitulos(video):
-    salida_final = video if video.suffix.lower() == ".mkv" else video.with_suffix(".mkv")
-    tmp_mkv = salida_final.with_name(f"{salida_final.stem}.rescate_sin_subtitulos.tmp.mkv")
-    tmp_mkv.unlink(missing_ok=True)
-
-    cmd = [
-        "mkvmerge",
-        "-o",
-        str(tmp_mkv),
-        "--no-subtitles",
-        str(video),
-    ]
-    r = run(cmd, timeout=14400)
-    log = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
-    if r.returncode != 0 or not tmp_mkv.exists() or tmp_mkv.stat().st_size <= 0:
-        tmp_mkv.unlink(missing_ok=True)
-        raise RuntimeError("mkvmerge no pudo quitar subtitulos de imagen largos. " + log[-3000:])
-
-    data = ffprobe_streams_json(tmp_mkv)
-    subs = [s for s in data.get("streams", []) or [] if s.get("codec_type") == "subtitle"]
-    if subs:
-        tmp_mkv.unlink(missing_ok=True)
-        raise RuntimeError("El MKV remuxado seguia teniendo subtitulos.")
-
-    salida_final, original_eliminado = reemplazar_original_verificado(video, tmp_mkv, salida_final)
-    return salida_final, original_eliminado, log[-3000:]

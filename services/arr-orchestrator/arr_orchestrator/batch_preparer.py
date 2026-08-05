@@ -49,6 +49,7 @@ class BatchItem:
     episode_intent: Optional[Dict[str, object]] = None
     episode_validation: str = "UNKNOWN"
     episode_reason: str = ""
+    filebot_outputs: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -69,6 +70,7 @@ class BatchItem:
             ),
             episode_validation=str(payload.get("episode_validation") or "UNKNOWN"),
             episode_reason=str(payload.get("episode_reason") or ""),
+            filebot_outputs=[str(value) for value in payload.get("filebot_outputs") or []],
         )
 
 
@@ -221,6 +223,40 @@ def materialize_item(item: BatchItem, input_root: Path, child_root: Path) -> Pat
     return original
 
 
+def materialize_filebot_item(
+    item: BatchItem,
+    output_root: Path,
+    child_root: Path,
+) -> Path:
+    """Mueve el nombre FileBot ya calculado por el padre al taller del hijo."""
+
+    if not item.filebot_outputs:
+        raise BatchPreparationError("El elemento no contiene un mapa FileBot heredado")
+    root = Path(output_root)
+    destination_root = Path(child_root) / "series_filebot_output"
+    destinations: List[Path] = []
+    for raw in item.filebot_outputs:
+        relative = _safe_relative(raw)
+        source = root.joinpath(*relative.parts)
+        destination = destination_root.joinpath(*relative.parts)
+        source_exists = source.exists() or source.is_symlink()
+        destination_exists = destination.exists() or destination.is_symlink()
+        if source_exists and destination_exists:
+            raise BatchPreparationError(
+                f"El origen y el destino FileBot existen a la vez para {source.name}"
+            )
+        if source_exists:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+        elif not destination_exists:
+            raise BatchPreparationError(
+                f"No se localiza {source.name} en el mapa FileBot del padre"
+            )
+        destinations.append(destination)
+    _remove_empty_directories(root, [])
+    return destination_root
+
+
 def child_source_uid(parent_job_id: str, item: BatchItem) -> str:
     return f"batch:{parent_job_id}:{item.key}"
 
@@ -314,4 +350,5 @@ __all__ = [
     "child_source_uid",
     "clean_and_plan_batch",
     "materialize_item",
+    "materialize_filebot_item",
 ]

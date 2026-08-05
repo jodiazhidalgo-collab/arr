@@ -406,6 +406,17 @@ class RulesPanelContractTests(unittest.TestCase):
         self.assertIn("grid-template-columns: minmax(0, 1fr);", self.panel_css)
         self.assertIn(".report-row > b", self.panel_css)
 
+    def test_processing_routes_and_ocr_control_are_human_readable(self) -> None:
+        for text in (
+            "subtitulos.ocr_imagen_modo",
+            "Solo forzados cortos",
+            "Vía rápida",
+            "Remux único",
+            "OCR y remux único",
+            "Análisis",
+        ):
+            self.assertIn(text, self.panel_js)
+
     def test_removed_filebot_editor_and_proxy_are_not_exposed(self) -> None:
         for text in (
             'title: "FileBot Películas"',
