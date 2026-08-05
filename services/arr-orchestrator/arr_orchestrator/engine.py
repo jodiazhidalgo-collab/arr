@@ -1915,6 +1915,13 @@ class Engine:
     def _process_job(self, job: Dict[str, object]) -> None:
         source_value = str(job.get("source_path") or "").strip()
         source_path = Path(source_value) if source_value else None
+        if job["state"] == "staging" and job.get("category") in {"movies", "tv"}:
+            self._recover_staging_job(job, phase="stage")
+            job = self.db.get_job(str(job["job_id"]))
+            if not job or job["state"] in TERMINAL_STATES:
+                return
+            source_value = str(job.get("source_path") or "").strip()
+            source_path = Path(source_value) if source_value else None
         if job["state"] == "series_review_cleanup":
             self._run_series_review_cleanup(job)
             return
@@ -2058,6 +2065,16 @@ class Engine:
             self.config.workshop_root,
             "destino de taller",
         )
+        if job.get("category") in {"movies", "tv"} and not source.exists():
+            self.db.transition(
+                job_id,
+                "waiting_stable",
+                "stage",
+                "El origen desaparecio antes de moverlo; cola liberada",
+                last_error_code="stage_source_missing",
+                last_error_message="El origen ya no existe; se esperara a que reaparezca",
+            )
+            return
         self.db.transition(job_id, "staging", "stage", "Moviendo a taller")
         if job["category"] == "trailers_automatizacion":
             job_root, source_item = move_trailer_package_into_job(
@@ -2075,7 +2092,14 @@ class Engine:
             )
             return
 
-        job_root = move_into_job(source, self.config.workshop_root, job_id)
+        try:
+            job_root = move_into_job(source, self.config.workshop_root, job_id)
+        except FileNotFoundError:
+            if job.get("category") not in {"movies", "tv"}:
+                raise
+            current = self.db.get_job(job_id) or job
+            self._recover_staging_job(current, phase="stage")
+            return
         if job["category"] == "manual":
             destination = move_job_to_review_clean(job_root, self.config.review_dir, str(job["name"]))
             write_reason(
@@ -2108,6 +2132,68 @@ class Engine:
             "stage",
             "Taller preparado",
             stage_path=str(job_root),
+        )
+
+    def _recover_staging_job(
+        self,
+        job: Dict[str, object],
+        *,
+        phase: str,
+    ) -> None:
+        """Reconcilia un traslado interrumpido sin retener la cola global de TV."""
+
+        job_id = str(job["job_id"])
+        source_value = str(job.get("source_path") or "").strip()
+        source = Path(source_value) if source_value else None
+        configured_root = self.config.workshop_root / job_id
+        stage_value = str(job.get("stage_path") or "").strip()
+        job_root = Path(stage_value) if stage_value else configured_root
+        original_root = job_root / "original"
+        staged = original_root.is_dir() and any(original_root.iterdir())
+        source_exists = source is not None and source.exists()
+
+        if staged and not source_exists:
+            self.db.transition(
+                job_id,
+                "ready_extract",
+                phase,
+                "Traslado recuperado: el contenido ya estaba en el taller",
+                stage_path=str(job_root),
+                last_error_code=None,
+                last_error_message=None,
+            )
+            return
+        if source_exists and not staged:
+            self.db.transition(
+                job_id,
+                "ready_stage",
+                phase,
+                "Traslado no iniciado; se reintentara sin bloquear la cola",
+                stage_path=None,
+                last_error_code=None,
+                last_error_message=None,
+            )
+            return
+        if not source_exists and not staged:
+            self.db.transition(
+                job_id,
+                "waiting_stable",
+                phase,
+                "Origen ausente y taller vacio; cola liberada",
+                stage_path=None,
+                last_error_code="stage_source_missing",
+                last_error_message="El origen ya no existe; se esperara a que reaparezca",
+            )
+            return
+
+        self.db.transition(
+            job_id,
+            "manual_review",
+            phase,
+            "Traslado ambiguo: hay contenido tanto en origen como en taller",
+            stage_path=str(job_root),
+            last_error_code="stage_ambiguous",
+            last_error_message="Se conserva todo para revision sin bloquear la cola",
         )
 
     def _run_extract(self, job: Dict[str, object]) -> None:
@@ -7415,6 +7501,9 @@ class Engine:
             500,
         )
         for job in interrupted:
+            if job["state"] == "staging" and job.get("category") in {"movies", "tv"}:
+                self._recover_staging_job(job, phase="recovery")
+                continue
             job_root_value = str(job.get("stage_path") or "").strip()
             source_value = str(job.get("source_path") or "").strip()
             job_root = Path(job_root_value) if job_root_value else None

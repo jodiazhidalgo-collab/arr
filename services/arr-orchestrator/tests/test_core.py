@@ -3310,6 +3310,102 @@ class CoreTests(unittest.TestCase):
             finally:
                 database.close()
 
+    def test_stage_missing_source_releases_movies_and_tv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            try:
+                engine = Engine(config, database)
+                for category in ("movies", "tv"):
+                    with self.subTest(category=category):
+                        source = config.complete_root / category / f"Ausente-{category}"
+                        job = database.create_job(
+                            f"fs:{category}:stage-ausente",
+                            "fs",
+                            category,
+                            source.name,
+                            state="ready_stage",
+                            source_path=str(source),
+                        )
+
+                        engine._run_stage(job)
+
+                        current = database.get_job(job["job_id"])
+                        self.assertEqual(current["state"], "waiting_stable")
+                        self.assertEqual(current["last_error_code"], "stage_source_missing")
+            finally:
+                database.close()
+
+    def test_interrupted_stage_recovers_completed_move_for_movies_and_tv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            try:
+                engine = Engine(config, database)
+                for category in ("movies", "tv"):
+                    with self.subTest(category=category):
+                        source = config.complete_root / category / f"Movida-{category}"
+                        job = database.create_job(
+                            f"fs:{category}:stage-movida",
+                            "fs",
+                            category,
+                            source.name,
+                            state="staging",
+                            source_path=str(source),
+                        )
+                        job_root = config.workshop_root / str(job["job_id"])
+                        staged_source = job_root / "original" / source.name
+                        staged_source.mkdir(parents=True)
+                        (staged_source / "video.mkv").write_bytes(b"video")
+
+                        with patch.object(engine, "_run_extract") as run_extract:
+                            engine._process_job(job)
+
+                        current = database.get_job(job["job_id"])
+                        self.assertEqual(current["state"], "ready_extract")
+                        self.assertEqual(current["stage_path"], str(job_root))
+                        run_extract.assert_called_once()
+            finally:
+                database.close()
+
+    def test_interrupted_empty_stage_releases_movies_and_tv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = test_config(root)
+            config.ensure_directories()
+            database = Database(root / "test.db")
+            database.initialize()
+            try:
+                engine = Engine(config, database)
+                for category in ("movies", "tv"):
+                    with self.subTest(category=category):
+                        source = config.complete_root / category / f"Vacia-{category}"
+                        job = database.create_job(
+                            f"fs:{category}:stage-vacia",
+                            "fs",
+                            category,
+                            source.name,
+                            state="staging",
+                            source_path=str(source),
+                        )
+                        (config.workshop_root / str(job["job_id"]) / "original").mkdir(
+                            parents=True
+                        )
+
+                        engine._process_job(job)
+
+                        current = database.get_job(job["job_id"])
+                        self.assertEqual(current["state"], "waiting_stable")
+                        self.assertEqual(current["last_error_code"], "stage_source_missing")
+            finally:
+                database.close()
+
     def test_late_nested_ignored_file_pauses_only_jobs_under_effective_rules(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
