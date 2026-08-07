@@ -121,6 +121,14 @@ class RulesPanelContractTests(unittest.TestCase):
             self.panel_js,
         )
 
+    def test_video_section_exposes_the_shared_best_track_toggle(self) -> None:
+        self.assertIn(
+            'path: "video.seleccionar_mejor_si_hay_varias", label: "Elegir mejor pista"',
+            self.panel_js,
+        )
+        self.assertIn("Desactivado rechaza el archivo.", self.panel_js)
+        self.assertNotIn('label: "Pistas permitidas"', self.panel_js)
+
     def test_save_updates_only_the_selected_source(self) -> None:
         self.assertIn("state.documents[source] = savedState;", self.panel_js)
         self.assertIn("state.drafts[source]", self.panel_js)

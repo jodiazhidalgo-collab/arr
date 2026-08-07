@@ -647,6 +647,7 @@ def process_movie(payload: Dict[str, object]) -> Dict[str, object]:
             "problemas": plan.get("problemas"),
             "audio_modo": plan.get("audio_modo"),
             "subtitulo_titulo": plan.get("subtitulo_titulo"),
+            "video_selection": plan.get("video_selection") or {},
         },
     )
 

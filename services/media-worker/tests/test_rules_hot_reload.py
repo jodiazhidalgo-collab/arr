@@ -125,6 +125,26 @@ def test_invalid_or_stale_save_never_changes_disk_or_memory(tmp_path):
     assert store.payload()["fingerprint"] == initial["fingerprint"]
 
 
+def test_video_selection_toggle_persists_and_track_count_stays_fixed(tmp_path):
+    store, _active = _store(tmp_path)
+    initial = store.payload()
+    assert initial["rules"]["video"]["seleccionar_mejor_si_hay_varias"] is False
+
+    updated = deepcopy(initial["rules"])
+    updated["video"]["seleccionar_mejor_si_hay_varias"] = True
+    saved = store.save(
+        {"rules": updated, "expected_fingerprint": initial["fingerprint"]}
+    )
+    assert saved["rules"]["video"]["seleccionar_mejor_si_hay_varias"] is True
+
+    invalid = deepcopy(saved["rules"])
+    invalid["video"]["pistas_exactas"] = 2
+    with pytest.raises(reglas.RulesValidationError, match="debe ser 1"):
+        store.save(
+            {"rules": invalid, "expected_fingerprint": saved["fingerprint"]}
+        )
+
+
 def test_settings_endpoint_preserves_success_validation_and_conflict(rules_service):
     base_url, _store_value, _active, _report_root = rules_service
     get_status, current = _request(f"{base_url}/settings/rules")

@@ -28,6 +28,7 @@ def test_defaults_have_exactly_five_blocks_and_no_trailers(tmp_path: Path) -> No
     assert payload["applies_to"] == "new_jobs"
     assert payload["rules_path"] == "<CONFIG>/series-rules/reglas_series.json"
     assert payload["defaults_path"] == "<APP>/series-worker/default_rules.json"
+    assert payload["rules"]["video"]["seleccionar_mejor_si_hay_varias"] is False
 
 
 def test_save_uses_cas_persists_and_keeps_old_snapshot_frozen(tmp_path: Path) -> None:
@@ -66,6 +67,7 @@ def test_stale_fingerprint_is_rejected_without_writing(tmp_path: Path) -> None:
         lambda rules: rules["entrada"].update({"extensiones_video": [".mkv", ".flv"]}),
         lambda rules: rules["limpieza"].update({"capitulo_cada_segundos": -1}),
         lambda rules: rules["video"].update({"pistas_exactas": 0}),
+        lambda rules: rules["video"].update({"pistas_exactas": 2}),
         lambda rules: rules["limpieza"].update({"capitulo_cada_segundos": 0}),
         lambda rules: rules["subtitulos"]["delay_audio"].update({"frases_maximo": 0}),
         lambda rules: rules["subtitulos"].update(

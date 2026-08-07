@@ -149,6 +149,8 @@ def _validate_semantics(rules: dict[str, Any]) -> None:
             + ", ".join(unsupported)
             + "."
         )
+    if int(rules["video"]["pistas_exactas"]) != 1:
+        raise RulesValidationError("video.pistas_exactas debe ser 1.")
     strictly_positive_paths = (
         ("video", "pistas_exactas"),
         ("audio", "canales_convertir_ac3_desde"),

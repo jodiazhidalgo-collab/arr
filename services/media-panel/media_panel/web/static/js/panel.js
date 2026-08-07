@@ -54,10 +54,16 @@ const RULE_SECTIONS = {
     help: "Pista de video que acepta y como queda marcada.",
     groups: [
       {
-        title: "Validacion",
-        note: "El motor espera una pista de video clara.",
+        title: "Varias pistas de video",
+        note: "Desactivado rechaza el archivo. Activado conserva automaticamente la mejor pista.",
         controls: [
-          { type: "number", path: "video.pistas_exactas", label: "Pistas permitidas", min: 1, max: 3, step: 1 },
+          { type: "boolean", path: "video.seleccionar_mejor_si_hay_varias", label: "Elegir mejor pista" }
+        ]
+      },
+      {
+        title: "Validacion de idioma",
+        note: "Idiomas que el motor puede aceptar o corregir.",
+        controls: [
           { type: "list", path: "video.idiomas_aceptados", label: "Idiomas aceptados" },
           { type: "list", path: "video.idiomas_indeterminados_como_es", label: "Idiomas renombrados a ES" }
         ]

@@ -129,6 +129,8 @@ def _fingerprint(rules: dict[str, Any]) -> str:
 
 
 def _validate_semantics(rules: dict[str, Any]) -> None:
+    if int(rules.get("video", {}).get("pistas_exactas", 0) or 0) != 1:
+        raise RulesValidationError("video.pistas_exactas debe ser 1.")
     mode = str(rules.get("subtitulos", {}).get("ocr_imagen_modo") or "")
     if mode not in {"solo_forzados_cortos", "desactivado"}:
         raise RulesValidationError(

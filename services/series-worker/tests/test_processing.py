@@ -415,6 +415,93 @@ def test_invalid_video_track_count_is_a_typed_video_rejection(tmp_path: Path) ->
     )
 
 
+def test_multiple_video_tracks_stay_rejected_when_selection_is_disabled(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "Serie.S01E01.mkv"
+    source.write_bytes(b"episode")
+    probe = _stream_probe()
+    probe["streams"][0].update({"width": 3840, "height": 1600})
+    probe["streams"].append(
+        {
+            "index": 2,
+            "codec_type": "video",
+            "codec_name": "h264",
+            "width": 1248,
+            "height": 520,
+            "tags": {"language": "spa"},
+            "disposition": {"attached_pic": 0},
+        }
+    )
+
+    with pytest.raises(VideoInvalidError, match="hay 2"):
+        analyze_episode(
+            source,
+            tmp_path / "output.mkv",
+            _snapshot(tmp_path),
+            FakeRunner({source.name: probe}),
+        )
+
+
+def test_multiple_video_tracks_choose_the_best_and_force_one_remux(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "Serie.S02E07.mkv"
+    source.write_bytes(b"episode")
+    probe = _stream_probe()
+    probe["streams"][0].update(
+        {
+            "codec_name": "hevc",
+            "profile": "Main 10",
+            "pix_fmt": "yuv420p10le",
+            "color_transfer": "smpte2084",
+            "width": 3840,
+            "height": 1600,
+            "tags": {
+                "language": "spa",
+                "DURATION": "01:12:16.584",
+                "BPS": "18658829",
+            },
+            "disposition": {"attached_pic": 0, "default": 1},
+        }
+    )
+    probe["streams"].append(
+        {
+            "index": 2,
+            "codec_type": "video",
+            "codec_name": "h264",
+            "profile": "High",
+            "pix_fmt": "yuv420p",
+            "width": 1248,
+            "height": 520,
+            "tags": {
+                "language": "spa",
+                "DURATION": "01:12:16.584",
+                "BPS": "2319335",
+            },
+            "disposition": {"attached_pic": 0, "default": 1},
+        }
+    )
+    snapshot = _snapshot(
+        tmp_path,
+        lambda rules: rules["video"].update(
+            {"seleccionar_mejor_si_hay_varias": True}
+        ),
+    )
+
+    plan = analyze_episode(
+        source,
+        tmp_path / "output.mkv",
+        snapshot,
+        FakeRunner({source.name: probe}),
+    )
+
+    assert plan.video["index"] == 0
+    assert plan.video_selection["selected_index"] == 0
+    assert plan.video_selection["discarded_indexes"] == [2]
+    assert plan.processing_mode == "single_remux"
+
+
 def test_required_missing_subtitle_is_typed_without_parsing_its_text(
     tmp_path: Path,
 ) -> None:

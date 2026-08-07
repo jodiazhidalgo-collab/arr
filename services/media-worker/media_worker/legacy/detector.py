@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .reglas import REGLAS_ACTUALES
+from ..video_selection import VideoSelectionError, select_video_stream
 
 TALLER = Path(os.environ.get("MEDIA_AUTO_TALLER", "/taller"))
 WORK = TALLER / "work"
@@ -334,6 +335,12 @@ def analizar_archivo(ruta):
     subtitulos = []
     audio_es_valido = hay_audio_es_valido(streams)
     video_queda_es = video_queda_en_es(streams, audio_es_valido)
+    raw_videos = [
+        stream
+        for stream in streams
+        if stream.get("codec_type") == "video"
+        and int((stream.get("disposition") or {}).get("attached_pic", 0) or 0) != 1
+    ]
 
     for s in streams:
         stype = s.get("codec_type")
@@ -473,8 +480,32 @@ def analizar_archivo(ruta):
                 "prioridad": prioridad,
             })
 
-    pistas_video_esperadas = int(REGLAS.get("video", {}).get("pistas_exactas", 1) or 1)
-    video_ok = len(videos) == pistas_video_esperadas and all(int(v.get("prioridad", 0)) >= 100 for v in videos)
+    elegir_mejor_video = bool(
+        REGLAS.get("video", {}).get("seleccionar_mejor_si_hay_varias", False)
+    )
+    video_selection_error = ""
+    eligible_indexes = {
+        int(video.get("index"))
+        for video in videos
+        if int(video.get("prioridad", 0)) >= 100 and video.get("index") is not None
+    }
+    try:
+        selected_video, video_selection = select_video_stream(
+            raw_videos,
+            enabled=elegir_mejor_video,
+            eligible_indexes=eligible_indexes,
+        )
+        selected_video_index = int(selected_video.get("index"))
+        videos.sort(key=lambda video: int(video.get("index")) != selected_video_index)
+    except VideoSelectionError as error:
+        selected_video_index = None
+        video_selection_error = str(error)
+        video_selection = error.details
+    video_ok = (
+        selected_video_index is not None
+        and bool(videos)
+        and int(videos[0].get("prioridad", 0)) >= 100
+    )
     audio_ok = any(int(a.get("prioridad", 0)) > 0 for a in audios)
     sub_candidatos = [s for s in subtitulos if s["decision"] == "CANDIDATO FORZADO REAL"]
     sub_cero_ok = len(subtitulos) == 0 and sub_mode == "procesar_sin_subtitulos"
@@ -508,8 +539,8 @@ def analizar_archivo(ruta):
 
     if not videos:
         estado = "ERROR: sin vídeo"
-    elif len(videos) != pistas_video_esperadas:
-        estado = f"CUARENTENA: debe haber exactamente {pistas_video_esperadas} pista de video"
+    elif video_selection_error:
+        estado = f"CUARENTENA: {video_selection_error}"
     elif not video_ok:
         estado = "CUARENTENA: idioma de video no permitido"
     elif not audio_ok:
@@ -521,7 +552,7 @@ def analizar_archivo(ruta):
     else:
         estado = "CUARENTENA: no hay subtítulo forzado claro"
 
-    if videos and len(videos) == pistas_video_esperadas and video_ok and audio_ok:
+    if videos and not video_selection_error and video_ok and audio_ok:
         if hay_sub_imagen or hay_sub_dudoso:
             estado = "CUARENTENA: hay subtitulo es/spa no convertible o dudoso"
         elif sub_ok:
@@ -531,7 +562,7 @@ def analizar_archivo(ruta):
         else:
             estado = "CUARENTENA: no hay subtitulo es/spa valido"
 
-    if not audio_ok and videos and len(videos) == pistas_video_esperadas and video_ok:
+    if not audio_ok and videos and not video_selection_error and video_ok:
         estado = "CUARENTENA: no hay audio es/spa valido"
 
     return {
@@ -539,6 +570,7 @@ def analizar_archivo(ruta):
         "ruta": str(ruta),
         "estado": estado,
         "videos": videos,
+        "video_selection": video_selection,
         "audios": sorted(audios, key=lambda x: x["prioridad"], reverse=True),
         "subtitulos": sorted(subtitulos, key=lambda x: x["prioridad"], reverse=True),
         "duration": float_no_negativo((data.get("format") or {}).get("duration")),

@@ -4,6 +4,7 @@
   },
   "video": {
     "pistas_exactas": 1,
+    "seleccionar_mejor_si_hay_varias": false,
     "idiomas_aceptados": ["es", "spa", "esp", "esl", "spanish", "castilian"],
     "idiomas_indeterminados_como_es": ["", "-", "und", "undefined", "unknown", "unk", "none"],
     "aceptar_por_audio_es": true,

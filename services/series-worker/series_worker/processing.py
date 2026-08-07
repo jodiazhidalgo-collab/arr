@@ -13,12 +13,13 @@ import time
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Protocol, Sequence
 
 from .manifest import ManifestEntry, ManifestSidecar, SeriesManifest, validate_relative_path
 from .rules import RulesSnapshot
+from .video_selection import VideoSelectionError, select_video_stream
 
 
 BASE_TOOLS = ("ffmpeg", "ffprobe", "mkvpropedit")
@@ -199,6 +200,7 @@ class EpisodePlan:
     processing_mode: str
     analysis_ms: int
     ocr_ms: int
+    video_selection: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -407,7 +409,7 @@ def _disposition(enabled_default: bool, enabled_forced: bool) -> str:
 
 def _select_video_and_audio(
     probe: dict[str, Any], rules: dict[str, Any]
-) -> tuple[dict[str, Any], dict[str, Any], str]:
+) -> tuple[dict[str, Any], dict[str, Any], str, dict[str, Any]]:
     streams = probe.get("streams") or []
     videos = [
         stream
@@ -415,12 +417,6 @@ def _select_video_and_audio(
         if stream.get("codec_type") == "video"
         and int((stream.get("disposition") or {}).get("attached_pic", 0) or 0) != 1
     ]
-    expected = int(rules["video"]["pistas_exactas"])
-    if len(videos) != expected or not videos:
-        raise VideoInvalidError(
-            f"Se esperaban {expected} pistas de vídeo y hay {len(videos)}."
-        )
-
     audio_rules = rules["audio"]
     accepted_audio = {str(value).casefold() for value in audio_rules["idiomas_aceptados"]}
     direct = [
@@ -431,9 +427,7 @@ def _select_video_and_audio(
         and _is_spanish(stream, accepted_audio)
     ]
 
-    video = videos[0]
     video_rules = rules["video"]
-    video_language = _language(video)
     video_accepted = {str(value).casefold() for value in video_rules["idiomas_aceptados"]}
     video_indeterminate = {
         str(value).casefold() for value in video_rules["idiomas_indeterminados_como_es"]
@@ -441,19 +435,28 @@ def _select_video_and_audio(
     video_correctible = {
         str(value).casefold() for value in video_rules["idiomas_corregibles_por_audio_es"]
     }
-    video_ok = (
-        video_language in video_accepted
-        or video_language in video_indeterminate
-        or (
-            bool(video_rules["aceptar_por_audio_es"])
-            and bool(direct)
-            and video_language in video_correctible
+    eligible_indexes = {
+        int(video.get("index"))
+        for video in videos
+        if video.get("index") is not None
+        and (
+            _language(video) in video_accepted
+            or _language(video) in video_indeterminate
+            or (
+                bool(video_rules["aceptar_por_audio_es"])
+                and bool(direct)
+                and _language(video) in video_correctible
+            )
         )
-    )
-    if not video_ok:
-        raise VideoInvalidError(
-            "La pista de vídeo no puede etiquetarse como española."
+    }
+    try:
+        video, video_selection = select_video_stream(
+            videos,
+            enabled=bool(video_rules["seleccionar_mejor_si_hay_varias"]),
+            eligible_indexes=eligible_indexes,
         )
+    except VideoSelectionError as error:
+        raise VideoInvalidError(str(error)) from error
 
     candidates = list(direct)
     if not candidates and audio_rules["aceptar_indeterminado_si_video_es"]:
@@ -493,7 +496,7 @@ def _select_video_and_audio(
     codec = str(audio.get("codec_name") or "").casefold()
     threshold = int(audio_rules["canales_convertir_ac3_desde"])
     audio_mode = "convert_ac3_5_1" if channels >= threshold and codec != "ac3" else "copy"
-    return video, audio, audio_mode
+    return video, audio, audio_mode, video_selection
 
 
 def _subtitle_cues_from_text(value: str) -> int:
@@ -847,7 +850,9 @@ def analyze_episode(
     if source_path.is_symlink() or not source_path.is_file():
         raise VideoInvalidError("La entrada no es un archivo físico regular.")
     probe = _probe(source_path, active)
-    video, audio, audio_mode = _select_video_and_audio(probe, rules_snapshot.rules)
+    video, audio, audio_mode, video_selection = _select_video_and_audio(
+        probe, rules_snapshot.rules
+    )
     subtitle, image_stream = _select_subtitle(
         source_path, probe, rules_snapshot.rules, active, external_subtitles
     )
@@ -949,6 +954,7 @@ def analyze_episode(
         processing_mode=processing_mode,
         analysis_ms=round((time.monotonic() - analysis_started) * 1000),
         ocr_ms=ocr_ms,
+        video_selection=video_selection,
     )
 
 
@@ -1288,6 +1294,7 @@ def _execute_plan(
         verification_ms = round((time.monotonic() - verification_started) * 1000)
         verification["chapters"] = chapters
         verification["processing_mode"] = plan.processing_mode
+        verification["video_selection"] = dict(plan.video_selection)
         verification["timings_ms"] = {
             "analysis": plan.analysis_ms,
             "ocr": plan.ocr_ms,

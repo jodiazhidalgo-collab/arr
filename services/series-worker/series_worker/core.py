@@ -2912,6 +2912,7 @@ class SeriesCoordinator:
                             "source_relpath": episode.source_relpath,
                             "processing_mode": episode.verification.get("processing_mode"),
                             "timings_ms": episode.verification.get("timings_ms") or {},
+                            "video_selection": episode.verification.get("video_selection") or {},
                         }
                         for episode in processing.episodes
                     ]

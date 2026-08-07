@@ -358,7 +358,7 @@ function identitySectionsForProfile(profile) {
 }
 const cleaningSections = [
   ["entrada", "entrada.extensiones_video"],
-  ["video", "video.pistas_exactas"],
+  ["video", "video.seleccionar_mejor_si_hay_varias"],
   ["audio", "audio.idiomas_aceptados"],
   ["subtitulos", "subtitulos.idiomas_aceptados"],
   ["limpieza", "limpieza.crear_capitulos"],
