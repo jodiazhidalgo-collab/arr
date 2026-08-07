@@ -11,6 +11,9 @@ from .legacy import detector, planificador, procesador, rescate_subtitulos, trai
 from .legacy.reglas import valor
 
 
+BLURAY_STRUCTURE_DIRECTORIES = {"bdmv", "certificate"}
+
+
 def _safe_folder_name(value: str) -> str:
     text = re.sub(r"[\\/]+", " ", value or "").strip()
     text = re.sub(r"[\x00-\x1f]+", " ", text)
@@ -31,6 +34,56 @@ def _numbered_path(path: Path) -> Path:
 def _write_json(path: Path, payload: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def _unique_review_file(destination: Path) -> Path:
+    if not destination.exists():
+        return destination
+    for index in range(1, 10000):
+        candidate = destination.with_name(
+            f"{destination.stem} ({index}){destination.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+    return destination.with_name(
+        f"{destination.stem} ({int(time.time())}){destination.suffix}"
+    )
+
+
+def _move_review_content_flat(source: Path, destination: Path) -> None:
+    if source.is_file():
+        shutil.move(str(source), str(_unique_review_file(destination / source.name)))
+        return
+    entries = sorted(source.rglob("*"), key=lambda path: str(path).casefold())
+    protected = []
+    if source.name.casefold() in BLURAY_STRUCTURE_DIRECTORIES:
+        protected.append(source)
+    else:
+        protected.extend(
+            entry
+            for entry in entries
+            if entry.is_dir()
+            and entry.name.casefold() in BLURAY_STRUCTURE_DIRECTORIES
+            and not any(
+                parent.name.casefold() in BLURAY_STRUCTURE_DIRECTORIES
+                for parent in entry.parents
+                if parent == source or source in parent.parents
+            )
+        )
+    protected_set = set(protected)
+    files = [
+        entry
+        for entry in entries
+        if entry.is_file()
+        and not any(parent in protected_set for parent in entry.parents)
+    ]
+    for folder in protected:
+        shutil.move(str(folder), str(_numbered_path(destination / folder.name)))
+    for item in files:
+        if item.exists():
+            shutil.move(str(item), str(_unique_review_file(destination / item.name)))
+    if source.exists() and source.is_dir():
+        shutil.rmtree(source, ignore_errors=True)
 
 
 def _video_files(folder: Path) -> List[Path]:
@@ -57,10 +110,9 @@ def _move_to_review(
     review_root.mkdir(parents=True, exist_ok=True)
     name = source.name if source.exists() else payload.get("name") or "item"
     destination = _numbered_path(review_root / _safe_folder_name(str(name)))
+    destination.mkdir(parents=True, exist_ok=True)
     if source.exists():
-        shutil.move(str(source), str(destination))
-    else:
-        destination.mkdir(parents=True, exist_ok=True)
+        _move_review_content_flat(source, destination)
     payload = {**payload, "review_path": str(destination), "reason_file": reason_file}
     _write_json(destination / "reason.json", payload)
     reason_text = [str(line) for line in lines if str(line).strip()]

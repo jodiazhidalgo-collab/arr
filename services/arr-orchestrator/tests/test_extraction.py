@@ -545,7 +545,7 @@ class LayeredExtractionTests(unittest.TestCase):
             self.assertIn("Capa de extracción 1 preparada", report_events)
             database.close()
 
-    def test_extraction_failure_review_preserves_original_and_extracted_trees(self) -> None:
+    def test_extraction_failure_review_flattens_original_and_extracted_trees(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             job_root, original = self._job(root)
@@ -560,9 +560,11 @@ class LayeredExtractionTests(unittest.TestCase):
                 "Movie Failure",
             )
 
-            self.assertTrue((review / "original" / "outer.rar").is_file())
-            self.assertTrue(
-                (review / "extracted" / "layer_01.tmp" / "inner.part01.rar").is_file()
+            self.assertTrue((review / "outer.rar").is_file())
+            self.assertTrue((review / "inner.part01.rar").is_file())
+            self.assertEqual(
+                {path.name for path in review.iterdir()},
+                {"outer.rar", "inner.part01.rar"},
             )
             self.assertTrue(preservation["preserved_original"])
             self.assertTrue(preservation["preserved_extracted"])
@@ -581,7 +583,7 @@ class LayeredExtractionTests(unittest.TestCase):
             real_move = shutil.move
 
             def controlled_move(source, destination):
-                if Path(source).name == "extracted":
+                if Path(source).name == "partial.rar":
                     raise OSError(28, "No space left on device", str(source))
                 return real_move(source, destination)
 
@@ -592,8 +594,8 @@ class LayeredExtractionTests(unittest.TestCase):
                     "Movie Failure",
                 )
 
-            self.assertTrue((review / "original" / "outer.rar").is_file())
-            self.assertFalse((review / "extracted").exists())
+            self.assertTrue((review / "outer.rar").is_file())
+            self.assertFalse((review / "partial.rar").exists())
             self.assertTrue((job_root / "extracted" / "partial.rar").is_file())
             self.assertTrue(preservation["preserved_original"])
             self.assertFalse(preservation["preserved_extracted"])
@@ -650,10 +652,10 @@ class LayeredExtractionTests(unittest.TestCase):
             reason = json.loads((review / "reason.json").read_text(encoding="utf-8"))
             self.assertEqual(updated["state"], "error_terminal")
             self.assertEqual(updated["last_error_code"], "extract_volume_missing")
-            self.assertTrue((review / "original" / "outer.rar").is_file())
-            self.assertTrue(
-                (review / "extracted" / "layer_01.tmp" / "inner.part01.rar").is_file()
-            )
+            self.assertTrue((review / "outer.rar").is_file())
+            self.assertTrue((review / "inner.part01.rar").is_file())
+            self.assertFalse((review / "original").exists())
+            self.assertFalse((review / "extracted").exists())
             self.assertTrue((review / "Error de extraccion.txt").is_file())
             self.assertTrue(reason["preserved_original"])
             self.assertTrue(reason["preserved_extracted"])

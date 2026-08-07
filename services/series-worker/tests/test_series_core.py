@@ -2038,9 +2038,9 @@ def test_review_moves_pack_once_without_hidden_staging(layout, monkeypatch):
     result = coordinator.wait("job-1").payload["result"]
 
     assert result["status"] == "review"
-    assert len(calls) == 1
+    assert len(calls) == 3
     review = layout["review"] / result["review_path"]
-    assert (review / "Serie/bonus.mkv").read_bytes() == b"bonus"
+    assert (review / "bonus.mkv").read_bytes() == b"bonus"
     assert not Path(payload["source_root"]).exists()
     assert not list(layout["review"].glob(".*series-worker*"))
 
@@ -2058,7 +2058,7 @@ def test_review_never_overwrites_existing_job_destination(layout):
     assert result["status"] == "review"
     assert result["review_path"] == "Series sin clasificar (1)"
     assert (
-        layout["review"] / result["review_path"] / "Serie/bonus.mkv"
+        layout["review"] / result["review_path"] / "bonus.mkv"
     ).read_bytes() == b"bonus"
     assert (destination / "foreign.bin").read_bytes() == b"keep"
 

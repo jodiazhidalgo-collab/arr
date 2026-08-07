@@ -799,6 +799,48 @@ def _safe_review_folder_name(value: str) -> str:
     return text[:180].rstrip(" .") or "Series sin clasificar"
 
 
+def _unique_review_file(destination: Path) -> Path:
+    if not destination.exists():
+        return destination
+    for index in range(1, 10000):
+        candidate = destination.with_name(
+            f"{destination.stem} ({index}){destination.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+    return destination.with_name(
+        f"{destination.stem} ({int(time.time())}){destination.suffix}"
+    )
+
+
+def _move_review_content_flat(source: Path, destination: Path) -> None:
+    entries = sorted(source.rglob("*"), key=lambda path: str(path).casefold())
+    for entry in entries:
+        if entry.is_symlink():
+            raise SeriesWorkerError(
+                "El pack de revisión no puede contener enlaces simbólicos"
+            )
+        if not entry.is_dir() and not entry.is_file():
+            raise SeriesWorkerError(
+                "El pack de revisión contiene una entrada no regular"
+            )
+    destination.mkdir(parents=True, exist_ok=False)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for item in (entry for entry in entries if entry.is_file()):
+            target = _unique_review_file(destination / item.name)
+            shutil.move(str(item), str(target))
+            moved.append((target, item))
+    except Exception:
+        for target, original in reversed(moved):
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(target), str(original))
+        if destination.is_dir() and not any(destination.iterdir()):
+            destination.rmdir()
+        raise
+    shutil.rmtree(source, ignore_errors=True)
+
+
 def _review_folder_label(manifest: SeriesManifest) -> str:
     series_name = str(manifest.series_name or "").strip()
     entries = tuple(manifest.entries)
@@ -1389,7 +1431,7 @@ def _review_pack(
             encoding="utf-8",
         )
         text_path.write_text(expected_text, encoding="utf-8")
-        shutil.move(str(source), str(destination))
+        _move_review_content_flat(source, destination)
     except Exception:
         if source.is_dir() and not source.is_symlink():
             for reserved in _REVIEW_METADATA:

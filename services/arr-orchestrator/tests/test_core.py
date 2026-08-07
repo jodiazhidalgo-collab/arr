@@ -903,6 +903,27 @@ class CoreTests(unittest.TestCase):
             self.assertTrue((destination / "Pelicula rara.mkv").exists())
             self.assertFalse(job_root.exists())
 
+    def test_move_job_to_review_clean_keeps_colliding_names_at_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            job_root = root / "taller" / "job-movie"
+            source = job_root / "original" / "Release"
+            (source / "disc-1").mkdir(parents=True)
+            (source / "disc-2").mkdir(parents=True)
+            (source / "disc-1" / "sample.mkv").write_bytes(b"one")
+            (source / "disc-2" / "sample.mkv").write_bytes(b"two")
+
+            destination = move_job_to_review_clean(job_root, review, "Release")
+
+            self.assertEqual((destination / "sample.mkv").read_bytes(), b"one")
+            self.assertEqual((destination / "sample (1).mkv").read_bytes(), b"two")
+            self.assertEqual(
+                {path.name for path in destination.iterdir()},
+                {"sample.mkv", "sample (1).mkv"},
+            )
+            self.assertFalse(job_root.exists())
+
     def test_movie_duplicate_review_uses_clean_layout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1013,10 +1034,41 @@ class CoreTests(unittest.TestCase):
 
             self.assertEqual(destination.name, "Mi Serie S01E01")
             self.assertEqual(
-                next(destination.rglob("*.sup")).read_bytes(),
+                (destination / "subtitulo_original.sup").read_bytes(),
                 b"subtitle-image",
             )
-            self.assertEqual(next(destination.rglob("*.mkv")).read_bytes(), b"episode")
+            self.assertEqual(
+                (destination / "Mi Serie S01E01.mkv").read_bytes(),
+                b"episode",
+            )
+            self.assertFalse((destination / "series_filebot_output").exists())
+            self.assertFalse(job_root.exists())
+
+    def test_move_tv_job_to_review_flattens_the_complete_workshop(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            review = root / "review"
+            job_root = root / "taller" / "job-tv"
+            original = job_root / "original" / "Release"
+            extracted = job_root / "extracted" / "layer_01"
+            original.mkdir(parents=True)
+            extracted.mkdir(parents=True)
+            (original / "episode.mkv").write_bytes(b"episode")
+            (extracted / "partial.rar").write_bytes(b"partial")
+
+            destination = move_tv_job_to_review(
+                job_root,
+                review,
+                "Mi Serie S01E01",
+                whole_tree=True,
+            )
+
+            self.assertEqual((destination / "episode.mkv").read_bytes(), b"episode")
+            self.assertEqual((destination / "partial.rar").read_bytes(), b"partial")
+            self.assertEqual(
+                {path.name for path in destination.iterdir()},
+                {"episode.mkv", "partial.rar"},
+            )
             self.assertFalse(job_root.exists())
 
     def test_tv_duplicate_review_uses_the_jobs_frozen_parser_rules(self) -> None:
@@ -3981,7 +4033,8 @@ class CoreTests(unittest.TestCase):
             recovered = list(review.rglob("Timeout Show - S01E10.mkv"))
             self.assertEqual(len(recovered), 1)
             self.assertEqual(list(review.rglob("Timeout Show - S01E100.mkv")), [])
-            self.assertIn("filebot_rejected", recovered[0].parts)
+            self.assertEqual(recovered[0].parent, review)
+            self.assertFalse((review / "filebot_rejected").exists())
             database.close()
 
     def test_real_torrent_fixture_when_available(self) -> None:

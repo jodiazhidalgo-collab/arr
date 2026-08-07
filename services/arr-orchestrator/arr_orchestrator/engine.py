@@ -54,7 +54,6 @@ from .filesystem import (
     media_files,
     move_extraction_failure_to_review,
     move_into_job,
-    move_job_to,
     move_job_to_review_clean,
     move_tv_job_to_review,
     move_trailer_package_into_job,
@@ -4567,15 +4566,12 @@ class Engine:
             if resolved_review_root != lexical_review_root:
                 raise ValueError("La raiz de revision de Series atraviesa un enlace simbolico")
             review_name = str(job.get("name") or job.get("job_id") or "serie")
-            if clean_review:
-                review = move_tv_job_to_review(
-                    job_root,
-                    resolved_review_root,
-                    review_name,
-                )
-            else:
-                mover = move_job_to if preserve_whole_tree else move_job_to_review_clean
-                review = mover(job_root, resolved_review_root, review_name)
+            review = move_tv_job_to_review(
+                job_root,
+                resolved_review_root,
+                review_name,
+                whole_tree=preserve_whole_tree,
+            )
             self.db.update_job(job_id, stage_path=str(review))
             if review.parent != resolved_review_root or review.is_symlink():
                 raise ValueError("El destino de revision de Series no es canonico")
@@ -4583,11 +4579,10 @@ class Engine:
                 review,
                 whole_tree=preserve_whole_tree,
             )
-            signatures_match = (
-                sorted((size, fingerprint) for _path, size, fingerprint in before)
-                == sorted((size, fingerprint) for _path, size, fingerprint in after)
-                if clean_review
-                else before == after
+            signatures_match = sorted(
+                (size, fingerprint) for _path, size, fingerprint in before
+            ) == sorted(
+                (size, fingerprint) for _path, size, fingerprint in after
             )
             if not signatures_match:
                 raise ValueError("La copia de revision no coincide con el pack completo")

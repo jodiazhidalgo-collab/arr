@@ -7,6 +7,27 @@ import pytest
 from media_worker import bluray, core, server
 
 
+def test_move_to_review_flattens_movie_wrappers(tmp_path):
+    source = tmp_path / "Release" / "original" / "Movie"
+    source.mkdir(parents=True)
+    (source / "movie.mkv").write_bytes(b"movie")
+
+    result = core._move_to_review(
+        tmp_path / "Release",
+        tmp_path / "review",
+        "job-1",
+        "Error de proceso.txt",
+        ["Fallo controlado."],
+        {"job_id": "job-1", "phase": "test"},
+    )
+
+    review = Path(result["review_path"])
+    assert (review / "movie.mkv").read_bytes() == b"movie"
+    assert (review / "reason.json").is_file()
+    assert (review / "Error de proceso.txt").is_file()
+    assert not (review / "original").exists()
+
+
 def probe_payload(
     duration=5400.0,
     videos=1,
@@ -568,6 +589,9 @@ def test_process_movie_fallo_bluray_conserva_origen_en_revision(tmp_path, monkey
     assert result["status"] == "review"
     assert (review / "BDMV").exists()
     assert (review / "CERTIFICATE").exists()
+    assert (review / "reason.json").is_file()
+    assert (review / result["reason_file"]).is_file()
+    assert not (review / source.name).exists()
 
 
 def test_endpoint_normalize_bluray_valida_raiz_permitida(tmp_path, monkeypatch):

@@ -35,6 +35,7 @@ REASON_TEXT_FILES = {
     "Revision manual.txt",
 }
 SIDECAR_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".idx"}
+BLURAY_STRUCTURE_DIRECTORIES = {"bdmv", "certificate"}
 MAX_EXTRACTION_LAYERS = 3
 EXTRACTION_LAYER_MARKER = ".arr-extraction-layer.json"
 DEFAULT_EXTRACTION_TIMEOUT_SECONDS = 7200
@@ -866,6 +867,75 @@ def move_job_to(job_root: Path, destination_root: Path, name: str) -> Path:
     return destination
 
 
+def _unique_review_file(destination: Path) -> Path:
+    if not destination.exists():
+        return destination
+    for index in range(1, 10000):
+        candidate = destination.with_name(
+            f"{destination.stem} ({index}){destination.suffix}"
+        )
+        if not candidate.exists():
+            return candidate
+    return destination.with_name(
+        f"{destination.stem} ({int(time.time())}){destination.suffix}"
+    )
+
+
+def _move_review_content_flat(source: Path, destination: Path) -> None:
+    """Quita carpetas envoltorio sin romper la estructura propia de Blu-ray."""
+
+    if source.is_symlink():
+        raise ValueError("El contenido de revisión no puede ser un enlace simbólico")
+    if source.is_file():
+        shutil.move(str(source), str(_unique_review_file(destination / source.name)))
+        return
+    if not source.is_dir():
+        raise ValueError("El contenido de revisión no es una entrada regular")
+
+    entries = sorted(source.rglob("*"), key=lambda path: str(path).casefold())
+    for entry in entries:
+        if entry.is_symlink():
+            raise ValueError("El contenido de revisión no puede contener enlaces simbólicos")
+        if not entry.is_dir() and not entry.is_file():
+            raise ValueError("El contenido de revisión contiene una entrada no regular")
+
+    protected = []
+    if source.name.casefold() in BLURAY_STRUCTURE_DIRECTORIES:
+        protected.append(source)
+    else:
+        protected.extend(
+            entry
+            for entry in entries
+            if entry.is_dir()
+            and entry.name.casefold() in BLURAY_STRUCTURE_DIRECTORIES
+            and not any(
+                parent != entry
+                and parent.name.casefold() in BLURAY_STRUCTURE_DIRECTORIES
+                for parent in entry.parents
+                if parent == source or source in parent.parents
+            )
+        )
+
+    protected_set = set(protected)
+    files = [
+        entry
+        for entry in entries
+        if entry.is_file()
+        and not any(parent in protected_set for parent in entry.parents)
+    ]
+    for folder in protected:
+        target = numbered_destination(destination / folder.name)
+        shutil.move(str(folder), str(target))
+    for item in files:
+        if item.exists():
+            shutil.move(
+                str(item),
+                str(_unique_review_file(destination / item.name)),
+            )
+    if source.exists() and source.is_dir():
+        shutil.rmtree(source, ignore_errors=True)
+
+
 def move_job_to_review_clean(job_root: Path, destination_root: Path, name: str) -> Path:
     destination_root.mkdir(parents=True, exist_ok=True)
     destination = numbered_destination(destination_root / safe_folder_name(name))
@@ -874,25 +944,29 @@ def move_job_to_review_clean(job_root: Path, destination_root: Path, name: str) 
     source_root = _review_content_root(job_root)
     moved = False
     if source_root.exists() and source_root.is_file():
-        shutil.move(str(source_root), str(unique_destination(destination / source_root.name)))
+        _move_review_content_flat(source_root, destination)
         moved = True
     elif source_root.exists():
-        for item in sorted(source_root.iterdir(), key=lambda child: child.name.lower()):
-            shutil.move(str(item), str(unique_destination(destination / item.name)))
-            moved = True
+        _move_review_content_flat(source_root, destination)
+        moved = True
 
     if not moved and job_root.exists():
-        for item in sorted(job_root.iterdir(), key=lambda child: child.name.lower()):
-            if item.name in {
-                "original",
-                "extracted",
-                "filebot_input",
-                "filebot_output",
-                "series_filebot_output",
-            }:
-                continue
-            shutil.move(str(item), str(unique_destination(destination / item.name)))
+        _move_review_content_flat(job_root, destination)
 
+    shutil.rmtree(job_root, ignore_errors=True)
+    return destination
+
+
+def _move_job_source_to_review_flat(
+    job_root: Path,
+    source_root: Path,
+    destination_root: Path,
+    name: str,
+) -> Path:
+    destination_root.mkdir(parents=True, exist_ok=True)
+    destination = numbered_destination(destination_root / safe_folder_name(name))
+    destination.mkdir(parents=True, exist_ok=True)
+    _move_review_content_flat(source_root, destination)
     shutil.rmtree(job_root, ignore_errors=True)
     return destination
 
@@ -965,13 +1039,13 @@ def move_extraction_failure_to_review(
         if not source.exists():
             continue
         try:
-            shutil.move(str(source), str(destination / folder_name))
+            _move_review_content_flat(source, destination)
             preserved[folder_name] = True
         except OSError as error:
             detail = error.strerror or error.__class__.__name__
             preservation_errors.append(f"{folder_name}: {detail}")
 
-    preserved_total_bytes = _tree_size(destination / "original") + _tree_size(destination / "extracted")
+    preserved_total_bytes = _tree_size(destination)
     residual_job_root = job_root.exists() and any(job_root.iterdir())
     if job_root.exists() and not residual_job_root:
         job_root.rmdir()
@@ -1002,6 +1076,7 @@ def _tree_size(root: Path) -> int:
 def _review_content_root(job_root: Path) -> Path:
     for root in (
         job_root / "series_filebot_output",
+        job_root / "filebot_output",
         job_root / "filebot_input",
         job_root / "extracted",
         job_root / "original",
@@ -1036,8 +1111,10 @@ def move_tv_job_to_review(
     destination_root: Path,
     name: str,
     parser_rules: Optional[Dict[str, object]] = None,
+    *,
+    whole_tree: bool = False,
 ) -> Path:
-    source_root = _review_content_root(job_root)
+    source_root = job_root if whole_tree else _review_content_root(job_root)
     allowed_suffixes = MEDIA_EXTENSIONS | SIDECAR_EXTENSIONS
     try:
         source_entries = list(source_root.rglob("*")) if source_root.is_dir() else [source_root]
@@ -1052,12 +1129,27 @@ def move_tv_job_to_review(
             )
             for entry in source_entries
         ):
-            return move_job_to(job_root, destination_root, name)
+            return _move_job_source_to_review_flat(
+                job_root,
+                source_root,
+                destination_root,
+                name,
+            )
     except OSError:
-        return move_job_to(job_root, destination_root, name)
+        return _move_job_source_to_review_flat(
+            job_root,
+            source_root,
+            destination_root,
+            name,
+        )
     videos = media_files(source_root)
     if not videos:
-        return move_job_to(job_root, destination_root, name)
+        return _move_job_source_to_review_flat(
+            job_root,
+            source_root,
+            destination_root,
+            name,
+        )
 
     parsed = parse_release_name(name, "tv", rules=parser_rules)
     title = safe_folder_name(parsed.display_title or Path(name).stem or name)

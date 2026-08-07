@@ -1463,7 +1463,7 @@ def test_private_filebot_collision_is_never_labeled_as_series_duplicate(
         database.close()
 
 
-def test_orchestrator_fallback_preserves_whole_tree_for_unknown_output_file(
+def test_orchestrator_fallback_flattens_whole_tree_for_unknown_output_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1484,9 +1484,9 @@ def test_orchestrator_fallback_preserves_whole_tree_for_unknown_output_file(
         updated = database.get_job(str(job["job_id"]))
         review = Path(str(updated["stage_path"]))
         assert review.parent == engine.config.series_review_dir
-        assert next(review.rglob("*.sup")).read_bytes() == b"subtitle-image"
-        assert next(review.rglob("*.mkv")).read_bytes() == b"episode-one"
-        assert (review / "series_filebot_output").is_dir()
+        assert (review / "subtitulo_original.sup").read_bytes() == b"subtitle-image"
+        assert (review / "Mi Serie S01E01.mkv").read_bytes() == b"episode-one"
+        assert not (review / "series_filebot_output").exists()
         assert not job_root.exists()
     finally:
         database.close()
@@ -1983,9 +1983,9 @@ def test_orchestrator_fallback_preserves_unknown_file_outside_filebot_output(
 
         updated = database.get_job(str(job["job_id"]))
         review = Path(str(updated["stage_path"]))
-        assert next(review.rglob("*.sup")).read_bytes() == b"subtitle-image"
-        assert next(review.rglob("*.mkv")).read_bytes() == b"episode-one"
-        assert (review / "original").is_dir()
+        assert (review / "subtitulo_original.sup").read_bytes() == b"subtitle-image"
+        assert (review / "Mi Serie S01E01.mkv").read_bytes() == b"episode-one"
+        assert not (review / "original").exists()
         assert not job_root.exists()
     finally:
         database.close()
@@ -2556,8 +2556,10 @@ def test_series_extraction_failure_preserves_whole_pack_before_client_cleanup(
         assert updated["state"] == "manual_review"
         assert updated["last_error_code"] == expected_code
         assert review.parent == engine.config.series_review_dir
-        assert (review / "original" / f"{job['name']}.rar").read_bytes() == b"archive"
-        assert (review / partial.relative_to(job_root)).read_bytes() == b"partial"
+        assert (review / f"{job['name']}.rar").read_bytes() == b"archive"
+        assert (review / partial.name).read_bytes() == b"partial"
+        assert not (review / "original").exists()
+        assert not (review / "extracted").exists()
         assert (review / "Error de extraccion.txt").is_file()
         assert reason["reason"] == expected_code
         assert reason["reason_code"] == expected_code
@@ -2611,7 +2613,7 @@ def test_series_extraction_review_blocks_cleanup_if_preserved_pack_changes(
         if tamper_mode == "delete":
             shutil.rmtree(review)
         else:
-            preserved_archive = review / "original" / f"{job['name']}.rar"
+            preserved_archive = review / f"{job['name']}.rar"
             preserved_archive.write_bytes(b"archive-manipulado")
 
         engine._reconcile_late_worker_results()
@@ -2845,7 +2847,9 @@ def test_movie_extraction_failure_keeps_legacy_review_flow(
         assert updated["state"] == "error_terminal"
         assert updated["last_error_code"] == "extract_volume_missing"
         assert review.parent == engine.config.review_dir
-        assert (review / partial.relative_to(job_root)).read_bytes() == b"partial"
+        assert (review / partial.name).read_bytes() == b"partial"
+        assert not (review / "original").exists()
+        assert not (review / "extracted").exists()
         assert (review / "Error de extraccion.txt").is_file()
         assert cleanup_calls == []
         assert not any(engine.config.series_review_dir.iterdir())
